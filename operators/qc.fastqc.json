@@ -1,0 +1,26 @@
+{
+  "id": "qc.fastqc",
+  "title": "FastQC",
+  "palette": ["QC"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "fastqc",
+  "conda": { "name": "axial-qc", "spec": ["bioconda::fastqc"] },
+  "params": {},
+  "ports": {
+    "in": [{ "name": "fastq", "type": "Fastq", "union": ["Fastq", "FastqGz"] }],
+    "out": [
+      { "name": "html", "type": "Html" },
+      { "name": "preview", "type": "Preview", "optional": true }
+    ]
+  },
+  "argv": ["fastqc", "{input.fastq}", "-o", "{work}/out", "--extract"],
+  "outputs": {
+    "html": { "glob": "{work}/out/*_fastqc.html", "type": "Html" },
+    "preview": {
+      "glob": "{work}/out/*_fastqc/Images/per_base_quality.png",
+      "type": "Preview",
+      "optional": true
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "id": "qc.busco",
+  "title": "BUSCO",
+  "palette": ["QC"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "busco",
+  "conda": { "name": "axial-asm", "spec": ["bioconda::busco"] },
+  "params": {
+    "lineage": { "type": "string", "label": "Lineage", "page": "BUSCO", "default": "arthropoda_odb10" },
+    "mode": { "type": "string", "label": "Mode", "page": "BUSCO", "default": "genome" }
+  },
+  "ports": {
+    "in": [{ "name": "fasta", "type": "Fasta", "union": ["Fasta", "FastaGz"] }],
+    "out": [{ "name": "report", "type": "Directory" }]
+  },
+  "argv": [
+    "busco",
+    "-i",
+    "{input.fasta}",
+    "-l",
+    "{param.lineage}",
+    "-m",
+    "{param.mode}",
+    "-o",
+    "busco",
+    "--out_path",
+    "{work}/out"
+  ],
+  "outputs": {
+    "report": { "glob": "{work}/out", "type": "Directory", "optional": true }
+  }
+}

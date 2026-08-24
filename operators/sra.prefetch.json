@@ -1,0 +1,33 @@
+{
+  "id": "sra.prefetch",
+  "title": "SRA prefetch",
+  "palette": ["NCBI", "SRA"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "prefetch",
+  "conda": { "name": "axial-ncbi", "spec": ["bioconda::sra-tools"] },
+  "params": {
+    "accession": {
+      "type": "string",
+      "label": "Accession",
+      "page": "SRA",
+      "required": true
+    },
+    "max_size": { "type": "string", "label": "Max size", "page": "SRA", "default": "20G" }
+  },
+  "ports": {
+    "in": [],
+    "out": [{ "name": "sra", "type": "Sra" }]
+  },
+  "argv": [
+    "prefetch",
+    "{param.accession}",
+    "-O",
+    "{work}/out/{param.accession}",
+    "--max-size",
+    "{param.max_size}"
+  ],
+  "outputs": {
+    "sra": { "glob": "{work}/out/{param.accession}/{param.accession}.sra", "type": "Sra" }
+  }
+}

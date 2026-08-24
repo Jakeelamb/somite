@@ -1,0 +1,20 @@
+Methods
+Whole genome sequencing
+5ug of genomic DNA was sheared to a suitable size for HiFi using the Megaruptor 3.
+Libraries were sequenced on the PacBio Sequel IIe.
+Aphids were sent to Phase Genomics for Hi-C sequencing.
+
+Genome assembly
+Genome characteristics were assessed using Genomescope (v2). Initial contig
+assemblies were generated using hifiasm (v0.16.1-r375) and was provided with
+both HiFi and Hi-C data for improved haplotype resolution. Both genome copies
+were individually scaffolded into linkage groups using YaHS (v1.2a.2). Blobtools
+(v1.1) was used to identify symbiont contigs. Assembly completeness was
+assessed using BUSCO (v5.2.2) and the arthropoda_odb10 database.
+HiFi reads were also provided to MitoHiFi (v3.0.0) for mitochondrial genome
+assembly. Symbionts were annotated using bakta (v1.9.3).
+
+RNA Iso-seq sequencing
+Iso-Seq libraries were sequenced on the PacBio Sequel IIe. Transcripts were
+mapped with minimap2. Transcript assemblies were then provided to Augustus
+(v3.5.0) for model training and gene prediction.

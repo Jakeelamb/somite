@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/axial-ir",
+    "crates/axial-ops",
+    "crates/axial-cook",
+    "crates/axial-paper",
+    "crates/axial-cli",
+    "crates/axial-app",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+version = "0.1.0"

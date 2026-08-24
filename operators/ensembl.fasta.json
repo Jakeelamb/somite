@@ -1,0 +1,31 @@
+{
+  "id": "ensembl.fasta",
+  "title": "Ensembl FASTA",
+  "palette": ["Ensembl"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "curl",
+  "params": {
+    "species": {
+      "type": "string",
+      "label": "Species",
+      "page": "Ensembl",
+      "default": "homo_sapiens"
+    },
+    "release": { "type": "string", "label": "Release", "page": "Ensembl", "default": "113" },
+    "url": {
+      "type": "string",
+      "label": "URL",
+      "page": "Ensembl",
+      "required": true
+    }
+  },
+  "ports": {
+    "in": [],
+    "out": [{ "name": "fasta", "type": "FastaGz" }]
+  },
+  "argv": ["curl", "-L", "-o", "{work}/out/genome.fa.gz", "{param.url}"],
+  "outputs": {
+    "fasta": { "glob": "{work}/out/genome.fa.gz", "type": "FastaGz" }
+  }
+}

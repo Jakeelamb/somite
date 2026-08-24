@@ -1,0 +1,22 @@
+{
+  "id": "qc.fastp",
+  "title": "fastp",
+  "palette": ["QC"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "fastp",
+  "conda": { "name": "axial-qc", "spec": ["bioconda::fastp"] },
+  "params": {
+    "threads": { "type": "int", "label": "Threads", "page": "fastp", "default": 4 }
+  },
+  "ports": {
+    "in": [{ "name": "fastq", "type": "Fastq", "union": ["Fastq", "FastqGz"] }],
+    "out": [{ "name": "out", "type": "FastqGz" }]
+  },
+  "argv": [
+    "fastp", "-i", "{input.fastq}", "-o", "{work}/out/clean.fastq.gz", "-w", "{param.threads}"
+  ],
+  "outputs": {
+    "out": { "glob": "{work}/out/clean.fastq.gz", "type": "FastqGz" }
+  }
+}

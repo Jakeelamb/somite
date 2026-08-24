@@ -1,0 +1,16 @@
+{
+  "id": "files.import",
+  "title": "Import file",
+  "palette": ["Files"],
+  "kind": "inprocess",
+  "cost": "low",
+  "params": {
+    "path": { "type": "string", "label": "Path", "page": "File", "required": true }
+  },
+  "ports": {
+    "in": [],
+    "out": [{ "name": "file", "type": "Fastq" }]
+  },
+  "argv": [],
+  "outputs": {}
+}

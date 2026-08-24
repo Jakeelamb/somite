@@ -1,0 +1,4 @@
+/target
+**/.axial/
+*.swp
+.DS_Store

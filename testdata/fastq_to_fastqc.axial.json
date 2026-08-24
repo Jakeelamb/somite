@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "nodes": [
+    {
+      "id": "import1",
+      "operator": "files.import",
+      "ports": [
+        { "name": "file", "dir": "out", "ty": "Fastq" }
+      ],
+      "params": { "path": "testdata/tiny_R1.fastq" },
+      "layout": { "x": 48.0, "y": 120.0 }
+    },
+    {
+      "id": "fastqc1",
+      "operator": "qc.fastqc",
+      "ports": [
+        { "name": "fastq", "dir": "in", "ty": "Fastq", "union": ["Fastq", "FastqGz"] },
+        { "name": "html", "dir": "out", "ty": "Html" },
+        { "name": "preview", "dir": "out", "ty": "Preview", "optional": true }
+      ],
+      "layout": { "x": 248.0, "y": 120.0 }
+    }
+  ],
+  "edges": [
+    {
+      "id": "e1",
+      "from_node": "import1",
+      "from_port": "file",
+      "to_node": "fastqc1",
+      "to_port": "fastq"
+    }
+  ]
+}

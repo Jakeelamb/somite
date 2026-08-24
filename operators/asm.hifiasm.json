@@ -1,0 +1,23 @@
+{
+  "id": "asm.hifiasm",
+  "title": "hifiasm",
+  "palette": ["Assembly"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "hifiasm",
+  "conda": { "name": "axial-asm", "spec": ["bioconda::hifiasm"] },
+  "params": {
+    "threads": { "type": "int", "label": "Threads", "page": "hifiasm", "default": 8, "min": 1, "max": 64 }
+  },
+  "ports": {
+    "in": [
+      { "name": "reads", "type": "Fastq", "union": ["Fastq", "FastqGz", "Fasta", "FastaGz"] },
+      { "name": "hic", "type": "Fastq", "union": ["Fastq", "FastqGz"], "optional": true }
+    ],
+    "out": [{ "name": "asm", "type": "Directory" }]
+  },
+  "argv": ["hifiasm", "-t", "{param.threads}", "-o", "{work}/out/asm", "{input.reads}"],
+  "outputs": {
+    "asm": { "glob": "{work}/out", "type": "Directory", "optional": true }
+  }
+}

@@ -1,0 +1,19 @@
+[package]
+name = "axial-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "axial cook / app"
+default-run = "axial"
+
+[[bin]]
+name = "axial"
+path = "src/main.rs"
+
+[dependencies]
+axial-ir = { path = "../axial-ir" }
+axial-ops = { path = "../axial-ops" }
+axial-cook = { path = "../axial-cook" }
+axial-paper = { path = "../axial-paper" }
+serde_json = "1"
+anyhow = "1"

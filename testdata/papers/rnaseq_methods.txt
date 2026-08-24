@@ -1,0 +1,4 @@
+RNA-seq was performed on Illumina NovaSeq. Raw reads (SRR12345678) were
+quality-checked with FastQC v0.12 and trimmed with fastp. Reads were aligned
+with STAR v2.7.10a to GRCh38. Gene counts used featureCounts. Differential
+expression was computed with DESeq2.

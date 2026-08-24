@@ -1,0 +1,19 @@
+{
+  "id": "ensembl.gtf",
+  "title": "Ensembl GTF",
+  "palette": ["Ensembl"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "curl",
+  "params": {
+    "url": { "type": "string", "label": "URL", "page": "Ensembl", "required": true }
+  },
+  "ports": {
+    "in": [],
+    "out": [{ "name": "gtf", "type": "GtfGz" }]
+  },
+  "argv": ["curl", "-L", "-o", "{work}/out/genes.gtf.gz", "{param.url}"],
+  "outputs": {
+    "gtf": { "glob": "{work}/out/genes.gtf.gz", "type": "GtfGz" }
+  }
+}

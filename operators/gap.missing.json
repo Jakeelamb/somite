@@ -1,0 +1,15 @@
+{
+  "id": "gap.missing",
+  "title": "Missing from catalog",
+  "palette": ["Gaps"],
+  "kind": "inprocess",
+  "cost": "low",
+  "params": {
+    "tool": { "type": "string", "label": "Tool", "page": "Gap", "required": true },
+    "quote": { "type": "string", "label": "Paper", "page": "Gap" }
+  },
+  "ports": {
+    "in": [{ "name": "in", "type": "Directory", "optional": true }],
+    "out": [{ "name": "out", "type": "Directory", "optional": true }]
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "id": "nf.sarek",
+  "title": "nf-core/sarek",
+  "palette": ["nf-core", "Variants"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "nextflow",
+  "conda": { "name": "axial-nf", "spec": ["bioconda::nextflow"] },
+  "params": {
+    "revision": { "type": "string", "label": "Version", "page": "Pipeline", "default": "3.10.0" }
+  },
+  "ports": {
+    "in": [{ "name": "sheet", "type": "Table" }],
+    "out": [{ "name": "results", "type": "Directory", "optional": true }]
+  },
+  "argv": [
+    "nextflow", "run", "nf-core/sarek", "-r", "{param.revision}",
+    "--input", "{input.sheet}", "--outdir", "{work}/out"
+  ],
+  "outputs": {
+    "results": { "glob": "{work}/out", "type": "Directory", "optional": true }
+  }
+}

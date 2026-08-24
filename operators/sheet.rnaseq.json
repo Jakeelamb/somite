@@ -1,0 +1,18 @@
+{
+  "id": "sheet.rnaseq",
+  "title": "RNA-seq samplesheet",
+  "palette": ["Files"],
+  "kind": "inprocess",
+  "cost": "low",
+  "params": {
+    "sample": { "type": "string", "label": "Sample", "page": "Sheet", "default": "sample1" },
+    "strandedness": { "type": "string", "label": "Strandedness", "page": "Sheet", "default": "auto" }
+  },
+  "ports": {
+    "in": [
+      { "name": "r1", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
+      { "name": "r2", "type": "Fastq", "union": ["Fastq", "FastqGz"], "optional": true }
+    ],
+    "out": [{ "name": "sheet", "type": "Table" }]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "ncbi.datasets_genome",
+  "title": "NCBI datasets genome",
+  "palette": ["NCBI", "Datasets"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "datasets",
+  "conda": { "name": "axial-ncbi", "spec": ["conda-forge::ncbi-datasets-cli"] },
+  "params": {
+    "taxon": { "type": "string", "label": "Taxon", "page": "Genome", "required": true, "default": "human" }
+  },
+  "ports": {
+    "in": [],
+    "out": [{ "name": "zip", "type": "Directory", "optional": true }]
+  },
+  "argv": [
+    "datasets",
+    "download",
+    "genome",
+    "taxon",
+    "{param.taxon}",
+    "--filename",
+    "{work}/out/genome.zip"
+  ],
+  "outputs": {
+    "zip": { "glob": "{work}/out/genome.zip", "type": "Directory", "optional": true }
+  }
+}

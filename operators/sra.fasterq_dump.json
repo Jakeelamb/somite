@@ -1,0 +1,41 @@
+{
+  "id": "sra.fasterq_dump",
+  "title": "fasterq-dump",
+  "palette": ["NCBI", "SRA"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "fasterq-dump",
+  "conda": { "name": "axial-ncbi", "spec": ["bioconda::sra-tools"] },
+  "params": {
+    "threads": { "type": "int", "label": "Threads", "page": "SRA", "default": 8, "min": 1, "max": 64 }
+  },
+  "ports": {
+    "in": [{ "name": "sra", "type": "Sra" }],
+    "out": [
+      { "name": "r1", "type": "Fastq" },
+      { "name": "r2", "type": "Fastq", "optional": true },
+      { "name": "unpaired", "type": "Fastq", "optional": true }
+    ]
+  },
+  "argv": [
+    "fasterq-dump",
+    "{input.sra}",
+    "-O",
+    "{work}/out",
+    "-t",
+    "{work}/tmp",
+    "-e",
+    "{param.threads}",
+    "--split-3"
+  ],
+  "outputs": {
+    "r1": { "glob": "{work}/out/*_1.fastq", "type": "Fastq" },
+    "r2": { "glob": "{work}/out/*_2.fastq", "type": "Fastq", "optional": true },
+    "unpaired": {
+      "glob": "{work}/out/*.fastq",
+      "type": "Fastq",
+      "optional": true,
+      "exclude": ["*_1.fastq", "*_2.fastq"]
+    }
+  }
+}

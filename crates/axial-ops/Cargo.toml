@@ -1,0 +1,12 @@
+[package]
+name = "axial-ops"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Operator catalog and argv rendering"
+
+[dependencies]
+axial-ir = { path = "../axial-ir" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
