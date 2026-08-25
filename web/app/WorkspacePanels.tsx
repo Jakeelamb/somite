@@ -8,13 +8,14 @@ import {
   FileSearch,
   FileInput,
   FolderOpen,
+  LoaderCircle,
   Play,
   Search,
   Star,
   X,
 } from "lucide-react";
-import { useMemo, useState, type RefObject } from "react";
-import { classifySource, type SourceRequest } from "./sourceBuilder";
+import { useEffect, useMemo, useState, type RefObject } from "react";
+import { classifySource, type SourceRequest, type SourceSearchResponse, type SourceSearchResult } from "./sourceBuilder";
 import { operatorContinues, type PendingConnection } from "./graphInteractions";
 import type {
   AxialGraphNode,
@@ -26,6 +27,7 @@ import type {
   SystemProfile,
 } from "./types";
 import { OperatorGlyph, portColor } from "./visual";
+import { jsonRequest } from "./api";
 
 export type LibraryMode = "build" | "sources" | "pipelines";
 
@@ -130,6 +132,9 @@ export function LibraryPanel({
   localCount,
   catalogCount,
   catalogStatus,
+  snakemakeCount,
+  snakemakeGraphCount,
+  snakemakeStatus,
   continuation,
   onMode,
   onQuery,
@@ -151,6 +156,9 @@ export function LibraryPanel({
   localCount: number;
   catalogCount: number;
   catalogStatus: "loading" | "ready" | "offline";
+  snakemakeCount: number;
+  snakemakeGraphCount: number;
+  snakemakeStatus: "loading" | "ready" | "offline";
   continuation?: PendingConnection | null;
   onMode: (mode: LibraryMode) => void;
   onQuery: (query: string) => void;
@@ -162,10 +170,66 @@ export function LibraryPanel({
 }) {
   const [accession, setAccession] = useState("");
   const request = classifySource(accession);
+  const hasDirectSource = request !== null;
+  const [sourceResults, setSourceResults] = useState<SourceSearchResult[]>([]);
+  const [sourceSearching, setSourceSearching] = useState(false);
+  const [sourceSearched, setSourceSearched] = useState(false);
+  const [activeSourceResult, setActiveSourceResult] = useState(0);
   const sections = useMemo(
     () => buildSections(operators, mode, filterQuery, favorites, recent, continuation),
     [continuation, favorites, filterQuery, mode, operators, recent],
   );
+
+  useEffect(() => {
+    const query = accession.trim();
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => {
+      if (mode !== "sources" || hasDirectSource || query.length < 2) {
+        setSourceResults([]);
+        setSourceSearching(false);
+        setSourceSearched(false);
+        setActiveSourceResult(0);
+        return;
+      }
+      setSourceResults([]);
+      setSourceSearching(true);
+      setSourceSearched(false);
+      setActiveSourceResult(0);
+      let pending = 2;
+      for (const provider of ["ncbi", "ensembl"] as const) {
+        jsonRequest<SourceSearchResponse>(`/api/sources/search?q=${encodeURIComponent(query)}&provider=${provider}`, {
+          signal: controller.signal,
+        })
+          .then((response) => {
+            if (controller.signal.aborted) return;
+            setSourceResults((current) => [
+              ...current.filter((result) => !result.key.startsWith(`${provider}-`) && !(provider === "ncbi" && result.key.startsWith("ncbi-"))),
+              ...response.results,
+            ]);
+          })
+          .catch(() => undefined)
+          .finally(() => {
+            if (controller.signal.aborted) return;
+            pending -= 1;
+            if (pending === 0) {
+              setSourceSearching(false);
+              setSourceSearched(true);
+            }
+          });
+      }
+    }, 360);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [accession, hasDirectSource, mode]);
+
+  const chooseSource = (source: SourceRequest) => {
+    onAddSource(source);
+    setAccession("");
+    setSourceResults([]);
+    setActiveSourceResult(0);
+  };
 
   return (
     <section className="floating-panel library-window" aria-label="Operator Library">
@@ -231,35 +295,76 @@ export function LibraryPanel({
               </span>
             ))}
           </div>
-          <label htmlFor="accession-entry">Paste an Accession or Record URL</label>
-          <input
-            id="accession-entry"
-            autoComplete="off"
-            name="accession"
-            placeholder="SRR… · GCA_/GCF_… · ENSG/ENST/ENSP…"
-            spellCheck={false}
-            value={accession}
-            onChange={(event) => setAccession(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && request) {
-                onAddSource(request);
-                setAccession("");
-              }
-            }}
-          />
+          <label htmlFor="accession-entry">Search Data or Enter an Accession</label>
+          <div className="source-search-input">
+            <Search size={13} aria-hidden="true" />
+            <input
+              id="accession-entry"
+              role="combobox"
+              aria-autocomplete="list"
+              aria-controls="source-search-results"
+              aria-expanded={sourceResults.length > 0}
+              aria-activedescendant={sourceResults[activeSourceResult] ? `source-result-${sourceResults[activeSourceResult].key}` : undefined}
+              autoComplete="off"
+              name="accession"
+              placeholder="human · mouse RNA-seq · BRCA2 · SRR…"
+              spellCheck={false}
+              value={accession}
+              onChange={(event) => setAccession(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "ArrowDown" && sourceResults.length) {
+                  event.preventDefault();
+                  setActiveSourceResult((index) => Math.min(index + 1, sourceResults.length - 1));
+                } else if (event.key === "ArrowUp" && sourceResults.length) {
+                  event.preventDefault();
+                  setActiveSourceResult((index) => Math.max(index - 1, 0));
+                } else if (event.key === "Enter") {
+                  if (request) chooseSource(request);
+                  else if (sourceResults[activeSourceResult]) chooseSource(sourceResults[activeSourceResult].request);
+                } else if (event.key === "Escape") {
+                  setAccession("");
+                }
+              }}
+            />
+            {sourceSearching && <LoaderCircle className="source-search-spinner" size={13} aria-label="Searching NCBI and Ensembl" />}
+          </div>
+          {sourceResults.length > 0 && (
+            <div className="source-results" id="source-search-results" role="listbox" aria-label="Data source results">
+              {sourceResults.map((result, index) => (
+                <button
+                  id={`source-result-${result.key}`}
+                  key={result.key}
+                  type="button"
+                  role="option"
+                  aria-selected={index === activeSourceResult}
+                  className={index === activeSourceResult ? "active" : ""}
+                  onPointerMove={() => setActiveSourceResult(index)}
+                  onClick={() => chooseSource(result.request)}
+                >
+                  <span className="source-result-head"><strong>{result.title}</strong><em>{result.data_kind}</em></span>
+                  <code>{result.accession}</code>
+                  <small>{result.provider} · {result.description}</small>
+                  <span className="source-result-tags">{result.tags.map((tag) => <i key={tag}>{tag}</i>)}</span>
+                </button>
+              ))}
+            </div>
+          )}
           <div className={`source-preview ${request ? "valid" : ""}`} aria-live="polite">
             {request ? (
               <><strong>{request.provider}</strong><code>{request.value}</code><span>{request.result}</span></>
+            ) : sourceSearching ? (
+              <span>Searching live NCBI and Ensembl records…</span>
+            ) : sourceSearched && !sourceResults.length ? (
+              <span>No direct matches · try an organism, assay, gene symbol, or accession</span>
             ) : (
-              <span>NCBI runs and assemblies · Ensembl stable IDs</span>
+              <span>Reads, reference genomes, assemblies, genes, and stable IDs</span>
             )}
           </div>
           <button type="button" className="source-action" disabled={!request} onClick={() => {
             if (!request) return;
-            onAddSource(request);
-            setAccession("");
+            chooseSource(request);
           }}>
-            {request?.action ?? "Add Source"}
+            {request?.action ?? "Choose a Result"}
           </button>
         </div>
       )}
@@ -268,7 +373,7 @@ export function LibraryPanel({
         <div className="pipeline-banner">
           <span className="section-kicker">Workflow Engines</span>
           <div><WayfindingMark label="NF" ready={toolReadiness?.nextflow} /><span><strong>Nextflow / nf-core</strong><small>{catalogStatus === "loading" ? "Loading the official catalog…" : catalogStatus === "offline" ? "Catalog offline · local workflows remain" : `${catalogCount} official workflows ready`}</small></span></div>
-          <div><WayfindingMark label="SM" ready={toolReadiness?.snakemake} /><span><strong>Snakemake</strong><small>Drop a workflow directory onto the canvas</small></span></div>
+          <div><WayfindingMark label="SM" ready={toolReadiness?.snakemake} /><span><strong>Snakemake Catalog</strong><small>{snakemakeStatus === "loading" ? "Loading released standardized workflows…" : snakemakeStatus === "offline" ? "Catalog offline · local workflows remain" : `${snakemakeCount} released · ${snakemakeGraphCount} graph-ready`}</small></span></div>
         </div>
       )}
 
@@ -302,7 +407,7 @@ export function LibraryPanel({
         })}
         {sections.every((section) => section.operators.length === 0) && <p className="panel-empty">No matching tools.</p>}
       </div>
-      <footer className="library-footer"><span>★ {favorites.size} favorites</span><span>{localCount} local · {catalogStatus === "loading" ? "catalog…" : catalogStatus === "offline" ? "catalog offline" : `${catalogCount} official`}</span></footer>
+      <footer className="library-footer"><span>★ {favorites.size} favorites</span><span>{localCount} local · {catalogStatus === "loading" || snakemakeStatus === "loading" ? "catalog…" : catalogStatus === "offline" && snakemakeStatus === "offline" ? "catalogs offline" : `${catalogCount + snakemakeCount} catalog`}</span></footer>
     </section>
   );
 }
@@ -485,7 +590,7 @@ export function InspectorPanel({
         <span className="section-kicker">Ports</span>
         {node.ports.map((port) => <div key={`${port.dir}-${port.name}`}><i style={{ background: portColor[port.ty] ?? "#8b949b" }} /><strong>{port.name}</strong><span>{port.ty}</span><small>{port.dir}</small></div>)}
       </div>
-      <div className="migration-note"><Play size={14} aria-hidden="true" /><span>Run uses the native Rust executor and content-addressed cache. Downloads and high-cost tools start only when you explicitly run the graph.</span></div>
+      <div className="migration-note"><Play size={14} aria-hidden="true" /><span>{operator.kind === "reference" ? "Imported workflow structure. Replace or promote this component to a native Axial tool before standalone execution." : "Run uses the native Rust executor and content-addressed cache. Downloads and high-cost tools start only when you explicitly run the graph."}</span></div>
     </section>
   );
 }

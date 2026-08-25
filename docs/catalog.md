@@ -21,6 +21,13 @@ Proof that agents can compile when the format exists: Jake's agent on HoX, `nf-c
 
 Acceptance: fixture FASTQ → FastQC PNG in CAS; second cook skips. Live SRA optional.
 
+The Sources launcher accepts exact accessions immediately and also searches
+NCBI SRA, NCBI reference assemblies, and Ensembl from ordinary terms such as
+`human`, `mouse RNA-seq`, or `human BRCA2`. Suggestions identify their provider
+and artifact role (`Reads`, `Genome`, `Reference`, `Gene`) before creating the
+same explicit source nodes listed above. Provider calls are independent and
+short-lived; a slow Ensembl response must not block available NCBI results.
+
 ### Tier 1 — wrap generator (this is the catalog)
 
 `axial ops wrap`. Shipped JSON is **copy-paste for the generator**, not a porting queue.
@@ -36,18 +43,28 @@ Acceptance: fixture FASTQ → FastQC PNG in CAS; second cook skips. Live SRA opt
 
 `hisat2`, `spades`, a lab Python script: wrap it. Do not wait for a tier.
 
-### Tier 2 — nf-core demand signal, not a port list
+### Tier 2 — nf-core workflow references, not native ports
 
 The canvas may discover every released, non-archived pipeline from nf-core's
-official catalog. These generated entries are generic pipeline operators with a
-pinned latest release, optional samplesheet input, and results directory output.
-They are a smooth discovery and launch path, not a claim that every pipeline's
-full schema has been curated. A checked-in operator with the same `nf.<name>` ID
-wins and supplies richer typed ports and parameters.
+official catalog. Dropping one asks Nextflow for its process graph and expands
+that graph into movable, connectable `workflow.reference` nodes. This exposes
+the pipeline's structure without claiming that every process has been converted
+into an independently executable Axial brick. The selected release is pinned in
+the reference metadata.
+
+Read-consuming boundary processes expose separate typed `r1` and optional `r2`
+inputs when the engine graph establishes that boundary. Internal reference
+nodes keep conservative structural ports, so an imported FASTQ cannot be wired
+arbitrarily into the middle of a pipeline. Checked-in `nf.*` adapters remain
+available to execution and paper tooling, but a catalog drop expands the
+catalog's selected workflow rather than collapsing it into that adapter.
 
 rnaseq 1356★, sarek 594, scrnaseq 350, mag 316, ampliseq 257, taxprofiler 192, …
 
-User paths: wrap modules as bricks, or `nextflow run` as a `Directory` compound, or agent-compile a small graph (the HoX `bulk-rna-v1` move). Axial ships **none** of those as a tasteful native app. An in-tree compile is a fixture for `ops wrap`.
+User paths: replace reference nodes with wrapped bricks, run the original
+workflow as a compound boundary, or agent-compile a small native graph (the HoX
+`bulk-rna-v1` move). Reference expansion is a transparency and editing surface;
+standalone execution still requires explicit promotion to native operators.
 
 `fetchngs` is not ingest. Use SRA bricks.
 
@@ -59,11 +76,12 @@ stages it as a writable copy, and invokes `snakemake --directory <copy>` with
 explicit cores and execution flags. The completed project returns as a typed
 `Directory`; the original and CAS copy remain unchanged.
 
-The Snakemake Workflow Catalog is useful discovery, but it is not treated as a
-uniform typed API: repositories retain their own configuration, targets,
-licenses, and output conventions. Axial therefore runs a chosen local project
-honestly instead of pretending every catalog entry shares an nf-core-style
-launch contract.
+The Library also searches the Snakemake Workflow Catalog. When a released
+catalog entry has a graph-ready rulegraph, dropping it expands that engine graph
+into editable `workflow.reference` nodes. Repositories retain their own
+configuration, targets, licenses, and output conventions, so this structural
+view is not presented as a uniform typed execution API. Local execution remains
+the explicit `files.import_directory → smk.workflow` boundary above.
 
 ### Tier 3 — never Axial's job
 

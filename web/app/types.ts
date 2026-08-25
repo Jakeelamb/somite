@@ -73,16 +73,30 @@ export type Operator = {
   id: string;
   title: string;
   palette: string[];
-  kind: "external" | "inprocess";
+  kind: "external" | "inprocess" | "reference";
   cost: "low" | "high";
   params: Record<string, ParamSpec>;
   ports: { in: PortSpec[]; out: PortSpec[] };
   description?: string;
   topics?: string[];
+  expandable?: boolean;
 };
 
 export type NfcoreCatalog = {
   entries: Array<{ operator: Operator; description: string; topics: string[]; revision: string }>;
+  cached: boolean;
+};
+
+export type SnakemakeCatalog = {
+  entries: Array<{ operator: Operator; description: string; topics: string[]; revision: string; stars: number; expandable: boolean }>;
+  cached: boolean;
+};
+
+export type WorkflowGraphResponse = {
+  engine: "nextflow" | "snakemake";
+  workflow: string;
+  revision: string;
+  graph: AxialGraph;
   cached: boolean;
 };
 

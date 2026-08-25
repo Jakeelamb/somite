@@ -1,6 +1,8 @@
 //! Operator JSON catalog. Palette groups (NCBI, Ensembl, nf-core) live here.
 
 pub mod nfcore;
+pub mod snakemake;
+pub mod workflow;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -79,6 +81,7 @@ pub struct OutputSpec {
 pub enum OpKind {
     External,
     Inprocess,
+    Reference,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

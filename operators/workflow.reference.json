@@ -1,0 +1,17 @@
+{
+  "id": "workflow.reference",
+  "title": "Imported workflow component",
+  "palette": ["Workflow", "Imported structure"],
+  "kind": "reference",
+  "cost": "low",
+  "params": {
+    "engine": { "type": "string", "label": "Engine", "page": "Provenance", "required": true },
+    "workflow": { "type": "string", "label": "Workflow", "page": "Provenance", "required": true },
+    "revision": { "type": "string", "label": "Revision", "page": "Provenance", "required": true },
+    "component": { "type": "string", "label": "Process / rule", "page": "Component", "required": true }
+  },
+  "ports": {
+    "in": [{ "name": "in", "type": "Directory", "optional": true }],
+    "out": [{ "name": "out", "type": "Directory", "optional": true }]
+  }
+}

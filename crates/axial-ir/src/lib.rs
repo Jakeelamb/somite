@@ -104,7 +104,7 @@ pub struct Edge {
 pub struct Graph {
     pub schema_version: u32,
     pub nodes: Vec<Node>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub edges: Vec<Edge>,
 }
 

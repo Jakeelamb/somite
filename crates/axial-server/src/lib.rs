@@ -1,18 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axial_bundle::{build_bundle, BundlePlan, ExportTarget};
-use axial_cook::{cook_graph, ArtifactMeta, NodeState, Project};
+use axial_cook::{cook_graph, pixi_available, ArtifactMeta, NodeState, Project};
 use axial_ir::Graph;
-use axial_ops::nfcore;
 use axial_ops::{current_pixi_platform, Catalog, Operator};
+use axial_ops::{nfcore, snakemake, workflow};
 use axial_paper::{
     extract_from_path, reconstruct, Assay, CandidateRole, EvidenceStatus, EvidenceTarget,
     ExtractVia,
 };
-use axum::extract::{DefaultBodyLimit, Multipart, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Query, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
@@ -22,6 +23,8 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
+
+mod source_search;
 
 #[derive(Debug, Error)]
 pub enum ServerError {
@@ -47,6 +50,10 @@ pub enum ServerError {
     InvalidProjectPath(String),
     #[error("nf-core catalog: {0}")]
     CatalogDiscovery(String),
+    #[error("workflow import: {0}")]
+    WorkflowImport(String),
+    #[error("source search: {0}")]
+    SourceSearch(String),
     #[error("export: {0}")]
     Export(#[from] axial_bundle::BundleError),
 }
@@ -64,7 +71,8 @@ impl IntoResponse for ServerError {
             | Self::Upload(_)
             | Self::Run(_)
             | Self::Export(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Paper(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Paper(_) | Self::WorkflowImport(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::SourceSearch(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::CatalogDiscovery(_) => StatusCode::SERVICE_UNAVAILABLE,
         };
         (
@@ -164,6 +172,37 @@ pub struct NfcoreEntry {
 }
 
 #[derive(Debug, Serialize)]
+pub struct SnakemakeCatalogResponse {
+    pub entries: Vec<SnakemakeEntry>,
+    pub cached: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SnakemakeEntry {
+    pub operator: Operator,
+    pub description: String,
+    pub topics: Vec<String>,
+    pub revision: String,
+    pub stars: u64,
+    pub expandable: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WorkflowGraphRequest {
+    pub workflow: String,
+    pub revision: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct WorkflowGraphResponse {
+    pub engine: String,
+    pub workflow: String,
+    pub revision: String,
+    pub graph: Graph,
+    pub cached: bool,
+}
+
+#[derive(Debug, Serialize)]
 pub struct ToolReadiness {
     pub pixi: bool,
     pub sra: bool,
@@ -178,6 +217,7 @@ pub struct WebProject {
     root: PathBuf,
     graph_path: PathBuf,
     catalog: Catalog,
+    source_search_cache: Mutex<BTreeMap<String, (Instant, Vec<source_search::SearchResult>)>>,
 }
 
 impl WebProject {
@@ -192,6 +232,7 @@ impl WebProject {
             root,
             graph_path,
             catalog,
+            source_search_cache: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -199,7 +240,7 @@ impl WebProject {
         let recovery_path = self.root.join(".axial/autosave.axial.json");
         let recovered = read_valid_graph(&recovery_path);
         let recovered_autosave = recovered.is_some();
-        let graph = match recovered {
+        let mut graph = match recovered {
             Some(graph) => graph,
             None => {
                 let raw = std::fs::read_to_string(&self.graph_path)?;
@@ -208,6 +249,8 @@ impl WebProject {
                 graph
             }
         };
+        workflow::upgrade_reference_ports(&mut graph);
+        graph.validate()?;
         Ok(ProjectSession {
             project_name: self.project_name(),
             graph_path: display_path(&self.root, &self.graph_path),
@@ -292,6 +335,10 @@ pub fn app(project: WebProject) -> Router {
         .route("/api/session", get(session))
         .route("/api/system", get(system_profile))
         .route("/api/catalog/nfcore", get(discover_nfcore))
+        .route("/api/catalog/nfcore/expand", post(expand_nfcore))
+        .route("/api/catalog/snakemake", get(discover_snakemake))
+        .route("/api/catalog/snakemake/expand", post(expand_snakemake))
+        .route("/api/sources/search", get(search_sources))
         .route("/api/graph", put(save_graph))
         .route("/api/graph/autosave", put(autosave_graph))
         .route("/api/graph/validate", post(validate_graph))
@@ -318,6 +365,68 @@ async fn session(
 
 async fn system_profile() -> Json<SystemProfile> {
     Json(detect_system_profile())
+}
+
+#[derive(Debug, Deserialize)]
+struct SourceSearchQuery {
+    q: String,
+    provider: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SourceSearchResponse {
+    query: String,
+    provider: String,
+    results: Vec<source_search::SearchResult>,
+}
+
+async fn search_sources(
+    State(project): State<Arc<WebProject>>,
+    Query(request): Query<SourceSearchQuery>,
+) -> Result<Json<SourceSearchResponse>, ServerError> {
+    let query = request.q.trim();
+    if !(2..=120).contains(&query.len())
+        || query.chars().any(char::is_control)
+        || !matches!(request.provider.as_str(), "ncbi" | "ensembl")
+    {
+        return Err(ServerError::SourceSearch("invalid query".to_owned()));
+    }
+    let key = format!("{}:{}", request.provider, query.to_ascii_lowercase());
+    if let Some((_, results)) = project
+        .source_search_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+        .filter(|(created, _)| created.elapsed() < Duration::from_secs(600))
+        .cloned()
+    {
+        return Ok(Json(SourceSearchResponse {
+            query: query.to_owned(),
+            provider: request.provider,
+            results,
+        }));
+    }
+    let owned_query = query.to_owned();
+    let provider = request.provider.clone();
+    let worker_provider = provider.clone();
+    let worker_query = owned_query.clone();
+    let results = tokio::task::spawn_blocking(move || match worker_provider.as_str() {
+        "ncbi" => source_search::search_ncbi(&worker_query),
+        "ensembl" => source_search::search_ensembl(&worker_query),
+        _ => Vec::new(),
+    })
+    .await
+    .map_err(|error| ServerError::SourceSearch(error.to_string()))?;
+    project
+        .source_search_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key, (Instant::now(), results.clone()));
+    Ok(Json(SourceSearchResponse {
+        query: owned_query,
+        provider,
+        results,
+    }))
 }
 
 async fn discover_nfcore(
@@ -356,6 +465,200 @@ async fn discover_nfcore(
     .await
     .map_err(|error| ServerError::CatalogDiscovery(error.to_string()))??;
     Ok(Json(response))
+}
+
+async fn discover_snakemake(
+    State(project): State<Arc<WebProject>>,
+) -> Result<Json<SnakemakeCatalogResponse>, ServerError> {
+    let cache_path = project.root.join(".axial/catalog/snakemake-workflows.json");
+    let response = tokio::task::spawn_blocking(move || {
+        let (workflows, cached) = match snakemake::fetch() {
+            Ok(workflows) => {
+                if let Some(parent) = cache_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&cache_path, serde_json::to_vec(&workflows)?)?;
+                (workflows, false)
+            }
+            Err(fetch_error) => {
+                let raw = std::fs::read_to_string(&cache_path)
+                    .map_err(|_| ServerError::CatalogDiscovery(fetch_error))?;
+                let workflows =
+                    snakemake::parse_compact(&raw).map_err(ServerError::CatalogDiscovery)?;
+                (workflows, true)
+            }
+        };
+        Ok::<_, ServerError>(SnakemakeCatalogResponse {
+            entries: workflows
+                .into_iter()
+                .map(|workflow| SnakemakeEntry {
+                    operator: workflow.operator(),
+                    description: workflow.description,
+                    topics: workflow.topics,
+                    revision: workflow.revision,
+                    stars: workflow.stars,
+                    expandable: workflow.rulegraph.is_some(),
+                })
+                .collect(),
+            cached,
+        })
+    })
+    .await
+    .map_err(|error| ServerError::CatalogDiscovery(error.to_string()))??;
+    Ok(Json(response))
+}
+
+async fn expand_snakemake(
+    State(project): State<Arc<WebProject>>,
+    Json(request): Json<WorkflowGraphRequest>,
+) -> Result<Json<WorkflowGraphResponse>, ServerError> {
+    if request.workflow.split('/').count() != 2
+        || request.workflow.chars().any(|character| {
+            !character.is_ascii_alphanumeric() && !matches!(character, '/' | '.' | '-' | '_')
+        })
+        || request.revision.is_empty()
+    {
+        return Err(ServerError::WorkflowImport(
+            "invalid Snakemake workflow or revision".to_owned(),
+        ));
+    }
+    let cache_path = project.root.join(".axial/catalog/snakemake-workflows.json");
+    let response = tokio::task::spawn_blocking(move || {
+        let raw = std::fs::read_to_string(cache_path).map_err(|_| {
+            ServerError::WorkflowImport("Snakemake catalog cache is not ready".to_owned())
+        })?;
+        let workflows = snakemake::parse_compact(&raw).map_err(ServerError::WorkflowImport)?;
+        let workflow_entry = workflows
+            .into_iter()
+            .find(|entry| entry.full_name == request.workflow && entry.revision == request.revision)
+            .ok_or_else(|| ServerError::WorkflowImport("workflow release is not in the current catalog".to_owned()))?;
+        let dot = workflow_entry.rulegraph.ok_or_else(|| {
+            ServerError::WorkflowImport(
+                "the official catalog could not resolve this workflow's rule graph; Axial will not insert an opaque replacement".to_owned(),
+            )
+        })?;
+        let graph = workflow::graph_from_dot(
+            workflow::DotFlavor::Snakemake,
+            &request.workflow,
+            &request.revision,
+            &dot,
+        )
+        .map_err(ServerError::WorkflowImport)?;
+        Ok::<_, ServerError>(WorkflowGraphResponse {
+            engine: "snakemake".to_owned(),
+            workflow: request.workflow,
+            revision: request.revision,
+            graph,
+            cached: true,
+        })
+    })
+    .await
+    .map_err(|error| ServerError::WorkflowImport(error.to_string()))??;
+    Ok(Json(response))
+}
+
+async fn expand_nfcore(
+    State(project): State<Arc<WebProject>>,
+    Json(request): Json<WorkflowGraphRequest>,
+) -> Result<Json<WorkflowGraphResponse>, ServerError> {
+    if !request.workflow.starts_with("nf-core/")
+        || request.workflow["nf-core/".len()..]
+            .chars()
+            .any(|character| !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_'))
+        || request.revision.is_empty()
+        || request.revision.chars().any(|character| {
+            !character.is_ascii_alphanumeric() && !matches!(character, '.' | '-' | '_')
+        })
+    {
+        return Err(ServerError::WorkflowImport(
+            "invalid nf-core workflow or revision".to_owned(),
+        ));
+    }
+    let root = project.root.clone();
+    let response = tokio::task::spawn_blocking(move || import_nfcore_graph(&root, &request))
+        .await
+        .map_err(|error| ServerError::WorkflowImport(error.to_string()))??;
+    Ok(Json(response))
+}
+
+fn import_nfcore_graph(
+    root: &Path,
+    request: &WorkflowGraphRequest,
+) -> Result<WorkflowGraphResponse, ServerError> {
+    let key = format!(
+        "{}-{}",
+        request
+            .workflow
+            .trim_start_matches("nf-core/")
+            .replace('_', "-"),
+        request.revision
+    );
+    let cache_path = root
+        .join(".axial/catalog/graphs")
+        .join(format!("nfcore-v2-{key}.json"));
+    if let Ok(raw) = std::fs::read_to_string(&cache_path) {
+        let mut cached: WorkflowGraphResponse = serde_json::from_str(&raw)?;
+        cached.cached = true;
+        return Ok(cached);
+    }
+    let nextflow = executable_path("nextflow").ok_or_else(|| {
+        ServerError::WorkflowImport(
+            "Nextflow is required to resolve this pipeline graph; install it through Axial's Pixi toolchain first".to_owned(),
+        )
+    })?;
+    let work = root.join(".axial/catalog/preview").join(&key);
+    std::fs::create_dir_all(&work)?;
+    let dot_path = work.join("workflow.dot");
+    let _ = std::fs::remove_file(&dot_path);
+    let output = Command::new("timeout")
+        .arg("120s")
+        .arg(nextflow)
+        .args([
+            "run",
+            &request.workflow,
+            "-r",
+            &request.revision,
+            "-profile",
+            "test",
+            "-preview",
+            "-with-dag",
+        ])
+        .arg(&dot_path)
+        .args(["--outdir", "results"])
+        .current_dir(&work)
+        .output()?;
+    if !output.status.success() || !dot_path.is_file() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = detail
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("Nextflow did not produce a DAG");
+        return Err(ServerError::WorkflowImport(format!(
+            "{}@{} could not be previewed: {detail}",
+            request.workflow, request.revision
+        )));
+    }
+    let dot = std::fs::read_to_string(dot_path)?;
+    let graph = workflow::graph_from_dot(
+        workflow::DotFlavor::Nextflow,
+        &request.workflow,
+        &request.revision,
+        &dot,
+    )
+    .map_err(ServerError::WorkflowImport)?;
+    let response = WorkflowGraphResponse {
+        engine: "nextflow".to_owned(),
+        workflow: request.workflow.clone(),
+        revision: request.revision.clone(),
+        graph,
+        cached: false,
+    };
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(cache_path, serde_json::to_vec_pretty(&response)?)?;
+    Ok(response)
 }
 
 async fn validate_graph(Json(graph): Json<Graph>) -> Result<Json<ValidationResponse>, ServerError> {
@@ -597,7 +900,7 @@ fn detect_system_profile() -> SystemProfile {
         gpus,
         os,
         tools: ToolReadiness {
-            pixi: executable("pixi"),
+            pixi: pixi_available(),
             sra: executable("prefetch") && executable("fasterq-dump"),
             datasets: executable("datasets"),
             ensembl: executable("curl"),
@@ -647,11 +950,22 @@ fn parse_cpuinfo(text: &str) -> (String, usize, usize) {
 }
 
 fn executable(binary: &str) -> bool {
+    executable_path(binary).is_some()
+}
+
+fn executable_path(binary: &str) -> Option<PathBuf> {
     std::env::var_os("PATH")
         .as_deref()
         .into_iter()
         .flat_map(std::env::split_paths)
-        .any(|directory| directory.join(binary).is_file())
+        .map(|directory| directory.join(binary))
+        .find(|path| path.is_file())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local/bin").join(binary))
+                .filter(|path| path.is_file())
+        })
 }
 
 async fn upload_file(

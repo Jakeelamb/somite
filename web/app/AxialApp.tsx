@@ -30,11 +30,13 @@ import {
   FileSearch,
   LoaderCircle,
   Minus,
+  Moon,
   PackageOpen,
   Plus,
   Play,
   Redo2,
   Save,
+  Sun,
   Undo2,
   Waypoints,
 } from "lucide-react";
@@ -66,6 +68,7 @@ import type {
   AxialPort,
   Operator,
   NfcoreCatalog,
+  SnakemakeCatalog,
   ParamValue,
   PaperCandidate,
   PaperEvidence,
@@ -75,10 +78,11 @@ import type {
   RunResponse,
   SystemProfile,
   UploadResult,
+  WorkflowGraphResponse,
 } from "./types";
 import { portColor } from "./visual";
+import { AXIAL_SERVER, jsonRequest } from "./api";
 
-const SERVER = process.env.NEXT_PUBLIC_AXIAL_SERVER ?? "http://localhost:7310";
 const SNAP: [number, number] = [20, 20];
 const HISTORY_LIMIT = 80;
 const READ_ONE_PATTERN = /(?:^|[_.])R?1(?:[_.]|$)/i;
@@ -95,6 +99,7 @@ type AxialNodeData = Record<string, unknown> & {
 type AxialFlowNode = Node<AxialNodeData, "axial">;
 type AxialFlowEdge = Edge<{ axial: AxialEdge; portType: string }, "typed">;
 type History = { past: AxialGraph[]; future: AxialGraph[] };
+type Theme = "dark" | "light";
 type ContinueFromPort = (nodeId: string, port: AxialPort) => void;
 
 const ContinuationContext = createContext<ContinueFromPort | null>(null);
@@ -212,11 +217,14 @@ const edgeTypes = { typed: TypedEdge };
 
 function flowNode(node: AxialGraphNode, operators: Map<string, Operator>, viewerHidden = false, runState: AxialNodeData["runState"] = "idle"): AxialFlowNode {
   const operator = operators.get(node.operator);
+  const importedTitle = node.operator === "workflow.reference" && typeof node.params?.component === "string"
+    ? node.params.component.split(":").at(-1)?.replaceAll("_", " ")
+    : undefined;
   return {
     id: node.id,
     type: "axial",
     position: node.layout,
-    data: { graphNode: node, title: operator?.title ?? node.operator, cost: operator?.cost ?? "high", viewerHidden, runState },
+    data: { graphNode: node, title: importedTitle ?? operator?.title ?? node.operator, cost: operator?.cost ?? "high", viewerHidden, runState },
   };
 }
 
@@ -266,15 +274,6 @@ function axialGraph(nodes: AxialFlowNode[], edges: AxialFlowEdge[]): AxialGraph 
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
-}
-
-async function jsonRequest<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${SERVER}${path}`, init);
-  if (!response.ok) {
-    const detail = (await response.json().catch(() => null)) as { error?: string } | null;
-    throw new Error(detail?.error ?? `${response.status} ${response.statusText}`);
-  }
-  return response.json() as Promise<T>;
 }
 
 function nextNodeId(operator: Operator, nodes: AxialFlowNode[]) {
@@ -355,6 +354,8 @@ function AxialWorkspace({ initialQuery }: { initialQuery: string }) {
   const [paperLoading, setPaperLoading] = useState(false);
   const [nfcoreCatalog, setNfcoreCatalog] = useState<NfcoreCatalog | null>(null);
   const [nfcoreStatus, setNfcoreStatus] = useState<"loading" | "ready" | "offline">("loading");
+  const [snakemakeCatalog, setSnakemakeCatalog] = useState<SnakemakeCatalog | null>(null);
+  const [snakemakeStatus, setSnakemakeStatus] = useState<"loading" | "ready" | "offline">("loading");
   const [categoryOpen, setCategoryOpen] = useState<Record<string, boolean>>({});
   const [favorites, setFavorites] = useState<Set<string>>(new Set());
   const [recent, setRecent] = useState<string[]>([]);
@@ -363,6 +364,7 @@ function AxialWorkspace({ initialQuery }: { initialQuery: string }) {
   const [saving, setSaving] = useState(false);
   const [running, setRunning] = useState(false);
   const [zoom, setZoom] = useState(1);
+  const [theme, setTheme] = useState<Theme>("dark");
   const [snapGuides, setSnapGuides] = useState<{ x?: number; y?: number }>({});
   const [pendingAddPosition, setPendingAddPosition] = useState<{ x: number; y: number } | null>(null);
   const [pendingConnection, setPendingConnection] = useState<PendingConnection | null>(null);
@@ -375,10 +377,11 @@ function AxialWorkspace({ initialQuery }: { initialQuery: string }) {
 
   const availableOperators = useMemo(() => {
     const operators = new Map<string, Operator>();
-    for (const entry of nfcoreCatalog?.entries ?? []) operators.set(entry.operator.id, { ...entry.operator, description: entry.description, topics: entry.topics });
     for (const operator of session?.operators ?? []) operators.set(operator.id, operator);
+    for (const entry of nfcoreCatalog?.entries ?? []) operators.set(entry.operator.id, { ...entry.operator, description: entry.description, topics: entry.topics });
+    for (const entry of snakemakeCatalog?.entries ?? []) operators.set(entry.operator.id, { ...entry.operator, description: `${entry.description}${entry.stars ? ` · ★ ${entry.stars}` : ""}${entry.expandable ? " · graph ready" : " · graph pending upstream"}`, topics: entry.topics, expandable: entry.expandable });
     return [...operators.values()];
-  }, [nfcoreCatalog, session]);
+  }, [nfcoreCatalog, session, snakemakeCatalog]);
   const operatorMap = useMemo(() => new Map(availableOperators.map((operator) => [operator.id, operator])), [availableOperators]);
   const snapshot = useCallback(() => axialGraph(nodes, edges), [edges, nodes]);
 
@@ -420,12 +423,25 @@ function AxialWorkspace({ initialQuery }: { initialQuery: string }) {
   }, [history, restoreGraph, snapshot]);
 
   useEffect(() => {
+    const stored = window.localStorage.getItem("axial.theme.v1");
+    if (stored !== "light" && stored !== "dark") return;
+    const timeout = window.setTimeout(() => setTheme(stored), 0);
+    return () => window.clearTimeout(timeout);
+  }, []);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem("axial.theme.v1", theme);
+    document.querySelector('meta[name="theme-color"]')?.setAttribute("content", theme === "light" ? "#f6f7f5" : "#050505");
+  }, [theme]);
+
+  useEffect(() => {
     jsonRequest<ProjectSession>("/api/session")
       .then((loaded) => {
         const operators = new Map(loaded.operators.map((operator) => [operator.id, operator]));
         setSession(loaded);
         setNodes(loaded.graph.nodes.map((node) => flowNode(node, operators)));
-        setEdges(loaded.graph.edges.map((edge) => flowEdge(edge, loaded.graph.nodes)));
+        setEdges((loaded.graph.edges ?? []).map((edge) => flowEdge(edge, loaded.graph.nodes)));
         setStatus(loaded.recovered_autosave ? "Recovered the last autosave" : "Tab add · drag ports to wire · space-drag pan · F fit");
       })
       .catch((error) => setStatus(`Project engine is not running — ${errorMessage(error)}`));
@@ -433,6 +449,9 @@ function AxialWorkspace({ initialQuery }: { initialQuery: string }) {
     jsonRequest<NfcoreCatalog>("/api/catalog/nfcore")
       .then((catalog) => { setNfcoreCatalog(catalog); setNfcoreStatus("ready"); })
       .catch(() => setNfcoreStatus("offline"));
+    jsonRequest<SnakemakeCatalog>("/api/catalog/snakemake")
+      .then((catalog) => { setSnakemakeCatalog(catalog); setSnakemakeStatus("ready"); })
+      .catch(() => setSnakemakeStatus("offline"));
   // The React Flow state helpers are not part of this effect's lifecycle.
   // Loading must happen exactly once or a setter identity change can turn the
   // project bootstrap into a fetch -> set state -> fetch render loop.
@@ -512,6 +531,68 @@ function AxialWorkspace({ initialQuery }: { initialQuery: string }) {
   }, [edges, nodes]);
 
   const addOperator = useCallback((operator: Operator, position?: { x: number; y: number }, params?: Record<string, ParamValue>) => {
+    if (operator.palette.includes("Catalog")) {
+      const revision = operator.params.revision?.default;
+      const isNfcore = operator.id.startsWith("nf.");
+      if (!isNfcore && !operator.expandable) {
+        setStatus(`${operator.title} has no resolved rule graph in the official catalog yet · Axial did not add an opaque node`);
+        return;
+      }
+      if (typeof revision !== "string") {
+        setStatus(`Could not import ${operator.title} — missing pinned revision`);
+        return;
+      }
+      const target = position ?? pendingAddPosition ?? canvasCenter();
+      setStatus(`Resolving ${operator.title} into its process graph…`);
+      const workflow = isNfcore
+        ? `nf-core/${operator.id.slice(3)}`
+        : operator.params.repository?.default;
+      if (typeof workflow !== "string") {
+        setStatus(`Could not import ${operator.title} — missing workflow provenance`);
+        return;
+      }
+      void jsonRequest<WorkflowGraphResponse>(isNfcore ? "/api/catalog/nfcore/expand" : "/api/catalog/snakemake/expand", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ workflow, revision }),
+      }).then((imported) => {
+        remember();
+        const occupied = new Set(nodes.map((node) => node.id));
+        const idMap = new Map<string, string>();
+        for (const source of imported.graph.nodes) {
+          let id = source.id;
+          let suffix = 2;
+          while (occupied.has(id)) id = `${source.id}-${suffix++}`;
+          occupied.add(id);
+          idMap.set(source.id, id);
+        }
+        const minX = Math.min(...imported.graph.nodes.map((node) => node.layout.x));
+        const minY = Math.min(...imported.graph.nodes.map((node) => node.layout.y));
+        const created = imported.graph.nodes.map((source) => ({
+          ...source,
+          id: idMap.get(source.id) ?? source.id,
+          layout: { x: target.x + source.layout.x - minX, y: target.y + source.layout.y - minY },
+        }));
+        const createdEdges = imported.graph.edges.map((edge, index) => ({
+          ...edge,
+          id: `e-${idMap.get(edge.from_node)}-out-${idMap.get(edge.to_node)}-in-${index}`,
+          from_node: idMap.get(edge.from_node) ?? edge.from_node,
+          to_node: idMap.get(edge.to_node) ?? edge.to_node,
+        }));
+        const graphNodes = [...nodes.map((node) => node.data.graphNode), ...created];
+        const createdFlowNodes = created.map((node) => flowNode(node, operatorMap, true));
+        setNodes((current) => [...current.map((node) => ({ ...node, selected: false })), ...createdFlowNodes]);
+        setEdges((current) => [...current, ...createdEdges.map((edge) => flowEdge(edge, graphNodes))]);
+        setSelectedIds([]);
+        setRecent((current) => [operator.id, ...current.filter((value) => value !== operator.id)].slice(0, 6));
+        setLibraryVisible(false);
+        setPendingAddPosition(null);
+        setDirty(true);
+        setStatus(`Expanded ${operator.title} ${revision} · ${created.length} processes · ${createdEdges.length} dependencies${imported.cached ? " · cached" : ""}`);
+        window.setTimeout(() => void flow?.fitView({ nodes: createdFlowNodes, padding: 0.16, duration: 520, maxZoom: 0.9 }), 0);
+      }).catch((error) => setStatus(`Could not expand ${operator.title} — ${errorMessage(error)}`));
+      return;
+    }
     remember();
     const id = nextNodeId(operator, nodes);
     const graphNode = makeGraphNode(operator, id, position ?? pendingConnection?.position ?? pendingAddPosition ?? canvasCenter(), params);
@@ -532,7 +613,7 @@ function AxialWorkspace({ initialQuery }: { initialQuery: string }) {
     if (connected) setLibraryVisible(false);
     setDirty(true);
     setStatus(connected ? `${id} connected${companion ? " · paired R1 + R2" : ""}` : `Dropped ${id}`);
-  }, [canvasCenter, edges, nodes, operatorMap, pendingAddPosition, pendingConnection, remember, setEdges, setNodes]);
+  }, [canvasCenter, edges, flow, nodes, operatorMap, pendingAddPosition, pendingConnection, remember, setEdges, setNodes]);
 
   const addSource = useCallback((request: SourceRequest) => {
     const center = canvasCenter();
@@ -772,7 +853,7 @@ function AxialWorkspace({ initialQuery }: { initialQuery: string }) {
     setExportDownloading(true);
     setStatus("Building portable run bundle…");
     try {
-      const response = await fetch(`${SERVER}/api/export`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(snapshot()) });
+      const response = await fetch(`${AXIAL_SERVER}/api/export`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(snapshot()) });
       if (!response.ok) {
         const detail = (await response.json().catch(() => null)) as { error?: string } | null;
         throw new Error(detail?.error ?? `${response.status} ${response.statusText}`);
@@ -981,6 +1062,7 @@ function AxialWorkspace({ initialQuery }: { initialQuery: string }) {
             <button type="button" className="studio-button" onClick={undo} disabled={!history.past.length} title="Undo (Ctrl/Cmd Z)"><Undo2 size={14} aria-hidden="true" /><span>Undo</span></button>
             <button type="button" className="studio-button" onClick={redo} disabled={!history.future.length} title="Redo (Shift Ctrl/Cmd Z)"><Redo2 size={14} aria-hidden="true" /><span>Redo</span></button>
             <button type="button" className="studio-button" onClick={toggleAllViewers} disabled={!nodes.length}>{allViewersHidden ? <Eye size={14} aria-hidden="true" /> : <EyeOff size={14} aria-hidden="true" />}<span>{allViewersHidden ? "Show Viewers" : "Hide Viewers"}</span></button>
+            <button type="button" className="studio-button theme-toggle" aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`} title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`} onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun size={14} aria-hidden="true" /> : <Moon size={14} aria-hidden="true" />}</button>
             <button type="button" className="studio-button" onClick={() => void flow?.fitView({ padding: .22, duration: 260, maxZoom: 1 })}>Fit</button>
             <button type="button" className="studio-button" onClick={() => void save()} disabled={saving || !dirty}>{saving ? <span className="spin"><LoaderCircle size={14} /></span> : dirty ? <Save size={14} /> : <Check size={14} />}<span>{saving ? "Saving…" : dirty ? "Save" : "Saved"}</span></button>
             <button type="button" className={`studio-button ${toolchainVisible ? "active" : ""}`} onClick={() => void toggleToolchain()} title="Environment and Export"><PackageOpen size={14} aria-hidden="true" /><span>Export</span></button>
@@ -1056,7 +1138,7 @@ function AxialWorkspace({ initialQuery }: { initialQuery: string }) {
             fitViewOptions={{ padding: .25, maxZoom: 1 }}
             snapToGrid
             snapGrid={SNAP}
-            minZoom={.3}
+            minZoom={.02}
             maxZoom={2.8}
             deleteKeyCode={["Backspace", "Delete"]}
             multiSelectionKeyCode={["Meta", "Control"]}
@@ -1071,7 +1153,7 @@ function AxialWorkspace({ initialQuery }: { initialQuery: string }) {
             connectionRadius={28}
             proOptions={{ hideAttribution: true }}
           >
-            <Background variant={BackgroundVariant.Lines} gap={20} size={1} color="#202020" />
+            <Background variant={BackgroundVariant.Lines} gap={20} size={1} color="var(--grid)" />
           </ReactFlow>
           </ContinuationContext.Provider>
           <div className="drop-hint"><CloudUpload size={14} aria-hidden="true" />Drop FASTQ pairs, local files, or workflow directories</div>
@@ -1085,7 +1167,7 @@ function AxialWorkspace({ initialQuery }: { initialQuery: string }) {
           <button type="button" className={paperVisible ? "active" : ""} aria-label="Rebuild from a Paper" title="Paper Drop" onClick={(event) => { event.stopPropagation(); setPendingConnection(null); setLibraryVisible(false); setToolchainVisible(false); setPaperVisible((visible) => !visible); }}><FileSearch size={15} aria-hidden="true" /></button>
         </aside>
 
-        {libraryVisible && <div className="panel-layer" onPointerDown={(event) => event.stopPropagation()}><LibraryPanel operators={availableOperators} mode={libraryMode} query={query} filterQuery={deferredQuery} favorites={favorites} recent={recent} categoryOpen={categoryOpen} searchInputRef={searchInputRef} toolReadiness={system?.tools} localCount={session.operators.length} catalogCount={nfcoreCatalog?.entries.length ?? 0} catalogStatus={nfcoreStatus} continuation={pendingConnection} onMode={(mode) => { setPendingConnection(null); setLibraryMode(mode); setQuery(""); }} onQuery={setQuery} onClose={() => { setLibraryVisible(false); setPendingConnection(null); }} onAddOperator={addOperator} onAddSource={addSource} onToggleFavorite={(id) => setFavorites((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; })} onToggleCategory={(title, open) => setCategoryOpen((current) => ({ ...current, [title]: open }))} /></div>}
+        {libraryVisible && <div className="panel-layer" onPointerDown={(event) => event.stopPropagation()}><LibraryPanel operators={availableOperators} mode={libraryMode} query={query} filterQuery={deferredQuery} favorites={favorites} recent={recent} categoryOpen={categoryOpen} searchInputRef={searchInputRef} toolReadiness={system?.tools} localCount={session.operators.length} catalogCount={nfcoreCatalog?.entries.length ?? 0} catalogStatus={nfcoreStatus} snakemakeCount={snakemakeCatalog?.entries.length ?? 0} snakemakeGraphCount={snakemakeCatalog?.entries.filter((entry) => entry.expandable).length ?? 0} snakemakeStatus={snakemakeStatus} continuation={pendingConnection} onMode={(mode) => { setPendingConnection(null); setLibraryMode(mode); setQuery(""); }} onQuery={setQuery} onClose={() => { setLibraryVisible(false); setPendingConnection(null); }} onAddOperator={addOperator} onAddSource={addSource} onToggleFavorite={(id) => setFavorites((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; })} onToggleCategory={(title, open) => setCategoryOpen((current) => ({ ...current, [title]: open }))} /></div>}
 
         {selectedNode && selectedOperator && <div className="inspector-layer" onPointerDown={(event) => event.stopPropagation()}><InspectorPanel key={selectedNode.id} node={selectedNode.data.graphNode} selectedCount={selectedIds.length} operator={selectedOperator} hiddenViewerCount={selectedHiddenCount} updateParam={updateParam} beginParamEdit={beginParamEdit} browseParam={browseParam} rename={renameSelected} toggleViewers={toggleSelectedViewers} close={() => { setSelectedIds([]); flow?.setNodes((current) => current.map((node) => ({ ...node, selected: false }))); }} /></div>}
 

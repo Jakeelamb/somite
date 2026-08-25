@@ -9,6 +9,23 @@ export type SourceRequest = {
   sequenceType?: "genomic" | "cdna" | "protein";
 };
 
+export type SourceSearchResult = {
+  key: string;
+  title: string;
+  accession: string;
+  description: string;
+  provider: string;
+  data_kind: string;
+  tags: string[];
+  request: SourceRequest;
+};
+
+export type SourceSearchResponse = {
+  query: string;
+  provider: "ncbi" | "ensembl";
+  results: SourceSearchResult[];
+};
+
 const SRA_PATTERN = /^(?:SRR|ERR|DRR)\d+$/;
 const ASSEMBLY_PATTERN = /^(?:GCA_|GCF_)\d+(?:\.\d+)?$/;
 const ENSEMBL_PATTERN = /^(ENS[A-Z]*)([GTP])(\d{6,})(?:\.\d+)?$/;

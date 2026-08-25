@@ -176,6 +176,16 @@ fn tool_requirement(
             detail: "Needs a reviewed Axial adapter: package discovery cannot infer typed ports, argv, or outputs.".to_owned(),
         };
     }
+    if operator.kind == OpKind::Reference {
+        return ToolRequirement {
+            operator_id: operator.id.clone(),
+            title: operator.title.clone(),
+            binary: None,
+            packages: Vec::new(),
+            state: ToolState::AdapterNeeded,
+            detail: "Imported workflow structure; convert this component to a native Axial tool before standalone execution.".to_owned(),
+        };
+    }
     if operator.kind == OpKind::Inprocess {
         return ToolRequirement {
             operator_id: operator.id.clone(),

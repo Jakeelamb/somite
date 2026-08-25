@@ -289,6 +289,19 @@ fn which(bin: &str) -> Option<PathBuf> {
     None
 }
 
+fn pixi_executable() -> Option<PathBuf> {
+    which("pixi").or_else(|| {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".pixi/bin/pixi"))
+            .filter(|path| path.is_file())
+    })
+}
+
+pub fn pixi_available() -> bool {
+    pixi_executable().is_some()
+}
+
 fn pixi_command(project: &Project, op: &Operator, rest: &[String]) -> Result<Command, CookError> {
     let bin = op.bin.as_deref().unwrap_or("");
     if op.pixi.is_empty() {
@@ -301,7 +314,7 @@ fn pixi_command(project: &Project, op: &Operator, rest: &[String]) -> Result<Com
         c.args(rest);
         return Ok(c);
     }
-    let pixi = which("pixi").ok_or_else(|| {
+    let pixi = pixi_executable().ok_or_else(|| {
         CookError::BinNotFound(
             "pixi — install Pixi once; Axial will resolve and lock workflow tools automatically"
                 .to_owned(),
@@ -563,6 +576,10 @@ fn cook_node(
         };
         fs::write(&idx, serde_json::to_vec_pretty(&out).unwrap_or_default())?;
         return Ok((NodeState::Done, arts));
+    }
+
+    if op.kind == OpKind::Reference {
+        return Ok((NodeState::Skipped, BTreeMap::new()));
     }
 
     if op.kind != OpKind::External {

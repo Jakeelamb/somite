@@ -118,8 +118,12 @@ server filesystem access.
 - Library, Paper, Machine, and Export are temporary mutually exclusive panels.
 - Connections are typed; incompatible ports never connect.
 - Paired reads have separate R1 and R2 ports and snap together when possible.
+- The source launcher resolves exact accessions locally and searches NCBI and
+  Ensembl into provider- and artifact-tagged suggestions.
 - Node dragging uses a magnetic grid and neighbor alignment.
-- Pan and zoom work with mouse, trackpad, keyboard, and canvas controls.
+- Pan and zoom work with mouse, trackpad, keyboard, and canvas controls; the
+  overview range reaches 2% for very large imported workflows.
+- A compact sun/crescent control switches the persisted light or dark theme.
 - Multi-selection moves, duplicates, deletes, and toggles viewers as a group.
 - Clicking outside a temporary panel closes it.
 - Saves and autosaves are server-validated.
@@ -144,7 +148,8 @@ Generated state stays under `.axial/`. Operator contracts remain in
 
 - maintaining a second desktop GUI;
 - supporting multiple competing environment managers;
-- silently translating arbitrary workflow DSLs into native nodes;
+- claiming that engine-authored structural workflow references are translated
+  native executable nodes;
 - treating a package name as a complete operator;
 - embedding scientific file bytes in the graph JSON;
 - inventing outputs or tool provenance that the source does not establish.
