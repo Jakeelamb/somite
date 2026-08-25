@@ -103,6 +103,20 @@ Clicking anywhere outside the active surface closes it, as do Escape and the
 surface's own toggle. Search focus is requested once when a surface opens so
 the fields never steal focus back while the user navigates results.
 
+Completing Paper Drop opens a reconstruction report beside the editable canvas.
+Each node is labeled **paper**, **inferred**, or **missing**, with its retained
+evidence span or inference explanation. Generated connections are separately
+listed as inferred rather than presented as paper-stated fact. Clicking a report
+entry selects the corresponding node or wire; clicking the paper name in the
+top bar reopens the report after dismissal. If the methods describe separate
+analysis tracks or compare mutually exclusive tools, the report keeps them as
+named **Candidate Graphs** with Parallel or Alternative roles. The candidate
+selector swaps the editable canvas without discarding per-candidate edits.
+
+File-source paths are never picker-only. Import File, Paired Reads, and Import
+Directory nodes keep editable path fields and add **Browse...** controls that
+open the system file or directory picker as appropriate.
+
 One search spans all three modes. Recent tools and starred Favorites are
 shortcuts, not new operator types; they and the active mode persist in
 `.axial/library-state.json`. Rows show a compact purpose line; hover reveals the

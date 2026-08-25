@@ -52,11 +52,99 @@ pub enum Assay {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateRole {
+    Primary,
+    Parallel,
+    Alternative,
+}
+
 #[derive(Debug, Clone)]
-pub struct Reconstruction {
+pub struct CandidateGraph {
+    pub name: String,
+    pub role: CandidateRole,
     pub graph: Graph,
     pub assay: Assay,
     pub warnings: Vec<String>,
+    pub evidence: Vec<EvidenceRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Reconstruction {
+    pub candidates: Vec<CandidateGraph>,
+    active: usize,
+}
+
+impl Reconstruction {
+    fn new(candidates: Vec<CandidateGraph>) -> Self {
+        debug_assert!(!candidates.is_empty());
+        Self {
+            candidates,
+            active: 0,
+        }
+    }
+
+    pub fn active_index(&self) -> usize {
+        self.active
+    }
+
+    pub fn activate(&mut self, index: usize) -> bool {
+        if index < self.candidates.len() {
+            self.active = index;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn warn_all(&mut self, warning: impl Into<String>) {
+        let warning = warning.into();
+        for candidate in &mut self.candidates {
+            candidate.warnings.insert(0, warning.clone());
+        }
+    }
+}
+
+impl std::ops::Deref for Reconstruction {
+    type Target = CandidateGraph;
+
+    fn deref(&self) -> &Self::Target {
+        &self.candidates[self.active]
+    }
+}
+
+impl std::ops::DerefMut for Reconstruction {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.candidates[self.active]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceStatus {
+    Explicit,
+    Inferred,
+    MissingImplementation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvidenceTarget {
+    Node(String),
+    Edge(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvidenceRecord {
+    pub target: EvidenceTarget,
+    pub status: EvidenceStatus,
+    pub detail: String,
+}
+
+impl EvidenceTarget {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Node(id) | Self::Edge(id) => id,
+        }
+    }
 }
 
 const RNA_COMPOUND_COVERS: &[&str] = &[
@@ -116,6 +204,56 @@ const GAPS: &[(&str, &[&str])] = &[
     ("SoupX", &["soupx"]),
     ("Seurat", &["seurat"]),
     ("DoubletFinder", &["doubletfinder", "doublet finder"]),
+];
+
+#[derive(Clone, Copy)]
+struct AssemblyMethod {
+    key: &'static str,
+    name: &'static str,
+    needles: &'static [&'static str],
+}
+
+const ASSEMBLY_METHODS: &[AssemblyMethod] = &[
+    AssemblyMethod {
+        key: "hifiasm",
+        name: "hifiasm",
+        needles: &["hifiasm"],
+    },
+    AssemblyMethod {
+        key: "falcon",
+        name: "FALCON",
+        needles: &["falcon-unzip", "falcon unzip", "falcon"],
+    },
+    AssemblyMethod {
+        key: "flye",
+        name: "Flye",
+        needles: &["flye"],
+    },
+    AssemblyMethod {
+        key: "hicanu",
+        name: "HiCanu",
+        needles: &["hicanu"],
+    },
+    AssemblyMethod {
+        key: "canu",
+        name: "Canu",
+        needles: &["canu"],
+    },
+    AssemblyMethod {
+        key: "peregrine",
+        name: "Peregrine",
+        needles: &["peregrine"],
+    },
+    AssemblyMethod {
+        key: "shasta",
+        name: "Shasta",
+        needles: &["shasta"],
+    },
+    AssemblyMethod {
+        key: "masurca",
+        name: "MaSuRCA",
+        needles: &["masurca", "maSuRCA"],
+    },
 ];
 
 pub fn text_from_path(path: &Path) -> Result<String, PaperError> {
@@ -290,10 +428,31 @@ pub fn reconstruct(catalog: &Catalog, text: &str) -> Reconstruction {
         scan = text;
         low = text.to_ascii_lowercase();
     }
-    if assay == Assay::Assembly {
-        return build_assembly(catalog, scan, &low);
+    let tracks = detected_assays(&low);
+    if tracks.len() > 1 {
+        let candidates = tracks
+            .into_iter()
+            .flat_map(|track| {
+                if track == Assay::Assembly {
+                    build_assembly_candidates(catalog, scan, &low, CandidateRole::Parallel)
+                } else {
+                    let mut candidate = build_bricks(catalog, text, scan, &low, track);
+                    candidate.role = CandidateRole::Parallel;
+                    vec![candidate]
+                }
+            })
+            .collect();
+        return Reconstruction::new(candidates);
     }
-    build_bricks(catalog, text, scan, &low, assay)
+    if assay == Assay::Assembly {
+        return Reconstruction::new(build_assembly_candidates(
+            catalog,
+            scan,
+            &low,
+            CandidateRole::Primary,
+        ));
+    }
+    Reconstruction::new(vec![build_bricks(catalog, text, scan, &low, assay)])
 }
 
 fn build_bricks(
@@ -302,7 +461,7 @@ fn build_bricks(
     scan: &str,
     low: &str,
     assay: Assay,
-) -> Reconstruction {
+) -> CandidateGraph {
     let acc = accessions(full);
     let genome = genome_token(low);
     let mut warnings = Vec::new();
@@ -751,7 +910,10 @@ fn build_bricks(
     if let Err(e) = g.validate() {
         warnings.push(format!("graph did not validate: {e}"));
     }
-    Reconstruction {
+    CandidateGraph {
+        name: candidate_name(assay).into(),
+        role: CandidateRole::Primary,
+        evidence: evidence_ledger(&g),
         graph: g,
         assay,
         warnings,
@@ -759,7 +921,32 @@ fn build_bricks(
 }
 
 fn classify(low: &str) -> Assay {
-    let scores = [
+    let mut ranked = assay_scores(low);
+    ranked.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
+    let (assay, score) = ranked[0];
+    if score >= 6 && ranked[1].1 >= 6 {
+        return Assay::Mixed;
+    }
+    if score > 0 {
+        assay
+    } else if low.contains("fastqc") {
+        Assay::Qc
+    } else {
+        Assay::Unknown
+    }
+}
+
+fn detected_assays(low: &str) -> Vec<Assay> {
+    let mut tracks = assay_scores(low)
+        .into_iter()
+        .filter(|(_, score)| *score >= 6)
+        .collect::<Vec<_>>();
+    tracks.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
+    tracks.into_iter().map(|(assay, _)| assay).collect()
+}
+
+fn assay_scores(low: &str) -> [(Assay, u16); 5] {
+    [
         (
             Assay::Assembly,
             evidence_score(
@@ -845,19 +1032,19 @@ fn classify(low: &str) -> Assay {
                 ],
             ),
         ),
-    ];
-    let mut ranked = scores;
-    ranked.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
-    let (assay, score) = ranked[0];
-    if score >= 6 && ranked[1].1 >= 6 {
-        return Assay::Mixed;
-    }
-    if score > 0 {
-        assay
-    } else if low.contains("fastqc") {
-        Assay::Qc
-    } else {
-        Assay::Unknown
+    ]
+}
+
+fn candidate_name(assay: Assay) -> &'static str {
+    match assay {
+        Assay::Assembly => "Assembly methods",
+        Assay::RnaSeq => "RNA-seq methods",
+        Assay::Variants => "Variant methods",
+        Assay::Metagenome => "Metagenome methods",
+        Assay::SingleCell => "Single-cell methods",
+        Assay::Mixed => "Mixed methods",
+        Assay::Qc => "Quality-control methods",
+        Assay::Unknown => "Unresolved methods",
     }
 }
 
@@ -868,7 +1055,65 @@ fn evidence_score(low: &str, cues: &[(&str, u8)]) -> u16 {
         .sum()
 }
 
-fn build_assembly(catalog: &Catalog, text: &str, low: &str) -> Reconstruction {
+fn build_assembly_candidates(
+    catalog: &Catalog,
+    text: &str,
+    low: &str,
+    single_role: CandidateRole,
+) -> Vec<CandidateGraph> {
+    let methods = detected_assembly_methods(low);
+    if methods.len() > 1 {
+        methods
+            .into_iter()
+            .map(|method| {
+                build_assembly(catalog, text, low, Some(method), CandidateRole::Alternative)
+            })
+            .collect()
+    } else {
+        vec![build_assembly(
+            catalog,
+            text,
+            low,
+            methods.first().copied(),
+            single_role,
+        )]
+    }
+}
+
+fn detected_assembly_methods(low: &str) -> Vec<&'static AssemblyMethod> {
+    let mut methods = ASSEMBLY_METHODS
+        .iter()
+        .filter_map(|method| {
+            method
+                .needles
+                .iter()
+                .filter_map(|needle| {
+                    first_term_position(low, needle).map(|position| (position, method))
+                })
+                .min_by_key(|(position, _)| *position)
+        })
+        .collect::<Vec<_>>();
+    methods.sort_by_key(|(position, _)| *position);
+    methods.into_iter().map(|(_, method)| method).collect()
+}
+
+fn first_term_position(low: &str, needle: &str) -> Option<usize> {
+    low.match_indices(needle).find_map(|(position, _)| {
+        let before = low[..position].chars().next_back();
+        let after = low[position + needle.len()..].chars().next();
+        let bounded = before.is_none_or(|ch| !ch.is_ascii_alphanumeric())
+            && after.is_none_or(|ch| !ch.is_ascii_alphanumeric());
+        (bounded && contains_positive(low, needle)).then_some(position)
+    })
+}
+
+fn build_assembly(
+    catalog: &Catalog,
+    text: &str,
+    low: &str,
+    method: Option<&AssemblyMethod>,
+    role: CandidateRole,
+) -> CandidateGraph {
     let mut warnings = Vec::new();
     let mut g = Graph {
         schema_version: SCHEMA_VERSION,
@@ -959,26 +1204,32 @@ fn build_assembly(catalog: &Catalog, text: &str, low: &str) -> Reconstruction {
             break;
         }
     }
-    let asm = if mentioned(low, &["hifiasm"]) {
-        add(
+    let asm = match method.map(|method| method.key) {
+        Some("hifiasm") => add(
             &mut g,
             "asm.hifiasm",
             vec![],
             snippet(text, "hifiasm").or_else(|| Some("hifiasm (HiFi ± Hi-C phasing)".into())),
-        )
-    } else if mentioned(low, &["falcon"]) {
-        gap(&mut g, "FALCON", snippet(text, "FALCON"), gap_from_reads())
-    } else if mentioned(low, &["flye"]) {
-        gap(&mut g, "Flye", snippet(text, "Flye"), gap_from_reads())
-    } else if mentioned(low, &["canu"]) {
-        gap(&mut g, "Canu", snippet(text, "Canu"), gap_from_reads())
-    } else {
-        add(
+        ),
+        Some(key) => {
+            let method = ASSEMBLY_METHODS
+                .iter()
+                .find(|method| method.key == key)
+                .copied();
+            method.and_then(|method| {
+                let note = method
+                    .needles
+                    .iter()
+                    .find_map(|needle| snippet(text, needle));
+                gap(&mut g, method.name, note, gap_from_reads())
+            })
+        }
+        None => add(
             &mut g,
             "asm.hifiasm",
             vec![],
             Some("assembler not named — hifiasm is the default HiFi brick".into()),
-        )
+        ),
     };
     let purge = if mentioned(low, &["purge_dups", "purge haplotigs", "purge_haplotigs"]) {
         gap(
@@ -1125,11 +1376,72 @@ fn build_assembly(catalog: &Catalog, text: &str, low: &str) -> Reconstruction {
     if let Err(e) = g.validate() {
         warnings.push(format!("graph did not validate: {e}"));
     }
-    Reconstruction {
+    CandidateGraph {
+        name: method
+            .map(|method| format!("{} assembly", method.name))
+            .unwrap_or_else(|| "Assembly methods".into()),
+        role,
+        evidence: evidence_ledger(&g),
         graph: g,
         assay: Assay::Assembly,
         warnings,
     }
+}
+
+fn evidence_ledger(graph: &Graph) -> Vec<EvidenceRecord> {
+    let mut ledger = graph
+        .nodes
+        .iter()
+        .map(|node| {
+            let status = if node.operator == "gap.missing" {
+                EvidenceStatus::MissingImplementation
+            } else if node.note.as_deref().is_some_and(is_inferred_note) {
+                EvidenceStatus::Inferred
+            } else if node.note.is_some() {
+                EvidenceStatus::Explicit
+            } else {
+                EvidenceStatus::Inferred
+            };
+            let detail = node.note.clone().unwrap_or_else(|| {
+                format!(
+                    "{} was inferred from typed workflow compatibility; no direct evidence span was retained",
+                    node.operator
+                )
+            });
+            EvidenceRecord {
+                target: EvidenceTarget::Node(node.id.clone()),
+                status,
+                detail,
+            }
+        })
+        .collect::<Vec<_>>();
+    ledger.extend(graph.edges.iter().map(|edge| EvidenceRecord {
+        target: EvidenceTarget::Edge(edge.id.clone()),
+        status: EvidenceStatus::Inferred,
+        detail: format!(
+            "{}:{} → {}:{} was inferred from typed compatibility and canonical method order",
+            edge.from_node, edge.from_port, edge.to_node, edge.to_port
+        ),
+    }));
+    ledger
+}
+
+fn is_inferred_note(note: &str) -> bool {
+    let note = note.to_ascii_lowercase();
+    [
+        "no sra accession",
+        "drop pacbio",
+        "drop a fastq",
+        "drop the r1",
+        "not named",
+        " is the default ",
+        "sra → fastq",
+        "gene models",
+        "samplesheet from the reads",
+    ]
+    .iter()
+    .any(|marker| note.contains(marker))
+        || note.starts_with("reference ")
 }
 
 fn contains_any(s: &str, needles: &[&str]) -> bool {
@@ -2027,24 +2339,85 @@ were called with GATK Mutect2 following the sarek workflow.
     }
 
     #[test]
-    fn mixed_methods_keep_independent_typed_branches() {
+    fn mixed_methods_become_separate_parallel_candidate_graphs() {
         let text = "Methods article with two workflows. RNA-seq uses HISAT2 and StringTie for differential expression. Germline variant calling uses BWA-MEM and HaplotypeCaller.";
         let r = reconstruct(&cat(), text);
-        assert_eq!(r.assay, Assay::Mixed);
-        let actual = ops(&r);
-        for op in [
-            "align.hisat2",
-            "quant.stringtie",
-            "align.bwa",
-            "var.haplotypecaller",
-        ] {
-            assert!(actual.contains(&op), "missing {op}: {actual:?}");
-        }
+        assert_eq!(r.candidates.len(), 2);
         assert!(r
-            .warnings
+            .candidates
             .iter()
-            .any(|w| w.contains("multiple assay workflows")));
-        r.graph.validate().unwrap();
+            .all(|candidate| candidate.role == CandidateRole::Parallel));
+        let rna = r
+            .candidates
+            .iter()
+            .find(|candidate| candidate.assay == Assay::RnaSeq)
+            .unwrap();
+        let variants = r
+            .candidates
+            .iter()
+            .find(|candidate| candidate.assay == Assay::Variants)
+            .unwrap();
+        assert!(rna
+            .graph
+            .nodes
+            .iter()
+            .any(|node| node.operator == "align.hisat2"));
+        assert!(!rna
+            .graph
+            .nodes
+            .iter()
+            .any(|node| node.operator == "align.bwa"));
+        assert!(variants
+            .graph
+            .nodes
+            .iter()
+            .any(|node| node.operator == "align.bwa"));
+        assert!(!variants
+            .graph
+            .nodes
+            .iter()
+            .any(|node| node.operator == "align.hisat2"));
+        rna.graph.validate().unwrap();
+        variants.graph.validate().unwrap();
+    }
+
+    #[test]
+    fn compared_assemblers_become_alternative_candidate_graphs() {
+        let text = "Methods\nPacBio HiFi reads were assembled in separate comparisons using hifiasm, FALCON-Unzip, and Flye. BUSCO evaluated each assembly.";
+        let reconstruction = reconstruct(&cat(), text);
+
+        assert_eq!(reconstruction.candidates.len(), 3);
+        assert!(reconstruction
+            .candidates
+            .iter()
+            .all(|candidate| candidate.role == CandidateRole::Alternative));
+        let names = reconstruction
+            .candidates
+            .iter()
+            .map(|candidate| candidate.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["hifiasm assembly", "FALCON assembly", "Flye assembly"]
+        );
+        for candidate in &reconstruction.candidates {
+            candidate.graph.validate().unwrap();
+            let assemblers = candidate
+                .graph
+                .nodes
+                .iter()
+                .filter(|node| {
+                    node.operator == "asm.hifiasm"
+                        || node.params.contains_key("tool")
+                            && matches!(
+                                node.params.get("tool"),
+                                Some(ParamValue::String(tool))
+                                    if ["FALCON", "Flye"].contains(&tool.as_str())
+                            )
+                })
+                .count();
+            assert_eq!(assemblers, 1, "{} flattened alternatives", candidate.name);
+        }
     }
 
     #[test]
@@ -2147,6 +2520,54 @@ were called with GATK Mutect2 following the sarek workflow.
             checked += 1;
             let extracted = extract_from_path(&path).unwrap();
             let r = reconstruct(&cat(), &extracted.text);
+            if *assay == Assay::Mixed {
+                let assays: Vec<_> = r
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.assay)
+                    .collect();
+                assert!(
+                    assays.contains(&Assay::RnaSeq),
+                    "{}: {assays:?}",
+                    path.display()
+                );
+                assert!(
+                    assays.contains(&Assay::Variants),
+                    "{}: {assays:?}",
+                    path.display()
+                );
+                assert!(
+                    r.candidates
+                        .iter()
+                        .all(|candidate| candidate.role == CandidateRole::Parallel),
+                    "{} did not preserve separate parallel tracks",
+                    path.display()
+                );
+                let actual: Vec<_> = r
+                    .candidates
+                    .iter()
+                    .flat_map(|candidate| candidate.graph.nodes.iter())
+                    .map(|node| node.operator.as_str())
+                    .collect();
+                for op in *required {
+                    assert!(
+                        actual.contains(op),
+                        "{} missing {op}: {actual:?}",
+                        path.display()
+                    );
+                }
+                for op in *forbidden {
+                    assert!(
+                        !actual.contains(op),
+                        "{} invented {op}: {actual:?}",
+                        path.display()
+                    );
+                }
+                for candidate in &r.candidates {
+                    candidate.graph.validate().unwrap();
+                }
+                continue;
+            }
             assert_eq!(&r.assay, assay, "{}", path.display());
             let actual = ops(&r);
             for op in *required {
@@ -2213,6 +2634,54 @@ were called with GATK Mutect2 following the sarek workflow.
         assert!(ids.contains(&"fastqc"));
         assert!(ids.contains(&"star"));
         assert!(ids.contains(&"deseq2"));
+    }
+
+    #[test]
+    fn reconstruction_returns_evidence_for_every_canvas_node_and_edge() {
+        let reconstruction = reconstruct(
+            &cat(),
+            "Methods\nPaired-end RNA-seq reads were checked with FastQC and aligned with STAR.",
+        );
+
+        let node_targets = reconstruction
+            .evidence
+            .iter()
+            .filter(|record| matches!(record.target, EvidenceTarget::Node(_)))
+            .count();
+        let edge_targets = reconstruction
+            .evidence
+            .iter()
+            .filter(|record| matches!(record.target, EvidenceTarget::Edge(_)))
+            .count();
+        assert_eq!(node_targets, reconstruction.graph.nodes.len());
+        assert_eq!(edge_targets, reconstruction.graph.edges.len());
+        assert!(reconstruction.evidence.iter().any(|record| {
+            record.status == EvidenceStatus::Explicit
+                && reconstruction
+                    .graph
+                    .nodes
+                    .iter()
+                    .any(|node| node.id == record.target.id() && node.operator == "qc.fastqc")
+        }));
+        assert!(reconstruction.evidence.iter().any(|record| {
+            record.status == EvidenceStatus::Inferred
+                && reconstruction.graph.nodes.iter().any(|node| {
+                    node.id == record.target.id() && node.operator == "files.import_paired"
+                })
+        }));
+    }
+
+    #[test]
+    fn missing_bricks_are_labeled_as_missing_implementation() {
+        let reconstruction = reconstruct(
+            &cat(),
+            "Methods\nRNA-seq reads were aligned with HISAT2, assembled with StringTie, and analyzed with Ballgown.",
+        );
+
+        assert!(reconstruction.evidence.iter().any(|record| {
+            record.status == EvidenceStatus::MissingImplementation
+                && record.detail.to_ascii_lowercase().contains("ballgown")
+        }));
     }
 
     #[test]

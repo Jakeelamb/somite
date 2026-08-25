@@ -5,6 +5,7 @@ pub(crate) enum Surface {
     Library,
     Machine,
     Paper,
+    PaperReview,
     OpCreate,
 }
 

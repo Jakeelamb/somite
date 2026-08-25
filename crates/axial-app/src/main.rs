@@ -27,7 +27,10 @@ use axial_ir::{
     compatible, Direction, Graph, Layout, Node, ParamValue, Port, PortType, SCHEMA_VERSION,
 };
 use axial_ops::{Catalog, Cost, Operator};
-use axial_paper::{extract_from_path, reconstruct, text_from_path, ExtractVia, Reconstruction};
+use axial_paper::{
+    extract_from_path, reconstruct, text_from_path, CandidateGraph, CandidateRole, EvidenceStatus,
+    EvidenceTarget, ExtractVia, Reconstruction,
+};
 use canvas::{
     advance_drag_delta, connect, paired_companion, rename_node, snap_drag, snap_point_to_grid,
     zoom_about, Connection, EditHistory, Selection, SelectionMode, SnapGuides, SnapSource,
@@ -73,6 +76,13 @@ struct NodeDrag {
     anchor: String,
     start: BTreeMap<String, Pos2>,
     accumulated: Vec2,
+}
+
+#[derive(Clone)]
+struct PaperReview {
+    name: String,
+    candidates: Vec<CandidateGraph>,
+    active: usize,
 }
 
 impl Marquee {
@@ -137,6 +147,22 @@ fn selection_mode(modifiers: egui::Modifiers) -> SelectionMode {
 enum ViewerAction {
     Show,
     Hide,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathPicker {
+    File,
+    Directory,
+}
+
+fn path_picker_for(operator: &str, param: &str) -> Option<PathPicker> {
+    match (operator, param) {
+        ("files.import", "path")
+        | ("files.import_paired", "r1")
+        | ("files.import_paired", "r2") => Some(PathPicker::File),
+        ("files.import_directory", "path") => Some(PathPicker::Directory),
+        _ => None,
+    }
 }
 
 fn viewer_action<'a>(
@@ -423,6 +449,7 @@ struct App {
     last_arts: BTreeMap<String, BTreeMap<String, ArtifactMeta>>,
     paper_rx: Option<Receiver<Result<Reconstruction, String>>>,
     paper_name: String,
+    paper_review: Option<PaperReview>,
     auto_fit: bool,
     history: EditHistory,
     rename_target: Option<String>,
@@ -496,6 +523,7 @@ impl App {
             last_arts: BTreeMap::new(),
             paper_rx: None,
             paper_name: String::new(),
+            paper_review: None,
             auto_fit: false,
             history: EditHistory::default(),
             rename_target: None,
@@ -517,21 +545,12 @@ impl App {
         if let Ok(p) = env::var("AXIAL_OPEN") {
             if let Ok(text) = text_from_path(Path::new(&p)) {
                 let r = reconstruct(&app.catalog, &text);
-                let n = r.graph.nodes.len();
-                app.graph = r.graph;
-                app.graph_path = None;
-                app.autosave_due = Some(Instant::now());
-                app.selection.clear();
-                if let Some(node) = app.graph.nodes.first() {
-                    app.selection.select_node(&node.id, SelectionMode::Replace);
-                }
-                app.paper_name = Path::new(&p)
+                let name = Path::new(&p)
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("paper")
                     .to_string();
-                app.request_fit();
-                app.status = format!("rebuilt {n} nodes from {} ({:?})", app.paper_name, r.assay);
+                app.install_paper_reconstruction(name, r);
             } else {
                 app.open_paper(PathBuf::from(p));
             }
@@ -541,6 +560,79 @@ impl App {
 
     fn open_paper(&mut self, path: PathBuf) {
         self.ingest_path(path, self.last_graph_pos);
+    }
+
+    fn install_paper_reconstruction(&mut self, name: String, reconstruction: Reconstruction) {
+        let active = reconstruction.active_index();
+        let candidates = reconstruction.candidates;
+        let Some(candidate) = candidates.get(active) else {
+            self.status = format!("{name} did not produce a Candidate Graph");
+            return;
+        };
+        let graph = candidate.graph.clone();
+        let assay = candidate.assay;
+        let warnings = candidate.warnings.clone();
+        let candidate_count = candidates.len();
+        let node_count = graph.nodes.len();
+        self.paper_name = name.clone();
+        self.paper_review = Some(PaperReview {
+            name,
+            candidates,
+            active,
+        });
+        self.activate_paper_graph(graph);
+        self.open_surface(Surface::PaperReview);
+        let mut status = format!(
+            "rebuilt {node_count} nodes from {} ({assay:?})",
+            self.paper_name
+        );
+        if candidate_count > 1 {
+            status.push_str(&format!(" · {candidate_count} Candidate Graphs"));
+        }
+        if !warnings.is_empty() {
+            status.push_str(" · ");
+            status.push_str(&warnings.join(" · "));
+        }
+        self.status = status;
+    }
+
+    fn activate_paper_graph(&mut self, graph: Graph) {
+        self.graph = graph;
+        self.graph_path = None;
+        self.autosave_due = Some(Instant::now());
+        self.history = EditHistory::default();
+        self.selection.clear();
+        if let Some(node) = self.graph.nodes.first() {
+            self.selection.select_node(&node.id, SelectionMode::Replace);
+        }
+        self.param_page.clear();
+        self.last_states.clear();
+        self.last_arts.clear();
+        self.viewer_off.clear();
+        self.sizes.clear();
+        self.pan = Vec2::new(20.0, 28.0);
+        self.zoom = 1.0;
+        self.request_fit();
+    }
+
+    fn switch_paper_candidate(&mut self, index: usize) {
+        let Some(review) = &mut self.paper_review else {
+            return;
+        };
+        if index == review.active || index >= review.candidates.len() {
+            return;
+        }
+        if let Some(current) = review.candidates.get_mut(review.active) {
+            current.graph = self.graph.clone();
+        }
+        let Some(candidate) = review.candidates.get(index) else {
+            return;
+        };
+        let graph = candidate.graph.clone();
+        let name = candidate.name.clone();
+        review.active = index;
+        self.activate_paper_graph(graph);
+        self.status = format!("showing Candidate Graph: {name}");
     }
 
     fn node_size(&self, n: &Node) -> Vec2 {
@@ -1254,10 +1346,7 @@ impl App {
                 let r = extract_from_path(&p).map_err(|e| e.to_string()).map(|e| {
                     let mut rec = reconstruct(&cat, &e.text);
                     if e.via == ExtractVia::Tesseract {
-                        rec.warnings.insert(
-                            0,
-                            "OCR via tesseract (same flags as omarchy capture text)".into(),
-                        );
+                        rec.warn_all("OCR via tesseract (same flags as omarchy capture text)");
                     }
                     rec
                 });
@@ -1337,32 +1426,7 @@ impl App {
         };
         match rx.try_recv() {
             Ok(Ok(r)) => {
-                let n = r.graph.nodes.len();
-                let assay = r.assay;
-                let warns = r.warnings.clone();
-                self.graph = r.graph;
-                self.graph_path = None;
-                self.autosave_due = Some(Instant::now());
-                self.history = EditHistory::default();
-                self.selection.clear();
-                if let Some(node) = self.graph.nodes.first() {
-                    self.selection.select_node(&node.id, SelectionMode::Replace);
-                }
-                self.param_page.clear();
-                self.last_states.clear();
-                self.last_arts.clear();
-                self.viewer_off.clear();
-                self.sizes.clear();
-                self.pan = Vec2::new(20.0, 28.0);
-                self.zoom = 1.0;
-                self.request_fit();
-                self.close_surface_if(Surface::Paper);
-                let mut s = format!("rebuilt {n} nodes from {}  ({assay:?})", self.paper_name);
-                if !warns.is_empty() {
-                    s.push_str("  ·  ");
-                    s.push_str(&warns.join("  ·  "));
-                }
-                self.status = s;
+                self.install_paper_reconstruction(self.paper_name.clone(), r);
                 self.paper_rx = None;
             }
             Ok(Err(e)) => {
@@ -1425,6 +1489,23 @@ impl App {
         } else {
             Some(PathBuf::from(p))
         }
+    }
+
+    fn pick_source_path(kind: PathPicker, current: &str) -> Option<PathBuf> {
+        let mut command = Command::new("zenity");
+        command.args(["--file-selection", "--title=Axial — choose source"]);
+        if kind == PathPicker::Directory {
+            command.arg("--directory");
+        }
+        if !current.trim().is_empty() {
+            command.arg(format!("--filename={}", current.trim()));
+        }
+        let output = command.output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        (!path.is_empty()).then(|| PathBuf::from(path))
     }
 
     fn pick_snakemake_directory() -> Option<PathBuf> {
@@ -2354,10 +2435,42 @@ fn machine_profile_row(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.add_space(3.0);
 }
 
+fn evidence_status_style(status: EvidenceStatus) -> (&'static str, Color32) {
+    match status {
+        EvidenceStatus::Explicit => ("PAPER", GRAPHITE.success),
+        EvidenceStatus::Inferred => ("INFERRED", GRAPHITE.warning),
+        EvidenceStatus::MissingImplementation => ("MISSING", GRAPHITE.danger),
+    }
+}
+
+fn candidate_role_label(role: CandidateRole) -> &'static str {
+    match role {
+        CandidateRole::Primary => "PRIMARY",
+        CandidateRole::Parallel => "PARALLEL",
+        CandidateRole::Alternative => "ALTERNATIVE",
+    }
+}
+
+fn evidence_count_chip(ui: &mut egui::Ui, count: usize, label: &str, color: Color32) {
+    Frame::new()
+        .fill(color.gamma_multiply(0.10))
+        .stroke(Stroke::new(1.0, color.gamma_multiply(0.45)))
+        .inner_margin(Margin::symmetric(7, 3))
+        .corner_radius(8)
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(format!("{count} {label}"))
+                    .size(9.0)
+                    .color(color),
+            );
+        });
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_visuals(ctx);
         let surface_at_frame_start = self.overlays.active();
+        let mut surface_activator_clicked = false;
         {
             let r = ctx.screen_rect();
             ctx.layer_painter(egui::LayerId::background())
@@ -2484,7 +2597,20 @@ impl eframe::App for App {
                     ui.label(egui::RichText::new("project1").color(MUTED).size(11.5));
                     if !self.paper_name.is_empty() {
                         ui.label(egui::RichText::new("/").color(MUTED).size(12.0));
-                        ui.label(egui::RichText::new(&self.paper_name).color(TEXT).size(11.5));
+                        let paper_name = ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(&self.paper_name).color(TEXT).size(11.5),
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE)
+                                .frame(false),
+                            )
+                            .on_hover_text("Open the paper evidence report");
+                        if paper_name.clicked() && self.paper_review.is_some() {
+                            surface_activator_clicked = true;
+                            self.toggle_surface(Surface::PaperReview);
+                        }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let cook_l = if cooking {
@@ -2574,7 +2700,6 @@ impl eframe::App for App {
                 });
             });
 
-        let mut surface_activator_clicked = false;
         let mut zoom_step = None;
         egui::TopBottomPanel::bottom("hint")
             .exact_height(24.0)
@@ -3528,6 +3653,7 @@ impl eframe::App for App {
                                         for k in keys {
                                             let spec = &op.params[&k];
                                             let label = spec.label.clone().unwrap_or(k.clone());
+                                            let picker = path_picker_for(&op_id, &k);
                                             let (edit, previous) = {
                                                 let node = &mut self.graph.nodes[nidx];
                                                 let entry = node
@@ -3539,9 +3665,24 @@ impl eframe::App for App {
                                                         )
                                                     });
                                                 let previous = entry.clone();
-                                                let edit = param_row(
-                                                    ui, &label, entry, spec.min, spec.max,
+                                                let mut edit = param_row(
+                                                    ui, &label, entry, spec.min, spec.max, picker,
                                                 );
+                                                if edit.browse_clicked {
+                                                    let current = match entry {
+                                                        ParamValue::String(path) => path.as_str(),
+                                                        _ => "",
+                                                    };
+                                                    if let Some(path) = picker.and_then(|kind| {
+                                                        Self::pick_source_path(kind, current)
+                                                    }) {
+                                                        *entry = ParamValue::String(
+                                                            path.display().to_string(),
+                                                        );
+                                                        edit.began = true;
+                                                        edit.changed = true;
+                                                    }
+                                                }
                                                 (edit, previous)
                                             };
                                             if edit.began {
@@ -4449,6 +4590,295 @@ impl eframe::App for App {
             }
         }
 
+        if self.overlays.is_open(Surface::PaperReview) {
+            let mut close_review = false;
+            let mut selected_evidence: Option<EvidenceTarget> = None;
+            let mut switch_candidate = None;
+            if let Some(review) = self.paper_review.clone() {
+                let Some(candidate) = review.candidates.get(review.active) else {
+                    self.close_surface_if(Surface::PaperReview);
+                    return;
+                };
+                let explicit = candidate
+                    .evidence
+                    .iter()
+                    .filter(|record| record.status == EvidenceStatus::Explicit)
+                    .count();
+                let inferred = candidate
+                    .evidence
+                    .iter()
+                    .filter(|record| record.status == EvidenceStatus::Inferred)
+                    .count();
+                let missing = candidate
+                    .evidence
+                    .iter()
+                    .filter(|record| record.status == EvidenceStatus::MissingImplementation)
+                    .count();
+                let review_response = egui::Window::new("paper_review")
+                    .title_bar(false)
+                    .anchor(egui::Align2::LEFT_TOP, [68.0, 66.0])
+                    .default_width(350.0)
+                    .default_height(560.0)
+                    .resizable(true)
+                    .collapsible(false)
+                    .frame(
+                        Frame::new()
+                            .fill(GRAPHITE.surface)
+                            .stroke(Stroke::new(1.0, GRAPHITE.border_strong))
+                            .inner_margin(Margin::same(12))
+                            .corner_radius(12),
+                    )
+                    .show(ctx, |ui| {
+                        ui.set_min_width(320.0);
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Paper reconstruction")
+                                        .size(13.0)
+                                        .strong()
+                                        .color(TEXT),
+                                );
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} · {:?}",
+                                        review.name, candidate.assay
+                                    ))
+                                    .size(9.5)
+                                    .color(MUTED),
+                                );
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add(
+                                            egui::Button::new(
+                                                egui::RichText::new("×").size(15.0).color(MUTED),
+                                            )
+                                            .fill(Color32::TRANSPARENT)
+                                            .stroke(Stroke::NONE),
+                                        )
+                                        .clicked()
+                                    {
+                                        close_review = true;
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(7.0);
+                        if review.candidates.len() > 1 {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("CANDIDATE GRAPH")
+                                        .size(8.5)
+                                        .color(MUTED),
+                                );
+                                egui::ComboBox::from_id_salt("paper_candidate_graph")
+                                    .selected_text(
+                                        egui::RichText::new(&candidate.name)
+                                            .size(10.0)
+                                            .color(TEXT),
+                                    )
+                                    .width(205.0)
+                                    .show_ui(ui, |ui| {
+                                        for (index, option) in
+                                            review.candidates.iter().enumerate()
+                                        {
+                                            let label = format!(
+                                                "{} · {}",
+                                                candidate_role_label(option.role),
+                                                option.name
+                                            );
+                                            if ui
+                                                .selectable_label(index == review.active, label)
+                                                .clicked()
+                                            {
+                                                switch_candidate = Some(index);
+                                            }
+                                        }
+                                    });
+                            });
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(match candidate.role {
+                                        CandidateRole::Parallel => {
+                                            "A separately reported method track; it is not wired into its siblings."
+                                        }
+                                        CandidateRole::Alternative => {
+                                            "A mutually exclusive or compared method; only this Candidate Graph is on the canvas."
+                                        }
+                                        CandidateRole::Primary => {
+                                            "The primary interpretation selected for this paper."
+                                        }
+                                    })
+                                    .size(9.0)
+                                    .color(MUTED),
+                                )
+                                .wrap(),
+                            );
+                            ui.add_space(5.0);
+                        }
+                        ui.horizontal_wrapped(|ui| {
+                            evidence_count_chip(ui, explicit, "paper", GRAPHITE.success);
+                            evidence_count_chip(ui, inferred, "inferred", GRAPHITE.warning);
+                            evidence_count_chip(ui, missing, "missing", GRAPHITE.danger);
+                        });
+                        if !candidate.warnings.is_empty() {
+                            ui.add_space(7.0);
+                            Frame::new()
+                                .fill(GRAPHITE.warning.gamma_multiply(0.10))
+                                .stroke(Stroke::new(1.0, GRAPHITE.warning.gamma_multiply(0.45)))
+                                .inner_margin(Margin::symmetric(9, 7))
+                                .corner_radius(6)
+                                .show(ui, |ui| {
+                                    for warning in &candidate.warnings {
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(warning)
+                                                    .size(10.0)
+                                                    .color(GRAPHITE.warning),
+                                            )
+                                            .wrap(),
+                                        );
+                                    }
+                                });
+                        }
+                        ui.add_space(7.0);
+                        ui.separator();
+                        egui::ScrollArea::vertical()
+                            .id_salt("paper_evidence_scroll")
+                            .max_height((ui.available_height() - 10.0).max(180.0))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("CANVAS NODES").size(8.5).color(MUTED),
+                                );
+                                ui.add_space(4.0);
+                                for record in candidate.evidence.iter().filter(|record| {
+                                    matches!(record.target, EvidenceTarget::Node(_))
+                                }) {
+                                    let id = record.target.id();
+                                    let title = self
+                                        .graph
+                                        .node(id)
+                                        .and_then(|node| self.catalog.get(&node.operator).ok())
+                                        .map(|operator| operator.title.as_str())
+                                        .unwrap_or(id);
+                                    let (status, color) = evidence_status_style(record.status);
+                                    Frame::new()
+                                        .fill(GRAPHITE.surface_raised)
+                                        .stroke(Stroke::new(1.0, GRAPHITE.border))
+                                        .inner_margin(Margin::symmetric(9, 7))
+                                        .corner_radius(6)
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            egui::RichText::new(title)
+                                                                .size(10.5)
+                                                                .strong()
+                                                                .color(TEXT),
+                                                        )
+                                                        .fill(Color32::TRANSPARENT)
+                                                        .stroke(Stroke::NONE)
+                                                        .frame(false),
+                                                    )
+                                                    .on_hover_text("Select this node on the canvas")
+                                                    .clicked()
+                                                {
+                                                    selected_evidence = Some(record.target.clone());
+                                                }
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(status)
+                                                                .size(8.5)
+                                                                .color(color),
+                                                        );
+                                                    },
+                                                );
+                                            });
+                                            ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(&record.detail)
+                                                        .size(9.5)
+                                                        .color(MUTED),
+                                                )
+                                                .wrap(),
+                                            );
+                                        });
+                                    ui.add_space(4.0);
+                                }
+                                let edge_records = candidate
+                                    .evidence
+                                    .iter()
+                                    .filter(|record| {
+                                        matches!(record.target, EvidenceTarget::Edge(_))
+                                    })
+                                    .collect::<Vec<_>>();
+                                if !edge_records.is_empty() {
+                                    egui::CollapsingHeader::new(
+                                        egui::RichText::new(format!(
+                                            "INFERRED CONNECTIONS   {}",
+                                            edge_records.len()
+                                        ))
+                                        .size(8.5)
+                                        .color(GRAPHITE.warning),
+                                    )
+                                    .default_open(false)
+                                    .show(ui, |ui| {
+                                        for record in edge_records {
+                                            if ui
+                                                .add(
+                                                    egui::Button::new(
+                                                        egui::RichText::new(&record.detail)
+                                                            .size(9.0)
+                                                            .color(MUTED),
+                                                    )
+                                                    .fill(Color32::TRANSPARENT)
+                                                    .stroke(Stroke::NONE)
+                                                    .wrap(),
+                                                )
+                                                .on_hover_text("Select this inferred connection")
+                                                .clicked()
+                                            {
+                                                selected_evidence = Some(record.target.clone());
+                                            }
+                                        }
+                                    });
+                                }
+                            });
+                    });
+                let clicked_away =
+                    review_response.is_some_and(|response| response.response.clicked_elsewhere());
+                self.overlays.dismiss_on_click_away(
+                    Surface::PaperReview,
+                    surface_at_frame_start,
+                    clicked_away,
+                    surface_activator_clicked,
+                );
+            }
+            if close_review {
+                self.close_surface_if(Surface::PaperReview);
+            }
+            if let Some(target) = selected_evidence {
+                match target {
+                    EvidenceTarget::Node(id) => {
+                        self.selection.select_node(id, SelectionMode::Replace);
+                        self.param_page.clear();
+                    }
+                    EvidenceTarget::Edge(id) => self.selection.select_edge(id),
+                }
+            }
+            if let Some(index) = switch_candidate {
+                self.switch_paper_candidate(index);
+            }
+        }
+
         if self.overlays.is_open(Surface::Paper) {
             let mut load_example = false;
             let mut pick = false;
@@ -4711,6 +5141,7 @@ impl eframe::App for App {
 struct ParamEdit {
     began: bool,
     changed: bool,
+    browse_clicked: bool,
 }
 
 fn param_row(
@@ -4719,6 +5150,7 @@ fn param_row(
     entry: &mut ParamValue,
     min: Option<i64>,
     max: Option<i64>,
+    picker: Option<PathPicker>,
 ) -> ParamEdit {
     let edit = ui.horizontal(|ui| {
         ui.add_space(10.0);
@@ -4728,14 +5160,34 @@ fn param_row(
                 .halign(egui::Align::RIGHT),
         );
         ui.add_space(8.0);
+        let mut browse_clicked = false;
         let response = match entry {
-            ParamValue::String(s) => ui.add(
-                egui::TextEdit::singleline(s)
-                    .desired_width(ui.available_width() - 8.0)
-                    .font(FontId::proportional(12.0))
-                    .text_color(TEXT)
-                    .background_color(GRAPHITE.control),
-            ),
+            ParamValue::String(s) => {
+                let response = ui.add(
+                    egui::TextEdit::singleline(s)
+                        .desired_width(
+                            ui.available_width() - if picker.is_some() { 76.0 } else { 8.0 },
+                        )
+                        .font(FontId::proportional(12.0))
+                        .text_color(TEXT)
+                        .background_color(GRAPHITE.control),
+                );
+                if picker.is_some()
+                    && ui
+                        .add(
+                            egui::Button::new(
+                                egui::RichText::new("Browse…").size(10.0).color(TEXT),
+                            )
+                            .fill(GRAPHITE.surface_raised)
+                            .stroke(Stroke::new(1.0, GRAPHITE.border))
+                            .corner_radius(5),
+                        )
+                        .clicked()
+                {
+                    browse_clicked = true;
+                }
+                response
+            }
             ParamValue::Int(i) => {
                 let mut dv = egui::DragValue::new(i).speed(1.0);
                 if let Some(a) = min {
@@ -4749,6 +5201,7 @@ fn param_row(
         ParamEdit {
             began: response.gained_focus() || response.drag_started() || response.clicked(),
             changed: response.changed(),
+            browse_clicked,
         }
     });
     ui.add_space(5.0);
@@ -4877,6 +5330,27 @@ mod tests {
             pair_dropped_fastqs(vec![r2.clone(), r1.clone()]),
             vec![(r1, r2)]
         );
+    }
+
+    #[test]
+    fn source_path_pickers_match_import_parameters() {
+        assert_eq!(
+            path_picker_for("files.import", "path"),
+            Some(PathPicker::File)
+        );
+        assert_eq!(
+            path_picker_for("files.import_paired", "r1"),
+            Some(PathPicker::File)
+        );
+        assert_eq!(
+            path_picker_for("files.import_paired", "r2"),
+            Some(PathPicker::File)
+        );
+        assert_eq!(
+            path_picker_for("files.import_directory", "path"),
+            Some(PathPicker::Directory)
+        );
+        assert_eq!(path_picker_for("align.star", "genome"), None);
     }
 
     #[test]

@@ -70,7 +70,19 @@ Tools run via PATH or `conda run -n <env>` if the operator has a `conda` spec. S
 Drop matching R1 and R2 FASTQs together to create a paired-read source with two
 separate streams. Connecting either stream to a paired-aware tool snaps both
 mates when the companion input is free; single-end inputs remain supported.
+Import File, Paired Reads, and Import Directory nodes also keep their path fields
+directly editable and provide a **Browse...** button for choosing sources with
+the system file picker.
 
-Paper Drop is a bonus graph-drafting feature. For its optional acceptance
-corpus, run `scripts/fetch-paper-corpus`, then
+Paper Drop turns a methods PDF or text export into an editable typed graph and
+opens an evidence report beside the canvas. Every reconstructed node is marked
+as supported by retained paper text, inferred from workflow compatibility, or
+named but missing a local implementation; every generated connection is
+explicitly labeled as inferred. Click a report entry to select its node or wire,
+and click the paper name in the top bar to reopen the report. When a paper
+contains separate analyses or compared methods, the report presents named
+**Candidate Graphs** as parallel tracks or alternatives instead of flattening
+them into one misleading graph. Switching candidates preserves edits made to
+each candidate during the review session. For the optional
+acceptance corpus, run `scripts/fetch-paper-corpus`, then
 `cargo test -p axial-paper downloaded_real_paper_corpus_reconstructs`.

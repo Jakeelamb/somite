@@ -8,6 +8,16 @@ Local-first node graph for bioinformatics. The graph file is the source of truth
 The directed typed network the user edits. The source of truth on disk.
 _Avoid_: Pipeline, patch, network, workflow
 
+**Reconstruction**:
+An evidence-bound interpretation of a paper package that contains one or more named Candidate Graphs. It is a draft for review, not a claim that the paper supplied an executable graph.
+
+**Candidate Graph**:
+One named Graph interpretation of a distinct method track in a Reconstruction. Comparisons and mutually exclusive methods remain separate Candidate Graphs instead of being flattened into one Graph.
+_Avoid_: Subworkflow, extracted workflow
+
+**Candidate Role**:
+The relationship of a Candidate Graph to its siblings: Primary is the default interpretation, Parallel is a separately reported track, and Alternative is a mutually exclusive or compared method.
+
 **Project**:
 A directory that contains one or more graph files, a local cache, and project config.
 
