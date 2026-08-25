@@ -20,7 +20,6 @@
       "params": {
         "snakefile": "Snakefile",
         "cores": 2,
-        "use_conda": false,
         "dry_run": false,
         "keep_going": false,
         "printshellcmds": true

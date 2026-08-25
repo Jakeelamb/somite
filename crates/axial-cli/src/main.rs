@@ -43,23 +43,22 @@ fn main() -> Result<()> {
         }
         "env" => {
             let cat = Catalog::load_dir(&operators_dir())?;
-            println!("# conda envs operators expect. Create with e.g.");
-            println!("#   conda create -n axial-qc -c bioconda -c conda-forge fastqc fastp");
             let mut seen = std::collections::BTreeSet::new();
             for op in cat.ops.values() {
-                if let Some(c) = &op.conda {
-                    if seen.insert(&c.name) {
-                        println!("{} : {}", c.name, c.spec.join(" "));
-                    }
+                for package in &op.pixi {
+                    seen.insert(package);
                 }
+            }
+            println!("# Pixi packages declared by the operator catalog");
+            for package in seen {
+                println!("{package}");
             }
         }
         "help" | "-h" | "--help" => {
             println!("axial cook <graph.json>          run the graph");
             println!("axial paper <methods.txt|pdf>    rebuild graph from a paper");
             println!("axial palette                    list NCBI / Ensembl / nf-core / QC");
-            println!("axial env                        conda env names + specs");
-            println!("axial-app                        (separate binary) TD-like window");
+            println!("axial env                        list Pixi package requirements");
         }
         other => bail!("unknown command {other}"),
     }
@@ -73,10 +72,7 @@ fn cook_cmd(graph_path: &Path) -> Result<()> {
     let project_root = if cwd.join("operators").is_dir() || cwd.join("testdata").is_dir() {
         cwd
     } else {
-        graph_path
-            .parent()
-            .unwrap_or(&cwd)
-            .to_path_buf()
+        graph_path.parent().unwrap_or(&cwd).to_path_buf()
     };
     let project = Project::open(&project_root)?;
     let cat = Catalog::load_dir(&operators_dir())?;

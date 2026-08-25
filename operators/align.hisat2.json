@@ -5,7 +5,7 @@
   "kind": "external",
   "cost": "high",
   "bin": "hisat2",
-  "conda": { "name": "axial-rna", "spec": ["bioconda::hisat2"] },
+  "pixi": ["bioconda::hisat2"],
   "params": {
     "threads": { "type": "int", "label": "Threads", "page": "HISAT2", "default": 8, "min": 1, "max": 64 }
   },

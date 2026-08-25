@@ -5,7 +5,7 @@
   "kind": "external",
   "cost": "high",
   "bin": "Rscript",
-  "conda": { "name": "axial-r", "spec": ["bioconda::bioconductor-deseq2"] },
+  "pixi": ["bioconda::bioconductor-deseq2"],
   "params": {
     "design": { "type": "string", "label": "Design", "page": "DESeq2", "default": "~ condition" }
   },

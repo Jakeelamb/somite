@@ -5,7 +5,7 @@
   "kind": "external",
   "cost": "high",
   "bin": "stringtie",
-  "conda": { "name": "axial-rna", "spec": ["bioconda::stringtie"] },
+  "pixi": ["bioconda::stringtie"],
   "ports": {
     "in": [
       { "name": "bam", "type": "Bam" },

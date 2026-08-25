@@ -5,11 +5,10 @@
   "kind": "external",
   "cost": "high",
   "bin": "snakemake",
-  "conda": { "name": "axial-snakemake", "spec": ["bioconda::snakemake-minimal"] },
+  "pixi": ["bioconda::snakemake-minimal"],
   "params": {
     "snakefile": { "type": "string", "label": "Snakefile", "page": "Workflow", "default": "workflow/Snakefile", "required": true },
     "cores": { "type": "int", "label": "Cores", "page": "Execution", "default": 4, "min": 1, "max": 256 },
-    "use_conda": { "type": "bool", "label": "Use workflow Conda envs", "page": "Deployment", "default": true },
     "dry_run": { "type": "bool", "label": "Dry run", "page": "Execution", "default": false },
     "keep_going": { "type": "bool", "label": "Keep going", "page": "Execution", "default": false },
     "printshellcmds": { "type": "bool", "label": "Print commands", "page": "Execution", "default": true }
@@ -23,7 +22,6 @@
     "--snakefile", "{input.workflow}/{param.snakefile}",
     "--directory", "{input.workflow}",
     "--cores", "{param.cores}",
-    "{flag.use_conda}",
     "{flag.dry_run}",
     "{flag.keep_going}",
     "{flag.printshellcmds}"

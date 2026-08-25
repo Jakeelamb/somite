@@ -5,7 +5,7 @@
   "kind": "external",
   "cost": "high",
   "bin": "fastp",
-  "conda": { "name": "axial-qc", "spec": ["bioconda::fastp"] },
+  "pixi": ["bioconda::fastp"],
   "params": {
     "threads": { "type": "int", "label": "Threads", "page": "fastp", "default": 4 }
   },

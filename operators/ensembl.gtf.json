@@ -5,6 +5,7 @@
   "kind": "external",
   "cost": "high",
   "bin": "curl",
+  "pixi": ["conda-forge::curl"],
   "params": {
     "url": { "type": "string", "label": "URL", "page": "Ensembl", "required": true }
   },

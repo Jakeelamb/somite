@@ -5,10 +5,9 @@
   "kind": "external",
   "cost": "high",
   "bin": "nextflow",
-  "conda": { "name": "axial-nf", "spec": ["bioconda::nextflow"] },
+  "pixi": ["bioconda::nextflow"],
   "params": {
     "revision": { "type": "string", "label": "Version", "page": "Pipeline", "default": "3.26.0" },
-    "profile": { "type": "string", "label": "Profile", "page": "Pipeline", "default": "conda" },
     "stub_run": { "type": "bool", "label": "Stub run", "page": "Pipeline", "default": false }
   },
   "ports": {
@@ -25,8 +24,6 @@
     "nf-core/rnaseq",
     "-r",
     "{param.revision}",
-    "-profile",
-    "{param.profile}",
     "--input",
     "{input.sheet}",
     "--fasta",

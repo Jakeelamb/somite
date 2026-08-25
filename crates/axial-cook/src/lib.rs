@@ -1,13 +1,15 @@
-//! Cook: hash inputs, skip if cached, else run (PATH or `conda run`).
+//! Cook: hash inputs, sync one Pixi workspace, then run or reuse cached artifacts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use axial_ir::{Direction, Graph, Node, ParamValue, PortType};
-use axial_ops::{render_argv, Bindings, Catalog, Cost, OpKind, Operator};
+use axial_ops::{
+    current_pixi_platform, pixi_manifest, render_argv, Bindings, Catalog, Cost, OpKind, Operator,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -287,53 +289,71 @@ fn which(bin: &str) -> Option<PathBuf> {
     None
 }
 
-fn conda_env_bin(op: &Operator) -> Option<PathBuf> {
-    let bin = op.bin.as_deref()?;
-    let envn = op.conda.as_ref()?.name.as_str();
-    let mut cands = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
-        for root in ["miniconda3", "mambaforge", "miniforge3", "anaconda3"] {
-            cands.push(
-                PathBuf::from(&home)
-                    .join(root)
-                    .join("envs")
-                    .join(envn)
-                    .join("bin")
-                    .join(bin),
-            );
-        }
-    }
-    if let Ok(prefix) = std::env::var("CONDA_PREFIX") {
-        if let Some(parent) = Path::new(&prefix).parent() {
-            cands.push(parent.join("envs").join(envn).join("bin").join(bin));
-        }
-    }
-    cands.into_iter().find(|p| p.is_file())
-}
-
-fn conda_prefix(op: &Operator, rest: &[String]) -> Result<Command, CookError> {
+fn pixi_command(project: &Project, op: &Operator, rest: &[String]) -> Result<Command, CookError> {
     let bin = op.bin.as_deref().unwrap_or("");
-    if let Some(exe) = which(bin).or_else(|| conda_env_bin(op)) {
+    if op.pixi.is_empty() {
+        let Some(exe) = which(bin) else {
+            return Err(CookError::BinNotFound(format!(
+                "{bin} — this operator needs a Pixi package declaration"
+            )));
+        };
         let mut c = Command::new(exe);
         c.args(rest);
         return Ok(c);
     }
-    if let Some(conda) = &op.conda {
-        if let Some(exe) = which("conda")
-            .or_else(|| which("mamba"))
-            .or_else(|| which("micromamba"))
-        {
-            let mut c = Command::new(exe);
-            c.arg("run")
-                .arg("-n")
-                .arg(&conda.name)
-                .arg("--no-capture-output");
-            c.arg(bin);
-            c.args(rest);
-            return Ok(c);
-        }
+    let pixi = which("pixi").ok_or_else(|| {
+        CookError::BinNotFound(
+            "pixi — install Pixi once; Axial will resolve and lock workflow tools automatically"
+                .to_owned(),
+        )
+    })?;
+    let mut command = Command::new(pixi);
+    command
+        .arg("run")
+        .arg("--manifest-path")
+        .arg(pixi_manifest_path(project))
+        .arg(bin)
+        .args(rest);
+    Ok(command)
+}
+
+fn prepare_pixi_workspace(
+    project: &Project,
+    catalog: &Catalog,
+    graph: &Graph,
+) -> Result<(), CookError> {
+    let operator_ids = graph
+        .nodes
+        .iter()
+        .map(|node| node.operator.as_str())
+        .collect::<BTreeSet<_>>();
+    let operators = operator_ids
+        .into_iter()
+        .map(|id| catalog.get(id))
+        .collect::<Result<Vec<_>, _>>()?;
+    if operators.iter().all(|operator| operator.pixi.is_empty()) {
+        return Ok(());
     }
-    Err(CookError::BinNotFound(bin.into()))
+    let project_name = project
+        .root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("axial-workflow");
+    let manifest = pixi_manifest(project_name, current_pixi_platform(), operators);
+    let path = pixi_manifest_path(project);
+    if fs::read_to_string(&path).ok().as_deref() != Some(manifest.as_str()) {
+        fs::write(path, manifest)?;
+    }
+    Ok(())
+}
+
+fn pixi_manifest_path(project: &Project) -> PathBuf {
+    let bundled = project.root.join("toolchain/pixi.toml");
+    if bundled.is_file() {
+        bundled
+    } else {
+        project.root.join(".axial/pixi.toml")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -354,6 +374,7 @@ pub fn cook_graph(
     graph: &Graph,
 ) -> Result<CookReport, CookError> {
     graph.validate()?;
+    prepare_pixi_workspace(project, catalog, graph)?;
     let mut report = CookReport::default();
     let mut produced: BTreeMap<(String, String), ArtifactMeta> = BTreeMap::new();
     for nid in graph.topo() {
@@ -580,7 +601,7 @@ fn cook_node(
         argv.clone()
     };
 
-    let mut cmd = conda_prefix(op, &rest)?;
+    let mut cmd = pixi_command(project, op, &rest)?;
     cmd.current_dir(&work);
     let out = cmd.output().map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
@@ -594,18 +615,6 @@ fn cook_node(
     lf.write_all(&out.stderr)?;
     lf.write_all(&out.stdout)?;
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        if err.contains("EnvironmentLocationNotFound") || err.contains("Not a conda environment") {
-            return Err(CookError::BinNotFound(format!(
-                "{} — install on PATH or: conda create -n {} {}",
-                op.bin.clone().unwrap_or_default(),
-                op.conda.as_ref().map(|c| c.name.as_str()).unwrap_or("?"),
-                op.conda
-                    .as_ref()
-                    .map(|c| c.spec.join(" "))
-                    .unwrap_or_default()
-            )));
-        }
         return Err(CookError::Exit {
             op: op.id.clone(),
             code: out.status.code().unwrap_or(-1),
@@ -676,7 +685,7 @@ fn subst_glob(g: &str, b: &Bindings<'_>) -> String {
             kind: OpKind::External,
             cost: Cost::High,
             bin: None,
-            conda: None,
+            pixi: Vec::new(),
             params: BTreeMap::new(),
             ports: Default::default(),
             argv: vec![g.to_string()],

@@ -5,7 +5,7 @@ use axial_ir::{Direction, Graph, Layout, Node, ParamValue, Port, PortType, SCHEM
 use axial_ops::Catalog;
 use tempfile::tempdir;
 
-use crate::{command_failure_detail, cook_graph, NodeState, Project};
+use crate::{command_failure_detail, cook_graph, pixi_manifest_path, NodeState, Project};
 
 #[test]
 fn command_failures_surface_a_compact_actionable_message() {
@@ -14,6 +14,17 @@ fn command_failures_surface_a_compact_actionable_message() {
         "curl: (22) The requested URL returned error: 404"
     );
     assert_eq!(command_failure_detail(b"", b""), "no diagnostic output");
+}
+
+#[test]
+fn portable_bundle_uses_its_exported_pixi_manifest() {
+    let dir = tempdir().unwrap();
+    let toolchain = dir.path().join("toolchain");
+    std::fs::create_dir(&toolchain).unwrap();
+    std::fs::write(toolchain.join("pixi.toml"), "[workspace]\n").unwrap();
+    let project = Project::open(dir.path()).unwrap();
+
+    assert_eq!(pixi_manifest_path(&project), toolchain.join("pixi.toml"));
 }
 
 #[test]
@@ -119,6 +130,8 @@ fn unbound_required_input_is_skipped() {
     let proj = Project::open(dir.path()).unwrap();
     let r = cook_graph(&proj, &cat, &g).unwrap();
     assert_eq!(r.states.get("fastqc1"), Some(&NodeState::Skipped));
+    let manifest = std::fs::read_to_string(dir.path().join(".axial/pixi.toml")).unwrap();
+    assert!(manifest.contains("\"fastqc\" = { version = \"*\", channel = \"bioconda\" }"));
 }
 
 #[test]

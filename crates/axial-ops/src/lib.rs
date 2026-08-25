@@ -1,5 +1,7 @@
 //! Operator JSON catalog. Palette groups (NCBI, Ensembl, nf-core) live here.
 
+pub mod nfcore;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,13 +24,6 @@ pub enum OpsError {
     Unknown(String),
     #[error("argv: {0}")]
     Argv(String),
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CondaSpec {
-    pub name: String,
-    #[serde(default)]
-    pub spec: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +89,7 @@ pub enum Cost {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Operator {
     pub id: String,
     pub title: String,
@@ -105,7 +101,7 @@ pub struct Operator {
     #[serde(default)]
     pub bin: Option<String>,
     #[serde(default)]
-    pub conda: Option<CondaSpec>,
+    pub pixi: Vec<String>,
     #[serde(default)]
     pub params: BTreeMap<String, ParamSpec>,
     #[serde(default)]
@@ -118,6 +114,76 @@ pub struct Operator {
 
 fn high() -> Cost {
     Cost::High
+}
+
+/// Render the one Pixi workspace used by cooking and portable exports.
+pub fn pixi_manifest<'a>(
+    name: &str,
+    platform: &str,
+    operators: impl IntoIterator<Item = &'a Operator>,
+) -> String {
+    let packages = operators
+        .into_iter()
+        .flat_map(|operator| operator.pixi.iter())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut manifest = format!(
+        "[workspace]\nname = \"{}\"\nchannels = [\"conda-forge\", \"bioconda\"]\nplatforms = [\"{platform}\"]\n\n[dependencies]\n",
+        safe_workspace_name(name)
+    );
+    for requirement in packages {
+        let (channel, package, version) = split_package_requirement(requirement);
+        if channel.is_empty() {
+            manifest.push_str(&format!("\"{package}\" = \"{version}\"\n"));
+        } else {
+            manifest.push_str(&format!(
+                "\"{package}\" = {{ version = \"{version}\", channel = \"{channel}\" }}\n"
+            ));
+        }
+    }
+    manifest
+}
+
+pub fn current_pixi_platform() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => "linux-64",
+        ("linux", "aarch64") => "linux-aarch64",
+        ("macos", "x86_64") => "osx-64",
+        ("macos", "aarch64") => "osx-arm64",
+        _ => "linux-64",
+    }
+}
+
+fn split_package_requirement(requirement: &str) -> (&str, &str, &str) {
+    let (channel, package_requirement) = requirement.split_once("::").unwrap_or(("", requirement));
+    let split = package_requirement.find(['=', '<', '>', '!', '~']);
+    match split {
+        Some(index) => (
+            channel,
+            &package_requirement[..index],
+            &package_requirement[index..],
+        ),
+        None => (channel, package_requirement, "*"),
+    }
+}
+
+fn safe_workspace_name(name: &str) -> String {
+    let safe = name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_owned();
+    if safe.is_empty() {
+        "axial-workflow".to_owned()
+    } else {
+        safe
+    }
 }
 
 impl Operator {
@@ -322,7 +388,7 @@ mod tests {
             kind: OpKind::External,
             cost: Cost::High,
             bin: Some("prefetch".into()),
-            conda: None,
+            pixi: Vec::new(),
             params: BTreeMap::new(),
             ports: PortsSpec::default(),
             argv: vec!["-O".into(), "{work}/out/{param.accession}".into()],
@@ -353,7 +419,7 @@ mod tests {
             kind: OpKind::External,
             cost: Cost::High,
             bin: Some("nextflow".into()),
-            conda: None,
+            pixi: Vec::new(),
             params: BTreeMap::new(),
             ports: PortsSpec {
                 r#in: vec![PortSpec {
@@ -563,7 +629,6 @@ mod tests {
                 ParamValue::String("workflow/Snakefile".into()),
             ),
             ("cores".into(), ParamValue::Int(8)),
-            ("use_conda".into(), ParamValue::Bool(true)),
             ("dry_run".into(), ParamValue::Bool(false)),
             ("keep_going".into(), ParamValue::Bool(true)),
             ("printshellcmds".into(), ParamValue::Bool(true)),
@@ -590,10 +655,29 @@ mod tests {
                 "/w/in/workflow/project",
                 "--cores",
                 "8",
-                "--use-conda",
                 "--keep-going",
                 "--printshellcmds",
             ]
         );
+    }
+
+    #[test]
+    fn pixi_manifest_merges_used_operator_packages_with_explicit_channels() {
+        let catalog =
+            Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
+                .unwrap();
+        let manifest = pixi_manifest(
+            "RNA workflow",
+            "linux-64",
+            [
+                catalog.get("qc.fastqc").unwrap(),
+                catalog.get("align.star").unwrap(),
+            ],
+        );
+
+        assert!(manifest.contains("name = \"RNA-workflow\""));
+        assert!(manifest.contains("\"fastqc\" = { version = \"*\", channel = \"bioconda\" }"));
+        assert!(manifest.contains("\"star\" = { version = \"*\", channel = \"bioconda\" }"));
+        assert_eq!(manifest.matches("\"fastqc\"").count(), 1);
     }
 }

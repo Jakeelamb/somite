@@ -5,6 +5,7 @@
   "kind": "external",
   "cost": "high",
   "bin": "curl",
+  "pixi": ["conda-forge::curl"],
   "params": {
     "accession": {
       "type": "string",

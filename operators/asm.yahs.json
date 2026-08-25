@@ -5,7 +5,7 @@
   "kind": "external",
   "cost": "high",
   "bin": "yahs",
-  "conda": { "name": "axial-asm", "spec": ["bioconda::yahs"] },
+  "pixi": ["bioconda::yahs"],
   "ports": {
     "in": [
       { "name": "contigs", "type": "Fasta", "union": ["Fasta", "FastaGz", "Directory"] },

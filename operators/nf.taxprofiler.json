@@ -5,7 +5,7 @@
   "kind": "external",
   "cost": "high",
   "bin": "nextflow",
-  "conda": { "name": "axial-nf", "spec": ["bioconda::nextflow"] },
+  "pixi": ["bioconda::nextflow"],
   "params": {
     "revision": { "type": "string", "label": "Version", "page": "Pipeline", "default": "2.0.1" }
   },

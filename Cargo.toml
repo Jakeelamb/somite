@@ -6,7 +6,8 @@ members = [
     "crates/axial-cook",
     "crates/axial-paper",
     "crates/axial-cli",
-    "crates/axial-app",
+    "crates/axial-server",
+    "crates/axial-bundle",
 ]
 
 [workspace.package]

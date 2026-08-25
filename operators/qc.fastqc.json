@@ -5,7 +5,7 @@
   "kind": "external",
   "cost": "high",
   "bin": "fastqc",
-  "conda": { "name": "axial-qc", "spec": ["bioconda::fastqc"] },
+  "pixi": ["bioconda::fastqc"],
   "params": {},
   "ports": {
     "in": [{ "name": "fastq", "type": "Fastq", "union": ["Fastq", "FastqGz"] }],

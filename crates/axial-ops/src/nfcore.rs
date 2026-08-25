@@ -1,28 +1,29 @@
-//! nf-core discovery behind a small, cache-friendly interface.
+//! Official nf-core discovery behind one cache-friendly operator interface.
 
 use std::collections::BTreeMap;
 use std::process::Command;
 
 use axial_ir::{ParamValue, PortType};
-use axial_ops::{CondaSpec, Cost, OpKind, Operator, OutputSpec, ParamSpec, PortSpec, PortsSpec};
 
-pub(crate) const CATALOG_URL: &str = "https://nf-co.re/pipelines.json";
-pub(crate) type FetchResult = Result<(String, Vec<Pipeline>), String>;
+use crate::{Cost, OpKind, Operator, OutputSpec, ParamSpec, PortSpec, PortsSpec};
+
+pub const CATALOG_URL: &str = "https://nf-co.re/pipelines.json";
+pub type FetchResult = Result<(String, Vec<Pipeline>), String>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Pipeline {
-    pub(crate) name: String,
-    pub(crate) description: String,
-    pub(crate) topics: Vec<String>,
-    pub(crate) revision: String,
+pub struct Pipeline {
+    pub name: String,
+    pub description: String,
+    pub topics: Vec<String>,
+    pub revision: String,
 }
 
 impl Pipeline {
-    pub(crate) fn operator_id(&self) -> String {
+    pub fn operator_id(&self) -> String {
         format!("nf.{}", self.name)
     }
 
-    pub(crate) fn operator(&self) -> Operator {
+    pub fn operator(&self) -> Operator {
         let mut params = BTreeMap::new();
         params.insert(
             "revision".into(),
@@ -31,18 +32,6 @@ impl Pipeline {
                 label: Some("Version".into()),
                 page: Some("Pipeline".into()),
                 default: Some(ParamValue::String(self.revision.clone())),
-                required: true,
-                min: None,
-                max: None,
-            },
-        );
-        params.insert(
-            "profile".into(),
-            ParamSpec {
-                ty: "string".into(),
-                label: Some("Profile".into()),
-                page: Some("Pipeline".into()),
-                default: Some(ParamValue::String("conda".into())),
                 required: true,
                 min: None,
                 max: None,
@@ -79,10 +68,7 @@ impl Pipeline {
             kind: OpKind::External,
             cost: Cost::High,
             bin: Some("nextflow".into()),
-            conda: Some(CondaSpec {
-                name: "axial-nf".into(),
-                spec: vec!["bioconda::nextflow".into()],
-            }),
+            pixi: vec!["bioconda::nextflow".into()],
             params,
             ports,
             argv: vec![
@@ -91,8 +77,6 @@ impl Pipeline {
                 format!("nf-core/{}", self.name),
                 "-r".into(),
                 "{param.revision}".into(),
-                "-profile".into(),
-                "{param.profile}".into(),
                 "--input".into(),
                 "{input.sheet}".into(),
                 "--outdir".into(),
@@ -103,7 +87,7 @@ impl Pipeline {
     }
 }
 
-pub(crate) fn parse(text: &str) -> Result<Vec<Pipeline>, String> {
+pub fn parse(text: &str) -> Result<Vec<Pipeline>, String> {
     let root: serde_json::Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
     let workflows = root
         .get("remote_workflows")
@@ -122,9 +106,9 @@ pub(crate) fn parse(text: &str) -> Result<Vec<Pipeline>, String> {
             let revision = workflow
                 .get("releases")?
                 .as_array()?
-                .first()?
-                .get("tag_name")?
-                .as_str()?
+                .iter()
+                .filter_map(|release| release.get("tag_name")?.as_str())
+                .find(|tag| *tag != "dev")?
                 .to_owned();
             let description = workflow
                 .get("description")
@@ -151,7 +135,7 @@ pub(crate) fn parse(text: &str) -> Result<Vec<Pipeline>, String> {
     Ok(pipelines)
 }
 
-pub(crate) fn fetch() -> FetchResult {
+pub fn fetch() -> FetchResult {
     let output = Command::new("curl")
         .args(["-fsSL", "--max-time", "15", CATALOG_URL])
         .output()
@@ -175,14 +159,15 @@ mod tests {
             {"name":"rnaseq","description":"RNA analysis","topics":["rna"],"archived":false,
              "releases":[{"tag_name":"3.26.0"}]},
             {"name":"old","archived":true,"releases":[{"tag_name":"1.0.0"}]},
+            {"name":"dev-only","archived":false,"releases":[{"tag_name":"dev"}]},
             {"name":"new","archived":false,"releases":[]}
           ]
         }"#;
 
-        let pipelines = parse(text).unwrap();
+        let pipelines = parse(text).expect("valid catalog");
         assert_eq!(pipelines.len(), 1);
         assert_eq!(pipelines[0].name, "rnaseq");
         assert_eq!(pipelines[0].revision, "3.26.0");
-        assert_eq!(pipelines[0].operator().argv[2], "nf-core/rnaseq".to_owned());
+        assert_eq!(pipelines[0].operator().argv[2], "nf-core/rnaseq");
     }
 }

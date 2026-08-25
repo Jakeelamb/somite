@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+graph_path="${1:-}"
+
+cleanup() {
+  if [[ -n "${server_pid:-}" ]]; then
+    kill "$server_pid" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+if [[ -n "$graph_path" ]]; then
+  AXIAL_PROJECT_ROOT="$project_root" AXIAL_GRAPH="$graph_path" \
+    cargo run --manifest-path "$project_root/Cargo.toml" -p axial-server &
+else
+  AXIAL_PROJECT_ROOT="$project_root" \
+    cargo run --manifest-path "$project_root/Cargo.toml" -p axial-server &
+fi
+server_pid=$!
+
+cd "$project_root/web"
+npm run dev

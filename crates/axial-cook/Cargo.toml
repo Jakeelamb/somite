@@ -3,7 +3,7 @@ name = "axial-cook"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Cook engine: CAS, staging, conda, processes"
+description = "Cook engine: CAS, staging, Pixi environments, processes"
 
 [dependencies]
 axial-ir = { path = "../axial-ir" }

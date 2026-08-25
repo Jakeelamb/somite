@@ -5,7 +5,7 @@
   "kind": "external",
   "cost": "high",
   "bin": "bwa",
-  "conda": { "name": "axial-var", "spec": ["bioconda::bwa"] },
+  "pixi": ["bioconda::bwa"],
   "params": {
     "threads": { "type": "int", "label": "Threads", "page": "BWA", "default": 8, "min": 1, "max": 64 }
   },

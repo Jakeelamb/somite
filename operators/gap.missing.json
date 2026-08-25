@@ -1,12 +1,12 @@
 {
   "id": "gap.missing",
-  "title": "Missing from catalog",
-  "palette": ["Gaps"],
+  "title": "Needs tool adapter",
+  "palette": ["Resolve"],
   "kind": "inprocess",
   "cost": "low",
   "params": {
-    "tool": { "type": "string", "label": "Tool", "page": "Gap", "required": true },
-    "quote": { "type": "string", "label": "Paper", "page": "Gap" }
+    "tool": { "type": "string", "label": "Tool", "page": "Resolve", "required": true },
+    "quote": { "type": "string", "label": "Paper", "page": "Resolve" }
   },
   "ports": {
     "in": [{ "name": "in", "type": "Directory", "optional": true }],

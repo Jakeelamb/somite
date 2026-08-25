@@ -5,7 +5,7 @@
   "kind": "external",
   "cost": "high",
   "bin": "datasets",
-  "conda": { "name": "axial-ncbi", "spec": ["conda-forge::ncbi-datasets-cli"] },
+  "pixi": ["conda-forge::ncbi-datasets-cli"],
   "params": {
     "taxon": { "type": "string", "label": "Taxon", "page": "Genome", "required": true, "default": "human" }
   },

@@ -5,7 +5,7 @@
   "kind": "external",
   "cost": "high",
   "bin": "salmon",
-  "conda": { "name": "axial-rna", "spec": ["bioconda::salmon"] },
+  "pixi": ["bioconda::salmon"],
   "params": {
     "libtype": { "type": "string", "label": "Lib type", "page": "Salmon", "default": "A" }
   },

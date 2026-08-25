@@ -12,7 +12,6 @@
       ],
       "params": {
         "revision": "3.26.0",
-        "profile": "test,docker",
         "stub_run": true
       },
       "layout": { "x": 120.0, "y": 160.0 }

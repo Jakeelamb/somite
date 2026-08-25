@@ -100,6 +100,22 @@ New artifact type = design change (CAS, staging, sniff). New kind = a string in 
 8. **`cost: high` or `low`.** High never viewer-pulls. Genomics CLIs are high. Preview extractors are low.
 9. **Do not fork the scientific tool.** Own an **adapter** if I/O is dirty. If argv cannot express the tool, the adapter *is* the modification. Axial does not import Python. Agents generate adapters; humans review the type contract.
 10. **Deterministic enough to hash.** Same inputs + params + schema → same cook key. Do not embed timestamps in output names if you can help it; glob the stable suffix. Adapters MUST be in the cook key (schema hash).
+11. **Declare managed packages when they exist.** `pixi` lists the channel and
+    package requirements for the one graph-wide Pixi workspace. A package
+    declaration makes an operator installable; it does not replace the typed
+    ports, argv, or output globs that make the operator valid.
+
+## Pixi execution and export
+
+An Axial graph is portable only with its operator contracts and tool
+requirements. Axial writes one Pixi manifest for the graph. The web exporter
+emits that manifest with the graph, every referenced operator JSON, a tool
+audit, and a Pixi launcher. `pixi run` resolves, locks, installs, activates, and
+runs the managed tools.
+
+The exporter MUST NOT silently turn a discovered package into a node.
+`gap.missing` means the paper named a method that still needs a reviewed adapter
+contract.
 
 ---
 
@@ -164,9 +180,8 @@ Map:
 | `type: boolean` / `val` | Param |
 | `versions.yml` | Ignore, or optional `Text` |
 | `optional: true` | `"optional": true` |
-| container / conda | v0.1: `bin` on PATH. Container seam is later (same ExternalProcess, different supervisor). |
 
-Prefer calling the **tool binary** (`fastqc`, `star`, `kraken2`) over `nextflow run` of a one-module pipeline. Nextflow is for compounds (whole pipelines) and for modules that only exist as Groovy+container.
+Prefer calling the **tool binary** (`fastqc`, `star`, `kraken2`) over `nextflow run` of a one-module pipeline. Nextflow is for compounds (whole pipelines), not ordinary bricks.
 
 A later `axial ops import-nf-module` MAY generate the JSON from `meta.yml`. Until then, hand-write. The mapping above is the generator spec.
 
@@ -176,7 +191,7 @@ A later `axial ops import-nf-module` MAY generate the JSON from `meta.yml`. Unti
 
 Three legal paths, user's choice. Axial does not pick a tasteful cut for them.
 
-1. **Compound (blunt):** `nextflow run nf-core/<name> -r <pin> --input {input.sheet} --outdir {work}/out`. Out is `Directory`. Ugly. Works today. Exception to the no-Directory rule.
+1. **Compound (blunt):** `nextflow run nf-core/<name> -r <pin> --input {input.sheet} --outdir {work}/out`. Out is `Directory`. Pixi installs Nextflow itself; a pipeline still needs reviewed Pixi package requirements before Axial can promise its internal tasks are runnable. Exception to the no-Directory rule.
 2. **Bricks (Lego):** wrap the modules you actually want (`fastp`, `star`, `salmon`) as JSON. Build the graph yourself. This is the default we optimize for.
 3. **Compile (agent):** same move as `bulk-rna-v1` on HoX. Agent emits a small graph with optional kinds. Axial does not maintain that graph as a product.
 
@@ -197,9 +212,9 @@ blunt `nextflow run`, with one important staging rule:
 
 Directory inputs MUST be staged as copies, not CAS symlinks, because Snakemake
 normally writes results and `.snakemake` metadata beside the workflow. The
-source directory and CAS object MUST remain immutable. `use_conda`, `dry_run`,
-`keep_going`, and `printshellcmds` map to Snakemake CLI flags; no shell wrapper
-or second execution engine is involved.
+source directory and CAS object MUST remain immutable. `dry_run`, `keep_going`,
+and `printshellcmds` map to Snakemake CLI flags; no shell wrapper or second
+execution engine is involved. Pixi supplies the Snakemake executable.
 
 A catalog workflow is not automatically a typed Axial operator. Its repository
 must first be reviewed for configuration, target, input, output, revision, and

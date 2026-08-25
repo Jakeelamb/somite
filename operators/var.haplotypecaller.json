@@ -5,7 +5,7 @@
   "kind": "external",
   "cost": "high",
   "bin": "gatk",
-  "conda": { "name": "axial-var", "spec": ["bioconda::gatk4"] },
+  "pixi": ["bioconda::gatk4"],
   "ports": {
     "in": [
       { "name": "bam", "type": "Bam" },

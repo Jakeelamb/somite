@@ -5,7 +5,7 @@
   "kind": "external",
   "cost": "high",
   "bin": "busco",
-  "conda": { "name": "axial-asm", "spec": ["bioconda::busco"] },
+  "pixi": ["bioconda::busco"],
   "params": {
     "lineage": { "type": "string", "label": "Lineage", "page": "BUSCO", "default": "arthropoda_odb10" },
     "mode": { "type": "string", "label": "Mode", "page": "BUSCO", "default": "genome" }

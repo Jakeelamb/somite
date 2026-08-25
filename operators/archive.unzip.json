@@ -5,6 +5,7 @@
   "kind": "external",
   "cost": "low",
   "bin": "unzip",
+  "pixi": ["conda-forge::unzip"],
   "params": {},
   "ports": {
     "in": [{ "name": "archive", "type": "Zip" }],

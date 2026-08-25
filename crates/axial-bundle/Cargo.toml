@@ -1,25 +1,17 @@
 [package]
-name = "axial-app"
+name = "axial-bundle"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "TouchDesigner-like Axial window"
-default-run = "axial-app"
-
-[[bin]]
-name = "axial-app"
-path = "src/main.rs"
+description = "Portable Axial workflow and toolchain bundles"
 
 [dependencies]
 axial-ir = { path = "../axial-ir" }
 axial-ops = { path = "../axial-ops" }
-axial-cook = { path = "../axial-cook" }
-axial-paper = { path = "../axial-paper" }
-eframe = "0.32"
-egui = "0.32"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-anyhow = "1"
+thiserror = "2"
+zip = { version = "=8.6.0", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

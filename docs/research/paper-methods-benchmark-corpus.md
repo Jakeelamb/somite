@@ -57,9 +57,9 @@ FASTQ(s)
   -> branch B: featureCounts per sample -> count-table gather -> DESeq2
 ```
 
-This is the strongest paper-to-machine-graph case. The Methods explicitly describe optional QC/trimming, per-sample execution, a cross-sample StringTie merge, two differential-expression branches, CWL scatter, Docker images, and selectable outputs. The accompanying MIT-licensed repository supplies the CWL graph and wrappers, so extraction can be compared with executable truth rather than a human paraphrase ([paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC10662043/), [source](https://github.com/BiodataAnalysisGroup/CWL_HTS_pipelines)).
+This is the strongest paper-to-machine-graph case. The Methods explicitly describe optional QC/trimming, per-sample execution, a cross-sample StringTie merge, two differential-expression branches, CWL scatter, packaged execution environments, and selectable outputs. The accompanying MIT-licensed repository supplies the CWL graph and wrappers, so extraction can be compared with executable truth rather than a human paraphrase ([paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC10662043/), [source](https://github.com/BiodataAnalysisGroup/CWL_HTS_pipelines)).
 
-**Labels to preserve:** optional preprocessing; scatter; gather; parallel analysis branches; experimental-design, contrast, threshold, and batch-effect parameters; tool containers; workflow outputs.
+**Labels to preserve:** optional preprocessing; scatter; gather; parallel analysis branches; experimental-design, contrast, threshold, and batch-effect parameters; packaged tool provenance; workflow outputs.
 
 ### 2. Short-read germline and somatic calling: Garcia et al. 2020
 
@@ -182,7 +182,7 @@ Each gold paper should have two linked products:
 Minimum node labels:
 
 - canonical tool and mentioned spelling;
-- tool version/container/release when explicit;
+- tool version and release when explicit;
 - operation class (`qc`, `trim`, `align`, `quantify`, `call`, `assemble`, `bin`, `classify`, `filter`, `annotate`, `evaluate`);
 - named inputs/outputs and artifact types;
 - exact argv or parameter/value/unit when explicit;

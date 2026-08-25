@@ -5,7 +5,7 @@
   "kind": "external",
   "cost": "high",
   "bin": "prefetch",
-  "conda": { "name": "axial-ncbi", "spec": ["bioconda::sra-tools"] },
+  "pixi": ["bioconda::sra-tools"],
   "params": {
     "accession": {
       "type": "string",
