@@ -10,7 +10,10 @@
     "revision": { "type": "string", "label": "Version", "page": "Pipeline", "default": "3.10.0" }
   },
   "ports": {
-    "in": [{ "name": "sheet", "type": "Table" }],
+    "in": [
+      { "name": "sheet", "type": "Table", "optional": true },
+      { "name": "fastq", "type": "Fastq", "union": ["Fastq", "FastqGz"], "optional": true }
+    ],
     "out": [{ "name": "results", "type": "Directory", "optional": true }]
   },
   "argv": [

@@ -1,0 +1,36 @@
+{
+  "id": "ncbi.datasets_assembly",
+  "title": "NCBI assembly accession",
+  "palette": ["NCBI", "Datasets"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "datasets",
+  "conda": { "name": "axial-ncbi", "spec": ["conda-forge::ncbi-datasets-cli"] },
+  "params": {
+    "accession": {
+      "type": "string",
+      "label": "GCA / GCF accession",
+      "page": "Assembly",
+      "required": true
+    }
+  },
+  "ports": {
+    "in": [],
+    "out": [{ "name": "package", "type": "Zip" }]
+  },
+  "argv": [
+    "datasets",
+    "download",
+    "genome",
+    "accession",
+    "{param.accession}",
+    "--include",
+    "genome,gff3,gtf,protein,seq-report",
+    "--filename",
+    "{work}/out/assembly.zip",
+    "--no-progressbar"
+  ],
+  "outputs": {
+    "package": { "glob": "{work}/out/assembly.zip", "type": "Zip" }
+  }
+}

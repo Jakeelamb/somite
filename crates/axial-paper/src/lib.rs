@@ -46,6 +46,8 @@ pub enum Assay {
     RnaSeq,
     Variants,
     Metagenome,
+    SingleCell,
+    Mixed,
     Qc,
     Unknown,
 }
@@ -58,10 +60,51 @@ pub struct Reconstruction {
 }
 
 const RNA_COMPOUND_COVERS: &[&str] = &[
-    "STAR", "HISAT2", "Salmon", "Kallisto", "featureCounts", "RSEM", "StringTie",
+    "align.star",
+    "align.hisat2",
+    "quant.salmon",
+    "quant.featurecounts",
+    "quant.stringtie",
 ];
-const VAR_COMPOUND_COVERS: &[&str] = &["GATK", "BWA", "Mutect2", "HaplotypeCaller", "Strelka"];
-const MAG_COMPOUND_COVERS: &[&str] = &["SPAdes", "Kraken2", "MetaBAT"];
+const VAR_COMPOUND_COVERS: &[&str] = &["align.bwa", "var.haplotypecaller"];
+const MAG_COMPOUND_COVERS: &[&str] = &["class.kraken2"];
+
+/// Catalog bricks the methods section can name. nf-core compounds only if named.
+const BRICKS: &[(&str, &[&str])] = &[
+    ("qc.fastqc", &["fastqc"]),
+    ("qc.fastp", &["fastp", "cutadapt", "trimmomatic", "trim galore", "trimgalore"]),
+    ("align.star", &["star"]),
+    ("align.hisat2", &["hisat2", "hisat"]),
+    ("align.bwa", &["bwa-mem", "bwa mem", "bwa"]),
+    ("align.minimap2", &["minimap2", "minimap"]),
+    ("quant.featurecounts", &["featurecounts", "feature counts", "rsubread"]),
+    ("quant.salmon", &["salmon"]),
+    ("quant.stringtie", &["stringtie"]),
+    ("diff.deseq2", &["deseq2", "deseq"]),
+    ("class.kraken2", &["kraken2", "kraken"]),
+    ("var.haplotypecaller", &["haplotypecaller", "gatk"]),
+    ("asm.hifiasm", &["hifiasm"]),
+    ("asm.yahs", &["yahs"]),
+    ("qc.busco", &["busco"]),
+    ("nf.rnaseq", &["nf-core/rnaseq", "nf-core rnaseq"]),
+    ("nf.sarek", &["nf-core/sarek", "sarek"]),
+    ("nf.mag", &["nf-core/mag"]),
+    ("nf.taxprofiler", &["nf-core/taxprofiler"]),
+];
+
+const GAPS: &[(&str, &[&str])] = &[
+    ("Ballgown", &["ballgown"]),
+    ("Kallisto", &["kallisto"]),
+    ("MultiQC", &["multiqc"]),
+    ("Picard", &["picard", "markduplicates"]),
+    ("Mutect2", &["mutect"]),
+    ("MetaBAT", &["metabat"]),
+    ("SPAdes", &["spades"]),
+    ("Cell Ranger", &["cellranger", "cell ranger"]),
+    ("SoupX", &["soupx"]),
+    ("Seurat", &["seurat"]),
+    ("DoubletFinder", &["doubletfinder", "doublet finder"]),
+];
 
 pub fn text_from_path(path: &Path) -> Result<String, PaperError> {
     Ok(extract_from_path(path)?.text)
@@ -213,13 +256,37 @@ fn pdf_ocr(path: &Path) -> Result<String, PaperError> {
 }
 
 pub fn reconstruct(catalog: &Catalog, text: &str) -> Reconstruction {
-    let low = text.to_ascii_lowercase();
+    let focus = methods_window(text);
+    let mut scan = if focus.len() >= 200 { focus } else { text };
+    let mut low = scan.to_ascii_lowercase();
     let assay = classify(&low);
-    if assay == Assay::Assembly {
-        return build_assembly(catalog, text, &low);
+    // Some two-column single-cell PDFs isolate a late statistics subsection as
+    // "Methods" while the actual workflow is described earlier. Recover the
+    // named pipeline tools from the body once the assay itself is unambiguous.
+    if assay == Assay::SingleCell
+        && !mentions(
+            &low,
+            &["cellranger", "cell ranger", "seurat", "soupx", "doubletfinder"],
+        )
+    {
+        scan = text;
+        low = text.to_ascii_lowercase();
     }
-    let acc = accessions(text);
-    let genome = genome_token(&low);
+    if assay == Assay::Assembly {
+        return build_assembly(catalog, scan, &low);
+    }
+    build_bricks(catalog, text, scan, &low, assay)
+}
+
+fn build_bricks(
+    catalog: &Catalog,
+    full: &str,
+    scan: &str,
+    low: &str,
+    assay: Assay,
+) -> Reconstruction {
+    let acc = accessions(full);
+    let genome = genome_token(low);
     let mut warnings = Vec::new();
     let mut g = Graph {
         schema_version: SCHEMA_VERSION,
@@ -268,7 +335,143 @@ pub fn reconstruct(catalog: &Catalog, text: &str) -> Reconstruction {
     } else {
         None
     };
-    if prefetch.is_none() && (assay == Assay::Qc || mentioned(&low, &["fastq", "illumina", "reads were"])) {
+
+    let named_nf_rnaseq = mentions(low, &["nf-core/rnaseq", "nf-core rnaseq"]);
+    let named_nf_sarek = mentions(low, &["nf-core/sarek", "sarek"]);
+    let named_nf_tax = mentions(low, &["nf-core/taxprofiler"]);
+    let named_nf_mag = mentions(low, &["nf-core/mag"]);
+
+    for (op, needles) in BRICKS {
+        if !mentions(low, needles) {
+            continue;
+        }
+        // A full protocol often names comparison tools from other assays. A
+        // domain-incompatible mention is evidence, not a runnable step.
+        if matches!(
+            (*op, assay),
+            ("align.star" | "align.hisat2" | "quant.featurecounts" | "quant.salmon"
+                | "quant.stringtie" | "diff.deseq2" | "nf.rnaseq", Assay::Variants | Assay::Metagenome)
+                | ("align.bwa" | "var.haplotypecaller" | "nf.sarek", Assay::RnaSeq | Assay::Metagenome)
+                | ("class.kraken2" | "nf.mag" | "nf.taxprofiler", Assay::RnaSeq | Assay::Variants)
+        ) {
+            continue;
+        }
+        if *op == "nf.rnaseq" && !named_nf_rnaseq {
+            continue;
+        }
+        if *op == "nf.sarek" && !named_nf_sarek {
+            continue;
+        }
+        if *op == "nf.taxprofiler" && !named_nf_tax {
+            continue;
+        }
+        if *op == "nf.mag" && !named_nf_mag {
+            continue;
+        }
+        if named_nf_rnaseq && RNA_COMPOUND_COVERS.contains(op) {
+            continue;
+        }
+        if named_nf_sarek && VAR_COMPOUND_COVERS.contains(op) {
+            continue;
+        }
+        if (named_nf_tax || named_nf_mag) && MAG_COMPOUND_COVERS.contains(op) {
+            continue;
+        }
+        if *op == "diff.deseq2"
+            && !mentions(low, &["featurecounts", "feature counts", "rsubread", "salmon", "htseq"])
+        {
+            continue;
+        }
+        let q = needles.iter().find_map(|n| snippet(scan, n));
+        add(&mut g, op, vec![], q);
+    }
+
+    for (tool, needles) in GAPS {
+        if !mentions(low, needles) {
+            continue;
+        }
+        if named_nf_rnaseq && ["Kallisto", "MultiQC"].contains(tool) {
+            continue;
+        }
+        if named_nf_sarek && ["Picard", "Mutect2"].contains(tool) {
+            continue;
+        }
+        let q = needles.iter().find_map(|n| snippet(scan, n));
+        if let Some(id) = add(
+            &mut g,
+            "gap.missing",
+            vec![
+                ("tool", ParamValue::String((*tool).into())),
+                ("quote", ParamValue::String(q.clone().unwrap_or_default())),
+            ],
+            q.or_else(|| Some(format!("paper used {tool}; not a brick yet — wrap it"))),
+        ) {
+            if let Some(n) = g.nodes.iter_mut().find(|n| n.id == id) {
+                n.ports = match *tool {
+                    "Ballgown" => vec![
+                        p_in("in", PortType::Gtf, vec![PortType::Gtf]),
+                        p_out("out", PortType::Table),
+                    ],
+                    "Picard" => vec![
+                        p_in("in", PortType::Bam, vec![PortType::Bam]),
+                        p_out("out", PortType::Bam),
+                    ],
+                    "Cell Ranger" => vec![
+                        p_in(
+                            "in",
+                            PortType::Fastq,
+                            vec![PortType::Fastq, PortType::FastqGz],
+                        ),
+                        p_out("out", PortType::Directory),
+                    ],
+                    "SoupX" | "Seurat" | "DoubletFinder" => vec![
+                        p_in(
+                            "in",
+                            PortType::Directory,
+                            vec![PortType::Directory, PortType::Table],
+                        ),
+                        p_out("out", PortType::Directory),
+                    ],
+                    "Kallisto" => vec![
+                        p_in(
+                            "in",
+                            PortType::Fastq,
+                            vec![PortType::Fastq, PortType::FastqGz],
+                        ),
+                        p_out("out", PortType::Table),
+                    ],
+                    _ => n.ports.clone(),
+                };
+            }
+        }
+    }
+
+    if prefetch.is_none()
+        && g.nodes
+            .iter()
+            .any(|n| {
+                n.operator != "gap.missing"
+                    || matches!(assay, Assay::Qc | Assay::SingleCell)
+            })
+        && !g.nodes.iter().any(|n| n.operator == "files.import")
+        && (assay == Assay::SingleCell
+            || g.nodes.iter().any(|n| {
+                matches!(
+                    n.operator.as_str(),
+                    "qc.fastqc"
+                        | "qc.fastp"
+                        | "align.star"
+                        | "align.hisat2"
+                        | "align.bwa"
+                        | "quant.salmon"
+                        | "class.kraken2"
+                        | "nf.rnaseq"
+                        | "nf.sarek"
+                        | "nf.mag"
+                        | "nf.taxprofiler"
+                )
+            }))
+    {
         add(
             &mut g,
             "files.import",
@@ -277,113 +480,37 @@ pub fn reconstruct(catalog: &Catalog, text: &str) -> Reconstruction {
         );
     }
 
-    if mentioned(&low, &["fastqc"]) || matches!(assay, Assay::RnaSeq | Assay::Variants | Assay::Metagenome | Assay::Qc)
-    {
-        let q = snippet(text, "fastqc").or_else(|| snippet(text, "quality control"));
-        add(&mut g, "qc.fastqc", vec![], q);
-    }
-    if mentioned(&low, &["fastp", "cutadapt", "trimmomatic", "trim galore", "trimgalore"]) {
-        let q = snippet(text, "fastp")
-            .or_else(|| snippet(text, "cutadapt"))
-            .or_else(|| snippet(text, "trimmomatic"))
-            .or_else(|| snippet(text, "trim"));
-        add(&mut g, "qc.fastp", vec![], q);
-    }
-
-    let compound = match assay {
-        Assay::RnaSeq => {
-            let covers: Vec<&str> = RNA_COMPOUND_COVERS
-                .iter()
-                .copied()
-                .filter(|t| low.contains(&t.to_ascii_lowercase()))
-                .collect();
-            let mut note = "nf-core/rnaseq is the compound for this methods section".to_string();
-            if !covers.is_empty() {
-                note.push_str(&format!(". paper used {} — pipeline wraps it", covers.join(", ")));
-            }
-            if let Some(gname) = genome {
-                note.push_str(&format!(". reference {gname}"));
-            }
-            add(&mut g, "nf.rnaseq", vec![], Some(note));
-            Some("nf.rnaseq")
-        }
-        Assay::Variants => {
-            let covers: Vec<&str> = VAR_COMPOUND_COVERS
-                .iter()
-                .copied()
-                .filter(|t| low.contains(&t.to_ascii_lowercase()))
-                .collect();
-            let mut note = "nf-core/sarek for the variant methods".to_string();
-            if !covers.is_empty() {
-                note.push_str(&format!(". paper used {}", covers.join(", ")));
-            }
-            add(&mut g, "nf.sarek", vec![], Some(note));
-            Some("nf.sarek")
-        }
-        Assay::Metagenome => {
-            let op = if mentioned(&low, &["kraken", "taxonom", "profil"]) {
-                "nf.taxprofiler"
-            } else {
-                "nf.mag"
-            };
+    let needs_fasta = g.nodes.iter().any(|n| {
+        matches!(
+            n.operator.as_str(),
+            "align.star" | "align.hisat2" | "align.bwa" | "quant.salmon" | "nf.rnaseq"
+        )
+    });
+    let fasta = if needs_fasta {
+        genome.as_ref().and_then(|genome| {
             add(
                 &mut g,
-                op,
+                "ensembl.fasta",
                 vec![],
-                Some("compound for the metagenomic methods".into()),
-            );
-            Some(op)
-        }
-        Assay::Qc | Assay::Unknown | Assay::Assembly => None,
+                Some(format!("reference {genome}")),
+            )
+        })
+    } else {
+        None
+    };
+    let gtf = if genome.is_some()
+        && g.nodes.iter().any(|n| {
+            matches!(
+                n.operator.as_str(),
+                "quant.featurecounts" | "quant.stringtie" | "nf.rnaseq"
+            )
+        }) {
+        add(&mut g, "ensembl.gtf", vec![], Some("gene models".into()))
+    } else {
+        None
     };
 
-    let covered: &[&str] = match compound {
-        Some("nf.rnaseq") => RNA_COMPOUND_COVERS,
-        Some("nf.sarek") => VAR_COMPOUND_COVERS,
-        Some("nf.mag") | Some("nf.taxprofiler") => MAG_COMPOUND_COVERS,
-        _ => &[],
-    };
-    for (needle, tool) in [
-        (" star", "STAR"),
-        ("hisat", "HISAT2"),
-        ("salmon", "Salmon"),
-        ("kallisto", "Kallisto"),
-        ("bwa ", "BWA"),
-        ("gatk", "GATK"),
-        ("mutect", "Mutect2"),
-        ("spades", "SPAdes"),
-        ("kraken", "Kraken2"),
-        ("deseq", "DESeq2"),
-        ("multiqc", "MultiQC"),
-        ("cellranger", "Cell Ranger"),
-        ("seurat", "Seurat"),
-    ] {
-        if !low.contains(needle.trim()) && !low.contains(&tool.to_ascii_lowercase()) {
-            continue;
-        }
-        if covered.iter().any(|c| c.eq_ignore_ascii_case(tool)) {
-            continue;
-        }
-        let q = snippet(text, tool).or_else(|| snippet(text, needle.trim()));
-        add(
-            &mut g,
-            "gap.missing",
-            vec![
-                ("tool", ParamValue::String(tool.into())),
-                (
-                    "quote",
-                    ParamValue::String(q.clone().unwrap_or_default()),
-                ),
-            ],
-            q.or_else(|| Some(format!("paper used {tool}; not a brick yet — wrap it"))),
-        );
-    }
-
-    if g.nodes.is_empty() {
-        warnings.push("no tools or assay I could map. drop a methods section, not a cover page.".into());
-    }
-
-    let sheet = if compound == Some("nf.rnaseq") {
+    let sheet = if g.nodes.iter().any(|n| n.operator == "nf.rnaseq") {
         add(
             &mut g,
             "sheet.rnaseq",
@@ -394,36 +521,143 @@ pub fn reconstruct(catalog: &Catalog, text: &str) -> Reconstruction {
         None
     };
 
+    if g.nodes.is_empty() {
+        warnings.push("no tools or assay I could map. drop a methods section, not a cover page.".into());
+    }
+    if assay == Assay::Mixed {
+        warnings.push(
+            "multiple assay workflows detected; typed branches are shown together until named subworkflows land"
+                .into(),
+        );
+    }
+
     if let (Some(a), Some(b)) = (&prefetch, &fasterq) {
         wire(&mut g, a, b);
     }
     let reads = fasterq
         .clone()
         .or_else(|| g.nodes.iter().find(|n| n.operator == "files.import").map(|n| n.id.clone()));
+
     if let Some(src) = &reads {
         for n in g.nodes.clone() {
-            if n.operator == "qc.fastqc" || n.operator == "qc.fastp" {
+            if matches!(
+                n.operator.as_str(),
+                "qc.fastqc"
+                    | "qc.fastp"
+                    | "quant.salmon"
+                    | "class.kraken2"
+                    | "nf.sarek"
+                    | "nf.mag"
+                    | "nf.taxprofiler"
+            ) {
                 wire(&mut g, src, &n.id);
             }
         }
     }
-    let trim = g
+    let trimmed = g
         .nodes
         .iter()
         .find(|n| n.operator == "qc.fastp")
-        .map(|n| n.id.clone());
-    let sheet_src = trim.or(reads);
-    if let (Some(src), Some(sh)) = (&sheet_src, &sheet) {
-        wire(&mut g, src, sh);
+        .map(|n| n.id.clone())
+        .or(reads.clone());
+    if let Some(src) = &trimmed {
+        for n in g.nodes.clone() {
+            if matches!(n.operator.as_str(), "align.star" | "align.hisat2" | "align.bwa") {
+                wire(&mut g, src, &n.id);
+            }
+        }
     }
-    if let Some(sh) = &sheet {
-        if let Some(nf) = g
+    if let Some(fa) = &fasta {
+        for n in g.nodes.clone() {
+            if matches!(
+                n.operator.as_str(),
+                "align.star" | "align.hisat2" | "align.bwa" | "quant.salmon" | "var.haplotypecaller"
+            ) {
+                wire(&mut g, fa, &n.id);
+            }
+        }
+    }
+    for aligner in g.nodes.clone() {
+        let downstream: &[&str] = match aligner.operator.as_str() {
+            "align.star" | "align.hisat2" => &["quant.featurecounts", "quant.stringtie"],
+            "align.bwa" => &["var.haplotypecaller"],
+            _ => continue,
+        };
+        for n in g.nodes.clone() {
+            if downstream.contains(&n.operator.as_str()) {
+                wire(&mut g, &aligner.id, &n.id);
+            }
+        }
+    }
+    if let Some(gt) = &gtf {
+        for n in g.nodes.clone() {
+            if matches!(n.operator.as_str(), "quant.featurecounts" | "quant.stringtie") {
+                wire(&mut g, gt, &n.id);
+            }
+        }
+    }
+    let counts = g
+        .nodes
+        .iter()
+        .find(|n| n.operator == "quant.featurecounts" || n.operator == "quant.salmon")
+        .map(|n| n.id.clone());
+    if let (Some(c), Some(de)) = (
+        &counts,
+        g.nodes.iter().find(|n| n.operator == "diff.deseq2").map(|n| n.id.clone()),
+    ) {
+        wire(&mut g, c, &de);
+    }
+    if let Some(st) = g.nodes.iter().find(|n| n.operator == "quant.stringtie").map(|n| n.id.clone()) {
+        if let Some(bg) = g
             .nodes
             .iter()
-            .find(|n| n.operator == "nf.rnaseq")
+            .find(|n| n.params.get("tool") == Some(&ParamValue::String("Ballgown".into())))
             .map(|n| n.id.clone())
         {
+            wire(&mut g, &st, &bg);
+        }
+    }
+    if let Some(bw) = g.nodes.iter().find(|n| n.operator == "align.bwa").map(|n| n.id.clone()) {
+        if let Some(pic) = g
+            .nodes
+            .iter()
+            .find(|n| n.params.get("tool") == Some(&ParamValue::String("Picard".into())))
+            .map(|n| n.id.clone())
+        {
+            wire(&mut g, &bw, &pic);
+            if let Some(hc) = g
+                .nodes
+                .iter()
+                .find(|n| n.operator == "var.haplotypecaller")
+                .map(|n| n.id.clone())
+            {
+                wire(&mut g, &pic, &hc);
+            }
+        }
+    }
+    if let (Some(src), Some(sh)) = (trimmed.as_ref().or(reads.as_ref()), &sheet) {
+        wire(&mut g, src, sh);
+    }
+    if let Some(nf) = g.nodes.iter().find(|n| n.operator == "nf.rnaseq").map(|n| n.id.clone()) {
+        if let Some(sh) = &sheet {
             wire(&mut g, sh, &nf);
+        }
+        if let Some(fa) = &fasta {
+            wire(&mut g, fa, &nf);
+        }
+        if let Some(gt) = &gtf {
+            wire(&mut g, gt, &nf);
+        }
+    }
+
+    // leftover gaps: snap to the nearest typed neighbour so nothing sits isolated
+    let mut prev: Option<String> = reads.clone();
+    for n in g.nodes.clone() {
+        if n.operator == "gap.missing" {
+            if let Some(p) = &prev {
+                wire(&mut g, p, &n.id);
+            }
+            prev = Some(n.id);
         }
     }
 
@@ -439,57 +673,113 @@ pub fn reconstruct(catalog: &Catalog, text: &str) -> Reconstruction {
 }
 
 fn classify(low: &str) -> Assay {
-    if contains_any(
-        low,
-        &[
-            "hifiasm",
-            "yahs",
-            "genomescope",
-            "mitohifi",
-            "blobtools",
-            "chromosome-scale assembl",
-            "chromosome scale assembl",
-            "haplotype assembl",
-            "pacbio hifi",
-            "hifi and hi-c",
-            "hi-c sequencing",
-        ],
-    ) {
-        Assay::Assembly
-    } else if contains_any(
-        low,
-        &[
-            "rna-seq",
-            "rna seq",
-            "rnaseq",
-            "nf-core/rnaseq",
-            "pseudoalign",
-            "differential expression",
-        ],
-    ) {
-        Assay::RnaSeq
-    } else if contains_any(
-        low,
-        &[
-            "sarek",
-            "somatic",
-            "germline",
-            "variant call",
-            "mutect",
-            "haplotypecaller",
-            "whole genome sequenc",
-            "wgs ",
-            "wes ",
-        ],
-    ) {
-        Assay::Variants
-    } else if contains_any(low, &["metagenom", "taxonom", "kraken", "metabat", "mag "]) {
-        Assay::Metagenome
+    let scores = [
+        (
+            Assay::Assembly,
+            evidence_score(
+                low,
+                &[
+                    ("hifiasm", 5),
+                    ("yahs", 4),
+                    ("genomescope", 3),
+                    ("mitohifi", 4),
+                    ("blobtools", 3),
+                    ("chromosome-scale assembl", 4),
+                    ("chromosome scale assembl", 4),
+                    ("haplotype assembl", 4),
+                    ("pacbio hifi", 2),
+                    ("falcon", 4),
+                    ("purge_dups", 4),
+                    ("purge haplotigs", 4),
+                    ("iterative assembly pipeline", 5),
+                    ("vertebrate genome project", 5),
+                ],
+            ),
+        ),
+        (
+            Assay::RnaSeq,
+            evidence_score(
+                low,
+                &[
+                    ("nf-core/rnaseq", 6),
+                    ("hisat2", 4),
+                    ("stringtie", 4),
+                    ("rna-seq", 2),
+                    ("rna seq", 2),
+                    ("rnaseq", 2),
+                    ("pseudoalign", 3),
+                    ("differential expression", 3),
+                ],
+            ),
+        ),
+        (
+            Assay::Variants,
+            evidence_score(
+                low,
+                &[
+                    ("gatk best practices", 6),
+                    ("haplotypecaller", 5),
+                    ("gatk haplot", 5),
+                    ("variant call", 4),
+                    ("mutect", 4),
+                    ("sarek", 5),
+                    ("somatic", 3),
+                    ("germline", 3),
+                    ("whole genome sequenc", 2),
+                ],
+            ),
+        ),
+        (
+            Assay::Metagenome,
+            evidence_score(
+                low,
+                &[
+                    ("kraken 2", 6),
+                    ("kraken2", 6),
+                    ("nf-core/mag", 6),
+                    ("nf-core/taxprofiler", 6),
+                    ("metagenom", 4),
+                    ("metabat", 4),
+                ],
+            ),
+        ),
+        (
+            Assay::SingleCell,
+            evidence_score(
+                low,
+                &[
+                    ("single-cell rna", 6),
+                    ("single cell rna", 6),
+                    ("scrna", 5),
+                    ("cellranger", 5),
+                    ("cell ranger", 5),
+                    ("seurat", 4),
+                    ("doubletfinder", 4),
+                    ("soupx", 4),
+                ],
+            ),
+        ),
+    ];
+    let mut ranked = scores;
+    ranked.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
+    let (assay, score) = ranked[0];
+    if score >= 6 && ranked[1].1 >= 6 {
+        return Assay::Mixed;
+    }
+    if score > 0 {
+        assay
     } else if low.contains("fastqc") {
         Assay::Qc
     } else {
         Assay::Unknown
     }
+}
+
+fn evidence_score(low: &str, cues: &[(&str, u8)]) -> u16 {
+    cues.iter()
+        .filter(|(cue, _)| contains_positive(low, cue))
+        .map(|(_, weight)| u16::from(*weight))
+        .sum()
 }
 
 fn build_assembly(catalog: &Catalog, text: &str, low: &str) -> Reconstruction {
@@ -573,14 +863,41 @@ fn build_assembly(catalog: &Catalog, text: &str, low: &str) -> Reconstruction {
             break;
         }
     }
-    let asm = add(
-        &mut g,
-        "asm.hifiasm",
-        vec![],
-        snippet(text, "hifiasm").or_else(|| Some("hifiasm (HiFi ± Hi-C phasing)".into())),
-    );
+    let asm = if mentioned(low, &["hifiasm"]) {
+        add(
+            &mut g,
+            "asm.hifiasm",
+            vec![],
+            snippet(text, "hifiasm").or_else(|| Some("hifiasm (HiFi ± Hi-C phasing)".into())),
+        )
+    } else if mentioned(low, &["falcon"]) {
+        gap(&mut g, "FALCON", snippet(text, "FALCON"), gap_from_reads())
+    } else if mentioned(low, &["flye"]) {
+        gap(&mut g, "Flye", snippet(text, "Flye"), gap_from_reads())
+    } else if mentioned(low, &["canu"]) {
+        gap(&mut g, "Canu", snippet(text, "Canu"), gap_from_reads())
+    } else {
+        add(
+            &mut g,
+            "asm.hifiasm",
+            vec![],
+            Some("assembler not named — hifiasm is the default HiFi brick".into()),
+        )
+    };
+    let purge = if mentioned(low, &["purge_dups", "purge haplotigs", "purge_haplotigs"]) {
+        gap(
+            &mut g,
+            "Purge_Dups",
+            snippet(text, "Purge_Dups").or_else(|| snippet(text, "Purge_Haplotigs")),
+            gap_from_asm(),
+        )
+    } else {
+        None
+    };
     let yahs = if mentioned(low, &["yahs"]) {
-        gap(&mut g, "YaHS", snippet(text, "YaHS"), gap_from_asm())
+        add(&mut g, "asm.yahs", vec![], snippet(text, "YaHS"))
+    } else if mentioned(low, &["salsa"]) {
+        gap(&mut g, "Salsa", snippet(text, "Salsa"), gap_from_asm())
     } else {
         None
     };
@@ -592,7 +909,17 @@ fn build_assembly(catalog: &Catalog, text: &str, low: &str) -> Reconstruction {
     let busco = if mentioned(low, &["busco"]) {
         let mut n = snippet(text, "BUSCO").unwrap_or_else(|| "BUSCO completeness".into());
         n.push_str(&format!("  lineage {lineage}"));
-        gap(&mut g, "BUSCO", Some(n), gap_from_asm())
+        add(
+            &mut g,
+            "qc.busco",
+            vec![("lineage", ParamValue::String(lineage.clone()))],
+            Some(n),
+        )
+    } else {
+        None
+    };
+    let merqury = if mentioned(low, &["merqury"]) {
+        gap(&mut g, "Merqury", snippet(text, "Merqury"), gap_from_asm())
     } else {
         None
     };
@@ -617,7 +944,7 @@ fn build_assembly(catalog: &Catalog, text: &str, low: &str) -> Reconstruction {
         None
     };
     let mm = if mentioned(low, &["minimap"]) {
-        gap(&mut g, "minimap2", snippet(text, "minimap2"), gap_minimap())
+        add(&mut g, "align.minimap2", vec![], snippet(text, "minimap2"))
     } else {
         None
     };
@@ -640,7 +967,7 @@ fn build_assembly(catalog: &Catalog, text: &str, low: &str) -> Reconstruction {
         wire(&mut g, a, b);
     }
     let mut prev = asm.clone();
-    for nxt in [&yahs, &blob] {
+    for nxt in [&purge, &yahs, &blob] {
         if let (Some(a), Some(b)) = (&prev, nxt) {
             wire(&mut g, a, b);
             prev = Some(b.clone());
@@ -649,6 +976,12 @@ fn build_assembly(catalog: &Catalog, text: &str, low: &str) -> Reconstruction {
         }
     }
     if let (Some(a), Some(b)) = (&prev, &busco) {
+        wire(&mut g, a, b);
+    }
+    if let (Some(a), Some(b)) = (&busco, &merqury) {
+        wire(&mut g, a, b);
+    }
+    if let (Some(a), Some(b)) = (&hic, &yahs) {
         wire(&mut g, a, b);
     }
     if let (Some(a), Some(b)) = (&blob, &bakta) {
@@ -667,12 +1000,14 @@ fn build_assembly(catalog: &Catalog, text: &str, low: &str) -> Reconstruction {
     place(&mut g, hic.as_deref(), 1, 0);
     place(&mut g, hifi.as_deref(), 0, 1);
     place(&mut g, asm.as_deref(), 1, 1);
-    place(&mut g, yahs.as_deref(), 2, 1);
-    place(&mut g, blob.as_deref(), 3, 1);
-    place(&mut g, busco.as_deref(), 4, 1);
+    place(&mut g, purge.as_deref(), 2, 1);
+    place(&mut g, yahs.as_deref(), 3, 1);
+    place(&mut g, blob.as_deref(), 4, 1);
+    place(&mut g, busco.as_deref(), 5, 1);
+    place(&mut g, merqury.as_deref(), 6, 1);
     place(&mut g, gs.as_deref(), 0, 2);
     place(&mut g, mito.as_deref(), 1, 2);
-    place(&mut g, bakta.as_deref(), 3, 2);
+    place(&mut g, bakta.as_deref(), 4, 2);
     place(&mut g, iso.as_deref(), 0, 3);
     place(&mut g, mm.as_deref(), 1, 3);
     place(&mut g, aug.as_deref(), 2, 3);
@@ -687,11 +1022,176 @@ fn build_assembly(catalog: &Catalog, text: &str, low: &str) -> Reconstruction {
 }
 
 fn contains_any(s: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|n| s.contains(n))
+    needles.iter().any(|n| contains_positive(s, n))
+}
+
+fn contains_positive(s: &str, needle: &str) -> bool {
+    let mut i = 0;
+    while let Some(j) = s[i..].find(needle) {
+        let at = i + j;
+        let before = s[..at].trim_end_matches(|c: char| !c.is_ascii_alphabetic());
+        let denied = before.ends_with(" no")
+            || before.ends_with(" not")
+            || before.ends_with(" without")
+            || before == "no"
+            || before == "not";
+        if !denied {
+            return true;
+        }
+        i = at + needle.len();
+    }
+    false
 }
 
 fn mentioned(low: &str, needles: &[&str]) -> bool {
     contains_any(low, needles)
+}
+
+fn has_word(low: &str, word: &str) -> bool {
+    let w = word.as_bytes();
+    let b = low.as_bytes();
+    if w.is_empty() || b.len() < w.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i + w.len() <= b.len() {
+        if &b[i..i + w.len()] == w {
+            let before = i == 0 || !b[i - 1].is_ascii_alphanumeric();
+            let after = i + w.len() == b.len() || !b[i + w.len()].is_ascii_alphanumeric();
+            if before && after {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn mentions(low: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|n| {
+        if n.len() <= 4 {
+            has_word(low, n)
+        } else {
+            low.contains(n)
+        }
+    })
+}
+
+/// Prefer the actual methods section so references and comparison prose do not
+/// spawn tools. `pdftotext -layout` can put a two-column heading at either the
+/// start or the far right of a line, and Nature PDFs commonly attach it to a
+/// form-feed. Match those layouts rather than arbitrary occurrences of the word.
+pub fn methods_window(text: &str) -> &str {
+    const STARTS: &[&str] = &[
+        "materials and methods",
+        "materials & methods",
+        "online methods",
+        "experimental procedures",
+        "methods",
+        "method",
+    ];
+    const ENDS: &[&str] = &[
+        "results",
+        "discussion",
+        "data availability",
+        "code availability",
+        "acknowledgements",
+        "acknowledgments",
+        "author contributions",
+        "competing interests",
+        "references",
+        "bibliography",
+    ];
+
+    let front: String = text.chars().take(2048).collect::<String>().to_ascii_lowercase();
+    if front.contains("type methods")
+        || (front.contains("subjects:") && front.contains("bioinformatics, methods"))
+    {
+        let end = find_heading(text, &["references", "bibliography"], 0).unwrap_or(text.len());
+        let body = &text[..end];
+        if body.len() >= 200 {
+            return body;
+        }
+    }
+
+    if let Some(start) = find_heading(text, STARTS, 0) {
+        // A lone reporting-checklist heading at the very end is not the paper's
+        // Methods section. In that case the body fallback below is safer.
+        if start.saturating_mul(10) < text.len().saturating_mul(9) {
+            let search_from = next_line(text, start);
+            let end = find_heading(text, ENDS, search_from).unwrap_or(text.len());
+            let slice = &text[start..end];
+            if slice.len() >= 200 {
+                return slice;
+            }
+        }
+    }
+
+    // Tutorials and protocol papers sometimes have no literal Methods heading.
+    // Keep their body, but exclude a real references/bibliography heading.
+    let end = find_heading(text, &["references", "bibliography"], 0).unwrap_or(text.len());
+    let body = &text[..end];
+    if body.len() >= 200 { body } else { text }
+}
+
+fn next_line(text: &str, at: usize) -> usize {
+    text[at..]
+        .find('\n')
+        .map(|n| at + n + 1)
+        .unwrap_or(text.len())
+}
+
+fn find_heading(text: &str, headings: &[&str], from: usize) -> Option<usize> {
+    let mut offset = from;
+    for line in text[from..].split_inclusive('\n') {
+        if let Some(in_line) = heading_in_line(line, headings) {
+            return Some(offset + in_line);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+fn heading_in_line(line: &str, headings: &[&str]) -> Option<usize> {
+    let low = line.to_ascii_lowercase();
+    let content_end = low.trim_end_matches(char::is_whitespace).len();
+    let content = &low[..content_end];
+    let first = content
+        .char_indices()
+        .find(|(_, c)| !c.is_whitespace() && *c != '\u{c}')
+        .map(|(i, _)| i)?;
+
+    for heading in headings {
+        if content[first..].starts_with(heading) {
+            let rest = &content[first + heading.len()..];
+            let gutter = rest.chars().take_while(|c| c.is_whitespace()).count();
+            if rest.is_empty()
+                || rest
+                    .chars()
+                    .next()
+                    .is_some_and(|c| matches!(c, ':' | '.' | '\u{c}'))
+                || (gutter >= 4 && gutter < rest.chars().count())
+            {
+                return Some(first);
+            }
+        }
+
+        // In two-column layout the left column can end on the same line where
+        // the right column begins with a heading. Require a wide gutter so
+        // prose such as "see the Methods" is never accepted as a heading.
+        if content.ends_with(heading) {
+            let at = content.len() - heading.len();
+            let gutter = content[..at]
+                .chars()
+                .rev()
+                .take_while(|c| c.is_whitespace())
+                .count();
+            if gutter >= 4 {
+                return Some(at);
+            }
+        }
+    }
+    None
 }
 
 fn accessions(text: &str) -> Vec<String> {
@@ -767,21 +1267,32 @@ fn short_leaf(op: &str, params: &[(&str, ParamValue)]) -> String {
         "nf.mag" => "mag".into(),
         "nf.taxprofiler" => "taxprofiler".into(),
         "asm.hifiasm" => "hifiasm".into(),
+        "asm.yahs" => "yahs".into(),
         "qc.busco" => "busco".into(),
         "files.import" => "import".into(),
         "sheet.rnaseq" => "sheet".into(),
         "ensembl.fasta" => "fasta".into(),
         "ensembl.gtf" => "gtf".into(),
+        "align.star" => "star".into(),
+        "align.hisat2" => "hisat2".into(),
+        "align.bwa" => "bwa".into(),
+        "align.minimap2" => "minimap2".into(),
+        "quant.featurecounts" => "featurecounts".into(),
+        "quant.salmon" => "salmon".into(),
+        "quant.stringtie" => "stringtie".into(),
+        "diff.deseq2" => "deseq2".into(),
+        "class.kraken2" => "kraken2".into(),
+        "var.haplotypecaller" => "gatk".into(),
         _ => op.rsplit('.').next().unwrap_or(op).to_string(),
     }
 }
 
 fn next_name(existing: &[String], op: &str, params: &[(&str, ParamValue)]) -> String {
     let leaf = short_leaf(op, params);
-    if op == "gap.missing" && !existing.iter().any(|id| id == &leaf) {
+    if !existing.iter().any(|id| id == &leaf) {
         return leaf;
     }
-    let mut i = 1u32;
+    let mut i = 2u32;
     loop {
         let cand = format!("{leaf}{i}");
         if !existing.iter().any(|id| id == &cand) {
@@ -834,6 +1345,16 @@ fn p_in(name: &str, ty: PortType, union: Vec<PortType>) -> Port {
     }
 }
 
+fn p_in_opt(name: &str, ty: PortType, union: Vec<PortType>) -> Port {
+    Port {
+        name: name.into(),
+        dir: Direction::In,
+        ty,
+        union,
+        optional: true,
+    }
+}
+
 fn gap_reads() -> Vec<Port> {
     vec![p_out("out", PortType::Fastq)]
 }
@@ -858,23 +1379,17 @@ fn gap_from_asm() -> Vec<Port> {
         p_in(
             "in",
             PortType::Directory,
-            vec![PortType::Directory, PortType::Fasta, PortType::FastaGz],
+            vec![
+                PortType::Directory,
+                PortType::Fasta,
+                PortType::FastaGz,
+                PortType::Bam,
+            ],
         ),
-        p_out("out", PortType::Directory),
-    ]
-}
-
-fn gap_minimap() -> Vec<Port> {
-    vec![
-        p_in(
-            "reads",
-            PortType::Fasta,
-            vec![PortType::Fasta, PortType::FastaGz, PortType::Fastq, PortType::FastqGz],
-        ),
-        p_in(
-            "ref",
-            PortType::Directory,
-            vec![PortType::Directory, PortType::Fasta, PortType::FastaGz],
+        p_in_opt(
+            "hic",
+            PortType::Fastq,
+            vec![PortType::Fastq, PortType::FastqGz],
         ),
         p_out("out", PortType::Directory),
     ]
@@ -949,52 +1464,75 @@ Whole genome sequencing libraries were aligned with BWA-MEM. Somatic variants
 were called with GATK Mutect2 following the sarek workflow.
 "#;
 
+    fn ops(r: &Reconstruction) -> Vec<&str> {
+        r.graph.nodes.iter().map(|n| n.operator.as_str()).collect()
+    }
+
+    fn assert_wired(r: &Reconstruction) {
+        r.graph.validate().unwrap();
+        for n in &r.graph.nodes {
+            let deg = r
+                .graph
+                .edges
+                .iter()
+                .filter(|e| e.from_node == n.id || e.to_node == n.id)
+                .count();
+            assert!(deg > 0, "node {} ({}) has no edges", n.id, n.operator);
+        }
+    }
+
+    fn fixture(name: &str) -> String {
+        std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/papers").join(name),
+        )
+        .unwrap()
+    }
+
     #[test]
-    fn rnaseq_paper_builds_a_valid_graph() {
+    fn rnaseq_paper_builds_a_brick_dag() {
         let r = reconstruct(&cat(), RNA);
         assert_eq!(r.assay, Assay::RnaSeq);
-        r.graph.validate().unwrap();
-        let ops: Vec<_> = r.graph.nodes.iter().map(|n| n.operator.as_str()).collect();
-        assert!(ops.contains(&"sra.prefetch"));
+        let ops = ops(&r);
+        assert!(ops.contains(&"sra.prefetch"), "{ops:?}");
         assert!(ops.contains(&"sra.fasterq_dump"));
         assert!(ops.contains(&"qc.fastqc"));
         assert!(ops.contains(&"qc.fastp"));
-        assert!(ops.contains(&"nf.rnaseq"));
-        assert!(ops.contains(&"sheet.rnaseq"));
-        assert!(ops.contains(&"gap.missing")); // DESeq2
-        assert!(
-            r.graph.edges.iter().any(|e| {
-                r.graph.node(&e.to_node).map(|n| n.operator.as_str()) == Some("nf.rnaseq")
-                    && e.to_port == "sheet"
-            }),
-            "sheet should snap to nf-core/rnaseq"
-        );
+        assert!(ops.contains(&"align.star"), "STAR is a brick, not buried in nf-core");
+        assert!(ops.contains(&"quant.featurecounts"));
+        assert!(ops.contains(&"diff.deseq2"));
+        assert!(!ops.contains(&"nf.rnaseq"), "paper did not name nf-core/rnaseq");
         let pref = r.graph.nodes.iter().find(|n| n.operator == "sra.prefetch").unwrap();
         match pref.params.get("accession") {
             Some(ParamValue::String(s)) => assert_eq!(s, "SRR12345678"),
             _ => panic!("accession"),
         }
-        let nf = r.graph.nodes.iter().find(|n| n.operator == "nf.rnaseq").unwrap();
-        let note = nf.note.as_deref().unwrap_or("");
-        assert!(note.contains("STAR"), "{note}");
-        assert!(note.contains("GRCh38"), "{note}");
-        assert!(r.graph.edges.iter().any(|e| e.from_port.len() > 0));
+        assert!(
+            r.graph.edges.iter().any(|e| {
+                r.graph.node(&e.from_node).map(|n| n.operator.as_str()) == Some("align.star")
+                    && r.graph.node(&e.to_node).map(|n| n.operator.as_str()) == Some("quant.featurecounts")
+            }),
+            "STAR should snap to featureCounts"
+        );
+        assert!(
+            r.graph.edges.iter().any(|e| {
+                r.graph.node(&e.from_node).map(|n| n.operator.as_str()) == Some("quant.featurecounts")
+                    && r.graph.node(&e.to_node).map(|n| n.operator.as_str()) == Some("diff.deseq2")
+            }),
+            "counts should snap to DESeq2"
+        );
+        assert_wired(&r);
     }
 
     #[test]
-    fn star_is_not_a_duplicate_brick_when_rnaseq_is_present() {
-        let r = reconstruct(&cat(), RNA);
-        let gaps: Vec<_> = r
-            .graph
-            .nodes
-            .iter()
-            .filter(|n| n.operator == "gap.missing")
-            .filter_map(|n| n.params.get("tool"))
-            .collect();
-        let has_star = gaps.iter().any(|v| matches!(v, ParamValue::String(s) if s == "STAR"));
-        assert!(!has_star, "STAR is inside nf-core/rnaseq, should be a note not a gap");
-        let has_deseq = gaps.iter().any(|v| matches!(v, ParamValue::String(s) if s == "DESeq2"));
-        assert!(has_deseq);
+    fn nfcore_named_hides_star_inside_the_compound() {
+        let r = reconstruct(&cat(), &fixture("nfcore_rnaseq_methods.txt"));
+        assert_eq!(r.assay, Assay::RnaSeq);
+        let ops = ops(&r);
+        assert!(ops.contains(&"nf.rnaseq"), "{ops:?}");
+        assert!(ops.contains(&"sheet.rnaseq"));
+        assert!(ops.contains(&"qc.fastqc"));
+        assert!(!ops.contains(&"align.star"), "STAR lives inside nf-core/rnaseq");
+        assert_wired(&r);
     }
 
     #[test]
@@ -1007,11 +1545,13 @@ were called with GATK Mutect2 following the sarek workflow.
     }
 
     #[test]
-    fn variants_go_to_sarek() {
+    fn variants_without_sarek_are_bwa_then_gatk() {
         let r = reconstruct(&cat(), VAR);
         assert_eq!(r.assay, Assay::Variants);
-        r.graph.validate().unwrap();
-        assert!(r.graph.nodes.iter().any(|n| n.operator == "nf.sarek"));
+        let ops = ops(&r);
+        assert!(ops.contains(&"nf.sarek"), "fixture names sarek: {ops:?}");
+        assert!(!ops.contains(&"align.bwa"), "BWA is inside sarek");
+        assert_wired(&r);
     }
 
     #[test]
@@ -1039,17 +1579,7 @@ were called with GATK Mutect2 following the sarek workflow.
         let ops: Vec<_> = r.graph.nodes.iter().map(|n| n.operator.as_str()).collect();
         assert!(ops.contains(&"asm.hifiasm"), "{ops:?}");
         assert!(!ops.contains(&"nf.rnaseq"), "must not misread Iso-seq as bulk RNA-seq");
-        let tools: Vec<_> = r
-            .graph
-            .nodes
-            .iter()
-            .filter(|n| n.operator == "gap.missing")
-            .filter_map(|n| n.params.get("tool"))
-            .collect();
-        assert!(
-            tools.iter().any(|v| matches!(v, ParamValue::String(s) if s == "YaHS")),
-            "{tools:?}"
-        );
+        assert!(ops.contains(&"asm.yahs"), "YaHS is a brick: {ops:?}");
         assert!(r.graph.edges.len() >= 2, "assembly steps should wire");
         for n in &r.graph.nodes {
             let deg = r
@@ -1077,8 +1607,273 @@ were called with GATK Mutect2 following the sarek workflow.
                 .unwrap()
         };
         assert!(x("asm.hifiasm") > x("files.import"));
-        assert!(x("YaHS") > x("asm.hifiasm"));
+        assert!(x("asm.yahs") > x("asm.hifiasm"));
         assert!(y("Iso-Seq") > y("files.import"), "annotation lane sits below assembly");
+        assert!(ops.contains(&"asm.yahs"), "YaHS is a brick");
+        assert!(ops.contains(&"qc.busco"), "BUSCO is a brick");
+        assert!(ops.contains(&"align.minimap2"));
+    }
+
+    #[test]
+    fn love_deseq2_workflow_is_star_counts_deseq() {
+        let r = reconstruct(&cat(), &fixture("love_rnaseq_methods.txt"));
+        assert_eq!(r.assay, Assay::RnaSeq);
+        let ops = ops(&r);
+        assert!(ops.contains(&"align.star"), "{ops:?}");
+        assert!(ops.contains(&"quant.featurecounts"));
+        assert!(ops.contains(&"diff.deseq2"));
+        assert!(ops.contains(&"sra.prefetch"));
+        assert!(!ops.contains(&"nf.rnaseq"));
+        assert_wired(&r);
+    }
+
+    #[test]
+    fn pertea_hisat_stringtie_ballgown() {
+        let r = reconstruct(&cat(), &fixture("pertea_hisat_methods.txt"));
+        assert_eq!(r.assay, Assay::RnaSeq);
+        let ops = ops(&r);
+        assert!(ops.contains(&"align.hisat2"), "{ops:?}");
+        assert!(ops.contains(&"quant.stringtie"));
+        assert!(ops.contains(&"qc.fastqc"));
+        let has_ballgown = r.graph.nodes.iter().any(|n| {
+            n.params.get("tool") == Some(&ParamValue::String("Ballgown".into()))
+        });
+        assert!(has_ballgown, "Ballgown is not a brick yet — gap");
+        assert_wired(&r);
+    }
+
+    #[test]
+    fn gatk_best_practices_is_bwa_then_haplotypecaller() {
+        let r = reconstruct(&cat(), &fixture("gatk_methods.txt"));
+        assert_eq!(r.assay, Assay::Variants);
+        let ops = ops(&r);
+        assert!(ops.contains(&"align.bwa"), "{ops:?}");
+        assert!(ops.contains(&"var.haplotypecaller"));
+        assert!(!ops.contains(&"nf.sarek"));
+        assert_wired(&r);
+    }
+
+    #[test]
+    fn vgp_is_falcon_purge_salsa_busco() {
+        let r = reconstruct(&cat(), &fixture("vgp_assembly_methods.txt"));
+        assert_eq!(r.assay, Assay::Assembly);
+        let tools: Vec<_> = r
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| n.operator == "gap.missing")
+            .filter_map(|n| match n.params.get("tool") {
+                Some(ParamValue::String(s)) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(tools.iter().any(|t| t.contains("FALCON")), "{tools:?}");
+        assert!(tools.iter().any(|t| t.contains("Purge") || t.contains("Salsa")), "{tools:?}");
+        assert!(ops(&r).contains(&"qc.busco"));
+        assert!(!ops(&r).contains(&"nf.rnaseq"));
+        assert_wired(&r);
+    }
+
+    #[test]
+    fn kraken2_is_a_brick_not_taxprofiler() {
+        let r = reconstruct(&cat(), &fixture("kraken2_methods.txt"));
+        assert_eq!(r.assay, Assay::Metagenome);
+        let ops = ops(&r);
+        assert!(ops.contains(&"class.kraken2"), "{ops:?}");
+        assert!(!ops.contains(&"nf.taxprofiler"));
+        assert!(!ops.contains(&"nf.rnaseq"));
+        assert_wired(&r);
+    }
+
+    #[test]
+    fn star_is_not_a_substring_of_start() {
+        let r = reconstruct(&cat(), "The experiment will start next week with FastQC.");
+        assert!(!ops(&r).contains(&"align.star"));
+        assert!(ops(&r).contains(&"qc.fastqc"));
+    }
+
+    #[test]
+    fn methods_window_handles_two_column_pdf_headings() {
+        let text = format!(
+            "Abstract\ncomparison prose         Methods\nReads were aligned with BWA-MEM. {}\nData availability\nHISAT2 was archived here.\n",
+            "protocol details ".repeat(20)
+        );
+        let window = methods_window(&text);
+        assert!(window.starts_with("Methods"), "{window:?}");
+        assert!(window.contains("BWA-MEM"));
+        assert!(!window.contains("HISAT2"));
+
+        let nature = format!(
+            "front matter\n\u{c}Methods        other column\nFALCON was used. {}\nCode availability\nend",
+            "assembly details ".repeat(20)
+        );
+        let window = methods_window(&nature);
+        assert!(window.starts_with("Methods"), "{window:?}");
+        assert!(window.contains("FALCON"));
+        assert!(!window.contains("Code availability"));
+    }
+
+    #[test]
+    fn methods_word_in_prose_is_not_a_heading() {
+        let text = format!(
+            "RNA-seq methods papers help reproducibility.\nReads were aligned with STAR. {}\nReferences\nBWA-MEM was described elsewhere.",
+            "analysis details ".repeat(20)
+        );
+        let window = methods_window(&text);
+        assert!(window.contains("STAR"));
+        assert!(!window.contains("BWA-MEM"));
+    }
+
+    #[test]
+    fn strong_variant_evidence_beats_an_rnaseq_caveat() {
+        let text = "GATK Best Practices uses BWA-MEM and HaplotypeCaller for variant calling. RNA-seq requires a different aligner.";
+        let r = reconstruct(&cat(), text);
+        assert_eq!(r.assay, Assay::Variants);
+        assert!(ops(&r).contains(&"align.bwa"));
+        assert!(ops(&r).contains(&"var.haplotypecaller"));
+        assert!(!ops(&r).contains(&"align.star"));
+    }
+
+    #[test]
+    fn mixed_methods_keep_independent_typed_branches() {
+        let text = "Methods article with two workflows. RNA-seq uses HISAT2 and StringTie for differential expression. Germline variant calling uses BWA-MEM and HaplotypeCaller.";
+        let r = reconstruct(&cat(), text);
+        assert_eq!(r.assay, Assay::Mixed);
+        let actual = ops(&r);
+        for op in ["align.hisat2", "quant.stringtie", "align.bwa", "var.haplotypecaller"] {
+            assert!(actual.contains(&op), "missing {op}: {actual:?}");
+        }
+        assert!(r.warnings.iter().any(|w| w.contains("multiple assay workflows")));
+        r.graph.validate().unwrap();
+    }
+
+    #[test]
+    fn single_cell_methods_keep_analysis_chain() {
+        let text = "Single-cell RNA sequencing FASTQs were processed with Cell Ranger. SoupX correction was optional before Seurat analysis and DoubletFinder.";
+        let r = reconstruct(&cat(), text);
+        assert_eq!(r.assay, Assay::SingleCell);
+        assert!(ops(&r).contains(&"files.import"));
+        let gaps: Vec<_> = r
+            .graph
+            .nodes
+            .iter()
+            .filter_map(|n| match n.params.get("tool") {
+                Some(ParamValue::String(tool)) => Some(tool.as_str()),
+                _ => None,
+            })
+            .collect();
+        for tool in ["Cell Ranger", "SoupX", "Seurat", "DoubletFinder"] {
+            assert!(gaps.contains(&tool), "missing {tool}: {gaps:?}");
+        }
+        r.graph.validate().unwrap();
+    }
+
+    #[test]
+    fn downloaded_real_paper_corpus_reconstructs() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/papers");
+        let cases: &[(&str, Assay, &[&str], &[&str])] = &[
+            (
+                "pdf/love_f1000.pdf",
+                Assay::RnaSeq,
+                &["align.star", "quant.featurecounts", "diff.deseq2"],
+                &["nf.rnaseq"],
+            ),
+            (
+                "raw/pertea_hisat.txt",
+                Assay::RnaSeq,
+                &["align.hisat2", "quant.stringtie"],
+                &["align.bwa", "nf.rnaseq"],
+            ),
+            (
+                "raw/gatk_best_practices.txt",
+                Assay::Variants,
+                &["align.bwa", "var.haplotypecaller"],
+                &["nf.sarek", "align.hisat2"],
+            ),
+            (
+                "pdf/cheng_hifiasm.pdf",
+                Assay::Assembly,
+                &["asm.hifiasm"],
+                &["nf.rnaseq"],
+            ),
+            (
+                "pdf/rhie_vgp.pdf",
+                Assay::Assembly,
+                &["qc.busco"],
+                &["nf.rnaseq"],
+            ),
+            (
+                "pdf/wood_kraken2.pdf",
+                Assay::Metagenome,
+                &["class.kraken2"],
+                &["align.minimap2", "nf.taxprofiler"],
+            ),
+            (
+                "raw/cwl_workflows_pmc.txt",
+                Assay::Mixed,
+                &[
+                    "align.hisat2",
+                    "align.bwa",
+                    "quant.stringtie",
+                    "var.haplotypecaller",
+                ],
+                &["nf.rnaseq", "nf.sarek"],
+            ),
+            (
+                "raw/sarek_pmc.txt",
+                Assay::Variants,
+                &["nf.sarek"],
+                &["align.bwa", "var.haplotypecaller"],
+            ),
+            (
+                "raw/minto_pmc.txt",
+                Assay::Metagenome,
+                &["qc.fastp"],
+                &["nf.mag", "nf.taxprofiler"],
+            ),
+            (
+                "raw/scrnabox_pmc.txt",
+                Assay::SingleCell,
+                &["files.import"],
+                &["nf.rnaseq"],
+            ),
+        ];
+        let mut checked = 0;
+        for (relative, assay, required, forbidden) in cases {
+            let path = root.join(relative);
+            if !path.is_file() {
+                continue;
+            }
+            checked += 1;
+            let extracted = extract_from_path(&path).unwrap();
+            let r = reconstruct(&cat(), &extracted.text);
+            assert_eq!(&r.assay, assay, "{}", path.display());
+            let actual = ops(&r);
+            for op in *required {
+                assert!(actual.contains(op), "{} missing {op}: {actual:?}", path.display());
+            }
+            for op in *forbidden {
+                assert!(!actual.contains(op), "{} invented {op}: {actual:?}", path.display());
+            }
+            if relative.contains("scrnabox") {
+                let gaps: Vec<_> = r
+                    .graph
+                    .nodes
+                    .iter()
+                    .filter_map(|n| match n.params.get("tool") {
+                        Some(ParamValue::String(tool)) => Some(tool.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                for tool in ["Cell Ranger", "SoupX", "Seurat", "DoubletFinder"] {
+                    assert!(gaps.contains(&tool), "{} missing {tool}: {gaps:?}", path.display());
+                }
+            }
+            r.graph.validate().unwrap();
+        }
+        if root.join("pdf").is_dir() {
+            assert_eq!(checked, cases.len(), "downloaded corpus is incomplete");
+        }
     }
 
     #[test]
@@ -1100,11 +1895,11 @@ were called with GATK Mutect2 following the sarek workflow.
     fn paper_ids_are_short() {
         let r = reconstruct(&cat(), RNA);
         let ids: Vec<_> = r.graph.nodes.iter().map(|n| n.id.as_str()).collect();
-        assert!(ids.contains(&"prefetch1"), "{ids:?}");
-        assert!(ids.contains(&"fasterq1"), "{ids:?}");
-        assert!(ids.contains(&"fastqc1"), "{ids:?}");
-        assert!(ids.contains(&"sheet1"), "{ids:?}");
-        assert!(ids.contains(&"deseq2"), "{ids:?}");
+        assert!(ids.contains(&"prefetch"), "{ids:?}");
+        assert!(ids.contains(&"fasterq"));
+        assert!(ids.contains(&"fastqc"));
+        assert!(ids.contains(&"star"));
+        assert!(ids.contains(&"deseq2"));
     }
 
     #[test]
@@ -1157,6 +1952,11 @@ were called with GATK Mutect2 following the sarek workflow.
         );
         let r = reconstruct(&cat(), &e.text);
         assert_eq!(r.assay, Assay::RnaSeq);
-        assert!(r.graph.nodes.iter().any(|n| n.operator == "qc.fastqc"));
+        let ops: Vec<_> = r.graph.nodes.iter().map(|n| n.operator.as_str()).collect();
+        assert!(
+            ops.iter().any(|o| matches!(*o, "qc.fastqc" | "align.star" | "diff.deseq2")),
+            "ocr graph missed the RNA tools: {ops:?} text={:?}",
+            e.text
+        );
     }
 }

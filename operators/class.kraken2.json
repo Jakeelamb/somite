@@ -1,0 +1,30 @@
+{
+  "id": "class.kraken2",
+  "title": "Kraken2",
+  "palette": ["Metagenomics"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "kraken2",
+  "conda": { "name": "axial-meta", "spec": ["bioconda::kraken2"] },
+  "params": {
+    "threads": { "type": "int", "label": "Threads", "page": "Kraken2", "default": 8, "min": 1, "max": 64 }
+  },
+  "ports": {
+    "in": [
+      { "name": "fastq", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
+      { "name": "db", "type": "Directory", "optional": true }
+    ],
+    "out": [{ "name": "report", "type": "Table" }]
+  },
+  "argv": [
+    "kraken2",
+    "--db", "{input.db}",
+    "--threads", "{param.threads}",
+    "--report", "{work}/out/report.txt",
+    "--output", "{work}/out/class.tsv",
+    "{input.fastq}"
+  ],
+  "outputs": {
+    "report": { "glob": "{work}/out/report.txt", "type": "Table", "optional": true }
+  }
+}

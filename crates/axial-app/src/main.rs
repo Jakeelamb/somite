@@ -3,6 +3,11 @@
 //! Nodes are viewers. Names sit under the body. Ports snap. Tab / double-click
 //! opens OP Create. Palette drags onto the grid.
 
+mod canvas;
+mod nfcore_catalog;
+mod palette;
+mod sources;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
@@ -11,35 +16,64 @@ use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axial_cook::{cook_graph, ArtifactMeta, CookReport, NodeState, Project};
 use axial_ir::{compatible, Direction, Graph, Layout, Node, ParamValue, Port, PortType, SCHEMA_VERSION};
 use axial_ops::{Catalog, Cost, Operator};
 use axial_paper::{extract_from_path, reconstruct, text_from_path, ExtractVia, Reconstruction};
+use canvas::{
+    connect, rename_node, zoom_about, Connection, EditHistory, Selection, SelectionMode, WireStart,
+};
 use eframe::egui::{
     self, Color32, CornerRadius, CursorIcon, FontData, FontDefinitions, FontFamily, FontId, Frame,
     Id, Margin, Pos2, Rect, Sense, Stroke, Vec2,
 };
+use nfcore_catalog::Pipeline as NfcorePipeline;
+use palette::Mode as PaletteMode;
+use sources::AccessionKind;
 
-const BG: Color32 = Color32::from_rgb(34, 34, 36);
-const GRID: Color32 = Color32::from_rgb(44, 44, 46);
-const GRID_MAJ: Color32 = Color32::from_rgb(54, 54, 58);
-const PANEL: Color32 = Color32::from_rgb(42, 42, 46);
-const PANEL2: Color32 = Color32::from_rgb(50, 50, 56);
-const BAR: Color32 = Color32::from_rgb(28, 28, 32);
-const NODE: Color32 = Color32::from_rgb(24, 24, 26);
-const SELECT: Color32 = Color32::from_rgb(48, 220, 110);
-const TEXT: Color32 = Color32::from_rgb(226, 226, 228);
-const MUTED: Color32 = Color32::from_rgb(132, 132, 140);
-const ACCENT: Color32 = Color32::from_rgb(154, 130, 184);
-const HEADER_FG: Color32 = Color32::from_rgb(36, 22, 48);
+const BG: Color32 = Color32::from_rgb(27, 28, 33);
+const GRID: Color32 = Color32::from_rgb(40, 41, 48);
+const GRID_MAJ: Color32 = Color32::from_rgb(51, 52, 61);
+const PANEL: Color32 = Color32::from_rgb(32, 33, 40);
+const PANEL2: Color32 = Color32::from_rgb(44, 45, 54);
+const BAR: Color32 = Color32::from_rgb(23, 24, 30);
+const NODE: Color32 = Color32::from_rgb(25, 26, 32);
+const SELECT: Color32 = Color32::from_rgb(80, 210, 140);
+const TEXT: Color32 = Color32::from_rgb(235, 233, 229);
+const MUTED: Color32 = Color32::from_rgb(157, 155, 163);
+const ACCENT: Color32 = Color32::from_rgb(184, 151, 218);
+const HEADER_FG: Color32 = Color32::from_rgb(42, 28, 50);
 
 const NODE_W: f32 = 148.0;
 const NODE_H: f32 = 92.0;
 const NODE_H_FLAT: f32 = 22.0;
 const STRIP: f32 = 7.0;
 const NAME_GAP: f32 = 4.0;
+
+#[derive(Clone, Copy)]
+struct Marquee {
+    start: Pos2,
+    current: Pos2,
+    mode: SelectionMode,
+}
+
+impl Marquee {
+    fn rect(self) -> Rect {
+        Rect::from_two_pos(self.start, self.current)
+    }
+}
+
+fn selection_mode(modifiers: egui::Modifiers) -> SelectionMode {
+    if modifiers.command {
+        SelectionMode::Toggle
+    } else if modifiers.shift {
+        SelectionMode::Add
+    } else {
+        SelectionMode::Replace
+    }
+}
 
 fn font_px(base: f32, z: f32, min: f32, max: f32) -> FontId {
     FontId::proportional((base * z).clamp(min, max))
@@ -115,9 +149,14 @@ fn family_color(op_id: &str) -> Color32 {
         Color32::from_rgb(56, 168, 196)
     } else if op_id.starts_with("ensembl.") {
         Color32::from_rgb(72, 176, 138)
-    } else if op_id.starts_with("asm.") {
+    } else if op_id.starts_with("asm.") || op_id.starts_with("align.") {
         Color32::from_rgb(90, 140, 210)
-    } else if op_id.starts_with("nf.") {
+    } else if op_id.starts_with("quant.") || op_id.starts_with("diff.") {
+        Color32::from_rgb(196, 176, 72)
+    } else if op_id.starts_with("class.")
+        || op_id.starts_with("var.")
+        || op_id.starts_with("nf.")
+    {
         Color32::from_rgb(214, 132, 62)
     } else if op_id.starts_with("qc.") {
         Color32::from_rgb(78, 186, 110)
@@ -141,7 +180,7 @@ fn port_color(ty: PortType) -> Color32 {
         PortType::Gtf | PortType::GtfGz => Color32::from_rgb(120, 180, 90),
         PortType::Html | PortType::Preview | PortType::Image => Color32::from_rgb(230, 210, 120),
         PortType::Sra => Color32::from_rgb(70, 190, 200),
-        PortType::Directory => Color32::from_rgb(230, 180, 80),
+        PortType::Zip | PortType::Directory => Color32::from_rgb(230, 180, 80),
         PortType::Table | PortType::Json | PortType::Text => Color32::from_rgb(180, 180, 200),
     }
 }
@@ -163,6 +202,7 @@ fn type_name(ty: PortType) -> &'static str {
         PortType::Json => "JSON",
         PortType::Html => "HTML",
         PortType::Image => "IMAGE",
+        PortType::Zip => "ZIP",
         PortType::Directory => "DIR",
         PortType::Text => "TEXT",
         PortType::Preview => "PREVIEW",
@@ -247,17 +287,19 @@ fn install_fonts(ctx: &egui::Context) {
 struct App {
     catalog: Catalog,
     graph: Graph,
-    selected: Option<String>,
+    selection: Selection,
     pan: Vec2,
     zoom: f32,
     status: String,
     last_states: BTreeMap<String, NodeState>,
     search: String,
     param_page: String,
-    wire: Option<(String, String, bool)>,
+    wire: Option<WireStart>,
+    pending_insert: Option<WireStart>,
     cursor: Pos2,
     last_graph_pos: Pos2,
     op_create: bool,
+    op_create_screen: Pos2,
     op_create_q: String,
     op_create_i: usize,
     viewer_off: BTreeSet<String>,
@@ -265,8 +307,8 @@ struct App {
     fq: BTreeMap<String, FqPreview>,
     dragging: Option<String>,
     resizing: Option<String>,
+    marquee: Option<Marquee>,
     info: Option<String>,
-    pal_hover: Option<String>,
     cook_rx: Option<Receiver<Result<CookReport, String>>>,
     cook_started: Option<Instant>,
     hover_port: Option<(String, String, PortType, bool)>,
@@ -275,13 +317,25 @@ struct App {
     paper_name: String,
     paper_ui: bool,
     auto_fit: bool,
+    history: EditHistory,
+    rename_target: Option<String>,
+    rename_buffer: String,
+    graph_path: Option<PathBuf>,
+    autosave_due: Option<Instant>,
+    nfcore: BTreeMap<String, NfcorePipeline>,
+    nfcore_rx: Option<Receiver<nfcore_catalog::FetchResult>>,
+    accession: String,
+    palette_mode: PaletteMode,
+    recent_ops: Vec<String>,
+    favorite_ops: BTreeSet<String>,
+    focus_accession: bool,
 }
 
 impl App {
     fn new() -> Self {
         let catalog = Catalog::load_dir(&operators_dir()).unwrap_or_default();
         let graph_path = project_root().join("testdata/fastq_to_fastqc.axial.json");
-        let graph: Graph = fs::read_to_string(&graph_path)
+        let default_graph: Graph = fs::read_to_string(&graph_path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or(Graph {
@@ -289,21 +343,37 @@ impl App {
                 nodes: vec![],
                 edges: vec![],
             });
-        let selected = graph.nodes.first().map(|n| n.id.clone());
+        let recovery_path = project_root().join(".axial/autosave.axial.json");
+        let recovered = fs::read_to_string(&recovery_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Graph>(&text).ok())
+            .filter(|graph| graph.validate().is_ok());
+        let did_recover = recovered.is_some();
+        let graph = recovered.unwrap_or(default_graph);
+        let mut selection = Selection::default();
+        if let Some(node) = graph.nodes.first() {
+            selection.select_node(&node.id, SelectionMode::Replace);
+        }
         let mut app = Self {
             catalog,
             graph,
-            selected,
+            selection,
             pan: Vec2::new(20.0, 28.0),
             zoom: 1.0,
-            status: "Drop a paper on the canvas to rebuild its pipeline".into(),
+            status: if did_recover {
+                "recovered the last autosave".into()
+            } else {
+                "Tab add  ·  drag ports to wire  ·  space-drag pan  ·  F fit".into()
+            },
             last_states: BTreeMap::new(),
             search: String::new(),
             param_page: String::new(),
             wire: None,
+            pending_insert: None,
             cursor: Pos2::ZERO,
             last_graph_pos: Pos2::new(160.0, 180.0),
             op_create: false,
+            op_create_screen: Pos2::new(420.0, 260.0),
             op_create_q: String::new(),
             op_create_i: 0,
             viewer_off: BTreeSet::new(),
@@ -311,8 +381,8 @@ impl App {
             fq: BTreeMap::new(),
             dragging: None,
             resizing: None,
+            marquee: None,
             info: None,
-            pal_hover: None,
             cook_rx: None,
             cook_started: None,
             hover_port: None,
@@ -321,13 +391,33 @@ impl App {
             paper_name: String::new(),
             paper_ui: false,
             auto_fit: false,
+            history: EditHistory::default(),
+            rename_target: None,
+            rename_buffer: String::new(),
+            graph_path: None,
+            autosave_due: None,
+            nfcore: BTreeMap::new(),
+            nfcore_rx: None,
+            accession: String::new(),
+            palette_mode: PaletteMode::Build,
+            recent_ops: Vec::new(),
+            favorite_ops: BTreeSet::new(),
+            focus_accession: false,
         };
+        app.load_nfcore_cache();
+        app.refresh_nfcore_catalog();
         if let Ok(p) = env::var("AXIAL_OPEN") {
             if let Ok(text) = text_from_path(Path::new(&p)) {
                 let r = reconstruct(&app.catalog, &text);
                 let n = r.graph.nodes.len();
                 app.graph = r.graph;
-                app.selected = app.graph.nodes.first().map(|n| n.id.clone());
+                app.graph_path = None;
+                app.autosave_due = Some(Instant::now());
+                app.selection.clear();
+                if let Some(node) = app.graph.nodes.first() {
+                    app.selection
+                        .select_node(&node.id, SelectionMode::Replace);
+                }
                 app.paper_name = Path::new(&p)
                     .file_name()
                     .and_then(|s| s.to_str())
@@ -390,7 +480,119 @@ impl App {
         self.to_screen(origin, Pos2::new(x, y))
     }
 
+    fn open_op_create(&mut self, graph_pos: Pos2, screen_pos: Pos2, wire: Option<WireStart>) {
+        self.last_graph_pos = graph_pos;
+        self.op_create_screen = screen_pos + Vec2::new(12.0, 12.0);
+        self.op_create = true;
+        self.op_create_q.clear();
+        self.op_create_i = 0;
+        self.pending_insert = wire;
+    }
+
+    fn invalidate_cook(&mut self) {
+        self.last_states.clear();
+        self.last_arts.clear();
+        self.autosave_due = Some(Instant::now());
+    }
+
+    fn nfcore_cache_path() -> PathBuf {
+        project_root().join(".axial/catalog/nfcore-pipelines.json")
+    }
+
+    fn install_nfcore_catalog(&mut self, pipelines: Vec<NfcorePipeline>) {
+        let current: BTreeSet<String> = pipelines
+            .iter()
+            .map(NfcorePipeline::operator_id)
+            .collect();
+        self.catalog.ops.retain(|id, operator| {
+            operator.palette.as_slice() != ["nf-core", "Catalog"] || current.contains(id)
+        });
+        self.nfcore.clear();
+        for pipeline in pipelines {
+            let id = pipeline.operator_id();
+            let replace_generated = self
+                .catalog
+                .ops
+                .get(&id)
+                .is_none_or(|operator| operator.palette.as_slice() == ["nf-core", "Catalog"]);
+            if replace_generated {
+                self.catalog.ops.insert(id.clone(), pipeline.operator());
+            }
+            self.nfcore.insert(id, pipeline);
+        }
+    }
+
+    fn load_nfcore_cache(&mut self) {
+        let Ok(text) = fs::read_to_string(Self::nfcore_cache_path()) else {
+            return;
+        };
+        if let Ok(pipelines) = nfcore_catalog::parse(&text) {
+            self.install_nfcore_catalog(pipelines);
+        }
+    }
+
+    fn refresh_nfcore_catalog(&mut self) {
+        if self.nfcore_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(nfcore_catalog::fetch());
+        });
+        self.nfcore_rx = Some(rx);
+    }
+
+    fn poll_nfcore_catalog(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.nfcore_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok((text, pipelines))) => {
+                let count = pipelines.len();
+                let path = Self::nfcore_cache_path();
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(path, text);
+                self.install_nfcore_catalog(pipelines);
+                self.nfcore_rx = None;
+                self.status = format!("nf-core catalog ready · {count} pipelines");
+            }
+            Ok(Err(error)) => {
+                self.nfcore_rx = None;
+                if self.nfcore.is_empty() {
+                    self.status = format!("nf-core catalog unavailable: {error}");
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(50)),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.nfcore_rx = None;
+            }
+        }
+    }
+
+    fn restore_history(&mut self, redo: bool) {
+        let changed = if redo {
+            self.history.redo(&mut self.graph)
+        } else {
+            self.history.undo(&mut self.graph)
+        };
+        if !changed {
+            self.status = if redo {
+                "nothing to redo".into()
+            } else {
+                "nothing to undo".into()
+            };
+            return;
+        }
+        self.selection.retain_graph(&self.graph);
+        self.invalidate_cook();
+        self.status = if redo { "redid edit" } else { "undid edit" }.into();
+    }
+
     fn drop_op(&mut self, op: &Operator, pos: Pos2) {
+        let before = self.graph.clone();
+        let pending = self.pending_insert.take();
         let existing: Vec<String> = self.graph.nodes.iter().map(|n| n.id.clone()).collect();
         let id = next_op_name(&existing, &op.id);
         let mut params = BTreeMap::new();
@@ -407,11 +609,180 @@ impl App {
             layout: Layout { x: pos.x, y: pos.y },
             note: None,
         });
-        self.selected = Some(id.clone());
+        self.recent_ops.retain(|id| id != &op.id);
+        self.recent_ops.insert(0, op.id.clone());
+        self.recent_ops.truncate(8);
+        self.history.remember(&before);
+        self.selection
+            .select_node(&id, SelectionMode::Replace);
         self.param_page.clear();
+        self.invalidate_cook();
         self.status = format!("dropped {id}");
+        if let Some(wire) = pending {
+            let connection = self.graph.node(&id).and_then(|node| {
+                node.ports
+                    .iter()
+                    .find_map(|port| wire.connection_to(&self.graph, &id, port))
+            });
+            if let Some(connection) = connection {
+                if connect(&mut self.graph, &connection).is_ok() {
+                    self.status = format!("inserted {id} and snapped");
+                }
+            }
+        }
         self.op_create = false;
         self.op_create_q.clear();
+    }
+
+    fn insert_accession(&mut self) {
+        let (kind, accession) = match sources::classify(&self.accession) {
+            Ok(value) => value,
+            Err(error) => {
+                self.status = error;
+                return;
+            }
+        };
+        self.pending_insert = None;
+        let pos = self.last_graph_pos;
+        match kind {
+            AccessionKind::SraRun => {
+                let Ok(prefetch) = self.catalog.get("sra.prefetch").cloned() else {
+                    self.status = "SRA prefetch operator is missing".into();
+                    return;
+                };
+                let Ok(fasterq) = self.catalog.get("sra.fasterq_dump").cloned() else {
+                    self.status = "fasterq-dump operator is missing".into();
+                    return;
+                };
+                self.drop_op(&prefetch, pos);
+                let Some(prefetch_id) = self.selection.primary().map(str::to_owned) else {
+                    return;
+                };
+                if let Some(node) = self.graph.nodes.iter_mut().find(|node| node.id == prefetch_id) {
+                    node.params
+                        .insert("accession".into(), ParamValue::String(accession.clone()));
+                }
+                self.drop_op(&fasterq, pos + Vec2::new(210.0, 0.0));
+                let Some(fasterq_id) = self.selection.primary().map(str::to_owned) else {
+                    return;
+                };
+                self.try_wire(Connection::new(
+                    &prefetch_id,
+                    "sra",
+                    &fasterq_id,
+                    "sra",
+                ));
+                self.selection.select_many(
+                    vec![prefetch_id, fasterq_id],
+                    SelectionMode::Replace,
+                );
+                self.status = format!("{accession} ready · Cook downloads and converts to FASTQ");
+            }
+            AccessionKind::Assembly => {
+                let Ok(operator) = self.catalog.get("ncbi.datasets_assembly").cloned() else {
+                    self.status = "NCBI assembly operator is missing".into();
+                    return;
+                };
+                let Ok(unzip) = self.catalog.get("archive.unzip").cloned() else {
+                    self.status = "archive unzip operator is missing".into();
+                    return;
+                };
+                self.drop_op(&operator, pos);
+                let Some(download_id) = self.selection.primary().map(str::to_owned) else {
+                    return;
+                };
+                if let Some(node) = self
+                    .graph
+                    .nodes
+                    .iter_mut()
+                    .find(|node| node.id == download_id)
+                {
+                    node.params
+                        .insert("accession".into(), ParamValue::String(accession.clone()));
+                }
+                self.drop_op(&unzip, pos + Vec2::new(210.0, 0.0));
+                let Some(unzip_id) = self.selection.primary().map(str::to_owned) else {
+                    return;
+                };
+                self.try_wire(Connection::new(
+                    &download_id,
+                    "package",
+                    &unzip_id,
+                    "archive",
+                ));
+                self.selection.select_many(
+                    vec![download_id, unzip_id],
+                    SelectionMode::Replace,
+                );
+                self.status =
+                    format!("{accession} ready · Cook downloads and unpacks the NCBI package");
+            }
+        }
+        self.accession.clear();
+        self.invalidate_cook();
+    }
+
+    fn insert_snakemake_project(&mut self, path: PathBuf) {
+        let has_snakefile = path.join("Snakefile").is_file()
+            || path.join("workflow").join("Snakefile").is_file();
+        if !path.is_dir() || !has_snakefile {
+            self.status = format!(
+                "{} is not a Snakemake project (expected Snakefile or workflow/Snakefile)",
+                path.display()
+            );
+            return;
+        }
+        let Ok(import) = self.catalog.get("files.import_directory").cloned() else {
+            self.status = "directory import operator is missing".into();
+            return;
+        };
+        let Ok(snakemake) = self.catalog.get("smk.workflow").cloned() else {
+            self.status = "Snakemake workflow operator is missing".into();
+            return;
+        };
+
+        self.pending_insert = None;
+        let pos = self.last_graph_pos;
+        self.drop_op(&import, pos);
+        let Some(import_id) = self.selection.primary().map(str::to_owned) else {
+            return;
+        };
+        if let Some(node) = self.graph.nodes.iter_mut().find(|node| node.id == import_id) {
+            node.params
+                .insert("path".into(), ParamValue::String(path.display().to_string()));
+        }
+        self.drop_op(&snakemake, pos + Vec2::new(220.0, 0.0));
+        let Some(snakemake_id) = self.selection.primary().map(str::to_owned) else {
+            return;
+        };
+        if path.join("Snakefile").is_file() {
+            if let Some(node) = self
+                .graph
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == snakemake_id)
+            {
+                node.params.insert(
+                    "snakefile".into(),
+                    ParamValue::String("Snakefile".into()),
+                );
+            }
+        }
+        self.try_wire(Connection::new(
+            &import_id,
+            "directory",
+            &snakemake_id,
+            "workflow",
+        ));
+        self.selection.select_many(
+            vec![import_id, snakemake_id],
+            SelectionMode::Replace,
+        );
+        self.invalidate_cook();
+        self.status = format!(
+            "{} ready · Cook runs Snakemake in an isolated copy",
+            path.file_name().and_then(|name| name.to_str()).unwrap_or("workflow")
+        );
     }
 
     fn cook(&mut self) {
@@ -479,43 +850,147 @@ impl App {
         }
     }
 
-    fn try_wire(&mut self, from_n: &str, from_p: &str, to_n: &str, to_p: &str) {
-        if from_n == to_n {
-            self.status = "no snap: self-edge".into();
-            return;
-        }
-        self.graph.edges.retain(|e| {
-            !(e.to_node == to_n && e.to_port == to_p)
-                && !(e.from_node == from_n && e.from_port == from_p && e.to_node == to_n && e.to_port == to_p)
-        });
-        let e = axial_ir::Edge {
-            id: format!("e_{from_n}_{from_p}_{to_n}_{to_p}"),
-            from_node: from_n.into(),
-            from_port: from_p.into(),
-            to_node: to_n.into(),
-            to_port: to_p.into(),
-        };
-        self.graph.edges.push(e);
-        if let Err(err) = self.graph.validate() {
-            self.graph.edges.pop();
-            self.status = format!("no snap: {err}");
-        } else {
-            self.status = "snapped".into();
+    fn try_wire(&mut self, connection: Connection) {
+        let before = self.graph.clone();
+        match connect(&mut self.graph, &connection) {
+            Ok(true) => {
+                self.history.remember(&before);
+                self.invalidate_cook();
+                self.status = format!(
+                    "snapped {}.{} → {}.{}",
+                    connection.from_node,
+                    connection.from_port,
+                    connection.to_node,
+                    connection.to_port
+                );
+            }
+            Ok(false) => self.status = "already snapped".into(),
+            Err(err) => self.status = format!("no snap: {err}"),
         }
     }
 
-    fn delete_selected(&mut self) {
-        let Some(id) = self.selected.take() else {
+    fn duplicate_selected(&mut self) {
+        let selected: BTreeSet<String> = self.selection.nodes().map(str::to_owned).collect();
+        if selected.is_empty() {
             return;
-        };
-        self.graph.nodes.retain(|n| n.id != id);
-        self.graph.edges.retain(|e| e.from_node != id && e.to_node != id);
-        self.last_states.remove(&id);
-        self.last_arts.remove(&id);
-        self.viewer_off.remove(&id);
-        self.sizes.remove(&id);
+        }
+        let before = self.graph.clone();
+        let mut existing: Vec<String> = self.graph.nodes.iter().map(|node| node.id.clone()).collect();
+        let mut renamed = BTreeMap::new();
+        let copies: Vec<Node> = self
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| selected.contains(&node.id))
+            .cloned()
+            .map(|mut node| {
+                let old = node.id.clone();
+                node.id = next_op_name(&existing, &node.operator);
+                existing.push(node.id.clone());
+                renamed.insert(old, node.id.clone());
+                node.layout.x += 28.0;
+                node.layout.y += 28.0;
+                node
+            })
+            .collect();
+        let copied_edges = self
+            .graph
+            .edges
+            .iter()
+            .filter(|edge| selected.contains(&edge.from_node) && selected.contains(&edge.to_node))
+            .cloned()
+            .map(|mut edge| {
+                edge.from_node = renamed[&edge.from_node].clone();
+                edge.to_node = renamed[&edge.to_node].clone();
+                edge.id = format!(
+                    "e_{}_{}_{}_{}",
+                    edge.from_node, edge.from_port, edge.to_node, edge.to_port
+                );
+                edge
+            })
+            .collect::<Vec<_>>();
+        let count = copies.len();
+        let copy_ids = copies.iter().map(|node| node.id.clone()).collect::<Vec<_>>();
+        self.graph.nodes.extend(copies);
+        self.graph.edges.extend(copied_edges);
+        self.history.remember(&before);
+        self.selection
+            .select_many(copy_ids, SelectionMode::Replace);
+        self.invalidate_cook();
+        self.status = format!("duplicated {count} node{}", if count == 1 { "" } else { "s" });
+    }
+
+    fn delete_selected(&mut self) {
+        if let Some(edge_id) = self.selection.edge().map(str::to_owned) {
+            let before = self.graph.clone();
+            self.graph.edges.retain(|edge| edge.id != edge_id);
+            if self.graph == before {
+                self.selection.clear();
+                return;
+            }
+            self.history.remember(&before);
+            self.selection.clear();
+            self.invalidate_cook();
+            self.status = "deleted wire".into();
+            return;
+        }
+        let selected: BTreeSet<String> = self.selection.nodes().map(str::to_owned).collect();
+        if selected.is_empty() {
+            return;
+        }
+        let before = self.graph.clone();
+        self.graph.nodes.retain(|node| !selected.contains(&node.id));
+        self.graph
+            .edges
+            .retain(|edge| !selected.contains(&edge.from_node) && !selected.contains(&edge.to_node));
+        self.history.remember(&before);
+        for id in &selected {
+            self.last_states.remove(id);
+            self.last_arts.remove(id);
+            self.viewer_off.remove(id);
+            self.sizes.remove(id);
+        }
+        let count = selected.len();
+        self.selection.clear();
         self.info = None;
-        self.status = format!("deleted {id}");
+        self.invalidate_cook();
+        self.status = format!("deleted {count} node{}", if count == 1 { "" } else { "s" });
+    }
+
+    fn commit_rename(&mut self, old: &str, requested: &str) {
+        let next = requested.trim().to_owned();
+        let before = self.graph.clone();
+        match rename_node(&mut self.graph, old, &next) {
+            Ok(true) => {
+                self.history.remember(&before);
+                self.selection
+                    .select_node(&next, SelectionMode::Replace);
+                if self.viewer_off.remove(old) {
+                    self.viewer_off.insert(next.clone());
+                }
+                if let Some(value) = self.sizes.remove(old) {
+                    self.sizes.insert(next.clone(), value);
+                }
+                if let Some(value) = self.last_states.remove(old) {
+                    self.last_states.insert(next.clone(), value);
+                }
+                if let Some(value) = self.last_arts.remove(old) {
+                    self.last_arts.insert(next.clone(), value);
+                }
+                if self.info.as_deref() == Some(old) {
+                    self.info = Some(next.clone());
+                }
+                self.rename_target = Some(next.clone());
+                self.rename_buffer = next.clone();
+                self.invalidate_cook();
+                self.status = format!("renamed {old} → {next}");
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.rename_buffer = old.to_owned();
+                self.status = error;
+            }
+        }
     }
 
     fn ingest_path(&mut self, path: PathBuf, pos: Pos2) {
@@ -529,6 +1004,22 @@ impl App {
             .and_then(|s| s.to_str())
             .unwrap_or("file")
             .to_string();
+        if path.is_dir() {
+            if path.join("Snakefile").is_file()
+                || path.join("workflow").join("Snakefile").is_file()
+            {
+                self.last_graph_pos = pos;
+                self.insert_snakemake_project(path);
+            } else if let Ok(operator) = self.catalog.get("files.import_directory").cloned() {
+                self.drop_op(&operator, pos);
+                if let Some(node) = self.graph.nodes.last_mut() {
+                    node.params
+                        .insert("path".into(), ParamValue::String(path.display().to_string()));
+                }
+                self.status = format!("import directory {name}");
+            }
+            return;
+        }
         if ext == "pdf" || ext == "txt" || ext == "md" {
             if self.paper_rx.is_some() {
                 return;
@@ -558,7 +1049,14 @@ impl App {
             match fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str::<Graph>(&s).ok()) {
                 Some(g) if g.validate().is_ok() => {
                     self.graph = g;
-                    self.selected = self.graph.nodes.first().map(|n| n.id.clone());
+                    self.graph_path = Some(path.clone());
+                    self.autosave_due = Some(Instant::now());
+                    self.history = EditHistory::default();
+                    self.selection.clear();
+                    if let Some(node) = self.graph.nodes.first() {
+                        self.selection
+                            .select_node(&node.id, SelectionMode::Replace);
+                    }
                     self.last_states.clear();
                     self.last_arts.clear();
                     self.request_fit();
@@ -579,7 +1077,7 @@ impl App {
             }
             return;
         }
-        self.status = format!("drop a paper (.pdf/.txt) or a FASTQ, not {name}");
+        self.status = format!("drop an Axial graph, data file, or methods paper—not {name}");
     }
 
     fn poll_paper(&mut self, ctx: &egui::Context) {
@@ -592,7 +1090,14 @@ impl App {
                 let assay = r.assay;
                 let warns = r.warnings.clone();
                 self.graph = r.graph;
-                self.selected = self.graph.nodes.first().map(|n| n.id.clone());
+                self.graph_path = None;
+                self.autosave_due = Some(Instant::now());
+                self.history = EditHistory::default();
+                self.selection.clear();
+                if let Some(node) = self.graph.nodes.first() {
+                    self.selection
+                        .select_node(&node.id, SelectionMode::Replace);
+                }
                 self.param_page.clear();
                 self.last_states.clear();
                 self.last_arts.clear();
@@ -675,6 +1180,94 @@ impl App {
         }
     }
 
+    fn pick_snakemake_directory() -> Option<PathBuf> {
+        let out = Command::new("zenity")
+            .args([
+                "--file-selection",
+                "--directory",
+                "--title=Axial — open Snakemake project",
+            ])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        (!path.is_empty()).then(|| PathBuf::from(path))
+    }
+
+    fn pick_graph_file() -> Option<PathBuf> {
+        let suggested = project_root().join("project1.axial.json");
+        let out = Command::new("zenity")
+            .args([
+                "--file-selection",
+                "--save",
+                "--confirm-overwrite",
+                "--title=Axial — save graph",
+                "--file-filter=Axial graphs | *.axial.json *.json",
+            ])
+            .arg(format!("--filename={}", suggested.display()))
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let path = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        (!path.is_empty()).then(|| PathBuf::from(path))
+    }
+
+    fn write_graph(&self, path: &Path) -> Result<(), String> {
+        self.graph.validate().map_err(|error| error.to_string())?;
+        let bytes = serde_json::to_vec_pretty(&self.graph).map_err(|error| error.to_string())?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("no parent directory for {}", path.display()))?;
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "graph filename is not valid UTF-8".to_owned())?;
+        let staged = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+        fs::write(&staged, bytes).map_err(|error| error.to_string())?;
+        fs::rename(&staged, path).map_err(|error| error.to_string())
+    }
+
+    fn save_graph(&mut self) {
+        let Some(path) = self.graph_path.clone().or_else(Self::pick_graph_file) else {
+            return;
+        };
+        match self.write_graph(&path) {
+            Ok(()) => {
+                self.graph_path = Some(path.clone());
+                self.autosave_due = None;
+                let recovery = project_root().join(".axial/autosave.axial.json");
+                self.status = match self.write_graph(&recovery) {
+                    Ok(()) => format!("saved {}", path.display()),
+                    Err(error) => format!(
+                        "saved {} · recovery copy failed: {error}",
+                        path.display()
+                    ),
+                };
+            }
+            Err(error) => self.status = format!("save failed: {error}"),
+        }
+    }
+
+    fn poll_autosave(&mut self, ctx: &egui::Context) {
+        let Some(due) = self.autosave_due else {
+            return;
+        };
+        if due.elapsed() < Duration::from_millis(700) {
+            ctx.request_repaint_after(Duration::from_millis(700) - due.elapsed());
+            return;
+        }
+        self.autosave_due = None;
+        let path = project_root().join(".axial/autosave.axial.json");
+        if let Err(error) = self.write_graph(&path) {
+            self.status = format!("autosave failed: {error}");
+        }
+    }
+
     fn refresh_fq(&mut self) {
         for n in &self.graph.nodes {
             if n.operator != "files.import" {
@@ -721,11 +1314,16 @@ impl App {
         let q = q.to_lowercase();
         let mut out = Vec::new();
         for op in self.catalog.ops.values() {
-            if q.is_empty()
+            let search_match = q.is_empty()
                 || op.title.to_lowercase().contains(&q)
                 || op.id.to_lowercase().contains(&q)
-                || op.palette.iter().any(|p| p.to_lowercase().contains(&q))
-            {
+                || op.palette.iter().any(|p| p.to_lowercase().contains(&q));
+            let wire_match = self.pending_insert.as_ref().is_none_or(|wire| {
+                op.ir_ports()
+                    .iter()
+                    .any(|port| wire.accepts(&self.graph, port))
+            });
+            if search_match && wire_match {
                 out.push(op.clone());
             }
         }
@@ -734,7 +1332,7 @@ impl App {
     }
 }
 
-fn bezier(painter: &egui::Painter, a: Pos2, b: Pos2, color: Color32, cooking: bool, t: f64) {
+fn bezier_points(a: Pos2, b: Pos2) -> Vec<Pos2> {
     let dx = (b.x - a.x).abs().max(48.0) * 0.5;
     let c1 = a + Vec2::new(dx, 0.0);
     let c2 = b - Vec2::new(dx, 0.0);
@@ -749,9 +1347,42 @@ fn bezier(painter: &egui::Painter, a: Pos2, b: Pos2, color: Color32, cooking: bo
             u * u * u * a.y + 3.0 * u * u * tt * c1.y + 3.0 * u * tt * tt * c2.y + tt * tt * tt * b.y,
         ));
     }
+    pts
+}
+
+fn segment_distance(point: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let segment = b - a;
+    let length_sq = segment.length_sq();
+    if length_sq <= f32::EPSILON {
+        return point.distance(a);
+    }
+    let t = ((point - a).dot(segment) / length_sq).clamp(0.0, 1.0);
+    point.distance(a + segment * t)
+}
+
+fn bezier_distance(a: Pos2, b: Pos2, point: Pos2) -> f32 {
+    bezier_points(a, b)
+        .windows(2)
+        .map(|window| segment_distance(point, window[0], window[1]))
+        .fold(f32::MAX, f32::min)
+}
+
+fn bezier(
+    painter: &egui::Painter,
+    a: Pos2,
+    b: Pos2,
+    color: Color32,
+    cooking: bool,
+    emphasized: bool,
+    t: f64,
+) {
+    let pts = bezier_points(a, b);
     let glow = color.gamma_multiply(0.28);
     for w in pts.windows(2) {
-        painter.line_segment([w[0], w[1]], Stroke::new(5.5, glow));
+        painter.line_segment(
+            [w[0], w[1]],
+            Stroke::new(if emphasized { 8.0 } else { 5.5 }, glow),
+        );
     }
     let pulse = if cooking {
         0.55 + 0.45 * ((t * 6.0).sin() as f32)
@@ -760,8 +1391,31 @@ fn bezier(painter: &egui::Painter, a: Pos2, b: Pos2, color: Color32, cooking: bo
     };
     let col = color.gamma_multiply(pulse);
     for w in pts.windows(2) {
-        painter.line_segment([w[0], w[1]], Stroke::new(if cooking { 2.4 } else { 1.7 }, col));
+        let width = if emphasized {
+            3.2
+        } else if cooking {
+            2.4
+        } else {
+            1.7
+        };
+        painter.line_segment([w[0], w[1]], Stroke::new(width, col));
     }
+}
+
+fn bezier_bounds(a: Pos2, b: Pos2) -> Rect {
+    let dx = (b.x - a.x).abs().max(48.0) * 0.5;
+    let c1 = a + Vec2::new(dx, 0.0);
+    let c2 = b - Vec2::new(dx, 0.0);
+    Rect::from_min_max(
+        Pos2::new(
+            a.x.min(b.x).min(c1.x).min(c2.x),
+            a.y.min(b.y).min(c1.y).min(c2.y),
+        ),
+        Pos2::new(
+            a.x.max(b.x).max(c1.x).max(c2.x),
+            a.y.max(b.y).max(c1.y).max(c2.y),
+        ),
+    )
 }
 
 fn draw_grid(painter: &egui::Painter, rect: Rect, pan: Vec2, zoom: f32) {
@@ -1142,6 +1796,184 @@ fn draw_viewer(painter: &egui::Painter, body: Rect, n: &Node, fq: Option<&FqPrev
     );
 }
 
+#[derive(Clone, Copy, Default)]
+struct PaletteRowHit {
+    clicked: bool,
+    favorite_clicked: bool,
+}
+
+fn draw_palette_action(
+    ui: &mut egui::Ui,
+    icon_text: &str,
+    title: &str,
+    subtitle: &str,
+    color: Color32,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), 44.0),
+        Sense::click(),
+    );
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 6, Color32::from_rgb(46, 47, 57));
+    }
+    let icon = Rect::from_min_size(rect.min + Vec2::new(7.0, 8.0), Vec2::splat(27.0));
+    ui.painter()
+        .rect_filled(icon, 6, color.gamma_multiply(0.2));
+    ui.painter().text(
+        icon.center(),
+        egui::Align2::CENTER_CENTER,
+        icon_text,
+        FontId::proportional(if icon_text.len() > 1 { 9.5 } else { 13.0 }),
+        color,
+    );
+    let clip = Rect::from_min_max(
+        rect.min + Vec2::new(43.0, 4.0),
+        rect.max - Vec2::new(5.0, 3.0),
+    );
+    draw_label(
+        ui.painter(),
+        clip.min,
+        egui::Align2::LEFT_TOP,
+        title,
+        FontId::proportional(12.0),
+        TEXT,
+        clip,
+    );
+    draw_label(
+        ui.painter(),
+        clip.min + Vec2::new(0.0, 19.0),
+        egui::Align2::LEFT_TOP,
+        subtitle,
+        FontId::proportional(10.0),
+        MUTED,
+        clip,
+    );
+    response
+}
+
+fn draw_palette_row(ui: &mut egui::Ui, item: &palette::Item, favorite: bool) -> PaletteRowHit {
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), 44.0),
+        Sense::click_and_drag(),
+    );
+    let color = family_color(&item.operator.id);
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 6, Color32::from_rgb(46, 47, 57));
+    }
+
+    let icon = Rect::from_min_size(rect.min + Vec2::new(7.0, 8.0), Vec2::splat(27.0));
+    ui.painter()
+        .rect_filled(icon, 6, color.gamma_multiply(0.2));
+    ui.painter().text(
+        icon.center(),
+        egui::Align2::CENTER_CENTER,
+        item.icon,
+        FontId::proportional(if item.icon.len() > 1 { 9.5 } else { 12.0 }),
+        color,
+    );
+
+    let star = Rect::from_center_size(
+        Pos2::new(rect.max.x - 14.0, rect.center().y),
+        Vec2::splat(24.0),
+    );
+    let text_right = star.min.x - 4.0;
+    let title_clip = Rect::from_min_max(
+        Pos2::new(rect.min.x + 43.0, rect.min.y + 5.0),
+        Pos2::new(text_right, rect.min.y + 22.0),
+    );
+    draw_label(
+        ui.painter(),
+        title_clip.min,
+        egui::Align2::LEFT_TOP,
+        &item.operator.title,
+        FontId::proportional(12.0),
+        TEXT,
+        title_clip,
+    );
+    let subtitle_clip = Rect::from_min_max(
+        Pos2::new(rect.min.x + 43.0, rect.min.y + 23.0),
+        Pos2::new(text_right, rect.max.y - 3.0),
+    );
+    draw_label(
+        ui.painter(),
+        subtitle_clip.min,
+        egui::Align2::LEFT_TOP,
+        &item.subtitle,
+        FontId::proportional(10.0),
+        MUTED,
+        subtitle_clip,
+    );
+    ui.painter().text(
+        star.center(),
+        egui::Align2::CENTER_CENTER,
+        if favorite { "★" } else { "☆" },
+        FontId::proportional(13.0),
+        if favorite { ACCENT } else { MUTED },
+    );
+
+    let favorite_clicked = response.clicked()
+        && response
+            .interact_pointer_pos()
+            .is_some_and(|pointer| star.contains(pointer));
+    PaletteRowHit {
+        clicked: response.clicked() && !favorite_clicked,
+        favorite_clicked,
+    }
+}
+
+fn palette_tooltip(ui: &mut egui::Ui, item: &palette::Item, pipeline: Option<&NfcorePipeline>) {
+    ui.set_max_width(300.0);
+    ui.label(
+        egui::RichText::new(&item.operator.title)
+            .size(13.0)
+            .strong()
+            .color(TEXT),
+    );
+    ui.label(
+        egui::RichText::new(&item.operator.id)
+            .size(10.0)
+            .monospace()
+            .color(MUTED),
+    );
+    ui.add_space(3.0);
+    ui.label(
+        egui::RichText::new(
+            pipeline
+                .map(|pipeline| pipeline.description.as_str())
+                .filter(|description| !description.is_empty())
+                .unwrap_or(&item.subtitle),
+        )
+        .size(11.0)
+        .color(TEXT),
+    );
+    ui.add_space(4.0);
+    ui.horizontal_wrapped(|ui| {
+        for port in &item.operator.ports.r#in {
+            ui.label(
+                egui::RichText::new(format!("◀ {}", port.name))
+                    .size(10.0)
+                    .color(port_color(port.ty)),
+            );
+        }
+        for port in &item.operator.ports.out {
+            ui.label(
+                egui::RichText::new(format!("{} ▶", port.name))
+                    .size(10.0)
+                    .color(port_color(port.ty)),
+            );
+        }
+    });
+    if let Some(pipeline) = pipeline.filter(|pipeline| !pipeline.topics.is_empty()) {
+        ui.label(
+            egui::RichText::new(pipeline.topics.join(" · "))
+                .size(9.5)
+                .color(ACCENT),
+        );
+    }
+}
+
 fn apply_visuals(ctx: &egui::Context) {
     let mut v = egui::Visuals::dark();
     v.panel_fill = PANEL;
@@ -1172,10 +2004,12 @@ impl eframe::App for App {
         {
             let r = ctx.screen_rect();
             ctx.layer_painter(egui::LayerId::background())
-                .rect_filled(r, 0, Color32::from_rgb(34, 34, 36));
+                .rect_filled(r, 0, BG);
         }
         self.poll_cook(ctx);
         self.poll_paper(ctx);
+        self.poll_autosave(ctx);
+        self.poll_nfcore_catalog(ctx);
         self.refresh_fq();
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -1191,6 +2025,18 @@ impl eframe::App for App {
         let t = ctx.input(|i| i.time);
 
         let typing = ctx.wants_keyboard_input();
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.op_create = false;
+            self.paper_ui = false;
+            self.info = None;
+            self.wire = None;
+            self.pending_insert = None;
+            self.marquee = None;
+        }
+        if self.op_create && ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
+            self.op_create = false;
+            self.pending_insert = None;
+        }
         if !typing {
             ctx.input(|i| {
                 if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
@@ -1199,10 +2045,24 @@ impl eframe::App for App {
                 false
             })
             .then(|| self.delete_selected());
-            if ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
-                self.op_create = !self.op_create;
-                self.op_create_q.clear();
-                self.op_create_i = 0;
+            if ctx.input(|i| i.key_pressed(egui::Key::Tab)) && !self.op_create {
+                let screen = ctx.pointer_latest_pos().unwrap_or(self.cursor);
+                self.open_op_create(self.last_graph_pos, screen, None);
+            }
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::D)) {
+                self.duplicate_selected();
+            }
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
+                self.save_graph();
+            }
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) {
+                let redo = ctx.input(|i| i.modifiers.shift);
+                self.restore_history(redo);
+            } else if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Y)) {
+                self.restore_history(true);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::F)) {
+                self.request_fit();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::F5) || (i.modifiers.ctrl && i.key_pressed(egui::Key::Enter)))
             {
@@ -1211,20 +2071,14 @@ impl eframe::App for App {
             if ctx.input(|i| i.key_pressed(egui::Key::P)) {
                 self.paper_ui = !self.paper_ui;
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                self.op_create = false;
-                self.paper_ui = false;
-                self.info = None;
-                self.wire = None;
-            }
         }
 
         egui::TopBottomPanel::top("bar")
-            .exact_height(28.0)
-            .frame(Frame::new().fill(BAR).inner_margin(Margin::symmetric(14, 4)))
+            .exact_height(34.0)
+            .frame(Frame::new().fill(BAR).inner_margin(Margin::symmetric(14, 5)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Axial").color(ACCENT).strong().size(13.0));
+                    ui.label(egui::RichText::new("Axial").color(ACCENT).strong().size(14.0));
                     ui.add_space(10.0);
                     ui.label(egui::RichText::new("/").color(MUTED).size(12.0));
                     ui.label(egui::RichText::new("project1").color(TEXT).size(12.0));
@@ -1251,12 +2105,21 @@ impl eframe::App for App {
                         }
                         if ui
                             .add(
-                                egui::Button::new(egui::RichText::new("  Paper  ").color(Color32::WHITE))
-                                    .fill(ACCENT),
+                                egui::Button::new(egui::RichText::new("  Fit  ").color(TEXT))
+                                    .fill(PANEL2),
                             )
                             .clicked()
                         {
-                            self.paper_ui = true;
+                            self.request_fit();
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new("  Save  ").color(TEXT))
+                                    .fill(PANEL2),
+                            )
+                            .clicked()
+                        {
+                            self.save_graph();
                         }
                     });
                 });
@@ -1286,161 +2149,365 @@ impl eframe::App for App {
                 });
             });
 
+        let mut pick_snakemake = false;
         egui::SidePanel::left("palette")
-            .default_width(208.0)
+            .default_width(272.0)
+            .min_width(238.0)
+            .max_width(380.0)
             .resizable(true)
-            .frame(Frame::new().fill(PANEL).inner_margin(Margin::same(0)))
+            .frame(Frame::new().fill(PANEL).inner_margin(Margin::ZERO))
             .show(ctx, |ui| {
-                let hdr = Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.available_width(), 22.0));
-                ui.painter().rect_filled(hdr, 0, Color32::from_rgb(36, 36, 40));
-                ui.add_space(3.0);
+                let header = Rect::from_min_size(
+                    ui.max_rect().min,
+                    Vec2::new(ui.available_width(), 38.0),
+                );
+                ui.painter().rect_filled(header, 0, BAR);
+                ui.add_space(9.0);
                 ui.horizontal(|ui| {
-                    ui.add_space(8.0);
-                    ui.label(egui::RichText::new("Palette").strong().size(12.0).color(TEXT));
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new("Library")
+                            .strong()
+                            .size(13.0)
+                            .color(TEXT),
+                    );
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new(format!("{} tools", self.catalog.ops.len()))
+                                    .size(10.0)
+                                    .color(MUTED),
+                            );
+                        },
+                    );
                 });
-                ui.add_space(4.0);
+                ui.add_space(11.0);
+
                 ui.horizontal(|ui| {
-                    ui.add_space(6.0);
+                    ui.add_space(10.0);
                     Frame::new()
-                        .fill(Color32::from_rgb(56, 56, 62))
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(78, 78, 86)))
-                        .inner_margin(Margin::symmetric(6, 3))
-                        .corner_radius(2)
+                        .fill(Color32::from_rgb(42, 43, 51))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(64, 65, 76)))
+                        .inner_margin(Margin::symmetric(8, 5))
+                        .corner_radius(6)
                         .show(ui, |ui| {
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.search)
-                                    .hint_text("search")
-                                    .desired_width(ui.available_width() - 18.0)
+                                    .id(Id::new("palette_search"))
+                                    .hint_text("Search tools, sources, pipelines…")
+                                    .desired_width((ui.available_width() - 12.0).max(100.0))
                                     .frame(false)
                                     .font(FontId::proportional(12.0)),
                             );
                         });
                 });
-                ui.add_space(4.0);
-                let q = self.search.to_lowercase();
-                let groups: Vec<(String, Vec<Operator>)> = self
-                    .catalog
-                    .groups()
-                    .into_iter()
-                    .map(|(g, ops)| {
-                        let ops: Vec<Operator> = ops
-                            .into_iter()
-                            .filter(|o| {
-                                q.is_empty()
-                                    || o.title.to_lowercase().contains(&q)
-                                    || o.id.to_lowercase().contains(&q)
-                                    || g.to_lowercase().contains(&q)
-                            })
-                            .cloned()
-                            .collect();
-                        (g, ops)
-                    })
-                    .filter(|(_, ops)| !ops.is_empty())
-                    .collect();
-                let mut drop_click: Option<Operator> = None;
-                egui::ScrollArea::vertical()
-                    .id_salt("pal_scroll")
-                    .max_height(ui.available_height() - 118.0)
-                    .show(ui, |ui| {
-                        for (group, ops) in &groups {
-                            egui::CollapsingHeader::new(
-                                egui::RichText::new(group).size(11.0).color(MUTED).strong(),
+                ui.add_space(7.0);
+
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    let width = ((ui.available_width() - 12.0) / 3.0).max(58.0);
+                    for mode in PaletteMode::ALL {
+                        let selected = self.palette_mode == mode;
+                        let response = ui.add_sized(
+                            Vec2::new(width, 26.0),
+                            egui::Button::new(
+                                egui::RichText::new(mode.label())
+                                    .size(11.0)
+                                    .color(if selected { TEXT } else { MUTED }),
                             )
-                            .default_open(true)
+                            .fill(if selected {
+                                Color32::from_rgb(48, 46, 57)
+                            } else {
+                                Color32::TRANSPARENT
+                            })
+                            .corner_radius(5),
+                        );
+                        if response.clicked() {
+                            self.palette_mode = mode;
+                            self.search.clear();
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                ui.separator();
+
+                let mut quick_drop: Option<Operator> = None;
+                if self.search.is_empty() && self.palette_mode == PaletteMode::Build {
+                    ui.add_space(5.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        ui.label(
+                            egui::RichText::new("QUICK ADD")
+                                .size(9.5)
+                                .color(MUTED),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        ui.vertical(|ui| {
+                            if draw_palette_action(
+                                ui,
+                                "+",
+                                "Import reads",
+                                "FASTQ, BAM, VCF or GTF",
+                                SELECT,
+                            )
+                            .clicked()
+                            {
+                                quick_drop = self.catalog.get("files.import").ok().cloned();
+                            }
+                            if draw_palette_action(
+                                ui,
+                                "ID",
+                                "Add accession",
+                                "SRA run or NCBI assembly",
+                                SELECT,
+                            )
+                            .clicked()
+                            {
+                                self.palette_mode = PaletteMode::Sources;
+                                self.focus_accession = true;
+                            }
+                            if draw_palette_action(
+                                ui,
+                                "nf",
+                                "Find a pipeline",
+                                &format!("{} released nf-core workflows", self.nfcore.len()),
+                                Color32::from_rgb(91, 174, 220),
+                            )
+                            .clicked()
+                            {
+                                self.palette_mode = PaletteMode::Pipelines;
+                                ui.memory_mut(|memory| {
+                                    memory.request_focus(Id::new("palette_search"));
+                                });
+                            }
+                        });
+                    });
+                    ui.add_space(2.0);
+                }
+
+                let mut add_accession = false;
+                if self.search.is_empty() && self.palette_mode == PaletteMode::Sources {
+                    ui.add_space(7.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        ui.label(
+                            egui::RichText::new("PASTE AN ACCESSION")
+                                .size(9.5)
+                                .color(MUTED),
+                        );
+                    });
+                    ui.add_space(2.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        Frame::new()
+                            .fill(Color32::from_rgb(37, 48, 44))
+                            .stroke(Stroke::new(1.0, SELECT.gamma_multiply(0.45)))
+                            .inner_margin(Margin::symmetric(8, 5))
+                            .corner_radius(6)
                             .show(ui, |ui| {
-                                for op in ops {
-                                    let col = family_color(&op.id);
-                                    let ir = ui.dnd_drag_source(
-                                        Id::new(("pal", op.id.as_str())),
-                                        op.id.clone(),
-                                        |ui| {
-                                            let (r, resp) = ui.allocate_exact_size(
-                                                Vec2::new(ui.available_width(), 20.0),
-                                                Sense::click(),
-                                            );
-                                            let bg = if self.pal_hover.as_deref() == Some(op.id.as_str()) {
-                                                Color32::from_rgb(58, 58, 68)
-                                            } else {
-                                                Color32::TRANSPARENT
-                                            };
-                                            ui.painter().rect_filled(r, 0, bg);
-                                            ui.painter().rect_filled(
-                                                Rect::from_min_size(r.min, Vec2::new(3.0, r.height())),
-                                                0,
-                                                col,
-                                            );
-                                            ui.painter().text(
-                                                r.min + Vec2::new(10.0, 3.0),
-                                                egui::Align2::LEFT_TOP,
-                                                &op.title,
-                                                FontId::proportional(12.0),
-                                                TEXT,
-                                            );
-                                            resp
-                                        },
+                                let response = ui.add(
+                                    egui::TextEdit::singleline(&mut self.accession)
+                                        .id(Id::new("accession_entry"))
+                                        .hint_text("SRR…  ERR…  GCA…  GCF…")
+                                        .desired_width((ui.available_width() - 52.0).max(80.0))
+                                        .frame(false)
+                                        .font(FontId::proportional(12.0)),
+                                );
+                                if self.focus_accession {
+                                    response.request_focus();
+                                    self.focus_accession = false;
+                                }
+                                if response.has_focus()
+                                    && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                                {
+                                    add_accession = true;
+                                }
+                            });
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("Add").size(11.0).color(TEXT),
+                                )
+                                .fill(PANEL2)
+                                .corner_radius(5),
+                            )
+                            .clicked()
+                        {
+                            add_accession = true;
+                        }
+                    });
+                    ui.add_space(5.0);
+                }
+
+                if self.search.is_empty() && self.palette_mode == PaletteMode::Pipelines {
+                    ui.add_space(5.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        ui.label(
+                            egui::RichText::new("WORKFLOW ENGINES")
+                                .size(9.5)
+                                .color(MUTED),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        if draw_palette_action(
+                            ui,
+                            "SM",
+                            "Open Snakemake project",
+                            "Snakefile → typed runnable graph",
+                            Color32::from_rgb(84, 168, 111),
+                        )
+                        .clicked()
+                        {
+                            pick_snakemake = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "NF-CORE CATALOG · {}",
+                                self.nfcore.len()
+                            ))
+                            .size(9.5)
+                            .color(MUTED),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                ui.add_space(8.0);
+                                if ui
+                                    .small_button("↻")
+                                    .on_hover_text("Refresh the official nf-core catalog")
+                                    .clicked()
+                                {
+                                    self.refresh_nfcore_catalog();
+                                }
+                            },
+                        );
+                    });
+                }
+
+                let sections = palette::sections(
+                    self.palette_mode,
+                    &self.catalog.ops,
+                    &self.nfcore,
+                    &self.search,
+                    &self.recent_ops,
+                    &self.favorite_ops,
+                );
+                let mut drop_click: Option<Operator> = None;
+                let mut toggle_favorite: Option<String> = None;
+                egui::ScrollArea::vertical()
+                    .id_salt("palette_scroll")
+                    .auto_shrink([false, false])
+                    .max_height((ui.available_height() - 28.0).max(100.0))
+                    .show(ui, |ui| {
+                        ui.add_space(4.0);
+                        for section in &sections {
+                            egui::CollapsingHeader::new(
+                                egui::RichText::new(format!(
+                                    "{}   {}",
+                                    section.title.to_uppercase(),
+                                    section.items.len()
+                                ))
+                                .size(9.5)
+                                .color(MUTED),
+                            )
+                            .default_open(section.open)
+                            .show(ui, |ui| {
+                                for item in &section.items {
+                                    let favorite = self.favorite_ops.contains(&item.operator.id);
+                                    let drag = ui.dnd_drag_source(
+                                        Id::new(("palette", item.operator.id.as_str())),
+                                        item.operator.id.clone(),
+                                        |ui| draw_palette_row(ui, item, favorite),
                                     );
-                                    if ir.response.hovered() {
-                                        self.pal_hover = Some(op.id.clone());
-                                    }
-                                    if ir.inner.clicked() || ir.response.clicked() {
-                                        drop_click = Some(op.clone());
+                                    drag.response.clone().on_hover_ui(|ui| {
+                                        palette_tooltip(
+                                            ui,
+                                            item,
+                                            self.nfcore.get(&item.operator.id),
+                                        );
+                                    });
+                                    if drag.inner.favorite_clicked {
+                                        toggle_favorite = Some(item.operator.id.clone());
+                                    } else if drag.inner.clicked {
+                                        drop_click = Some(item.operator.clone());
                                     }
                                 }
                             });
                         }
+                        if sections.iter().all(|section| section.items.is_empty()) {
+                            ui.add_space(12.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(12.0);
+                                ui.label(
+                                    egui::RichText::new("No matching tools")
+                                        .size(11.0)
+                                        .color(MUTED)
+                                        .italics(),
+                                );
+                            });
+                        }
                     });
-                if let Some(op) = drop_click {
-                    self.drop_op(&op, self.last_graph_pos);
+
+                if let Some(id) = toggle_favorite {
+                    if !self.favorite_ops.remove(&id) {
+                        self.favorite_ops.insert(id);
+                    }
+                }
+                if let Some(operator) = quick_drop.or(drop_click) {
+                    self.drop_op(&operator, self.last_graph_pos);
+                }
+                if add_accession {
+                    self.insert_accession();
                 }
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.add_space(6.0);
-                    ui.label(egui::RichText::new("Info").size(11.0).color(MUTED).strong());
+                    ui.add_space(12.0);
+                    ui.label(
+                        egui::RichText::new(format!("★ {} favorites", self.favorite_ops.len()))
+                            .size(10.0)
+                            .color(MUTED),
+                    );
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "✓ {} installed",
+                                    self.catalog.ops.len()
+                                ))
+                                .size(10.0)
+                                .color(MUTED),
+                            );
+                        },
+                    );
                 });
-                if let Some(id) = &self.pal_hover {
-                    if let Ok(op) = self.catalog.get(id) {
-                        ui.add_space(2.0);
-                        ui.horizontal(|ui| {
-                            ui.add_space(8.0);
-                            ui.label(egui::RichText::new(&op.title).size(12.0).color(TEXT));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.add_space(8.0);
-                            ui.label(egui::RichText::new(&op.id).size(10.0).color(MUTED).monospace());
-                        });
-                        ui.horizontal(|ui| {
-                            ui.add_space(8.0);
-                            for p in &op.ports.r#in {
-                                let c = port_color(p.ty);
-                                ui.label(egui::RichText::new(format!("▶ {}", p.name)).size(10.0).color(c));
-                            }
-                            for p in &op.ports.out {
-                                let c = port_color(p.ty);
-                                ui.label(egui::RichText::new(format!("{} ▶", p.name)).size(10.0).color(c));
-                            }
-                        });
-                        if let Some(c) = &op.conda {
-                            ui.horizontal(|ui| {
-                                ui.add_space(8.0);
-                                ui.label(
-                                    egui::RichText::new(format!("conda  {}", c.name))
-                                        .size(10.0)
-                                        .color(MUTED),
-                                );
-                            });
-                        }
-                    }
-                } else {
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(8.0);
-                        ui.label(egui::RichText::new("hover an operator").size(11.0).color(MUTED).italics());
-                    });
-                }
+                ui.add_space(6.0);
             });
 
-        let selected_id = self.selected.clone();
+        if pick_snakemake {
+            if let Some(path) = Self::pick_snakemake_directory() {
+                self.insert_snakemake_project(path);
+            }
+        }
+
+        let selected_id = self.selection.primary().map(str::to_owned);
+        if self.rename_target != selected_id {
+            self.rename_target = selected_id.clone();
+            self.rename_buffer = selected_id.clone().unwrap_or_default();
+        }
+        let mut rename_request: Option<(String, String)> = None;
         egui::SidePanel::right("params")
             .default_width(268.0)
             .resizable(true)
@@ -1462,7 +2529,22 @@ impl eframe::App for App {
                             ui.add_space(10.0);
                             ui.vertical(|ui| {
                                 ui.label(egui::RichText::new(&title).size(11.0).color(HEADER_FG));
-                                ui.label(egui::RichText::new(&node_name).size(15.0).strong().color(Color32::WHITE));
+                                let rename = ui.add(
+                                    egui::TextEdit::singleline(&mut self.rename_buffer)
+                                        .desired_width(150.0)
+                                        .font(FontId::proportional(15.0))
+                                        .text_color(Color32::WHITE)
+                                        .frame(false)
+                                        .margin(Margin::ZERO),
+                                );
+                                if (rename.lost_focus()
+                                    || (rename.has_focus()
+                                        && ui.input(|input| input.key_pressed(egui::Key::Enter))))
+                                    && self.rename_buffer != node_name
+                                {
+                                    rename_request =
+                                        Some((node_name.clone(), self.rename_buffer.clone()));
+                                }
                             });
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 ui.add_space(8.0);
@@ -1519,7 +2601,7 @@ impl eframe::App for App {
                             egui::ScrollArea::vertical().show(ui, |ui| {
                                 ui.add_space(8.0);
                                 if self.param_page == "Common" {
-                                    common_page(ui, &op, self.viewer_off.contains(id));
+                                    common_page(ui, &op, !self.viewer_off.contains(id));
                                     if let Some(note) = self.graph.nodes[nidx].note.clone() {
                                         ui.add_space(10.0);
                                         Frame::new()
@@ -1536,10 +2618,9 @@ impl eframe::App for App {
                                     if ui
                                         .add(egui::Button::new("toggle viewer").fill(PANEL2))
                                         .clicked()
+                                        && !self.viewer_off.remove(id)
                                     {
-                                        if !self.viewer_off.remove(id) {
-                                            self.viewer_off.insert(id.clone());
-                                        }
+                                        self.viewer_off.insert(id.clone());
                                     }
                                 } else {
                                     let keys: Vec<String> = op
@@ -1564,11 +2645,26 @@ impl eframe::App for App {
                                     for k in keys {
                                         let spec = &op.params[&k];
                                         let label = spec.label.clone().unwrap_or(k.clone());
-                                        let node = &mut self.graph.nodes[nidx];
-                                        let entry = node.params.entry(k.clone()).or_insert_with(|| {
-                                            spec.default.clone().unwrap_or(ParamValue::String(String::new()))
-                                        });
-                                        param_row(ui, &label, entry, spec.min, spec.max);
+                                        let (edit, previous) = {
+                                            let node = &mut self.graph.nodes[nidx];
+                                            let entry = node.params.entry(k.clone()).or_insert_with(|| {
+                                                spec.default
+                                                    .clone()
+                                                    .unwrap_or(ParamValue::String(String::new()))
+                                            });
+                                            let previous = entry.clone();
+                                            let edit = param_row(ui, &label, entry, spec.min, spec.max);
+                                            (edit, previous)
+                                        };
+                                        if edit.began {
+                                            let mut before = self.graph.clone();
+                                            before.nodes[nidx].params.insert(k.clone(), previous);
+                                            self.history.remember(&before);
+                                        }
+                                        if edit.changed {
+                                            self.invalidate_cook();
+                                            self.status = format!("changed {node_name}.{k}");
+                                        }
                                     }
                                 }
                             });
@@ -1582,6 +2678,9 @@ impl eframe::App for App {
                     });
                 }
             });
+        if let Some((old, requested)) = rename_request {
+            self.commit_rename(&old, &requested);
+        }
 
         egui::CentralPanel::default()
             .frame(Frame::new().fill(BG))
@@ -1607,24 +2706,38 @@ impl eframe::App for App {
                     }
                 }
 
+                let space_down = ui.input(|i| i.key_down(egui::Key::Space));
                 if resp.hovered() {
-                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                    if scroll.abs() > 0.1 {
+                    let (zoom_delta, pan_delta) =
+                        ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta));
+                    if (zoom_delta - 1.0).abs() > f32::EPSILON {
                         self.auto_fit = false;
-                        let old = self.zoom;
-                        self.zoom = (self.zoom * (1.0 + scroll * 0.0015)).clamp(0.3, 2.8);
                         if let Some(ptr) = resp.hover_pos() {
-                            let f = self.zoom / old;
-                            self.pan = (self.pan - (ptr - origin)) * f + (ptr - origin);
+                            (self.pan, self.zoom) =
+                                zoom_about(self.pan, self.zoom, origin, ptr, zoom_delta);
                         }
                     }
+                    if pan_delta != Vec2::ZERO {
+                        self.auto_fit = false;
+                        self.pan += pan_delta;
+                    }
+                    let panning = resp.dragged_by(egui::PointerButton::Middle)
+                        || resp.dragged_by(egui::PointerButton::Secondary)
+                        || (space_down && resp.dragged_by(egui::PointerButton::Primary));
                     ui.ctx().set_cursor_icon(if self.wire.is_some() {
                         CursorIcon::Crosshair
+                    } else if panning {
+                        CursorIcon::Grabbing
+                    } else if space_down {
+                        CursorIcon::Grab
                     } else {
                         CursorIcon::Default
                     });
                 }
-                if resp.dragged() && ui.input(|i| i.pointer.secondary_down() || i.pointer.middle_down()) {
+                let panning = resp.dragged_by(egui::PointerButton::Middle)
+                    || resp.dragged_by(egui::PointerButton::Secondary)
+                    || (space_down && resp.dragged_by(egui::PointerButton::Primary));
+                if panning {
                     self.auto_fit = false;
                     self.pan += resp.drag_delta();
                 }
@@ -1633,48 +2746,88 @@ impl eframe::App for App {
 
                 if let Some(pos) = ctx.pointer_latest_pos() {
                     self.cursor = pos;
+                    if resp.rect.contains(pos) {
+                        self.last_graph_pos = self.to_graph(origin, pos);
+                    }
                 }
 
-                let edges = self.graph.edges.clone();
-                for e in &edges {
+                let hovered_edge = resp.hover_pos().and_then(|pointer| {
+                    self.graph
+                        .edges
+                        .iter()
+                        .filter_map(|edge| {
+                            let from = self.graph.node(&edge.from_node)?;
+                            let to = self.graph.node(&edge.to_node)?;
+                            let output = from.port(&edge.from_port, Direction::Out)?;
+                            let input = to.port(&edge.to_port, Direction::In)?;
+                            let distance = bezier_distance(
+                                self.port_pos(origin, from, output),
+                                self.port_pos(origin, to, input),
+                                pointer,
+                            );
+                            (distance <= 9.0).then_some((distance, edge.id.clone()))
+                        })
+                        .min_by(|left, right| left.0.total_cmp(&right.0))
+                        .map(|(_, id)| id)
+                });
+
+                for e in &self.graph.edges {
                     let Some(a) = self.graph.node(&e.from_node) else { continue };
                     let Some(b) = self.graph.node(&e.to_node) else { continue };
                     let Some(ap) = a.port(&e.from_port, Direction::Out) else { continue };
                     let Some(bp) = b.port(&e.to_port, Direction::In) else { continue };
                     let p0 = self.port_pos(origin, a, ap);
                     let p1 = self.port_pos(origin, b, bp);
+                    if !bezier_bounds(p0, p1).expand(16.0).intersects(resp.rect) {
+                        continue;
+                    }
                     let failed = matches!(self.last_states.get(&e.from_node), Some(NodeState::Failed));
                     let col = if failed {
                         Color32::from_rgb(220, 80, 80)
                     } else {
                         port_color(ap.ty)
                     };
-                    bezier(&painter, p0, p1, col, cooking, t);
+                    let emphasized = self.selection.edge() == Some(e.id.as_str())
+                        || hovered_edge.as_deref() == Some(e.id.as_str());
+                    bezier(&painter, p0, p1, col, cooking, emphasized, t);
                 }
 
                 self.hover_port = None;
-                let mut hit_port: Option<(String, String, bool)> = None;
+                let mut hit_port: Option<WireStart> = None;
                 let mut hit_node: Option<String> = None;
                 let mut hit_flag: Option<String> = None;
                 let mut hit_resize: Option<String> = None;
                 let mut info_hit: Option<String> = None;
                 let mut snap_cursor = self.cursor;
 
-                let src_ty: Option<(PortType, Vec<PortType>, bool)> = self.wire.as_ref().and_then(|(nid, pname, is_out)| {
-                    let n = self.graph.node(nid)?;
-                    let p = n.port(pname, if *is_out { Direction::Out } else { Direction::In })?;
-                    Some((p.ty, p.union.clone(), *is_out))
-                });
+                let src_ty: Option<(PortType, Vec<PortType>, bool)> =
+                    self.wire.as_ref().and_then(|wire| {
+                        let n = self.graph.node(&wire.node)?;
+                        let p = n.port(&wire.port, wire.dir)?;
+                        Some((p.ty, p.union.clone(), wire.dir == Direction::Out))
+                    });
 
-                let nodes: Vec<Node> = self.graph.nodes.clone();
+                let visible = resp.rect.expand(48.0);
+                let nodes: Vec<Node> = self
+                    .graph
+                    .nodes
+                    .iter()
+                    .filter(|node| self.node_rect(origin, node).intersects(visible))
+                    .cloned()
+                    .collect();
                 let mut quote_tip: Option<(Pos2, String)> = None;
                 for n in &nodes {
                     let r = self.node_rect(origin, n);
-                    let sel = self.selected.as_deref() == Some(n.id.as_str());
+                    let sel = self.selection.contains(&n.id);
                     let z = self.zoom;
                     let hovered = resp.hover_pos().map(|p| r.contains(p)).unwrap_or(false);
 
-                    painter.rect_filled(r, CornerRadius::same(2), NODE);
+                    painter.rect_filled(
+                        r.translate(Vec2::new(0.0, 3.0 * z)),
+                        CornerRadius::same(6),
+                        Color32::from_rgba_unmultiplied(0, 0, 0, 72),
+                    );
+                    painter.rect_filled(r, CornerRadius::same(6), NODE);
                     painter.rect_filled(
                         Rect::from_min_max(r.min, Pos2::new(r.min.x + STRIP * z, r.max.y)),
                         0,
@@ -1722,7 +2875,7 @@ impl eframe::App for App {
                     } else {
                         Stroke::new(1.0, Color32::from_rgb(62, 62, 68))
                     };
-                    painter.rect_stroke(r, 2, stroke, egui::StrokeKind::Outside);
+                    painter.rect_stroke(r, 6, stroke, egui::StrokeKind::Outside);
 
                     // name under — clipped to node width so it never rides into a neighbor
                     if viewer_on {
@@ -1819,7 +2972,7 @@ impl eframe::App for App {
                                 painter.circle_stroke(c, rad + 2.0, Stroke::new(1.4, SELECT));
                                 self.hover_port = Some((n.id.clone(), p.name.clone(), p.ty, p.dir == Direction::Out));
                                 if resp.drag_started() && ui.input(|i| i.pointer.primary_down()) {
-                                    hit_port = Some((n.id.clone(), p.name.clone(), p.dir == Direction::Out));
+                                    hit_port = Some(WireStart::new(&n.id, &p.name, p.dir));
                                 }
                             }
                         }
@@ -1845,11 +2998,11 @@ impl eframe::App for App {
                     }
                 }
 
-                if let Some((nid, pname, is_out)) = &self.wire.clone() {
-                    if let Some(n) = self.graph.node(nid) {
-                        if let Some(p) = n.port(pname, if *is_out { Direction::Out } else { Direction::In }) {
+                if let Some(wire) = &self.wire {
+                    if let Some(n) = self.graph.node(&wire.node) {
+                        if let Some(p) = n.port(&wire.port, wire.dir) {
                             let p0 = self.port_pos(origin, n, p);
-                            bezier(&painter, p0, snap_cursor, SELECT, true, t);
+                            bezier(&painter, p0, snap_cursor, SELECT, true, true, t);
                         }
                     }
                 }
@@ -1866,77 +3019,140 @@ impl eframe::App for App {
                     draw_quote_tip(&painter, at, &note, resp.rect);
                 }
 
-                if resp.drag_started() && ui.input(|i| i.pointer.primary_down()) {
+                if resp.drag_started() && ui.input(|i| i.pointer.primary_down()) && !space_down {
                     if let Some(hp) = hit_port.clone() {
                         self.wire = Some(hp);
                         self.dragging = None;
+                        self.marquee = None;
                     } else if let Some(id) = &hit_resize {
+                        self.history.remember(&self.graph);
                         self.resizing = Some(id.clone());
+                        self.marquee = None;
                     } else if let Some(pos) = resp.interact_pointer_pos() {
                         let hit = nodes.iter().rev().find(|n| self.node_rect(origin, n).contains(pos));
                         if let Some(n) = hit {
                             if hit_flag.is_none() {
-                                self.dragging = Some(n.id.clone());
-                                self.selected = Some(n.id.clone());
+                                let mode = ui.input(|input| selection_mode(input.modifiers));
+                                if mode != SelectionMode::Replace || !self.selection.contains(&n.id) {
+                                    self.selection.select_node(&n.id, mode);
+                                }
+                                self.history.remember(&self.graph);
+                                self.dragging = self
+                                    .selection
+                                    .contains(&n.id)
+                                    .then(|| n.id.clone());
+                                self.marquee = None;
                                 self.param_page.clear();
                             }
                         } else {
-                            self.selected = None;
+                            self.marquee = Some(Marquee {
+                                start: pos,
+                                current: pos,
+                                mode: ui.input(|input| selection_mode(input.modifiers)),
+                            });
                         }
                     }
                 }
-                if resp.dragged() && ui.input(|i| i.pointer.primary_down()) && self.wire.is_none() {
-                    let d = resp.drag_delta() / self.zoom;
+                if resp.dragged()
+                    && ui.input(|i| i.pointer.primary_down())
+                    && !space_down
+                    && self.wire.is_none()
+                {
+                    let d = ui.input(|input| input.pointer.delta()) / self.zoom;
                     if let Some(id) = &self.resizing.clone() {
                         let sz = self.sizes.entry(id.clone()).or_insert(Vec2::new(NODE_W, NODE_H));
                         sz.x = (sz.x + d.x).clamp(90.0, 360.0);
                         sz.y = (sz.y + d.y).clamp(56.0, 280.0);
-                    } else if let Some(id) = &self.dragging {
-                        if let Some(n) = self.graph.nodes.iter_mut().find(|n| n.id == *id) {
-                            n.layout.x += d.x;
-                            n.layout.y += d.y;
+                    } else if self.dragging.is_some() {
+                        for node in &mut self.graph.nodes {
+                            if self.selection.contains(&node.id) {
+                                node.layout.x += d.x;
+                                node.layout.y += d.y;
+                            }
+                        }
+                    } else if let Some(marquee) = &mut self.marquee {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            marquee.current = pos;
                         }
                     }
                 }
+                if let Some(marquee) = self.marquee {
+                    let rect = marquee.rect().intersect(resp.rect);
+                    painter.rect_filled(rect, 0, SELECT.gamma_multiply(0.08));
+                    painter.rect_stroke(
+                        rect,
+                        0,
+                        Stroke::new(1.0, SELECT.gamma_multiply(0.85)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
                 if resp.drag_stopped() {
-                    if let Some((fnid, fp, is_out)) = self.wire.clone() {
+                    let moved_nodes = self.dragging.is_some();
+                    if let Some(wire) = self.wire.clone() {
                         if let Some(pos) = ctx.pointer_latest_pos() {
-                            for n in &nodes {
-                                for p in &n.ports {
-                                    let c = self.port_pos(origin, n, p);
-                                    if c.distance(pos) < 18.0 * self.zoom {
-                                        if is_out && p.dir == Direction::In {
-                                            self.try_wire(&fnid, &fp, &n.id, &p.name);
-                                        } else if !is_out && p.dir == Direction::Out {
-                                            self.try_wire(&n.id, &p.name, &fnid, &fp);
-                                        }
-                                    }
-                                }
+                            let target = nodes
+                                .iter()
+                                .flat_map(|node| {
+                                    node.ports.iter().filter_map(|port| {
+                                        let distance = self.port_pos(origin, node, port).distance(pos);
+                                        let connection = wire.connection_to(&self.graph, &node.id, port)?;
+                                        (distance < 18.0 * self.zoom)
+                                            .then_some((distance, connection))
+                                    })
+                                })
+                                .min_by(|a, b| a.0.total_cmp(&b.0));
+                            if let Some((_, connection)) = target {
+                                self.try_wire(connection);
+                            } else if resp.rect.contains(pos) {
+                                let graph_pos = self.to_graph(origin, pos);
+                                self.open_op_create(graph_pos, pos, Some(wire));
                             }
                         }
+                    }
+                    if let Some(marquee) = self.marquee.take() {
+                        let rect = marquee.rect();
+                        let ids = self
+                            .graph
+                            .nodes
+                            .iter()
+                            .filter(|node| self.node_rect(origin, node).intersects(rect))
+                            .map(|node| node.id.clone())
+                            .collect::<Vec<_>>();
+                        self.selection.select_many(ids, marquee.mode);
+                        self.param_page.clear();
+                        self.status = format!("selected {} node{}", self.selection.len(), if self.selection.len() == 1 { "" } else { "s" });
                     }
                     self.wire = None;
                     self.dragging = None;
                     self.resizing = None;
+                    if moved_nodes {
+                        self.autosave_due = Some(Instant::now());
+                    }
                 }
                 if let Some(id) = hit_node.clone() {
-                    self.selected = Some(id);
+                    let mode = ui.input(|input| selection_mode(input.modifiers));
+                    self.selection.select_node(id, mode);
                     self.param_page.clear();
                 }
                 if resp.clicked() && hit_node.is_none() && hit_port.is_none() && hit_flag.is_none() {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let on_node = nodes.iter().any(|n| self.node_rect(origin, n).contains(pos));
                         if !on_node {
-                            self.selected = None;
+                            if let Some(edge) = hovered_edge.clone() {
+                                self.selection.select_edge(edge);
+                                self.status = "selected wire  ·  Delete removes it".into();
+                            } else if selection_mode(ui.input(|input| input.modifiers))
+                                == SelectionMode::Replace
+                            {
+                                self.selection.clear();
+                            }
                             self.last_graph_pos = self.to_graph(origin, pos);
                         }
                     }
                 }
                 if let Some(id) = hit_flag {
-                    if resp.clicked() {
-                        if !self.viewer_off.remove(&id) {
-                            self.viewer_off.insert(id);
-                        }
+                    if resp.clicked() && !self.viewer_off.remove(&id) {
+                        self.viewer_off.insert(id);
                     }
                 }
                 if let Some(id) = info_hit {
@@ -1946,10 +3162,7 @@ impl eframe::App for App {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let on_node = nodes.iter().any(|n| self.node_rect(origin, n).contains(pos));
                         if !on_node {
-                            self.last_graph_pos = self.to_graph(origin, pos);
-                            self.op_create = true;
-                            self.op_create_q.clear();
-                            self.op_create_i = 0;
+                            self.open_op_create(self.to_graph(origin, pos), pos, None);
                         }
                     }
                 }
@@ -2018,6 +3231,7 @@ impl eframe::App for App {
 
         if self.op_create {
             let ops = self.filtered_ops(&self.op_create_q);
+            let inserting = self.pending_insert.is_some();
             if self.op_create_i >= ops.len() && !ops.is_empty() {
                 self.op_create_i = ops.len() - 1;
             }
@@ -2025,7 +3239,7 @@ impl eframe::App for App {
                 .title_bar(false)
                 .resizable(false)
                 .collapsible(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, -40.0])
+                .fixed_pos(self.op_create_screen)
                 .frame(
                     Frame::new()
                         .fill(Color32::from_rgb(30, 30, 34))
@@ -2035,7 +3249,15 @@ impl eframe::App for App {
                 )
                 .show(ctx, |ui| {
                     ui.set_min_width(320.0);
-                    ui.label(egui::RichText::new("Add Operator").size(11.0).color(MUTED));
+                    ui.label(
+                        egui::RichText::new(if inserting {
+                            "Insert compatible operator"
+                        } else {
+                            "Add operator"
+                        })
+                        .size(11.0)
+                        .color(MUTED),
+                    );
                     let te = ui.add(
                         egui::TextEdit::singleline(&mut self.op_create_q)
                             .hint_text("type to filter  ·  enter to drop")
@@ -2052,6 +3274,18 @@ impl eframe::App for App {
                     ui.add_space(4.0);
                     let mut chosen: Option<Operator> = None;
                     egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                        if ops.is_empty() {
+                            ui.label(
+                                egui::RichText::new(if inserting {
+                                    "No compatible operators match."
+                                } else {
+                                    "No operators match."
+                                })
+                                .size(12.0)
+                                .color(MUTED)
+                                .italics(),
+                            );
+                        }
                         for (i, op) in ops.iter().enumerate() {
                             let on = i == self.op_create_i;
                             let fill = if on {
@@ -2089,7 +3323,11 @@ impl eframe::App for App {
                         self.drop_op(&op, pos);
                     }
                     ui.add_space(4.0);
-                    ui.label(egui::RichText::new("esc to close  ·  tab toggles").size(10.0).color(MUTED));
+                    ui.label(
+                        egui::RichText::new("enter to place  ·  esc/tab to close")
+                            .size(10.0)
+                            .color(MUTED),
+                    );
                 });
         }
 
@@ -2140,38 +3378,51 @@ impl eframe::App for App {
     }
 }
 
-fn param_row(ui: &mut egui::Ui, label: &str, entry: &mut ParamValue, min: Option<i64>, max: Option<i64>) {
-    ui.horizontal(|ui| {
+#[derive(Clone, Copy, Default)]
+struct ParamEdit {
+    began: bool,
+    changed: bool,
+}
+
+fn param_row(
+    ui: &mut egui::Ui,
+    label: &str,
+    entry: &mut ParamValue,
+    min: Option<i64>,
+    max: Option<i64>,
+) -> ParamEdit {
+    let edit = ui.horizontal(|ui| {
         ui.add_space(8.0);
         ui.add_sized(
             Vec2::new(72.0, 18.0),
             egui::Label::new(egui::RichText::new(label).color(MUTED).size(11.0)).halign(egui::Align::RIGHT),
         );
         ui.add_space(6.0);
-        match entry {
+        let response = match entry {
             ParamValue::String(s) => {
                 ui.add(
                     egui::TextEdit::singleline(s)
                         .desired_width(ui.available_width() - 8.0)
                         .font(FontId::proportional(12.0)),
-                );
+                )
             }
             ParamValue::Int(i) => {
                 let mut dv = egui::DragValue::new(i).speed(1.0);
                 if let Some(a) = min {
                     dv = dv.range(a..=max.unwrap_or(i64::MAX));
                 }
-                ui.add(dv);
+                ui.add(dv)
             }
-            ParamValue::Float(f) => {
-                ui.add(egui::DragValue::new(f).speed(0.01));
-            }
-            ParamValue::Bool(b) => {
-                ui.checkbox(b, "");
-            }
+            ParamValue::Float(f) => ui.add(egui::DragValue::new(f).speed(0.01)),
+            ParamValue::Bool(b) => ui.checkbox(b, ""),
+        };
+        ParamEdit {
+            began: response.gained_focus() || response.drag_started() || response.clicked(),
+            changed: response.changed(),
         }
     });
     ui.add_space(3.0);
+    edit.inner
 }
 
 fn common_page(ui: &mut egui::Ui, op: &Operator, viewer_on: bool) {
@@ -2264,5 +3515,15 @@ mod tests {
     #[test]
     fn parse_empty() {
         assert!(parse_fastq("nope").is_none());
+    }
+
+    #[test]
+    fn wire_hit_testing_follows_the_curve() {
+        let from = Pos2::new(0.0, 0.0);
+        let to = Pos2::new(160.0, 80.0);
+        let on_curve = bezier_points(from, to)[14];
+
+        assert!(bezier_distance(from, to, on_curve) < 0.01);
+        assert!(bezier_distance(from, to, Pos2::new(80.0, 180.0)) > 40.0);
     }
 }

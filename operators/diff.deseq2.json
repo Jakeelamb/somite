@@ -1,0 +1,24 @@
+{
+  "id": "diff.deseq2",
+  "title": "DESeq2",
+  "palette": ["RNA"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "Rscript",
+  "conda": { "name": "axial-r", "spec": ["bioconda::bioconductor-deseq2"] },
+  "params": {
+    "design": { "type": "string", "label": "Design", "page": "DESeq2", "default": "~ condition" }
+  },
+  "ports": {
+    "in": [{ "name": "counts", "type": "Table" }],
+    "out": [{ "name": "results", "type": "Table" }]
+  },
+  "argv": [
+    "Rscript",
+    "-e",
+    "message('DESeq2: counts at {input.counts}; write results under {work}/out')"
+  ],
+  "outputs": {
+    "results": { "glob": "{work}/out/*.csv", "type": "Table", "optional": true }
+  }
+}

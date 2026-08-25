@@ -1,0 +1,25 @@
+{
+  "id": "asm.yahs",
+  "title": "YaHS",
+  "palette": ["Assembly"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "yahs",
+  "conda": { "name": "axial-asm", "spec": ["bioconda::yahs"] },
+  "ports": {
+    "in": [
+      { "name": "contigs", "type": "Fasta", "union": ["Fasta", "FastaGz", "Directory"] },
+      { "name": "hic", "type": "Fastq", "union": ["Fastq", "FastqGz", "Bam"], "optional": true }
+    ],
+    "out": [{ "name": "scaffolds", "type": "Fasta" }]
+  },
+  "argv": [
+    "yahs",
+    "{input.contigs}",
+    "{input.hic}",
+    "-o", "{work}/out/yahs"
+  ],
+  "outputs": {
+    "scaffolds": { "glob": "{work}/out/*.fa", "type": "Fasta", "optional": true }
+  }
+}

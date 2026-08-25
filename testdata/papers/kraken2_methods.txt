@@ -1,0 +1,6 @@
+Improved metagenomic analysis with Kraken 2
+Wood, Lu, Langmead. Genome Biology 2019.
+
+Shotgun metagenomic reads were taxonomically classified with Kraken2 against a RefSeq database.
+Kraken2 uses a compact hash table of minimizers to assign reads to the lowest common ancestor.
+A Kraken2 report table was produced per sample. This is taxonomic profiling, not MAG binning.

@@ -1,0 +1,25 @@
+{
+  "id": "var.haplotypecaller",
+  "title": "GATK HaplotypeCaller",
+  "palette": ["Variants"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "gatk",
+  "conda": { "name": "axial-var", "spec": ["bioconda::gatk4"] },
+  "ports": {
+    "in": [
+      { "name": "bam", "type": "Bam" },
+      { "name": "ref", "type": "Fasta", "union": ["Fasta", "FastaGz"], "optional": true }
+    ],
+    "out": [{ "name": "vcf", "type": "Vcf" }]
+  },
+  "argv": [
+    "gatk", "HaplotypeCaller",
+    "-I", "{input.bam}",
+    "-R", "{input.ref}",
+    "-O", "{work}/out/calls.vcf"
+  ],
+  "outputs": {
+    "vcf": { "glob": "{work}/out/calls.vcf", "type": "Vcf", "optional": true }
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "id": "quant.featurecounts",
+  "title": "featureCounts",
+  "palette": ["RNA"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "featureCounts",
+  "conda": { "name": "axial-rna", "spec": ["bioconda::subread"] },
+  "params": {
+    "threads": { "type": "int", "label": "Threads", "page": "Counts", "default": 4, "min": 1, "max": 64 }
+  },
+  "ports": {
+    "in": [
+      { "name": "bam", "type": "Bam" },
+      { "name": "gtf", "type": "Gtf", "union": ["Gtf", "GtfGz"], "optional": true }
+    ],
+    "out": [{ "name": "counts", "type": "Table" }]
+  },
+  "argv": [
+    "featureCounts",
+    "-T", "{param.threads}",
+    "-a", "{input.gtf}",
+    "-o", "{work}/out/counts.txt",
+    "{input.bam}"
+  ],
+  "outputs": {
+    "counts": { "glob": "{work}/out/counts.txt", "type": "Table", "optional": true }
+  }
+}

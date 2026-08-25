@@ -1,0 +1,8 @@
+From FastQ data to high-confidence variant calls: the Genome Analysis Toolkit best practices pipeline
+Van der Auwera et al. Current Protocols in Bioinformatics 2013. PMC4243306.
+
+Whole genome sequencing reads in FASTQ were aligned to the reference genome with BWA-MEM.
+Duplicate reads were marked with Picard MarkDuplicates.
+Base quality scores were recalibrated with GATK BaseRecalibrator.
+Germline variants were called with GATK HaplotypeCaller following the GATK Best Practices.
+The resulting VCF was filtered with variant quality score recalibration (VQSR).

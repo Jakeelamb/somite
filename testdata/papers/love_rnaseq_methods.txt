@@ -1,0 +1,9 @@
+RNA-Seq workflow: gene-level exploratory analysis and differential expression
+Love, Anders, Kim, Huber. F1000Research 2015, 4:1070. PMC4670015.
+
+RNA-seq reads (SRR1039520, project SRP033351) were downloaded from the Sequence Read Archive.
+The reads were aligned to the Ensembl release 75 human reference genome (GRCh37) using the STAR read aligner.
+STAR --genomeDir ENSEMBL.homo_sapiens.release-75 --readFilesIn fastq/SRR1039520_1.fastq fastq/SRR1039520_2.fastq --runThreadN 12
+SAMtools was used to generate BAM files from the STAR SAM output.
+Count matrices were generated with featureCounts (Rsubread) or summarizeOverlaps.
+Differential expression was computed with DESeq2 using a design formula ~ cell + dex.

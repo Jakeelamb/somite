@@ -1,0 +1,23 @@
+{
+  "id": "archive.unzip",
+  "title": "Unpack ZIP",
+  "palette": ["Files", "Archives"],
+  "kind": "external",
+  "cost": "low",
+  "bin": "unzip",
+  "params": {},
+  "ports": {
+    "in": [{ "name": "archive", "type": "Zip" }],
+    "out": [{ "name": "directory", "type": "Directory" }]
+  },
+  "argv": [
+    "unzip",
+    "-q",
+    "{input.archive}",
+    "-d",
+    "{work}/out/package"
+  ],
+  "outputs": {
+    "directory": { "glob": "{work}/out/package", "type": "Directory" }
+  }
+}

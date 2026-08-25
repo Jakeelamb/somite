@@ -1,0 +1,11 @@
+Towards complete and error-free genome assemblies of all vertebrate species
+Rhie et al. Nature 2021. PMC8081667. Vertebrate Genome Project.
+
+Iterative assembly pipeline
+PacBio continuous long reads (CLR) were assembled into haplotype-separated contigs with FALCON.
+False duplications were removed with Purge_Dups (and Purge_Haplotigs).
+Scaffolds were generated with 10X Genomics linked reads, Bionano optical maps, and Hi-C
+(Arima Genomics, Dovetail Genomics, or Phase Genomics) using Salsa.
+Gap filling and base-call polishing followed scaffolding, then manual curation.
+Assembly completeness was assessed with BUSCO (vertebrate gene set) and Merqury k-mers.
+Hi-C interaction maps were used to assign scaffolds to chromosomes.

@@ -1,0 +1,5 @@
+RNA-seq was analysed with the nf-core/rnaseq pipeline (Nextflow).
+Raw Illumina reads (SRR8890201) were quality-checked with FastQC, then the
+community-curated nf-core/rnaseq workflow performed alignment with STAR,
+quantification, and MultiQC reporting. Reference genome GRCh38.
+The nf-core framework provides portable, reproducible bioinformatics pipelines.

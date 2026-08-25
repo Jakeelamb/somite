@@ -11,7 +11,7 @@
     "mode": { "type": "string", "label": "Mode", "page": "BUSCO", "default": "genome" }
   },
   "ports": {
-    "in": [{ "name": "fasta", "type": "Fasta", "union": ["Fasta", "FastaGz"] }],
+    "in": [{ "name": "fasta", "type": "Fasta", "union": ["Fasta", "FastaGz", "Directory"] }],
     "out": [{ "name": "report", "type": "Directory" }]
   },
   "argv": [

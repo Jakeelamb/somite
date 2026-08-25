@@ -1,0 +1,29 @@
+{
+  "id": "quant.salmon",
+  "title": "Salmon",
+  "palette": ["RNA"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "salmon",
+  "conda": { "name": "axial-rna", "spec": ["bioconda::salmon"] },
+  "params": {
+    "libtype": { "type": "string", "label": "Lib type", "page": "Salmon", "default": "A" }
+  },
+  "ports": {
+    "in": [
+      { "name": "fastq", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
+      { "name": "index", "type": "Directory", "union": ["Directory", "Fasta", "FastaGz"], "optional": true }
+    ],
+    "out": [{ "name": "quant", "type": "Table" }]
+  },
+  "argv": [
+    "salmon", "quant",
+    "-i", "{input.index}",
+    "-l", "{param.libtype}",
+    "-r", "{input.fastq}",
+    "-o", "{work}/out"
+  ],
+  "outputs": {
+    "quant": { "glob": "{work}/out/quant.sf", "type": "Table", "optional": true }
+  }
+}

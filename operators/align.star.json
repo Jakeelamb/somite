@@ -1,0 +1,30 @@
+{
+  "id": "align.star",
+  "title": "STAR",
+  "palette": ["RNA"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "STAR",
+  "conda": { "name": "axial-rna", "spec": ["bioconda::star"] },
+  "params": {
+    "threads": { "type": "int", "label": "Threads", "page": "STAR", "default": 8, "min": 1, "max": 64 }
+  },
+  "ports": {
+    "in": [
+      { "name": "fastq", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
+      { "name": "genome", "type": "Directory", "union": ["Directory", "Fasta", "FastaGz"], "optional": true }
+    ],
+    "out": [{ "name": "bam", "type": "Bam" }]
+  },
+  "argv": [
+    "STAR",
+    "--runThreadN", "{param.threads}",
+    "--genomeDir", "{input.genome}",
+    "--readFilesIn", "{input.fastq}",
+    "--outFileNamePrefix", "{work}/out/star",
+    "--outSAMtype", "BAM", "SortedByCoordinate"
+  ],
+  "outputs": {
+    "bam": { "glob": "{work}/out/*.bam", "type": "Bam", "optional": true }
+  }
+}

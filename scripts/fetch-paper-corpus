@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+pdf_dir="$root/testdata/papers/pdf"
+raw_dir="$root/testdata/papers/raw"
+mkdir -p "$pdf_dir" "$raw_dir"
+
+for bin in curl sha256sum pdftotext; do
+    command -v "$bin" >/dev/null || {
+        echo "missing required command: $bin" >&2
+        exit 1
+    }
+done
+
+fetch() {
+    local url=$1
+    local destination=$2
+    local expected=$3
+    local current
+    if [[ -f "$destination" ]]; then
+        current=$(sha256sum "$destination" | awk '{print $1}')
+        if [[ "$current" == "$expected" ]]; then
+            echo "verified ${destination#"$root"/}"
+            return
+        fi
+    fi
+
+    local staged
+    staged=$(mktemp "$destination.download.XXXXXX")
+    if ! curl --fail --location --silent --show-error "$url" --output "$staged"; then
+        rm -f "$staged"
+        exit 1
+    fi
+    current=$(sha256sum "$staged" | awk '{print $1}')
+    if [[ "$current" != "$expected" ]]; then
+        echo "checksum mismatch for $url" >&2
+        echo "expected $expected" >&2
+        echo "actual   $current" >&2
+        rm -f "$staged"
+        exit 1
+    fi
+    install -m 0644 "$staged" "$destination"
+    rm -f "$staged"
+    echo "downloaded ${destination#"$root"/}"
+}
+
+pmc=https://pmc-oa-opendata.s3.amazonaws.com
+fetch "$pmc/PMC4670015.1/PMC4670015.1.pdf" \
+    "$pdf_dir/love_f1000.pdf" \
+    42acc228c7edde7af9953ff1ba82cb69090c6a822c4bb6fe42a09c9e9b3d3124
+fetch "$pmc/PMC8081667.1/PMC8081667.1.pdf" \
+    "$pdf_dir/rhie_vgp.pdf" \
+    f3b9f8d7a441f812cb6bc77b7fd189c28092c61a911817ea688db21a3e4f18b4
+fetch "$pmc/PMC6883579.1/PMC6883579.1.pdf" \
+    "$pdf_dir/wood_kraken2.pdf" \
+    3da3d574531deaa552ac6c5780f12c98781bd98e2788339ed5dd5cd28b6eb54f
+fetch "https://arxiv.org/pdf/2008.01237v1" \
+    "$pdf_dir/cheng_hifiasm.pdf" \
+    b3545e50e207ba963481237edbc3e457eaf8549c8077e723f396cab3d8dad863
+fetch "$pmc/PMC10662043.1/PMC10662043.1.pdf" \
+    "$pdf_dir/cwl_workflows.pdf" \
+    158cc3d126bae341848479c6f749f958c40ca319af1bacfe281d323edce7b4c6
+fetch "$pmc/PMC7111497.1/PMC7111497.1.pdf" \
+    "$pdf_dir/sarek.pdf" \
+    4cdf8ccba0057c39b0fa165b3d538b599834a66ac62c36864dfca21ea2047c88
+fetch "$pmc/PMC9580859.1/PMC9580859.1.pdf" \
+    "$pdf_dir/minto.pdf" \
+    6ec24fc7084849c2ae8be900d3c494b4988abcd63db7c15e9ae1cd290e74a202
+fetch "$pmc/PMC11443813.1/PMC11443813.1.pdf" \
+    "$pdf_dir/scrnabox.pdf" \
+    d00e84199b732bdba06c32eee94d69f848b61078627071dfa309865ec01611ae
+
+# These two PMC author manuscripts are licensed for text/data mining rather
+# than redistribution as OA PDFs. The official PMC dataset provides text.
+fetch "$pmc/PMC5032908.1/PMC5032908.1.txt" \
+    "$raw_dir/pertea_hisat.txt" \
+    63d6390de9ea01b2a9090f98a69af921c34718b672d2f65ccd2eb667e6c312eb
+fetch "$pmc/PMC4243306.1/PMC4243306.1.txt" \
+    "$raw_dir/gatk_best_practices.txt" \
+    3ab99142897c3ced9cb7c1b49b23e759463302b208420815985ed4c5dc1e6714
+fetch "$pmc/PMC10662043.1/PMC10662043.1.txt" \
+    "$raw_dir/cwl_workflows_pmc.txt" \
+    cdb1ec2a1b3a30fe5ca290a3941471b6073d81847f485fb2843a908bd6ff5092
+fetch "$pmc/PMC7111497.1/PMC7111497.1.txt" \
+    "$raw_dir/sarek_pmc.txt" \
+    534cb066aabaeb45a150990eb273fa1251372b326e8f96c9d4a186158bbdf689
+fetch "$pmc/PMC9580859.1/PMC9580859.1.txt" \
+    "$raw_dir/minto_pmc.txt" \
+    5c9b48c3681a2d7f75af1ad4c995b387d008fd951523a9afd306c3f02ebc19a8
+fetch "$pmc/PMC11443813.1/PMC11443813.1.txt" \
+    "$raw_dir/scrnabox_pmc.txt" \
+    a3a7ebd40c9f4814970c3f2a78dc9a9fb69ba56dc2932636eb15ca19b3de410d
+
+for paper in \
+    love_f1000 rhie_vgp wood_kraken2 cheng_hifiasm \
+    cwl_workflows sarek minto scrnabox; do
+    pdftotext -layout -q "$pdf_dir/$paper.pdf" "$raw_dir/$paper.txt"
+done
+
+echo "paper corpus ready"

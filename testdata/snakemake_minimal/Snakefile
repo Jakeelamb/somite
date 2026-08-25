@@ -1,0 +1,10 @@
+rule all:
+    input:
+        "results/hello.txt"
+
+
+rule hello:
+    output:
+        "results/hello.txt"
+    shell:
+        "mkdir -p results && printf 'Axial cooked Snakemake.\\n' > {output}"

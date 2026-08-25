@@ -58,9 +58,55 @@ v0.1: **constant mode only**. No expression/export/bind.
 
 `enable` when a param only makes sense if another is on (TD enable flag).
 
-## Palette (copy TD OP Create)
+## Library (TD OP Create, organized for biology)
 
 Double-click empty network or **Tab**: search operators, drop node. Not a wall of 1000 icons.
+
+The docked Library uses the same search-and-drop interaction without forcing
+every kind of work into one flat tree:
+
+- **Build** groups tools by intent: quality, align and map, quantify, assemble,
+  analyze, and utilities.
+- **Sources** groups NCBI/SRA, Ensembl, and local-file inputs.
+- **Pipelines** opens local Snakemake projects and combines Axial's typed
+  curated wrappers with the official nf-core catalog.
+
+One search spans all three modes. Recent tools and starred Favorites are
+session shortcuts, not new operator types. Rows show a compact purpose line;
+hover reveals the full description, typed ports, and topics. Quick Add routes
+directly to read import, accession entry, pipeline discovery, or a Snakemake
+project directory.
+
+Dragging a wire onto empty network opens OP Create filtered to compatible
+operators. Choosing one places it at the drop point and completes the wire in
+one action.
+
+The Sources accession box recognizes public SRA run accessions (`SRR`, `ERR`,
+`DRR`) and NCBI assembly accessions (`GCA_`, `GCF_`). SRA insertion creates and
+wires the download and FASTQ-conversion nodes; assembly insertion creates and
+wires the data-package download and ZIP-unpack nodes. Pipelines searches the
+official cached nf-core catalog and every result is click- or drag-insertable.
+Discovery never auto-cooks high-cost downloads or pipelines.
+
+Opening or dropping a directory with `Snakefile` or `workflow/Snakefile`
+creates a typed directory-import → Snakemake pair. The workflow engine receives
+a writable staged copy, never the immutable CAS directory. Its completed
+project directory is captured as the `run: Directory` output. Parameters expose
+cores, dry-run, keep-going, printed commands, and Snakemake's Conda deployment.
+
+## Canvas controls
+
+- Wheel/trackpad: pan in two axes.
+- Pinch or Ctrl/Cmd-wheel: zoom around the cursor.
+- Space + primary drag, middle drag, or secondary drag: pan.
+- Empty-space drag: marquee select. Shift adds; Ctrl/Cmd toggles.
+- Drag any selected node: move the whole selected group.
+- Ctrl/Cmd-D: duplicate selected nodes and their internal wires.
+- Click a wire: select it; Delete removes the selected wire or nodes.
+- Ctrl/Cmd-Z / Shift-Ctrl/Cmd-Z: undo / redo graph edits.
+- Edit the node name in the parameter header to rename it without breaking wires.
+- Ctrl/Cmd-S: save the graph. Valid edits also maintain `.axial/autosave.axial.json` for startup recovery.
+- F: fit the graph.
 
 ## Components (our Technique)
 

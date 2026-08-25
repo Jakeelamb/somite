@@ -1,0 +1,16 @@
+{
+  "id": "files.import_directory",
+  "title": "Import directory",
+  "palette": ["Files"],
+  "kind": "inprocess",
+  "cost": "low",
+  "params": {
+    "path": { "type": "string", "label": "Path", "page": "Directory", "required": true }
+  },
+  "ports": {
+    "in": [],
+    "out": [{ "name": "directory", "type": "Directory" }]
+  },
+  "argv": [],
+  "outputs": {}
+}

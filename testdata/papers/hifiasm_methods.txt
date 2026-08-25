@@ -1,0 +1,7 @@
+Haplotype-resolved de novo assembly using phased assembly graphs with hifiasm
+Cheng, Concepcion, Feng, Zhang, Li. Nature Methods 2021.
+
+PacBio HiFi reads were assembled with hifiasm to produce haplotype-resolved contig assemblies.
+When Hi-C data were available, hifiasm was run in Hi-C mode to phase haplotypes.
+Contig assemblies were evaluated for completeness.
+Contig N50 and BUSCO completeness were recorded for the haplotype-resolved assemblies.

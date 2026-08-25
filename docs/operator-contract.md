@@ -184,6 +184,30 @@ Pin `-r`. `nextflow_schema.json` → params. Do not wrap `nf-core/fetchngs`; use
 
 ---
 
+## How to run a Snakemake workflow
+
+The checked-in `smk.workflow` operator is the workflow-engine analogue of a
+blunt `nextflow run`, with one important staging rule:
+
+1. Import the project directory through `files.import_directory`.
+2. Wire its `Directory` output to `smk.workflow.workflow`.
+3. Axial copies that directory into the cook attempt before running
+   `snakemake --directory <copy> --cores <n>`.
+4. Axial ingests the completed copy as `run: Directory`.
+
+Directory inputs MUST be staged as copies, not CAS symlinks, because Snakemake
+normally writes results and `.snakemake` metadata beside the workflow. The
+source directory and CAS object MUST remain immutable. `use_conda`, `dry_run`,
+`keep_going`, and `printshellcmds` map to Snakemake CLI flags; no shell wrapper
+or second execution engine is involved.
+
+A catalog workflow is not automatically a typed Axial operator. Its repository
+must first be reviewed for configuration, target, input, output, revision, and
+license expectations. Once those are explicit, wrap it as a more specific
+`smk.<name>` operator or compile its useful tools into Axial bricks.
+
+---
+
 ## Sheet (the anti-Lego, solved)
 
 Almost every nf-core pipeline takes a CSV samplesheet. That is a form, not a snap.

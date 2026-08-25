@@ -1,0 +1,31 @@
+{
+  "id": "align.minimap2",
+  "title": "minimap2",
+  "palette": ["Assembly"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "minimap2",
+  "conda": { "name": "axial-asm", "spec": ["bioconda::minimap2"] },
+  "params": {
+    "preset": { "type": "string", "label": "Preset", "page": "minimap2", "default": "map-hifi" },
+    "threads": { "type": "int", "label": "Threads", "page": "minimap2", "default": 8, "min": 1, "max": 64 }
+  },
+  "ports": {
+    "in": [
+      { "name": "reads", "type": "Fastq", "union": ["Fastq", "FastqGz", "Fasta", "FastaGz"] },
+      { "name": "ref", "type": "Fasta", "union": ["Fasta", "FastaGz", "Directory"], "optional": true }
+    ],
+    "out": [{ "name": "bam", "type": "Bam" }]
+  },
+  "argv": [
+    "minimap2",
+    "-t", "{param.threads}",
+    "-ax", "{param.preset}",
+    "{input.ref}",
+    "{input.reads}",
+    "-o", "{work}/out/aln.sam"
+  ],
+  "outputs": {
+    "bam": { "glob": "{work}/out/aln.sam", "type": "Bam", "optional": true }
+  }
+}

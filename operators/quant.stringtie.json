@@ -1,0 +1,25 @@
+{
+  "id": "quant.stringtie",
+  "title": "StringTie",
+  "palette": ["RNA"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "stringtie",
+  "conda": { "name": "axial-rna", "spec": ["bioconda::stringtie"] },
+  "ports": {
+    "in": [
+      { "name": "bam", "type": "Bam" },
+      { "name": "gtf", "type": "Gtf", "union": ["Gtf", "GtfGz"], "optional": true }
+    ],
+    "out": [{ "name": "abund", "type": "Gtf" }]
+  },
+  "argv": [
+    "stringtie",
+    "{input.bam}",
+    "-G", "{input.gtf}",
+    "-o", "{work}/out/transcripts.gtf"
+  ],
+  "outputs": {
+    "abund": { "glob": "{work}/out/transcripts.gtf", "type": "Gtf", "optional": true }
+  }
+}

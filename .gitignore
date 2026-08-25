@@ -2,3 +2,5 @@
 **/.axial/
 *.swp
 .DS_Store
+testdata/papers/pdf/
+testdata/papers/raw/

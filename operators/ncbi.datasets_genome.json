@@ -11,7 +11,7 @@
   },
   "ports": {
     "in": [],
-    "out": [{ "name": "zip", "type": "Directory", "optional": true }]
+    "out": [{ "name": "zip", "type": "Zip", "optional": true }]
   },
   "argv": [
     "datasets",
@@ -23,6 +23,6 @@
     "{work}/out/genome.zip"
   ],
   "outputs": {
-    "zip": { "glob": "{work}/out/genome.zip", "type": "Directory", "optional": true }
+    "zip": { "glob": "{work}/out/genome.zip", "type": "Zip", "optional": true }
   }
 }

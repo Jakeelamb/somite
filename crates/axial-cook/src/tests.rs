@@ -125,3 +125,51 @@ fn import_then_rnaseq_sheet() {
     assert!(csv.contains("t.fastq"), "{csv}");
     assert!(csv.contains("sample1"), "{csv}");
 }
+
+#[test]
+fn directory_inputs_are_staged_as_writable_copies() {
+    let dir = tempdir().unwrap();
+    let workflow = dir.path().join("workflow-project");
+    std::fs::create_dir(&workflow).unwrap();
+    std::fs::write(workflow.join("Snakefile"), b"rule all:\n    input: []\n").unwrap();
+
+    let project = Project::open(dir.path()).unwrap();
+    let (_hash, meta) = project.put_dir(&workflow, PortType::Directory).unwrap();
+    let staged = project.stage(&meta, &dir.path().join("stage")).unwrap();
+    std::fs::write(staged.join("results.txt"), b"complete\n").unwrap();
+
+    assert!(staged.join("results.txt").is_file());
+    assert!(!project.cas_path(&meta.hash).join("results.txt").exists());
+}
+
+#[test]
+fn imports_a_workflow_directory_as_a_typed_artifact() {
+    let dir = tempdir().unwrap();
+    let workflow = dir.path().join("workflow-project");
+    std::fs::create_dir(&workflow).unwrap();
+    std::fs::write(workflow.join("Snakefile"), b"rule all:\n    input: []\n").unwrap();
+    let ops = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators");
+    let catalog = Catalog::load_dir(&ops).unwrap();
+    let operator = catalog.get("files.import_directory").unwrap();
+    let graph = Graph {
+        schema_version: SCHEMA_VERSION,
+        nodes: vec![Node {
+            id: "workflow1".into(),
+            operator: operator.id.clone(),
+            ports: operator.ir_ports(),
+            params: BTreeMap::from([(
+                "path".into(),
+                ParamValue::String(workflow.display().to_string()),
+            )]),
+            layout: Layout { x: 0.0, y: 0.0 },
+            note: None,
+        }],
+        edges: vec![],
+    };
+
+    let project = Project::open(dir.path()).unwrap();
+    let report = cook_graph(&project, &catalog, &graph).unwrap();
+    let artifact = &report.artifacts["workflow1"]["directory"];
+    assert_eq!(artifact.declared_type, PortType::Directory);
+    assert!(project.cas_path(&artifact.hash).join("Snakefile").is_file());
+}

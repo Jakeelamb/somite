@@ -25,6 +25,7 @@ pub enum PortType {
     Json,
     Html,
     Image,
+    Zip,
     Directory,
     Text,
     Preview,

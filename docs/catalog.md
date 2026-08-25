@@ -36,11 +36,32 @@ Acceptance: fixture FASTQ → FastQC PNG in CAS; second cook skips. Live SRA opt
 
 ### Tier 2 — nf-core demand signal, not a port list
 
+The canvas may discover every released, non-archived pipeline from nf-core's
+official catalog. These generated entries are generic pipeline operators with a
+pinned latest release, optional samplesheet input, and results directory output.
+They are a smooth discovery and launch path, not a claim that every pipeline's
+full schema has been curated. A checked-in operator with the same `nf.<name>` ID
+wins and supplies richer typed ports and parameters.
+
 rnaseq 1356★, sarek 594, scrnaseq 350, mag 316, ampliseq 257, taxprofiler 192, …
 
 User paths: wrap modules as bricks, or `nextflow run` as a `Directory` compound, or agent-compile a small graph (the HoX `bulk-rna-v1` move). Axial ships **none** of those as a tasteful native app. An in-tree compile is a fixture for `ops wrap`.
 
 `fetchngs` is not ingest. Use SRA bricks.
+
+### Tier 2b — Snakemake projects
+
+`files.import_directory → smk.workflow` is the native local-project boundary.
+The Library accepts a project containing `Snakefile` or `workflow/Snakefile`,
+stages it as a writable copy, and invokes `snakemake --directory <copy>` with
+explicit cores and execution flags. The completed project returns as a typed
+`Directory`; the original and CAS copy remain unchanged.
+
+The Snakemake Workflow Catalog is useful discovery, but it is not treated as a
+uniform typed API: repositories retain their own configuration, targets,
+licenses, and output conventions. Axial therefore runs a chosen local project
+honestly instead of pretending every catalog entry shares an nf-core-style
+launch contract.
 
 ### Tier 3 — never Axial's job
 

@@ -142,13 +142,8 @@ impl Project {
         let _ = fs::remove_file(&dest);
         let _ = fs::remove_dir_all(&dest);
         if src.is_dir() {
-            #[cfg(unix)]
-            {
-                if std::os::unix::fs::symlink(&src, &dest).is_err() {
-                    copy_tree(&src, &dest)?;
-                }
-            }
-            #[cfg(not(unix))]
+            // A workflow engine may create results beside its Snakefile. Keep
+            // the CAS immutable by staging directories as writable copies.
             copy_tree(&src, &dest)?;
             return Ok(dest);
         }
@@ -466,7 +461,9 @@ fn cook_node(
         return Ok((NodeState::Done, arts));
     }
 
-    if op.kind == OpKind::Inprocess && op.id == "files.import" {
+    if op.kind == OpKind::Inprocess
+        && matches!(op.id.as_str(), "files.import" | "files.import_directory")
+    {
         let path = match node.params.get("path") {
             Some(ParamValue::String(s)) => {
                 let p = PathBuf::from(s);
@@ -478,13 +475,23 @@ fn cook_node(
             }
             _ => return Err(CookError::Msg("files.import needs param path".into())),
         };
-        let ty = node
-            .port("file", Direction::Out)
-            .map(|p| p.ty)
-            .unwrap_or(PortType::Fastq);
-        let (_h, meta) = project.put_file(&path, ty)?;
+        let (port, ty) = if op.id == "files.import_directory" {
+            ("directory", PortType::Directory)
+        } else {
+            (
+                "file",
+                node.port("file", Direction::Out)
+                    .map(|p| p.ty)
+                    .unwrap_or(PortType::Fastq),
+            )
+        };
+        let (_h, meta) = if ty == PortType::Directory {
+            project.put_dir(&path, ty)?
+        } else {
+            project.put_file(&path, ty)?
+        };
         let mut arts = BTreeMap::new();
-        arts.insert("file".into(), meta);
+        arts.insert(port.into(), meta);
         let out = BindingsOut {
             artifacts: arts.clone(),
         };

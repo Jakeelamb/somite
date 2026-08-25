@@ -1,0 +1,10 @@
+Transcript-level expression analysis of RNA-seq experiments with HISAT, StringTie and Ballgown
+Pertea et al. Nature Protocols 2016. PMC5032908.
+
+This protocol analyzes RNA-seq data with the new Tuxedo pipeline.
+Paired-end Illumina RNA-seq reads were quality-checked with FastQC.
+Reads were aligned to the human genome with HISAT2.
+Aligned reads were assembled into transcripts and quantified with StringTie.
+Transcript assemblies were merged, then StringTie was rerun to estimate abundances.
+Differential expression at transcript and gene level was tested with Ballgown.
+Gene counts can alternatively be taken forward to DESeq2.

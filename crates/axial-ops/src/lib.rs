@@ -210,7 +210,11 @@ pub fn render_argv(op: &Operator, b: &Bindings<'_>) -> Result<Vec<String>, OpsEr
             }
             continue;
         }
-        if let Some(name) = tok.strip_prefix("{input.").and_then(|s| s.strip_suffix("}")) {
+        if let Some(name) = tok
+            .strip_prefix("{input.")
+            .and_then(|value| value.strip_suffix('}'))
+            .filter(|name| !name.contains(['{', '}', '/']))
+        {
             if let Some(p) = b.inputs.get(name) {
                 out.push(p.display().to_string());
             } else if op.ports.r#in.iter().any(|p| p.name == name && p.optional) {
@@ -346,5 +350,55 @@ mod tests {
         };
         let a = render_argv(&op, &b).unwrap();
         assert_eq!(a, vec!["nextflow", "--outdir", "/w/out"]);
+    }
+
+    #[test]
+    fn snakemake_workflow_renders_native_cli_arguments() {
+        let catalog = Catalog::load_dir(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"),
+        )
+        .unwrap();
+        let operator = catalog.get("smk.workflow").unwrap();
+        let params = BTreeMap::from([
+            (
+                "snakefile".into(),
+                ParamValue::String("workflow/Snakefile".into()),
+            ),
+            ("cores".into(), ParamValue::Int(8)),
+            ("use_conda".into(), ParamValue::Bool(true)),
+            ("dry_run".into(), ParamValue::Bool(false)),
+            ("keep_going".into(), ParamValue::Bool(true)),
+            ("printshellcmds".into(), ParamValue::Bool(true)),
+        ]);
+        let inputs = BTreeMap::from([(
+            "workflow".into(),
+            PathBuf::from("/w/in/workflow/project"),
+        )]);
+        let work = PathBuf::from("/w");
+        let out = work.join("out");
+        let tmp = work.join("tmp");
+        let bindings = Bindings {
+            params: &params,
+            inputs: &inputs,
+            work_out: &out,
+            work_tmp: &tmp,
+            work: &work,
+        };
+
+        assert_eq!(
+            render_argv(operator, &bindings).unwrap(),
+            vec![
+                "snakemake",
+                "--snakefile",
+                "/w/in/workflow/project/workflow/Snakefile",
+                "--directory",
+                "/w/in/workflow/project",
+                "--cores",
+                "8",
+                "--use-conda",
+                "--keep-going",
+                "--printshellcmds",
+            ]
+        );
     }
 }

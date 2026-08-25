@@ -1,0 +1,28 @@
+{
+  "id": "align.bwa",
+  "title": "BWA-MEM",
+  "palette": ["Variants"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "bwa",
+  "conda": { "name": "axial-var", "spec": ["bioconda::bwa"] },
+  "params": {
+    "threads": { "type": "int", "label": "Threads", "page": "BWA", "default": 8, "min": 1, "max": 64 }
+  },
+  "ports": {
+    "in": [
+      { "name": "fastq", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
+      { "name": "ref", "type": "Fasta", "union": ["Fasta", "FastaGz"], "optional": true }
+    ],
+    "out": [{ "name": "bam", "type": "Bam" }]
+  },
+  "argv": [
+    "bwa", "mem",
+    "-t", "{param.threads}",
+    "{input.ref}",
+    "{input.fastq}"
+  ],
+  "outputs": {
+    "bam": { "glob": "{work}/out/*", "type": "Bam", "optional": true }
+  }
+}
