@@ -92,7 +92,7 @@ New artifact type = design change (CAS, staging, sniff). New kind = a string in 
 
 1. **Typed ports.** Every file the tool reads or writes is a named port with a type from the closed list. Params are scalars, not files (unless the file is a path the user types and `files.import` already ingested).
 2. **JSON schema, deny unknown fields.** `operators/<id>.json`. Overlay: project > `~/.config/axial/operators/` > shipped.
-3. **argv is execve tokens.** No `/bin/sh -c`. Tokens MAY mix `{param.x}`, `{input.x}`, `{work}/out`. `{flag.x}` omits the whole token when false.
+3. **argv is execve tokens.** No `/bin/sh -c`. Tokens MAY mix `{param.x}`, `{input.x}`, `{work}/out`. `{flag.x}` omits the whole token when false. Prefix a token with `?r2:` to include it only when input `r2` is bound, or `?!r2:` only when it is unbound; this keeps one honest wrapper for paired- and single-end CLI forms.
 4. **Outputs are globs** after spawn, then ingested to CAS. One match, or `optional: true`. Two+ = `GlobMulti`. `exclude` is allowed (see `fasterq-dump` unpaired).
 5. **Do not write `$HOME`.** Out dir is `{work}/out`. SRA: always `-O`. FastQC: `-o` directory MUST exist (supervisor `mkdir -p`).
 6. **Exit 0 means success** unless `success_exit_codes` says otherwise.

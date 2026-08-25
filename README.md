@@ -16,25 +16,41 @@ cargo run -p axial-app
 
 Canvas controls: wheel/trackpad pans; pinch or Ctrl/Cmd-wheel zooms at the
 cursor; Space-, middle-, or right-drag pans; Tab or empty-space double-click
-adds an operator; dragging a wire onto empty space opens a compatible-tool
-picker; Ctrl/Cmd-D duplicates; Ctrl/Cmd-Z and Shift-Ctrl/Cmd-Z undo/redo; F
+adds an operator. Every output exposes a `+` continuation action that opens a
+type-filtered next-step picker and automatically wires the chosen node. Dragging
+a wire onto empty space opens the same picker. Ctrl/Cmd-K opens and focuses the
+global Library search; Ctrl/Cmd-D duplicates;
+Ctrl/Cmd-Z and Shift-Ctrl/Cmd-Z undo/redo; F
 fits the graph. Drag empty space for marquee selection; Shift adds and Ctrl/Cmd
 toggles nodes. Selected groups move and duplicate together with their internal
 wires. Click a wire to select it, then Delete to remove it. Rename a node in the
 parameter header. Ctrl/Cmd-S saves; edits also write a validated recovery graph
 to `.axial/autosave.axial.json`.
 
-The docked Library has one global search and three focused modes: **Build** for
+The canvas is the primary surface. A compact tool rail opens the Library as a
+temporary overlay, and node parameters appear only while a node is selected.
+The Library has one global search and three focused modes: **Build** for
 task-oriented tools, **Sources** for NCBI/SRA, Ensembl, and local inputs, and
 **Pipelines** for Snakemake projects plus curated and official nf-core
 workflows. Tool rows are
-draggable, recent tools stay close at hand for the session, and the star keeps
-frequent tools in a Favorites section. Hover a row for ports and full details.
+draggable, recent tools stay close at hand, and the star keeps frequent tools
+in a Favorites section. Favorites, recents, and the active Library mode persist
+in `.axial/library-state.json`. Hover a row for ports and full details. The
+footer reports local operator definitions separately from discovered nf-core
+catalog entries; discovery does not imply that a workflow engine is installed.
+nf-core and workflow-engine operators enter the canvas as compact workflow
+cards exposing their typed inputs and outputs instead of expanding their
+internal implementation.
 
-Paste an `SRR` / `ERR` / `DRR` run accession into the palette source box to
-insert a wired `prefetch → fasterq-dump` pair. Paste a `GCA_` / `GCF_` assembly
-accession to insert a wired NCBI Datasets download → ZIP unpack pair. Axial
-prepares the graph; large transfers still require an explicit **Cook**.
+Paste an accession—or its NCBI/Ensembl record URL—into **Sources**. Axial
+recognizes `SRR` / `ERR` / `DRR` runs and inserts a wired
+`prefetch → fasterq-dump` pair with separate R1/R2 streams. `GCA_` / `GCF_`
+assemblies become an NCBI Datasets download → ZIP unpack pair. Ensembl gene,
+transcript, and protein stable IDs (`ENSG`, species-prefixed `ENS…G/T/P`, and
+optional versions) become a direct REST-backed FASTA source with the correct
+genomic, cDNA, or protein sequence type. The source card previews the provider
+and result before insertion and reports whether SRA Toolkit, Datasets, and curl
+are configured. Downloads still require an explicit **Cook**.
 
 The **Pipelines** mode and global Library search query the official nf-core
 catalog by name,
@@ -50,6 +66,10 @@ a `Directory` artifact. The runner exposes cores, dry-run, keep-going, command
 logging, and workflow Conda environments.
 
 Tools run via PATH or `conda run -n <env>` if the operator has a `conda` spec. See `axial env`.
+
+Drop matching R1 and R2 FASTQs together to create a paired-read source with two
+separate streams. Connecting either stream to a paired-aware tool snaps both
+mates when the companion input is free; single-end inputs remain supported.
 
 Paper Drop is a bonus graph-drafting feature. For its optional acceptance
 corpus, run `scripts/fetch-paper-corpus`, then

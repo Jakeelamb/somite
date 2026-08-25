@@ -15,6 +15,8 @@ Proof that agents can compile when the format exists: Jake's agent on HoX, `nf-c
 | `files.import` | in-process | Source. Path relative to the graph file → CAS. |
 | `sra.prefetch` | brick | NCBI data plane. Always `-O`. |
 | `sra.fasterq_dump` | brick | `--split-3`. Optional r2 / unpaired. |
+| `ncbi.datasets_assembly` | brick | GCA/GCF → genome and annotation package. |
+| `ensembl.sequence` | brick | Ensembl stable ID → inferred genomic/cDNA/protein FASTA. |
 | `qc.fastqc` | brick | Wedge inspect. Glob `per_base_quality.png` → `Preview`. |
 
 Acceptance: fixture FASTQ → FastQC PNG in CAS; second cook skips. Live SRA optional.
@@ -25,12 +27,12 @@ Acceptance: fixture FASTQ → FastQC PNG in CAS; second cook skips. Live SRA opt
 
 | id | Snap | Why it is an example |
 |---|---|---|
-| `qc.fastp` | `FastqGz → FastqGz` | Typical CLI, optional r2 |
+| `qc.fastp` | `r1 + r2? → trimmed r1 + r2?` | Paired mates remain separate; single-end remains valid |
 | `sheet.build` | `FastqGz → Table` | Hostile I/O. Adapter, not a boutique module |
-| `align.star` | `FastqGz + Fasta → Bam` | Heavy binary, still JSON + staging |
-| `quant.salmon` | `FastqGz + index → Table` | |
+| `align.star` | `r1 + r2? + genome → Bam` | Heavy binary, still JSON + staging |
+| `quant.salmon` | `r1 + r2? + index → Table` | Selects paired or single CLI form from the bound ports |
 | `samtools.index` | `Bam → Bai` | Tiny glob |
-| `class.kraken2` | `FastqGz + db → Table` | |
+| `class.kraken2` | `r1 + r2? + db → Table` | Adds `--paired` only when r2 is bound |
 
 `hisat2`, `spades`, a lab Python script: wrap it. Do not wait for a tier.
 

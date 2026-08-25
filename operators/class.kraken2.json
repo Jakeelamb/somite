@@ -11,7 +11,8 @@
   },
   "ports": {
     "in": [
-      { "name": "fastq", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
+      { "name": "r1", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
+      { "name": "r2", "type": "Fastq", "union": ["Fastq", "FastqGz"], "optional": true },
       { "name": "db", "type": "Directory", "optional": true }
     ],
     "out": [{ "name": "report", "type": "Table" }]
@@ -22,7 +23,9 @@
     "--threads", "{param.threads}",
     "--report", "{work}/out/report.txt",
     "--output", "{work}/out/class.tsv",
-    "{input.fastq}"
+    "?r2:--paired",
+    "{input.r1}",
+    "{input.r2}"
   ],
   "outputs": {
     "report": { "glob": "{work}/out/report.txt", "type": "Table", "optional": true }

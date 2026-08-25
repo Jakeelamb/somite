@@ -5,7 +5,16 @@ use axial_ir::{Direction, Graph, Layout, Node, ParamValue, Port, PortType, SCHEM
 use axial_ops::Catalog;
 use tempfile::tempdir;
 
-use crate::{cook_graph, NodeState, Project};
+use crate::{command_failure_detail, cook_graph, NodeState, Project};
+
+#[test]
+fn command_failures_surface_a_compact_actionable_message() {
+    assert_eq!(
+        command_failure_detail(b"\ncurl: (22) The requested URL returned error: 404\n", b""),
+        "curl: (22) The requested URL returned error: 404"
+    );
+    assert_eq!(command_failure_detail(b"", b""), "no diagnostic output");
+}
 
 #[test]
 fn import_then_skip() {
@@ -45,6 +54,47 @@ fn import_then_skip() {
     assert!(s1.artifacts.get("n1").unwrap().contains_key("file"));
     let s2 = cook_graph(&proj, &cat, &g).unwrap();
     assert_eq!(s2.states.get("n1"), Some(&NodeState::Cached));
+}
+
+#[test]
+fn paired_import_keeps_mates_as_two_artifacts() {
+    let dir = tempdir().unwrap();
+    let reads = dir.path().join("reads");
+    std::fs::create_dir(&reads).unwrap();
+    std::fs::write(reads.join("sample_R1.fastq"), b"@r1\nACGT\n+\nIIII\n").unwrap();
+    std::fs::write(reads.join("sample_R2.fastq"), b"@r2\nTGCA\n+\nIIII\n").unwrap();
+    let ops = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators");
+    let catalog = Catalog::load_dir(&ops).unwrap();
+    let operator = catalog.get("files.import_paired").unwrap();
+    let graph = Graph {
+        schema_version: SCHEMA_VERSION,
+        nodes: vec![Node {
+            id: "reads1".into(),
+            operator: operator.id.clone(),
+            ports: operator.ir_ports(),
+            params: BTreeMap::from([
+                (
+                    "r1".into(),
+                    ParamValue::String("reads/sample_R1.fastq".into()),
+                ),
+                (
+                    "r2".into(),
+                    ParamValue::String("reads/sample_R2.fastq".into()),
+                ),
+            ]),
+            layout: Layout { x: 0.0, y: 0.0 },
+            note: None,
+        }],
+        edges: vec![],
+    };
+
+    let project = Project::open(dir.path()).unwrap();
+    let report = cook_graph(&project, &catalog, &graph).unwrap();
+    let artifacts = &report.artifacts["reads1"];
+    assert_eq!(artifacts.len(), 2);
+    assert_eq!(artifacts["r1"].declared_type, PortType::Fastq);
+    assert_eq!(artifacts["r2"].declared_type, PortType::Fastq);
+    assert_ne!(artifacts["r1"].hash, artifacts["r2"].hash);
 }
 
 #[test]

@@ -201,7 +201,32 @@ pub struct Bindings<'a> {
 
 pub fn render_argv(op: &Operator, b: &Bindings<'_>) -> Result<Vec<String>, OpsError> {
     let mut out = Vec::new();
-    for tok in &op.argv {
+    for configured in &op.argv {
+        let tok = if let Some((name, token)) = configured
+            .strip_prefix("?!")
+            .and_then(|value| value.split_once(':'))
+        {
+            if !op.ports.r#in.iter().any(|port| port.name == name) {
+                return Err(OpsError::Argv(format!("unknown conditional input {name}")));
+            }
+            if b.inputs.contains_key(name) {
+                continue;
+            }
+            token
+        } else if let Some((name, token)) = configured
+            .strip_prefix('?')
+            .and_then(|value| value.split_once(':'))
+        {
+            if !op.ports.r#in.iter().any(|port| port.name == name) {
+                return Err(OpsError::Argv(format!("unknown conditional input {name}")));
+            }
+            if !b.inputs.contains_key(name) {
+                continue;
+            }
+            token
+        } else {
+            configured.as_str()
+        };
         if let Some(name) = tok.strip_prefix("{flag.").and_then(|s| s.strip_suffix("}")) {
             match b.params.get(name) {
                 Some(ParamValue::Bool(true)) => out.push(format!("--{name}").replace('_', "-")),
@@ -353,11 +378,184 @@ mod tests {
     }
 
     #[test]
-    fn snakemake_workflow_renders_native_cli_arguments() {
-        let catalog = Catalog::load_dir(
-            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"),
+    fn fastp_preserves_both_mates_when_r2_is_bound() {
+        let catalog =
+            Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
+                .unwrap();
+        let operator = catalog.get("qc.fastp").unwrap();
+        let params = BTreeMap::from([("threads".into(), ParamValue::Int(4))]);
+        let inputs = BTreeMap::from([
+            ("r1".into(), PathBuf::from("/reads/sample_R1.fastq.gz")),
+            ("r2".into(), PathBuf::from("/reads/sample_R2.fastq.gz")),
+        ]);
+        let work = PathBuf::from("/w");
+        let bindings = Bindings {
+            params: &params,
+            inputs: &inputs,
+            work_out: &work.join("out"),
+            work_tmp: &work.join("tmp"),
+            work: &work,
+        };
+
+        assert_eq!(
+            render_argv(operator, &bindings).unwrap(),
+            vec![
+                "fastp",
+                "-i",
+                "/reads/sample_R1.fastq.gz",
+                "-o",
+                "/w/out/clean_R1.fastq.gz",
+                "-I",
+                "/reads/sample_R2.fastq.gz",
+                "-O",
+                "/w/out/clean_R2.fastq.gz",
+                "-w",
+                "4",
+            ]
+        );
+    }
+
+    #[test]
+    fn fastp_still_supports_single_end_reads() {
+        let catalog =
+            Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
+                .unwrap();
+        let operator = catalog.get("qc.fastp").unwrap();
+        let params = BTreeMap::from([("threads".into(), ParamValue::Int(4))]);
+        let inputs = BTreeMap::from([("r1".into(), PathBuf::from("/reads/sample.fastq.gz"))]);
+        let work = PathBuf::from("/w");
+        let bindings = Bindings {
+            params: &params,
+            inputs: &inputs,
+            work_out: &work.join("out"),
+            work_tmp: &work.join("tmp"),
+            work: &work,
+        };
+
+        assert_eq!(
+            render_argv(operator, &bindings).unwrap(),
+            vec![
+                "fastp",
+                "-i",
+                "/reads/sample.fastq.gz",
+                "-o",
+                "/w/out/clean_R1.fastq.gz",
+                "-w",
+                "4",
+            ]
+        );
+    }
+
+    #[test]
+    fn paired_consumers_share_the_r1_r2_port_contract() {
+        let catalog =
+            Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
+                .unwrap();
+        for id in [
+            "qc.fastp",
+            "align.star",
+            "align.hisat2",
+            "align.bwa",
+            "quant.salmon",
+            "class.kraken2",
+        ] {
+            let operator = catalog.get(id).unwrap();
+            assert!(operator.ports.r#in.iter().any(|port| port.name == "r1"));
+            assert!(operator
+                .ports
+                .r#in
+                .iter()
+                .any(|port| port.name == "r2" && port.optional));
+        }
+    }
+
+    #[test]
+    fn conditional_tokens_select_hisat2_paired_or_single_form() {
+        let catalog =
+            Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
+                .unwrap();
+        let operator = catalog.get("align.hisat2").unwrap();
+        let params = BTreeMap::from([("threads".into(), ParamValue::Int(8))]);
+        let work = PathBuf::from("/w");
+        let index = PathBuf::from("/ref/hisat2");
+        let r1 = PathBuf::from("/reads/R1.fastq.gz");
+        let r2 = PathBuf::from("/reads/R2.fastq.gz");
+        let paired_inputs = BTreeMap::from([
+            ("index".into(), index.clone()),
+            ("r1".into(), r1.clone()),
+            ("r2".into(), r2),
+        ]);
+        let single_inputs = BTreeMap::from([("index".into(), index), ("r1".into(), r1)]);
+        let render = |inputs: &BTreeMap<String, PathBuf>| {
+            render_argv(
+                operator,
+                &Bindings {
+                    params: &params,
+                    inputs,
+                    work_out: &work.join("out"),
+                    work_tmp: &work.join("tmp"),
+                    work: &work,
+                },
+            )
+            .unwrap()
+        };
+
+        let paired = render(&paired_inputs);
+        assert!(paired
+            .windows(2)
+            .any(|args| args == ["-1", "/reads/R1.fastq.gz"]));
+        assert!(paired
+            .windows(2)
+            .any(|args| args == ["-2", "/reads/R2.fastq.gz"]));
+        assert!(!paired.iter().any(|arg| arg == "-U"));
+
+        let single = render(&single_inputs);
+        assert!(single
+            .windows(2)
+            .any(|args| args == ["-U", "/reads/R1.fastq.gz"]));
+        assert!(!single.iter().any(|arg| arg == "-1" || arg == "-2"));
+    }
+
+    #[test]
+    fn ensembl_stable_id_renders_a_direct_fasta_request() {
+        let catalog =
+            Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
+                .unwrap();
+        let operator = catalog.get("ensembl.sequence").unwrap();
+        let params = BTreeMap::from([
+            (
+                "accession".into(),
+                ParamValue::String("ENSP00000288602".into()),
+            ),
+            ("sequence_type".into(), ParamValue::String("protein".into())),
+        ]);
+        let inputs = BTreeMap::new();
+        let work = PathBuf::from("/w");
+        let argv = render_argv(
+            operator,
+            &Bindings {
+                params: &params,
+                inputs: &inputs,
+                work_out: &work.join("out"),
+                work_tmp: &work.join("tmp"),
+                work: &work,
+            },
         )
         .unwrap();
+
+        assert!(argv.iter().any(|arg| {
+            arg == "https://rest.ensembl.org/sequence/id/ENSP00000288602?type=protein"
+        }));
+        assert!(argv
+            .windows(2)
+            .any(|args| args == ["--output", "/w/out/sequence.fa"]));
+    }
+
+    #[test]
+    fn snakemake_workflow_renders_native_cli_arguments() {
+        let catalog =
+            Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
+                .unwrap();
         let operator = catalog.get("smk.workflow").unwrap();
         let params = BTreeMap::from([
             (
@@ -370,10 +568,7 @@ mod tests {
             ("keep_going".into(), ParamValue::Bool(true)),
             ("printshellcmds".into(), ParamValue::Bool(true)),
         ]);
-        let inputs = BTreeMap::from([(
-            "workflow".into(),
-            PathBuf::from("/w/in/workflow/project"),
-        )]);
+        let inputs = BTreeMap::from([("workflow".into(), PathBuf::from("/w/in/workflow/project"))]);
         let work = PathBuf::from("/w");
         let out = work.join("out");
         let tmp = work.join("tmp");

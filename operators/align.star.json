@@ -11,7 +11,8 @@
   },
   "ports": {
     "in": [
-      { "name": "fastq", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
+      { "name": "r1", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
+      { "name": "r2", "type": "Fastq", "union": ["Fastq", "FastqGz"], "optional": true },
       { "name": "genome", "type": "Directory", "union": ["Directory", "Fasta", "FastaGz"], "optional": true }
     ],
     "out": [{ "name": "bam", "type": "Bam" }]
@@ -20,7 +21,7 @@
     "STAR",
     "--runThreadN", "{param.threads}",
     "--genomeDir", "{input.genome}",
-    "--readFilesIn", "{input.fastq}",
+    "--readFilesIn", "{input.r1}", "{input.r2}",
     "--outFileNamePrefix", "{work}/out/star",
     "--outSAMtype", "BAM", "SortedByCoordinate"
   ],

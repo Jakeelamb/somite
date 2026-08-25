@@ -418,7 +418,9 @@ dependencies = [
  "axial-paper",
  "eframe",
  "egui",
+ "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

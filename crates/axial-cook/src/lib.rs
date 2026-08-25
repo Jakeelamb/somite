@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use axial_ir::{Direction, Graph, Node, ParamValue, PortType};
-use axial_ops::{Catalog, Cost, OpKind, Operator, render_argv, Bindings};
+use axial_ops::{render_argv, Bindings, Catalog, Cost, OpKind, Operator};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -23,8 +23,12 @@ pub enum CookError {
     Msg(String),
     #[error("bin not found: {0}")]
     BinNotFound(String),
-    #[error("{op} exit {code}")]
-    Exit { op: String, code: i32 },
+    #[error("{op} exit {code}: {detail}")]
+    Exit {
+        op: String,
+        code: i32,
+        detail: String,
+    },
     #[error("glob {0}: {1}")]
     Glob(String, String),
 }
@@ -132,7 +136,11 @@ impl Project {
 
     pub fn cas_path(&self, hash: &str) -> PathBuf {
         let (a, b) = hash.split_at(2.min(hash.len()));
-        self.cache.join("cas").join(a).join(&b[0..2.min(b.len())]).join(hash)
+        self.cache
+            .join("cas")
+            .join(a)
+            .join(&b[0..2.min(b.len())])
+            .join(hash)
     }
 
     pub fn stage(&self, meta: &ArtifactMeta, dest_dir: &Path) -> io::Result<PathBuf> {
@@ -223,7 +231,11 @@ fn glob_one(dir: &Path, pattern: &str, exclude: &[String]) -> Result<Option<Path
     let pat = Path::new(pattern);
     let parent = pat.parent().unwrap_or(dir);
     let file_pat = pat.file_name().and_then(|s| s.to_str()).unwrap_or("*");
-    let search = if parent.is_absolute() { parent.to_path_buf() } else { dir.join(parent) };
+    let search = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        dir.join(parent)
+    };
     if !search.is_dir() {
         return Ok(None);
     }
@@ -243,10 +255,7 @@ fn glob_one(dir: &Path, pattern: &str, exclude: &[String]) -> Result<Option<Path
     match hits.len() {
         0 => Ok(None),
         1 => Ok(Some(hits.remove(0))),
-        n => Err(CookError::Glob(
-            file_pat.into(),
-            format!("{n} matches"),
-        )),
+        n => Err(CookError::Glob(file_pat.into(), format!("{n} matches"))),
     }
 }
 
@@ -405,8 +414,8 @@ fn cook_node(
     let key = cook_key(op, &node.params, &input_hashes);
     let idx = project.cache.join("index").join(format!("{key}.json"));
     if idx.exists() {
-        let b: BindingsOut = serde_json::from_slice(&fs::read(&idx)?)
-            .map_err(|e| CookError::Msg(e.to_string()))?;
+        let b: BindingsOut =
+            serde_json::from_slice(&fs::read(&idx)?).map_err(|e| CookError::Msg(e.to_string()))?;
         return Ok((NodeState::Cached, b.artifacts));
     }
 
@@ -444,7 +453,11 @@ fn cook_node(
             "sample,fastq_1,fastq_2,strandedness\n{},{},{},{}\n",
             csv_cell(&sample),
             csv_cell(&p1.display().to_string()),
-            csv_cell(&p2.as_ref().map(|p| p.display().to_string()).unwrap_or_default()),
+            csv_cell(
+                &p2.as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            ),
             csv_cell(&strand)
         );
         let tmp = project.cache.join("tmp");
@@ -454,6 +467,38 @@ fn cook_node(
         let (_h, meta) = project.put_file(&sheetp, PortType::Table)?;
         let mut arts = BTreeMap::new();
         arts.insert("sheet".into(), meta);
+        let out = BindingsOut {
+            artifacts: arts.clone(),
+        };
+        fs::write(&idx, serde_json::to_vec_pretty(&out).unwrap_or_default())?;
+        return Ok((NodeState::Done, arts));
+    }
+
+    if op.kind == OpKind::Inprocess && op.id == "files.import_paired" {
+        let mut arts = BTreeMap::new();
+        for mate in ["r1", "r2"] {
+            let path = match node.params.get(mate) {
+                Some(ParamValue::String(value)) => {
+                    let path = PathBuf::from(value);
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        project.root.join(path)
+                    }
+                }
+                _ => {
+                    return Err(CookError::Msg(format!(
+                        "files.import_paired needs param {mate}"
+                    )))
+                }
+            };
+            let ty = node
+                .port(mate, Direction::Out)
+                .map(|port| port.ty)
+                .unwrap_or(PortType::Fastq);
+            let (_hash, meta) = project.put_file(&path, ty)?;
+            arts.insert(mate.into(), meta);
+        }
         let out = BindingsOut {
             artifacts: arts.clone(),
         };
@@ -564,6 +609,7 @@ fn cook_node(
         return Err(CookError::Exit {
             op: op.id.clone(),
             code: out.status.code().unwrap_or(-1),
+            detail: command_failure_detail(&out.stderr, &out.stdout),
         });
     }
 
@@ -591,6 +637,26 @@ fn cook_node(
     fs::write(&idx, serde_json::to_vec_pretty(&bout).unwrap_or_default())?;
     let _ = fs::remove_dir_all(&work);
     Ok((NodeState::Done, arts))
+}
+
+fn command_failure_detail(stderr: &[u8], stdout: &[u8]) -> String {
+    let raw = if stderr.iter().any(|byte| !byte.is_ascii_whitespace()) {
+        stderr
+    } else {
+        stdout
+    };
+    let compact = String::from_utf8_lossy(raw)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if compact.is_empty() {
+        return "no diagnostic output".into();
+    }
+    let mut detail = compact.chars().take(180).collect::<String>();
+    if compact.chars().count() > 180 {
+        detail.push('…');
+    }
+    detail
 }
 
 fn csv_cell(s: &str) -> String {

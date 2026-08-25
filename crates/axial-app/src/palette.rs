@@ -3,10 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use axial_ops::Operator;
+use serde::{Deserialize, Serialize};
 
 use crate::nfcore_catalog::Pipeline;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub(crate) enum Mode {
     #[default]
     Build,
@@ -38,6 +40,14 @@ pub(crate) struct Section {
     pub(crate) title: String,
     pub(crate) items: Vec<Item>,
     pub(crate) open: bool,
+}
+
+pub(crate) fn inventory_counts(operators: &BTreeMap<String, Operator>) -> (usize, usize) {
+    let discovered = operators
+        .values()
+        .filter(|operator| is_generated_pipeline(operator))
+        .count();
+    (operators.len().saturating_sub(discovered), discovered)
 }
 
 pub(crate) fn sections(
@@ -153,11 +163,11 @@ fn source_sections(
     );
     push_filtered(
         &mut sections,
-        "Ensembl",
+        "Ensembl accessions",
         operators,
         nfcore,
         true,
-        |operator| operator.id.starts_with("ensembl."),
+        |operator| operator.id == "ensembl.sequence",
     );
     push_filtered(
         &mut sections,
@@ -322,6 +332,15 @@ fn family_icon(id: &str) -> &'static str {
 }
 
 fn family_subtitle(id: &str) -> &'static str {
+    if id == "ensembl.sequence" {
+        return "FASTA from an Ensembl stable ID";
+    }
+    if id == "ncbi.datasets_assembly" {
+        return "Genome package from GCA / GCF";
+    }
+    if id == "sra.prefetch" {
+        return "Public run from SRR / ERR / DRR";
+    }
     match id.split('.').next().unwrap_or_default() {
         "qc" => "Quality control",
         "align" => "Align and map reads",
@@ -401,6 +420,7 @@ mod tests {
         assert_eq!(pipelines[2].title, "Official nf-core catalog");
         assert_eq!(pipelines[0].items[0].operator.id, "smk.workflow");
         assert_eq!(pipelines[1].items[0].operator.id, "nf.rnaseq");
+        assert_eq!(inventory_counts(&operators), (4, 1));
     }
 
     #[test]

@@ -1,0 +1,43 @@
+{
+  "id": "ensembl.sequence",
+  "title": "Ensembl stable ID",
+  "palette": ["Ensembl"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "curl",
+  "params": {
+    "accession": {
+      "type": "string",
+      "label": "Stable ID",
+      "page": "Ensembl",
+      "required": true
+    },
+    "sequence_type": {
+      "type": "string",
+      "label": "Sequence type",
+      "page": "Ensembl",
+      "default": "genomic"
+    }
+  },
+  "ports": {
+    "in": [],
+    "out": [{ "name": "fasta", "type": "Fasta" }]
+  },
+  "argv": [
+    "curl",
+    "--fail",
+    "--silent",
+    "--show-error",
+    "--location",
+    "--retry",
+    "3",
+    "--header",
+    "Content-Type: text/x-fasta",
+    "--output",
+    "{work}/out/sequence.fa",
+    "https://rest.ensembl.org/sequence/id/{param.accession}?type={param.sequence_type}"
+  ],
+  "outputs": {
+    "fasta": { "glob": "{work}/out/sequence.fa", "type": "Fasta" }
+  }
+}

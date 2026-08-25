@@ -4,9 +4,13 @@
 //! opens OP Create. Palette drags onto the grid.
 
 mod canvas;
+mod library_state;
 mod nfcore_catalog;
+mod overlay;
 mod palette;
 mod sources;
+mod system_profile;
+mod theme;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -19,38 +23,43 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use axial_cook::{cook_graph, ArtifactMeta, CookReport, NodeState, Project};
-use axial_ir::{compatible, Direction, Graph, Layout, Node, ParamValue, Port, PortType, SCHEMA_VERSION};
+use axial_ir::{
+    compatible, Direction, Graph, Layout, Node, ParamValue, Port, PortType, SCHEMA_VERSION,
+};
 use axial_ops::{Catalog, Cost, Operator};
 use axial_paper::{extract_from_path, reconstruct, text_from_path, ExtractVia, Reconstruction};
 use canvas::{
-    connect, rename_node, zoom_about, Connection, EditHistory, Selection, SelectionMode, WireStart,
+    advance_drag_delta, connect, paired_companion, rename_node, snap_drag, snap_point_to_grid,
+    zoom_about, Connection, EditHistory, Selection, SelectionMode, SnapGuides, SnapSource,
+    WireStart,
 };
 use eframe::egui::{
     self, Color32, CornerRadius, CursorIcon, FontData, FontDefinitions, FontFamily, FontId, Frame,
     Id, Margin, Pos2, Rect, Sense, Stroke, Vec2,
 };
+use library_state::LibraryState;
 use nfcore_catalog::Pipeline as NfcorePipeline;
+use overlay::{OverlayState, Surface};
 use palette::Mode as PaletteMode;
 use sources::AccessionKind;
+use system_profile::SystemProfile;
+use theme::GRAPHITE;
 
-const BG: Color32 = Color32::from_rgb(27, 28, 33);
-const GRID: Color32 = Color32::from_rgb(40, 41, 48);
-const GRID_MAJ: Color32 = Color32::from_rgb(51, 52, 61);
-const PANEL: Color32 = Color32::from_rgb(32, 33, 40);
-const PANEL2: Color32 = Color32::from_rgb(44, 45, 54);
-const BAR: Color32 = Color32::from_rgb(23, 24, 30);
-const NODE: Color32 = Color32::from_rgb(25, 26, 32);
-const SELECT: Color32 = Color32::from_rgb(80, 210, 140);
-const TEXT: Color32 = Color32::from_rgb(235, 233, 229);
-const MUTED: Color32 = Color32::from_rgb(157, 155, 163);
-const ACCENT: Color32 = Color32::from_rgb(184, 151, 218);
-const HEADER_FG: Color32 = Color32::from_rgb(42, 28, 50);
+const BG: Color32 = GRAPHITE.canvas;
+const GRID: Color32 = GRAPHITE.grid;
+const GRID_MAJ: Color32 = GRAPHITE.grid_strong;
+const PANEL: Color32 = GRAPHITE.surface;
+const PANEL2: Color32 = GRAPHITE.surface_raised;
+const NODE: Color32 = GRAPHITE.node;
+const SELECT: Color32 = GRAPHITE.accent;
+const TEXT: Color32 = GRAPHITE.text;
+const MUTED: Color32 = GRAPHITE.text_muted;
+const ACCENT: Color32 = GRAPHITE.accent;
 
-const NODE_W: f32 = 148.0;
-const NODE_H: f32 = 92.0;
-const NODE_H_FLAT: f32 = 22.0;
-const STRIP: f32 = 7.0;
-const NAME_GAP: f32 = 4.0;
+const NODE_W: f32 = 176.0;
+const NODE_H: f32 = 112.0;
+const NODE_H_FLAT: f32 = 58.0;
+const NAME_GAP: f32 = 5.0;
 
 #[derive(Clone, Copy)]
 struct Marquee {
@@ -59,10 +68,59 @@ struct Marquee {
     mode: SelectionMode,
 }
 
+#[derive(Clone)]
+struct NodeDrag {
+    anchor: String,
+    start: BTreeMap<String, Pos2>,
+    accumulated: Vec2,
+}
+
 impl Marquee {
     fn rect(self) -> Rect {
         Rect::from_two_pos(self.start, self.current)
     }
+}
+
+fn paired_fastq_key(path: &Path) -> Option<(String, u8)> {
+    let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+    if !(name.ends_with(".fastq")
+        || name.ends_with(".fq")
+        || name.ends_with(".fastq.gz")
+        || name.ends_with(".fq.gz"))
+    {
+        return None;
+    }
+    for (marker, mate) in [
+        ("_r1_", 1),
+        ("_r2_", 2),
+        ("_r1.", 1),
+        ("_r2.", 2),
+        (".r1.", 1),
+        (".r2.", 2),
+        ("_1.", 1),
+        ("_2.", 2),
+    ] {
+        if let Some(index) = name.find(marker) {
+            let key = format!("{}__{}", &name[..index], &name[index + marker.len()..]);
+            return Some((key, mate));
+        }
+    }
+    None
+}
+
+fn pair_dropped_fastqs(paths: Vec<PathBuf>) -> Vec<(PathBuf, PathBuf)> {
+    let mut candidates: BTreeMap<(PathBuf, String), [Option<PathBuf>; 2]> = BTreeMap::new();
+    for path in paths {
+        let Some((key, mate)) = paired_fastq_key(&path) else {
+            continue;
+        };
+        let directory = path.parent().unwrap_or(Path::new("")).to_path_buf();
+        candidates.entry((directory, key)).or_default()[usize::from(mate - 1)] = Some(path);
+    }
+    candidates
+        .into_values()
+        .filter_map(|[r1, r2]| r1.zip(r2))
+        .collect()
 }
 
 fn selection_mode(modifiers: egui::Modifiers) -> SelectionMode {
@@ -72,6 +130,43 @@ fn selection_mode(modifiers: egui::Modifiers) -> SelectionMode {
         SelectionMode::Add
     } else {
         SelectionMode::Replace
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewerAction {
+    Show,
+    Hide,
+}
+
+fn viewer_action<'a>(
+    viewer_off: &BTreeSet<String>,
+    nodes: impl IntoIterator<Item = &'a str>,
+) -> Option<ViewerAction> {
+    let nodes = nodes.into_iter().collect::<Vec<_>>();
+    if nodes.is_empty() {
+        None
+    } else if nodes.iter().all(|node| viewer_off.contains(*node)) {
+        Some(ViewerAction::Show)
+    } else {
+        Some(ViewerAction::Hide)
+    }
+}
+
+fn apply_viewer_action<'a>(
+    viewer_off: &mut BTreeSet<String>,
+    nodes: impl IntoIterator<Item = &'a str>,
+    action: ViewerAction,
+) {
+    for node in nodes {
+        match action {
+            ViewerAction::Show => {
+                viewer_off.remove(node);
+            }
+            ViewerAction::Hide => {
+                viewer_off.insert(node.to_owned());
+            }
+        }
     }
 }
 
@@ -91,7 +186,12 @@ fn fit_label(painter: &egui::Painter, text: &str, font: FontId, max_w: f32) -> S
     while !chars.is_empty() {
         chars.pop();
         let t: String = chars.iter().chain(['…'].iter()).collect();
-        if painter.layout_no_wrap(t.clone(), font.clone(), TEXT).size().x <= max_w {
+        if painter
+            .layout_no_wrap(t.clone(), font.clone(), TEXT)
+            .size()
+            .x
+            <= max_w
+        {
             return t;
         }
     }
@@ -121,7 +221,9 @@ fn draw_label(
     if s.is_empty() {
         return;
     }
-    painter.with_clip_rect(clip).text(pos, anchor, s, font, color);
+    painter
+        .with_clip_rect(clip)
+        .text(pos, anchor, s, font, color);
 }
 
 fn short_op(op: &str) -> &str {
@@ -153,10 +255,7 @@ fn family_color(op_id: &str) -> Color32 {
         Color32::from_rgb(90, 140, 210)
     } else if op_id.starts_with("quant.") || op_id.starts_with("diff.") {
         Color32::from_rgb(196, 176, 72)
-    } else if op_id.starts_with("class.")
-        || op_id.starts_with("var.")
-        || op_id.starts_with("nf.")
-    {
+    } else if op_id.starts_with("class.") || op_id.starts_with("var.") || op_id.starts_with("nf.") {
         Color32::from_rgb(214, 132, 62)
     } else if op_id.starts_with("qc.") {
         Color32::from_rgb(78, 186, 110)
@@ -169,6 +268,13 @@ fn family_color(op_id: &str) -> Color32 {
     } else {
         Color32::from_rgb(140, 140, 150)
     }
+}
+
+fn is_workflow_operator(op_id: &str) -> bool {
+    op_id.starts_with("nfcore.")
+        || op_id.contains("nextflow")
+        || op_id.contains("snakemake")
+        || op_id.contains("workflow")
 }
 
 fn port_color(ty: PortType) -> Color32 {
@@ -298,14 +404,16 @@ struct App {
     pending_insert: Option<WireStart>,
     cursor: Pos2,
     last_graph_pos: Pos2,
-    op_create: bool,
+    overlays: OverlayState,
     op_create_screen: Pos2,
     op_create_q: String,
     op_create_i: usize,
+    focus_op_create: bool,
     viewer_off: BTreeSet<String>,
     sizes: BTreeMap<String, Vec2>,
     fq: BTreeMap<String, FqPreview>,
-    dragging: Option<String>,
+    dragging: Option<NodeDrag>,
+    snap_guides: SnapGuides,
     resizing: Option<String>,
     marquee: Option<Marquee>,
     info: Option<String>,
@@ -315,7 +423,6 @@ struct App {
     last_arts: BTreeMap<String, BTreeMap<String, ArtifactMeta>>,
     paper_rx: Option<Receiver<Result<Reconstruction, String>>>,
     paper_name: String,
-    paper_ui: bool,
     auto_fit: bool,
     history: EditHistory,
     rename_target: Option<String>,
@@ -325,24 +432,22 @@ struct App {
     nfcore: BTreeMap<String, NfcorePipeline>,
     nfcore_rx: Option<Receiver<nfcore_catalog::FetchResult>>,
     accession: String,
-    palette_mode: PaletteMode,
-    recent_ops: Vec<String>,
-    favorite_ops: BTreeSet<String>,
+    source_tools: sources::ToolReadiness,
+    system_profile: Option<SystemProfile>,
+    system_profile_rx: Option<Receiver<SystemProfile>>,
+    library: LibraryState,
     focus_accession: bool,
+    focus_library_search: bool,
 }
 
 impl App {
     fn new() -> Self {
         let catalog = Catalog::load_dir(&operators_dir()).unwrap_or_default();
-        let graph_path = project_root().join("testdata/fastq_to_fastqc.axial.json");
-        let default_graph: Graph = fs::read_to_string(&graph_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or(Graph {
-                schema_version: SCHEMA_VERSION,
-                nodes: vec![],
-                edges: vec![],
-            });
+        let default_graph = Graph {
+            schema_version: SCHEMA_VERSION,
+            nodes: vec![],
+            edges: vec![],
+        };
         let recovery_path = project_root().join(".axial/autosave.axial.json");
         let recovered = fs::read_to_string(&recovery_path)
             .ok()
@@ -372,14 +477,16 @@ impl App {
             pending_insert: None,
             cursor: Pos2::ZERO,
             last_graph_pos: Pos2::new(160.0, 180.0),
-            op_create: false,
+            overlays: OverlayState::default(),
             op_create_screen: Pos2::new(420.0, 260.0),
             op_create_q: String::new(),
             op_create_i: 0,
+            focus_op_create: false,
             viewer_off: BTreeSet::new(),
             sizes: BTreeMap::new(),
             fq: BTreeMap::new(),
             dragging: None,
+            snap_guides: SnapGuides::default(),
             resizing: None,
             marquee: None,
             info: None,
@@ -389,7 +496,6 @@ impl App {
             last_arts: BTreeMap::new(),
             paper_rx: None,
             paper_name: String::new(),
-            paper_ui: false,
             auto_fit: false,
             history: EditHistory::default(),
             rename_target: None,
@@ -399,10 +505,12 @@ impl App {
             nfcore: BTreeMap::new(),
             nfcore_rx: None,
             accession: String::new(),
-            palette_mode: PaletteMode::Build,
-            recent_ops: Vec::new(),
-            favorite_ops: BTreeSet::new(),
+            source_tools: sources::ToolReadiness::detect(),
+            system_profile: None,
+            system_profile_rx: Some(system_profile::detect_async()),
+            library: LibraryState::load(project_root().join(".axial/library-state.json")),
             focus_accession: false,
+            focus_library_search: false,
         };
         app.load_nfcore_cache();
         app.refresh_nfcore_catalog();
@@ -415,8 +523,7 @@ impl App {
                 app.autosave_due = Some(Instant::now());
                 app.selection.clear();
                 if let Some(node) = app.graph.nodes.first() {
-                    app.selection
-                        .select_node(&node.id, SelectionMode::Replace);
+                    app.selection.select_node(&node.id, SelectionMode::Replace);
                 }
                 app.paper_name = Path::new(&p)
                     .file_name()
@@ -483,10 +590,38 @@ impl App {
     fn open_op_create(&mut self, graph_pos: Pos2, screen_pos: Pos2, wire: Option<WireStart>) {
         self.last_graph_pos = graph_pos;
         self.op_create_screen = screen_pos + Vec2::new(12.0, 12.0);
-        self.op_create = true;
+        self.open_surface(Surface::OpCreate);
         self.op_create_q.clear();
         self.op_create_i = 0;
+        self.focus_op_create = true;
         self.pending_insert = wire;
+    }
+
+    fn open_surface(&mut self, surface: Surface) {
+        if self.overlays.is_open(Surface::OpCreate) && surface != Surface::OpCreate {
+            self.pending_insert = None;
+        }
+        self.overlays.open(surface);
+    }
+
+    fn toggle_surface(&mut self, surface: Surface) {
+        if self.overlays.is_open(Surface::OpCreate) {
+            self.pending_insert = None;
+        }
+        self.overlays.toggle(surface);
+    }
+
+    fn close_surface(&mut self) {
+        if self.overlays.is_open(Surface::OpCreate) {
+            self.pending_insert = None;
+        }
+        self.overlays.close();
+    }
+
+    fn close_surface_if(&mut self, surface: Surface) {
+        if self.overlays.is_open(surface) {
+            self.close_surface();
+        }
     }
 
     fn invalidate_cook(&mut self) {
@@ -500,10 +635,7 @@ impl App {
     }
 
     fn install_nfcore_catalog(&mut self, pipelines: Vec<NfcorePipeline>) {
-        let current: BTreeSet<String> = pipelines
-            .iter()
-            .map(NfcorePipeline::operator_id)
-            .collect();
+        let current: BTreeSet<String> = pipelines.iter().map(NfcorePipeline::operator_id).collect();
         self.catalog.ops.retain(|id, operator| {
             operator.palette.as_slice() != ["nf-core", "Catalog"] || current.contains(id)
         });
@@ -540,6 +672,29 @@ impl App {
             let _ = tx.send(nfcore_catalog::fetch());
         });
         self.nfcore_rx = Some(rx);
+    }
+
+    fn refresh_system_profile(&mut self) {
+        self.system_profile = None;
+        self.system_profile_rx = Some(system_profile::detect_async());
+    }
+
+    fn poll_system_profile(&mut self, ctx: &egui::Context) {
+        let Some(receiver) = &self.system_profile_rx else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(profile) => {
+                self.system_profile = Some(profile);
+                self.system_profile_rx = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.system_profile_rx = None;
+            }
+        }
     }
 
     fn poll_nfcore_catalog(&mut self, ctx: &egui::Context) {
@@ -593,6 +748,7 @@ impl App {
     fn drop_op(&mut self, op: &Operator, pos: Pos2) {
         let before = self.graph.clone();
         let pending = self.pending_insert.take();
+        let pos = snap_point_to_grid(pos);
         let existing: Vec<String> = self.graph.nodes.iter().map(|n| n.id.clone()).collect();
         let id = next_op_name(&existing, &op.id);
         let mut params = BTreeMap::new();
@@ -609,39 +765,62 @@ impl App {
             layout: Layout { x: pos.x, y: pos.y },
             note: None,
         });
-        self.recent_ops.retain(|id| id != &op.id);
-        self.recent_ops.insert(0, op.id.clone());
-        self.recent_ops.truncate(8);
+        if is_workflow_operator(&op.id) || op.palette.as_slice() == ["nf-core", "Catalog"] {
+            self.viewer_off.insert(id.clone());
+        }
+        let library_error = self.library.record(&op.id).err();
         self.history.remember(&before);
-        self.selection
-            .select_node(&id, SelectionMode::Replace);
+        self.selection.select_node(&id, SelectionMode::Replace);
         self.param_page.clear();
         self.invalidate_cook();
-        self.status = format!("dropped {id}");
+        self.status = if op.palette.as_slice() == ["nf-core", "Catalog"] {
+            let revision = self
+                .nfcore
+                .get(&op.id)
+                .map(|pipeline| pipeline.revision.as_str())
+                .unwrap_or("latest");
+            format!(
+                "added {} {revision} · configure inputs, then Cook",
+                op.title
+            )
+        } else {
+            format!("dropped {id}")
+        };
         if let Some(wire) = pending {
-            let connection = self.graph.node(&id).and_then(|node| {
-                node.ports
-                    .iter()
-                    .find_map(|port| wire.connection_to(&self.graph, &id, port))
-            });
+            let connection = self
+                .graph
+                .node(&id)
+                .and_then(|node| wire.best_connection_to(&self.graph, &id, &node.ports));
             if let Some(connection) = connection {
                 if connect(&mut self.graph, &connection).is_ok() {
-                    self.status = format!("inserted {id} and snapped");
+                    let paired = paired_companion(&self.graph, &connection)
+                        .is_some_and(|mate| connect(&mut self.graph, &mate).unwrap_or(false));
+                    self.status = if paired {
+                        format!("inserted {id} · snapped R1 + R2")
+                    } else {
+                        format!("inserted {id} and snapped")
+                    };
                 }
             }
         }
-        self.op_create = false;
+        self.close_surface_if(Surface::OpCreate);
         self.op_create_q.clear();
+        if let Some(error) = library_error {
+            self.status
+                .push_str(&format!(" · Library state was not saved: {error}"));
+        }
     }
 
     fn insert_accession(&mut self) {
-        let (kind, accession) = match sources::classify(&self.accession) {
+        let request = match sources::classify(&self.accession) {
             Ok(value) => value,
             Err(error) => {
                 self.status = error;
                 return;
             }
         };
+        let kind = request.kind;
+        let accession = request.value.clone();
         self.pending_insert = None;
         let pos = self.last_graph_pos;
         match kind {
@@ -658,7 +837,12 @@ impl App {
                 let Some(prefetch_id) = self.selection.primary().map(str::to_owned) else {
                     return;
                 };
-                if let Some(node) = self.graph.nodes.iter_mut().find(|node| node.id == prefetch_id) {
+                if let Some(node) = self
+                    .graph
+                    .nodes
+                    .iter_mut()
+                    .find(|node| node.id == prefetch_id)
+                {
                     node.params
                         .insert("accession".into(), ParamValue::String(accession.clone()));
                 }
@@ -666,16 +850,9 @@ impl App {
                 let Some(fasterq_id) = self.selection.primary().map(str::to_owned) else {
                     return;
                 };
-                self.try_wire(Connection::new(
-                    &prefetch_id,
-                    "sra",
-                    &fasterq_id,
-                    "sra",
-                ));
-                self.selection.select_many(
-                    vec![prefetch_id, fasterq_id],
-                    SelectionMode::Replace,
-                );
+                self.try_wire(Connection::new(&prefetch_id, "sra", &fasterq_id, "sra"));
+                self.selection
+                    .select_many(vec![prefetch_id, fasterq_id], SelectionMode::Replace);
                 self.status = format!("{accession} ready · Cook downloads and converts to FASTQ");
             }
             AccessionKind::Assembly => {
@@ -710,12 +887,34 @@ impl App {
                     &unzip_id,
                     "archive",
                 ));
-                self.selection.select_many(
-                    vec![download_id, unzip_id],
-                    SelectionMode::Replace,
-                );
+                self.selection
+                    .select_many(vec![download_id, unzip_id], SelectionMode::Replace);
                 self.status =
                     format!("{accession} ready · Cook downloads and unpacks the NCBI package");
+            }
+            AccessionKind::EnsemblGene
+            | AccessionKind::EnsemblTranscript
+            | AccessionKind::EnsemblProtein => {
+                let Ok(operator) = self.catalog.get("ensembl.sequence").cloned() else {
+                    self.status = "Ensembl stable-ID operator is missing".into();
+                    return;
+                };
+                self.drop_op(&operator, pos);
+                let Some(node_id) = self.selection.primary().map(str::to_owned) else {
+                    return;
+                };
+                if let Some(node) = self.graph.nodes.iter_mut().find(|node| node.id == node_id) {
+                    node.params
+                        .insert("accession".into(), ParamValue::String(accession.clone()));
+                    node.params.insert(
+                        "sequence_type".into(),
+                        ParamValue::String(request.sequence_type().unwrap_or("genomic").to_owned()),
+                    );
+                }
+                self.status = format!(
+                    "{accession} ready · Cook retrieves {} from Ensembl",
+                    request.result().to_ascii_lowercase()
+                );
             }
         }
         self.accession.clear();
@@ -723,8 +922,8 @@ impl App {
     }
 
     fn insert_snakemake_project(&mut self, path: PathBuf) {
-        let has_snakefile = path.join("Snakefile").is_file()
-            || path.join("workflow").join("Snakefile").is_file();
+        let has_snakefile =
+            path.join("Snakefile").is_file() || path.join("workflow").join("Snakefile").is_file();
         if !path.is_dir() || !has_snakefile {
             self.status = format!(
                 "{} is not a Snakemake project (expected Snakefile or workflow/Snakefile)",
@@ -747,9 +946,16 @@ impl App {
         let Some(import_id) = self.selection.primary().map(str::to_owned) else {
             return;
         };
-        if let Some(node) = self.graph.nodes.iter_mut().find(|node| node.id == import_id) {
-            node.params
-                .insert("path".into(), ParamValue::String(path.display().to_string()));
+        if let Some(node) = self
+            .graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == import_id)
+        {
+            node.params.insert(
+                "path".into(),
+                ParamValue::String(path.display().to_string()),
+            );
         }
         self.drop_op(&snakemake, pos + Vec2::new(220.0, 0.0));
         let Some(snakemake_id) = self.selection.primary().map(str::to_owned) else {
@@ -762,10 +968,8 @@ impl App {
                 .iter_mut()
                 .find(|node| node.id == snakemake_id)
             {
-                node.params.insert(
-                    "snakefile".into(),
-                    ParamValue::String("Snakefile".into()),
-                );
+                node.params
+                    .insert("snakefile".into(), ParamValue::String("Snakefile".into()));
             }
         }
         self.try_wire(Connection::new(
@@ -774,14 +978,14 @@ impl App {
             &snakemake_id,
             "workflow",
         ));
-        self.selection.select_many(
-            vec![import_id, snakemake_id],
-            SelectionMode::Replace,
-        );
+        self.selection
+            .select_many(vec![import_id, snakemake_id], SelectionMode::Replace);
         self.invalidate_cook();
         self.status = format!(
             "{} ready · Cook runs Snakemake in an isolated copy",
-            path.file_name().and_then(|name| name.to_str()).unwrap_or("workflow")
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("workflow")
         );
     }
 
@@ -854,15 +1058,24 @@ impl App {
         let before = self.graph.clone();
         match connect(&mut self.graph, &connection) {
             Ok(true) => {
+                let paired = paired_companion(&self.graph, &connection)
+                    .is_some_and(|mate| connect(&mut self.graph, &mate).unwrap_or(false));
                 self.history.remember(&before);
                 self.invalidate_cook();
-                self.status = format!(
-                    "snapped {}.{} → {}.{}",
-                    connection.from_node,
-                    connection.from_port,
-                    connection.to_node,
-                    connection.to_port
-                );
+                self.status = if paired {
+                    format!(
+                        "snapped {} → {} · R1 + R2",
+                        connection.from_node, connection.to_node
+                    )
+                } else {
+                    format!(
+                        "snapped {}.{} → {}.{}",
+                        connection.from_node,
+                        connection.from_port,
+                        connection.to_node,
+                        connection.to_port
+                    )
+                };
             }
             Ok(false) => self.status = "already snapped".into(),
             Err(err) => self.status = format!("no snap: {err}"),
@@ -875,7 +1088,12 @@ impl App {
             return;
         }
         let before = self.graph.clone();
-        let mut existing: Vec<String> = self.graph.nodes.iter().map(|node| node.id.clone()).collect();
+        let mut existing: Vec<String> = self
+            .graph
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect();
         let mut renamed = BTreeMap::new();
         let copies: Vec<Node> = self
             .graph
@@ -910,14 +1128,19 @@ impl App {
             })
             .collect::<Vec<_>>();
         let count = copies.len();
-        let copy_ids = copies.iter().map(|node| node.id.clone()).collect::<Vec<_>>();
+        let copy_ids = copies
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>();
         self.graph.nodes.extend(copies);
         self.graph.edges.extend(copied_edges);
         self.history.remember(&before);
-        self.selection
-            .select_many(copy_ids, SelectionMode::Replace);
+        self.selection.select_many(copy_ids, SelectionMode::Replace);
         self.invalidate_cook();
-        self.status = format!("duplicated {count} node{}", if count == 1 { "" } else { "s" });
+        self.status = format!(
+            "duplicated {count} node{}",
+            if count == 1 { "" } else { "s" }
+        );
     }
 
     fn delete_selected(&mut self) {
@@ -940,9 +1163,9 @@ impl App {
         }
         let before = self.graph.clone();
         self.graph.nodes.retain(|node| !selected.contains(&node.id));
-        self.graph
-            .edges
-            .retain(|edge| !selected.contains(&edge.from_node) && !selected.contains(&edge.to_node));
+        self.graph.edges.retain(|edge| {
+            !selected.contains(&edge.from_node) && !selected.contains(&edge.to_node)
+        });
         self.history.remember(&before);
         for id in &selected {
             self.last_states.remove(id);
@@ -963,8 +1186,7 @@ impl App {
         match rename_node(&mut self.graph, old, &next) {
             Ok(true) => {
                 self.history.remember(&before);
-                self.selection
-                    .select_node(&next, SelectionMode::Replace);
+                self.selection.select_node(&next, SelectionMode::Replace);
                 if self.viewer_off.remove(old) {
                     self.viewer_off.insert(next.clone());
                 }
@@ -1005,16 +1227,17 @@ impl App {
             .unwrap_or("file")
             .to_string();
         if path.is_dir() {
-            if path.join("Snakefile").is_file()
-                || path.join("workflow").join("Snakefile").is_file()
+            if path.join("Snakefile").is_file() || path.join("workflow").join("Snakefile").is_file()
             {
                 self.last_graph_pos = pos;
                 self.insert_snakemake_project(path);
             } else if let Ok(operator) = self.catalog.get("files.import_directory").cloned() {
                 self.drop_op(&operator, pos);
                 if let Some(node) = self.graph.nodes.last_mut() {
-                    node.params
-                        .insert("path".into(), ParamValue::String(path.display().to_string()));
+                    node.params.insert(
+                        "path".into(),
+                        ParamValue::String(path.display().to_string()),
+                    );
                 }
                 self.status = format!("import directory {name}");
             }
@@ -1046,7 +1269,10 @@ impl App {
             return;
         }
         if ext == "json" || name.ends_with(".axial.json") {
-            match fs::read_to_string(&path).ok().and_then(|s| serde_json::from_str::<Graph>(&s).ok()) {
+            match fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Graph>(&s).ok())
+            {
                 Some(g) if g.validate().is_ok() => {
                     self.graph = g;
                     self.graph_path = Some(path.clone());
@@ -1054,8 +1280,7 @@ impl App {
                     self.history = EditHistory::default();
                     self.selection.clear();
                     if let Some(node) = self.graph.nodes.first() {
-                        self.selection
-                            .select_node(&node.id, SelectionMode::Replace);
+                        self.selection.select_node(&node.id, SelectionMode::Replace);
                     }
                     self.last_states.clear();
                     self.last_arts.clear();
@@ -1066,18 +1291,44 @@ impl App {
             }
             return;
         }
-        if matches!(ext.as_str(), "fastq" | "fq" | "gz" | "fasta" | "fa" | "bam" | "vcf" | "gtf") {
+        if matches!(
+            ext.as_str(),
+            "fastq" | "fq" | "gz" | "fasta" | "fa" | "bam" | "vcf" | "gtf"
+        ) {
             if let Ok(op) = self.catalog.get("files.import").cloned() {
                 self.drop_op(&op, pos);
                 if let Some(n) = self.graph.nodes.last_mut() {
-                    n.params
-                        .insert("path".into(), ParamValue::String(path.display().to_string()));
+                    n.params.insert(
+                        "path".into(),
+                        ParamValue::String(path.display().to_string()),
+                    );
                 }
                 self.status = format!("import {name}");
             }
             return;
         }
         self.status = format!("drop an Axial graph, data file, or methods paper—not {name}");
+    }
+
+    fn ingest_paired_paths(&mut self, r1: PathBuf, r2: PathBuf, pos: Pos2) {
+        let Ok(operator) = self.catalog.get("files.import_paired").cloned() else {
+            self.ingest_path(r1, pos);
+            self.ingest_path(r2, pos + Vec2::new(0.0, 140.0));
+            return;
+        };
+        self.pending_insert = None;
+        self.drop_op(&operator, pos);
+        let Some(id) = self.selection.primary().map(str::to_owned) else {
+            return;
+        };
+        if let Some(node) = self.graph.nodes.iter_mut().find(|node| node.id == id) {
+            node.params
+                .insert("r1".into(), ParamValue::String(r1.display().to_string()));
+            node.params
+                .insert("r2".into(), ParamValue::String(r2.display().to_string()));
+        }
+        self.invalidate_cook();
+        self.status = "paired reads ready · R1 + R2 stay separate".into();
     }
 
     fn poll_paper(&mut self, ctx: &egui::Context) {
@@ -1095,8 +1346,7 @@ impl App {
                 self.history = EditHistory::default();
                 self.selection.clear();
                 if let Some(node) = self.graph.nodes.first() {
-                    self.selection
-                        .select_node(&node.id, SelectionMode::Replace);
+                    self.selection.select_node(&node.id, SelectionMode::Replace);
                 }
                 self.param_page.clear();
                 self.last_states.clear();
@@ -1106,11 +1356,8 @@ impl App {
                 self.pan = Vec2::new(20.0, 28.0);
                 self.zoom = 1.0;
                 self.request_fit();
-                self.paper_ui = false;
-                let mut s = format!(
-                    "rebuilt {n} nodes from {}  ({assay:?})",
-                    self.paper_name
-                );
+                self.close_surface_if(Surface::Paper);
+                let mut s = format!("rebuilt {n} nodes from {}  ({assay:?})", self.paper_name);
                 if !warns.is_empty() {
                     s.push_str("  ·  ");
                     s.push_str(&warns.join("  ·  "));
@@ -1243,10 +1490,9 @@ impl App {
                 let recovery = project_root().join(".axial/autosave.axial.json");
                 self.status = match self.write_graph(&recovery) {
                     Ok(()) => format!("saved {}", path.display()),
-                    Err(error) => format!(
-                        "saved {} · recovery copy failed: {error}",
-                        path.display()
-                    ),
+                    Err(error) => {
+                        format!("saved {} · recovery copy failed: {error}", path.display())
+                    }
                 };
             }
             Err(error) => self.status = format!("save failed: {error}"),
@@ -1270,10 +1516,12 @@ impl App {
 
     fn refresh_fq(&mut self) {
         for n in &self.graph.nodes {
-            if n.operator != "files.import" {
-                continue;
-            }
-            let Some(ParamValue::String(path)) = n.params.get("path") else {
+            let param = match n.operator.as_str() {
+                "files.import" => "path",
+                "files.import_paired" => "r1",
+                _ => continue,
+            };
+            let Some(ParamValue::String(path)) = n.params.get(param) else {
                 continue;
             };
             if self.fq.contains_key(path) {
@@ -1297,6 +1545,10 @@ impl App {
         let n = self.graph.node(id)?;
         if n.operator == "files.import" {
             if let Some(ParamValue::String(path)) = n.params.get("path") {
+                return self.fq.get(path);
+            }
+        } else if n.operator == "files.import_paired" {
+            if let Some(ParamValue::String(path)) = n.params.get("r1") {
                 return self.fq.get(path);
             }
         }
@@ -1343,8 +1595,14 @@ fn bezier_points(a: Pos2, b: Pos2) -> Vec<Pos2> {
         let tt = i as f32 / n as f32;
         let u = 1.0 - tt;
         pts.push(Pos2::new(
-            u * u * u * a.x + 3.0 * u * u * tt * c1.x + 3.0 * u * tt * tt * c2.x + tt * tt * tt * b.x,
-            u * u * u * a.y + 3.0 * u * u * tt * c1.y + 3.0 * u * tt * tt * c2.y + tt * tt * tt * b.y,
+            u * u * u * a.x
+                + 3.0 * u * u * tt * c1.x
+                + 3.0 * u * tt * tt * c2.x
+                + tt * tt * tt * b.x,
+            u * u * u * a.y
+                + 3.0 * u * u * tt * c1.y
+                + 3.0 * u * tt * tt * c2.y
+                + tt * tt * tt * b.y,
         ));
     }
     pts
@@ -1421,24 +1679,21 @@ fn bezier_bounds(a: Pos2, b: Pos2) -> Rect {
 fn draw_grid(painter: &egui::Painter, rect: Rect, pan: Vec2, zoom: f32) {
     let minor = 20.0 * zoom;
     let major = 100.0 * zoom;
-    if minor >= 6.0 {
+    if minor >= 9.0 {
         let ox = rect.min.x + pan.x.rem_euclid(minor);
         let oy = rect.min.y + pan.y.rem_euclid(minor);
         let mut x = ox;
         while x < rect.max.x {
-            painter.line_segment(
-                [Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)],
-                Stroke::new(1.0, GRID),
-            );
+            let mut y = oy;
+            while y < rect.max.y {
+                painter.circle_filled(
+                    Pos2::new(x, y),
+                    (0.82 * zoom.sqrt()).clamp(0.72, 1.15),
+                    GRID,
+                );
+                y += minor;
+            }
             x += minor;
-        }
-        let mut y = oy;
-        while y < rect.max.y {
-            painter.line_segment(
-                [Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)],
-                Stroke::new(1.0, GRID),
-            );
-            y += minor;
         }
     }
     if major >= 8.0 {
@@ -1446,19 +1701,48 @@ fn draw_grid(painter: &egui::Painter, rect: Rect, pan: Vec2, zoom: f32) {
         let oy = rect.min.y + pan.y.rem_euclid(major);
         let mut x = ox;
         while x < rect.max.x {
-            painter.line_segment(
-                [Pos2::new(x, rect.min.y), Pos2::new(x, rect.max.y)],
-                Stroke::new(1.0, GRID_MAJ),
-            );
+            let mut y = oy;
+            while y < rect.max.y {
+                painter.circle_filled(
+                    Pos2::new(x, y),
+                    (1.32 * zoom.sqrt()).clamp(1.05, 1.8),
+                    GRID_MAJ,
+                );
+                y += major;
+            }
             x += major;
         }
-        let mut y = oy;
-        while y < rect.max.y {
+    }
+}
+
+fn draw_snap_guides(
+    painter: &egui::Painter,
+    rect: Rect,
+    origin: Pos2,
+    pan: Vec2,
+    zoom: f32,
+    guides: SnapGuides,
+) {
+    let stroke = |source| match source {
+        SnapSource::Node => Stroke::new(1.15, SELECT.gamma_multiply(0.82)),
+        SnapSource::Grid => Stroke::new(1.0, SELECT.gamma_multiply(0.38)),
+    };
+    if let Some(guide) = guides.x {
+        let x = origin.x + guide.coordinate * zoom + pan.x;
+        if rect.left() <= x && x <= rect.right() {
             painter.line_segment(
-                [Pos2::new(rect.min.x, y), Pos2::new(rect.max.x, y)],
-                Stroke::new(1.0, GRID_MAJ),
+                [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+                stroke(guide.source),
             );
-            y += major;
+        }
+    }
+    if let Some(guide) = guides.y {
+        let y = origin.y + guide.coordinate * zoom + pan.y;
+        if rect.top() <= y && y <= rect.bottom() {
+            painter.line_segment(
+                [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+                stroke(guide.source),
+            );
         }
     }
 }
@@ -1570,7 +1854,10 @@ fn draw_pipeline(painter: &egui::Painter, body: Rect, title: &str, ver: &str, z:
         painter.rect_filled(r, 1, Color32::from_rgb(70, 70, 78));
         if i < 3 {
             painter.line_segment(
-                [Pos2::new(r.max.x, r.center().y), Pos2::new(r.max.x + 6.0, r.center().y)],
+                [
+                    Pos2::new(r.max.x, r.center().y),
+                    Pos2::new(r.max.x + 6.0, r.center().y),
+                ],
                 Stroke::new(1.0, MUTED),
             );
         }
@@ -1592,7 +1879,10 @@ fn draw_quote_tip(painter: &egui::Painter, at: Pos2, note: &str, canvas: Rect) {
     if min.x + size.x > canvas.max.x - 8.0 {
         min.x = (at.x - size.x - 16.0).max(canvas.min.x + 8.0);
     }
-    min.x = min.x.clamp(canvas.min.x + 8.0, (canvas.max.x - size.x - 8.0).max(canvas.min.x + 8.0));
+    min.x = min.x.clamp(
+        canvas.min.x + 8.0,
+        (canvas.max.x - size.x - 8.0).max(canvas.min.x + 8.0),
+    );
     if min.y + size.y > canvas.max.y - 8.0 {
         min.y = (canvas.max.y - size.y - 8.0).max(canvas.min.y + 8.0);
     }
@@ -1629,7 +1919,14 @@ fn draw_accession(painter: &egui::Painter, body: Rect, acc: &str, kind: &str, z:
     );
 }
 
-fn draw_viewer(painter: &egui::Painter, body: Rect, n: &Node, fq: Option<&FqPreview>, st: Option<&NodeState>, z: f32) {
+fn draw_viewer(
+    painter: &egui::Painter,
+    body: Rect,
+    n: &Node,
+    fq: Option<&FqPreview>,
+    st: Option<&NodeState>,
+    z: f32,
+) {
     let lit = matches!(st, Some(NodeState::Done) | Some(NodeState::Cached) | None);
     let inner = body.shrink2(Vec2::new(6.0, 4.0));
     if n.operator == "gap.missing" {
@@ -1652,7 +1949,10 @@ fn draw_viewer(painter: &egui::Painter, body: Rect, n: &Node, fq: Option<&FqPrev
         if let Some(fq) = fq {
             draw_fastq_seq(painter, body, fq, z);
         } else if let Some(ParamValue::String(p)) = n.params.get("path") {
-            let name = Path::new(p).file_name().and_then(|s| s.to_str()).unwrap_or(p);
+            let name = Path::new(p)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(p);
             draw_label(
                 painter,
                 body.center() + Vec2::new(0.0, -6.0 * z.max(0.7)),
@@ -1682,6 +1982,21 @@ fn draw_viewer(painter: &egui::Painter, body: Rect, n: &Node, fq: Option<&FqPrev
                 inner,
             );
         }
+        return;
+    }
+    if n.operator == "files.import_paired" {
+        if let Some(fq) = fq {
+            draw_fastq_seq(painter, body, fq, z);
+        }
+        draw_label(
+            painter,
+            body.min + Vec2::new(6.0, 4.0),
+            egui::Align2::LEFT_TOP,
+            "R1 + R2",
+            font_px(9.0, z, 7.0, 10.0),
+            MUTED,
+            inner,
+        );
         return;
     }
     if n.operator == "qc.fastqc" || n.operator == "qc.fastp" {
@@ -1750,7 +2065,13 @@ fn draw_viewer(painter: &egui::Painter, body: Rect, n: &Node, fq: Option<&FqPrev
             painter,
             body,
             acc,
-            type_name(n.ports.iter().find(|p| p.dir == Direction::Out).map(|p| p.ty).unwrap_or(PortType::Text)),
+            type_name(
+                n.ports
+                    .iter()
+                    .find(|p| p.dir == Direction::Out)
+                    .map(|p| p.ty)
+                    .unwrap_or(PortType::Text),
+            ),
             z,
         );
         return;
@@ -1765,7 +2086,10 @@ fn draw_viewer(painter: &egui::Painter, body: Rect, n: &Node, fq: Option<&FqPrev
                 Color32::from_rgb(50, 90, 120)
             };
             painter.rect_filled(
-                Rect::from_min_size(Pos2::new(x, band.top() + 10.0), Vec2::new(band.width() / 18.0 - 1.0, band.height() - 20.0)),
+                Rect::from_min_size(
+                    Pos2::new(x, band.top() + 10.0),
+                    Vec2::new(band.width() / 18.0 - 1.0, band.height() - 20.0),
+                ),
                 0,
                 col,
             );
@@ -1809,17 +2133,13 @@ fn draw_palette_action(
     subtitle: &str,
     color: Color32,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), 44.0),
-        Sense::click(),
-    );
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 44.0), Sense::click());
     if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, 6, Color32::from_rgb(46, 47, 57));
+        ui.painter().rect_filled(rect, 6, GRAPHITE.surface_hover);
     }
     let icon = Rect::from_min_size(rect.min + Vec2::new(7.0, 8.0), Vec2::splat(27.0));
-    ui.painter()
-        .rect_filled(icon, 6, color.gamma_multiply(0.2));
+    ui.painter().rect_filled(icon, 6, color.gamma_multiply(0.2));
     ui.painter().text(
         icon.center(),
         egui::Align2::CENTER_CENTER,
@@ -1859,13 +2179,11 @@ fn draw_palette_row(ui: &mut egui::Ui, item: &palette::Item, favorite: bool) -> 
     );
     let color = family_color(&item.operator.id);
     if response.hovered() {
-        ui.painter()
-            .rect_filled(rect, 6, Color32::from_rgb(46, 47, 57));
+        ui.painter().rect_filled(rect, 6, GRAPHITE.surface_hover);
     }
 
     let icon = Rect::from_min_size(rect.min + Vec2::new(7.0, 8.0), Vec2::splat(27.0));
-    ui.painter()
-        .rect_filled(icon, 6, color.gamma_multiply(0.2));
+    ui.painter().rect_filled(icon, 6, color.gamma_multiply(0.2));
     ui.painter().text(
         icon.center(),
         egui::Align2::CENTER_CENTER,
@@ -1948,6 +2266,18 @@ fn palette_tooltip(ui: &mut egui::Ui, item: &palette::Item, pipeline: Option<&Nf
         .size(11.0)
         .color(TEXT),
     );
+    if let Some(pipeline) = pipeline {
+        let provenance = if item.operator.palette.as_slice() == ["nf-core", "Catalog"] {
+            "discovered catalog definition"
+        } else {
+            "curated Axial definition"
+        };
+        ui.label(
+            egui::RichText::new(format!("release {} · {provenance}", pipeline.revision))
+                .size(9.5)
+                .color(MUTED),
+        );
+    }
     ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
         for port in &item.operator.ports.r#in {
@@ -1978,29 +2308,56 @@ fn apply_visuals(ctx: &egui::Context) {
     let mut v = egui::Visuals::dark();
     v.panel_fill = PANEL;
     v.window_fill = PANEL2;
-    v.extreme_bg_color = Color32::from_rgb(28, 28, 32);
-    v.faint_bg_color = Color32::from_rgb(38, 38, 42);
+    v.extreme_bg_color = GRAPHITE.control;
+    v.faint_bg_color = GRAPHITE.surface_hover;
+    v.text_edit_bg_color = Some(GRAPHITE.control);
+    v.hyperlink_color = GRAPHITE.accent;
+    v.warn_fg_color = GRAPHITE.warning;
+    v.error_fg_color = GRAPHITE.danger;
     v.override_text_color = Some(TEXT);
-    v.widgets.inactive.bg_fill = PANEL2;
-    v.widgets.inactive.weak_bg_fill = PANEL2;
-    v.widgets.hovered.bg_fill = Color32::from_rgb(62, 62, 70);
-    v.widgets.active.bg_fill = Color32::from_rgb(70, 70, 80);
-    v.selection.bg_fill = ACCENT.gamma_multiply(0.4);
-    v.widgets.inactive.corner_radius = CornerRadius::same(2);
-    v.widgets.hovered.corner_radius = CornerRadius::same(2);
-    v.window_corner_radius = CornerRadius::same(2);
-    v.window_stroke = Stroke::new(1.0, Color32::from_rgb(70, 70, 78));
+    v.widgets.inactive.bg_fill = GRAPHITE.control;
+    v.widgets.inactive.weak_bg_fill = GRAPHITE.surface_raised;
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, GRAPHITE.border);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.hovered.bg_fill = GRAPHITE.surface_hover;
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, GRAPHITE.border_strong);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.active.bg_fill = GRAPHITE.surface_active;
+    v.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
+    v.widgets.active.fg_stroke = Stroke::new(1.0, TEXT);
+    v.selection.bg_fill = GRAPHITE.accent_strong;
+    v.selection.stroke = Stroke::new(1.0, GRAPHITE.on_accent);
+    v.widgets.inactive.corner_radius = CornerRadius::same(8);
+    v.widgets.hovered.corner_radius = CornerRadius::same(8);
+    v.widgets.active.corner_radius = CornerRadius::same(8);
+    v.window_corner_radius = CornerRadius::same(14);
+    v.window_stroke = Stroke::new(1.0, GRAPHITE.border);
     ctx.set_visuals(v);
     ctx.style_mut(|s| {
-        s.spacing.item_spacing = Vec2::new(4.0, 3.0);
-        s.spacing.button_padding = Vec2::new(6.0, 3.0);
-        s.spacing.interact_size.y = 18.0;
+        s.spacing.item_spacing = Vec2::new(6.0, 5.0);
+        s.spacing.button_padding = Vec2::new(8.0, 5.0);
+        s.spacing.interact_size.y = 24.0;
     });
+}
+
+fn machine_profile_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal_top(|ui| {
+        ui.add_sized(
+            Vec2::new(68.0, 18.0),
+            egui::Label::new(egui::RichText::new(label).size(8.5).color(MUTED)),
+        );
+        ui.vertical(|ui| {
+            ui.set_width(222.0);
+            ui.add(egui::Label::new(egui::RichText::new(value).size(10.5).color(TEXT)).wrap());
+        });
+    });
+    ui.add_space(3.0);
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_visuals(ctx);
+        let surface_at_frame_start = self.overlays.active();
         {
             let r = ctx.screen_rect();
             ctx.layer_painter(egui::LayerId::background())
@@ -2010,6 +2367,7 @@ impl eframe::App for App {
         self.poll_paper(ctx);
         self.poll_autosave(ctx);
         self.poll_nfcore_catalog(ctx);
+        self.poll_system_profile(ctx);
         self.refresh_fq();
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -2018,24 +2376,48 @@ impl eframe::App for App {
                 .filter_map(|f| f.path.clone())
                 .collect()
         });
+        let pairs = pair_dropped_fastqs(dropped.clone());
+        let paired_paths: BTreeSet<PathBuf> = pairs
+            .iter()
+            .flat_map(|(r1, r2)| [r1.clone(), r2.clone()])
+            .collect();
+        for (index, (r1, r2)) in pairs.into_iter().enumerate() {
+            self.ingest_paired_paths(
+                r1,
+                r2,
+                self.last_graph_pos + Vec2::new(0.0, index as f32 * 140.0),
+            );
+        }
         for p in dropped {
-            self.ingest_path(p, self.last_graph_pos);
+            if !paired_paths.contains(&p) {
+                self.ingest_path(p, self.last_graph_pos);
+            }
         }
         let cooking = self.cook_rx.is_some();
         let t = ctx.input(|i| i.time);
+        let all_node_ids = self
+            .graph
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>();
+        let all_viewer_action =
+            viewer_action(&self.viewer_off, all_node_ids.iter().map(String::as_str));
 
         let typing = ctx.wants_keyboard_input();
+        if ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::K)) {
+            self.open_surface(Surface::Library);
+            self.focus_library_search = true;
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.op_create = false;
-            self.paper_ui = false;
+            self.close_surface();
             self.info = None;
             self.wire = None;
-            self.pending_insert = None;
             self.marquee = None;
         }
-        if self.op_create && ctx.input(|i| i.key_pressed(egui::Key::Tab)) {
-            self.op_create = false;
-            self.pending_insert = None;
+        if self.overlays.is_open(Surface::OpCreate) && ctx.input(|i| i.key_pressed(egui::Key::Tab))
+        {
+            self.close_surface();
         }
         if !typing {
             ctx.input(|i| {
@@ -2045,7 +2427,9 @@ impl eframe::App for App {
                 false
             })
             .then(|| self.delete_selected());
-            if ctx.input(|i| i.key_pressed(egui::Key::Tab)) && !self.op_create {
+            if ctx.input(|i| i.key_pressed(egui::Key::Tab))
+                && !self.overlays.is_open(Surface::OpCreate)
+            {
                 let screen = ctx.pointer_latest_pos().unwrap_or(self.cursor);
                 self.open_op_create(self.last_graph_pos, screen, None);
             }
@@ -2064,40 +2448,68 @@ impl eframe::App for App {
             if ctx.input(|i| i.key_pressed(egui::Key::F)) {
                 self.request_fit();
             }
-            if ctx.input(|i| i.key_pressed(egui::Key::F5) || (i.modifiers.ctrl && i.key_pressed(egui::Key::Enter)))
-            {
+            if ctx.input(|i| {
+                i.key_pressed(egui::Key::F5)
+                    || (i.modifiers.ctrl && i.key_pressed(egui::Key::Enter))
+            }) {
                 self.cook();
             }
             if ctx.input(|i| i.key_pressed(egui::Key::P)) {
-                self.paper_ui = !self.paper_ui;
+                self.toggle_surface(Surface::Paper);
             }
         }
 
         egui::TopBottomPanel::top("bar")
-            .exact_height(34.0)
-            .frame(Frame::new().fill(BAR).inner_margin(Margin::symmetric(14, 5)))
+            .exact_height(50.0)
+            .frame(Frame::new().fill(BG).inner_margin(Margin::symmetric(16, 9)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Axial").color(ACCENT).strong().size(14.0));
-                    ui.add_space(10.0);
-                    ui.label(egui::RichText::new("/").color(MUTED).size(12.0));
-                    ui.label(egui::RichText::new("project1").color(TEXT).size(12.0));
+                    let (logo, _) = ui.allocate_exact_size(Vec2::splat(17.0), Sense::hover());
+                    for offset in [
+                        Vec2::new(4.5, 4.5),
+                        Vec2::new(12.5, 4.5),
+                        Vec2::new(4.5, 12.5),
+                        Vec2::new(12.5, 12.5),
+                    ] {
+                        ui.painter().circle_filled(logo.min + offset, 2.6, ACCENT);
+                    }
+                    ui.add_space(5.0);
+                    ui.add_sized(
+                        Vec2::new(48.0, 22.0),
+                        egui::Label::new(
+                            egui::RichText::new("AXIAL").color(TEXT).strong().size(12.5),
+                        ),
+                    );
+                    ui.add_space(12.0);
+                    ui.label(egui::RichText::new("project1").color(MUTED).size(11.5));
                     if !self.paper_name.is_empty() {
                         ui.label(egui::RichText::new("/").color(MUTED).size(12.0));
-                        ui.label(egui::RichText::new(&self.paper_name).color(ACCENT).size(12.0));
+                        ui.label(egui::RichText::new(&self.paper_name).color(TEXT).size(11.5));
                     }
-                    ui.label(egui::RichText::new("  >>").color(MUTED).size(12.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let cook_l = if cooking { "  cooking…  " } else { "  Cook  " };
-                        let fill = if cooking {
-                            Color32::from_rgb(200, 170, 70)
+                        let cook_l = if cooking {
+                            "  Cooking…  "
                         } else {
-                            SELECT
+                            "  Cook  "
+                        };
+                        let fill = if cooking {
+                            GRAPHITE.warning
+                        } else {
+                            GRAPHITE.accent_strong
+                        };
+                        let foreground = if cooking {
+                            GRAPHITE.chrome
+                        } else {
+                            GRAPHITE.on_accent
                         };
                         if ui
                             .add(
-                                egui::Button::new(egui::RichText::new(cook_l).color(Color32::BLACK).strong())
-                                    .fill(fill),
+                                egui::Button::new(
+                                    egui::RichText::new(cook_l).color(foreground).strong(),
+                                )
+                                .fill(fill)
+                                .stroke(Stroke::NONE)
+                                .corner_radius(16),
                             )
                             .clicked()
                         {
@@ -2106,16 +2518,53 @@ impl eframe::App for App {
                         if ui
                             .add(
                                 egui::Button::new(egui::RichText::new("  Fit  ").color(TEXT))
-                                    .fill(PANEL2),
+                                    .fill(GRAPHITE.surface)
+                                    .corner_radius(16),
                             )
                             .clicked()
                         {
                             self.request_fit();
                         }
+                        let (viewer_label, viewer_tip) = match all_viewer_action {
+                            Some(ViewerAction::Show) => {
+                                ("  Show viewers  ", "Show previews on every node")
+                            }
+                            Some(ViewerAction::Hide) => {
+                                ("  Hide viewers  ", "Hide previews on every node")
+                            }
+                            None => ("  Viewers  ", "Add a node to control its preview"),
+                        };
+                        if ui
+                            .add_enabled(
+                                all_viewer_action.is_some(),
+                                egui::Button::new(egui::RichText::new(viewer_label).color(TEXT))
+                                    .fill(GRAPHITE.surface)
+                                    .corner_radius(16),
+                            )
+                            .on_hover_text(viewer_tip)
+                            .clicked()
+                        {
+                            if let Some(action) = all_viewer_action {
+                                apply_viewer_action(
+                                    &mut self.viewer_off,
+                                    all_node_ids.iter().map(String::as_str),
+                                    action,
+                                );
+                                self.status = match action {
+                                    ViewerAction::Show => {
+                                        format!("showing all {} node viewers", all_node_ids.len())
+                                    }
+                                    ViewerAction::Hide => {
+                                        format!("hid all {} node viewers", all_node_ids.len())
+                                    }
+                                };
+                            }
+                        }
                         if ui
                             .add(
                                 egui::Button::new(egui::RichText::new("  Save  ").color(TEXT))
-                                    .fill(PANEL2),
+                                    .fill(GRAPHITE.surface)
+                                    .corner_radius(16),
                             )
                             .clicked()
                         {
@@ -2125,376 +2574,665 @@ impl eframe::App for App {
                 });
             });
 
+        let mut surface_activator_clicked = false;
+        let mut zoom_step = None;
         egui::TopBottomPanel::bottom("hint")
-            .exact_height(20.0)
-            .frame(Frame::new().fill(BAR).inner_margin(Margin::symmetric(14, 1)))
+            .exact_height(24.0)
+            .frame(Frame::new().fill(BG).inner_margin(Margin::symmetric(16, 3)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
-                    egui::RichText::new(if self.paper_rx.is_some() {
-                        "reading paper…"
-                    } else {
-                        self.status.as_str()
-                    })
-                    .size(11.0)
-                    .color(MUTED),
-                );
+                        egui::RichText::new(if self.paper_rx.is_some() {
+                            "reading paper…"
+                        } else {
+                            self.status.as_str()
+                        })
+                        .size(11.0)
+                        .color(MUTED),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new(format!("{:.0}%", self.zoom * 100.0))
-                                .size(11.0)
-                                .color(MUTED),
-                        );
+                        let zoom_button = |label: &str| {
+                            egui::Button::new(egui::RichText::new(label).size(13.0).color(TEXT))
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE)
+                                .corner_radius(4)
+                        };
+                        if ui
+                            .add_sized(Vec2::new(24.0, 18.0), zoom_button("+"))
+                            .on_hover_text("Zoom in")
+                            .clicked()
+                        {
+                            zoom_step = Some(1.15);
+                        }
+                        if ui
+                            .add_sized(
+                                Vec2::new(48.0, 18.0),
+                                egui::Button::new(
+                                    egui::RichText::new(format!("{:.0}%", self.zoom * 100.0))
+                                        .size(10.5)
+                                        .color(MUTED),
+                                )
+                                .fill(Color32::TRANSPARENT)
+                                .stroke(Stroke::NONE),
+                            )
+                            .on_hover_text("Reset zoom to 100%")
+                            .clicked()
+                        {
+                            zoom_step = Some(1.0 / self.zoom);
+                        }
+                        if ui
+                            .add_sized(Vec2::new(24.0, 18.0), zoom_button("−"))
+                            .on_hover_text("Zoom out")
+                            .clicked()
+                        {
+                            zoom_step = Some(1.0 / 1.15);
+                        }
+                        if ui
+                            .add_sized(
+                                Vec2::new(76.0, 18.0),
+                                egui::Button::new(egui::RichText::new("Machine").size(10.5).color(
+                                    if self.overlays.is_open(Surface::Machine) {
+                                        GRAPHITE.on_accent
+                                    } else {
+                                        MUTED
+                                    },
+                                ))
+                                .fill(if self.overlays.is_open(Surface::Machine) {
+                                    GRAPHITE.accent
+                                } else {
+                                    Color32::TRANSPARENT
+                                })
+                                .stroke(Stroke::NONE)
+                                .corner_radius(4),
+                            )
+                            .on_hover_text("Show detected CPU, GPU, cores, threads, and memory")
+                            .clicked()
+                        {
+                            surface_activator_clicked = true;
+                            self.toggle_surface(Surface::Machine);
+                        }
                     });
                 });
             });
 
-        let mut pick_snakemake = false;
-        egui::SidePanel::left("palette")
-            .default_width(272.0)
-            .min_width(238.0)
-            .max_width(380.0)
-            .resizable(true)
-            .frame(Frame::new().fill(PANEL).inner_margin(Margin::ZERO))
+        if let Some(factor) = zoom_step {
+            let canvas = ctx.available_rect();
+            self.auto_fit = false;
+            (self.pan, self.zoom) =
+                zoom_about(self.pan, self.zoom, canvas.min, canvas.center(), factor);
+        }
+
+        egui::Area::new(Id::new("tool_rail"))
+            .anchor(egui::Align2::LEFT_TOP, [14.0, 66.0])
             .show(ctx, |ui| {
-                let header = Rect::from_min_size(
-                    ui.max_rect().min,
-                    Vec2::new(ui.available_width(), 38.0),
-                );
-                ui.painter().rect_filled(header, 0, BAR);
-                ui.add_space(9.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(12.0);
-                    ui.label(
-                        egui::RichText::new("Library")
-                            .strong()
-                            .size(13.0)
-                            .color(TEXT),
+                Frame::new()
+                    .fill(GRAPHITE.surface)
+                    .stroke(Stroke::new(1.0, GRAPHITE.border))
+                    .inner_margin(Margin::same(5))
+                    .corner_radius(22)
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            let add = ui
+                                .add_sized(
+                                    Vec2::splat(38.0),
+                                    egui::Button::new(egui::RichText::new("+").size(22.0).color(
+                                        if self.overlays.is_open(Surface::Library) {
+                                            GRAPHITE.on_accent
+                                        } else {
+                                            TEXT
+                                        },
+                                    ))
+                                    .fill(if self.overlays.is_open(Surface::Library) {
+                                        GRAPHITE.accent
+                                    } else {
+                                        GRAPHITE.surface_raised
+                                    })
+                                    .stroke(Stroke::NONE)
+                                    .corner_radius(19),
+                                )
+                                .on_hover_text("Open Library");
+                            if add.clicked() {
+                                surface_activator_clicked = true;
+                                self.toggle_surface(Surface::Library);
+                                if self.overlays.is_open(Surface::Library) {
+                                    self.focus_library_search = true;
+                                }
+                            }
+                            for (label, mode, tip) in [
+                                ("/", PaletteMode::Build, "Search tools"),
+                                ("ID", PaletteMode::Sources, "Add data source"),
+                                ("nf", PaletteMode::Pipelines, "Find a workflow"),
+                            ] {
+                                let active = self.overlays.is_open(Surface::Library)
+                                    && self.library.mode() == mode;
+                                let response = ui
+                                    .add_sized(
+                                        Vec2::splat(38.0),
+                                        egui::Button::new(
+                                            egui::RichText::new(label)
+                                                .size(if label.len() > 1 { 10.0 } else { 16.0 })
+                                                .color(if active { ACCENT } else { MUTED }),
+                                        )
+                                        .fill(Color32::TRANSPARENT)
+                                        .stroke(Stroke::NONE)
+                                        .corner_radius(19),
+                                    )
+                                    .on_hover_text(tip);
+                                if response.clicked() {
+                                    surface_activator_clicked = true;
+                                    self.open_surface(Surface::Library);
+                                    if let Err(error) = self.library.set_mode(mode) {
+                                        self.status =
+                                            format!("Library state was not saved: {error}");
+                                    }
+                                    if mode == PaletteMode::Build {
+                                        self.focus_library_search = true;
+                                    } else if mode == PaletteMode::Sources {
+                                        self.focus_accession = true;
+                                    }
+                                }
+                            }
+                            if ui
+                                .add_sized(
+                                    Vec2::splat(38.0),
+                                    egui::Button::new(
+                                        egui::RichText::new("P").size(11.0).color(MUTED),
+                                    )
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(Stroke::NONE)
+                                    .corner_radius(19),
+                                )
+                                .on_hover_text("Rebuild from a paper")
+                                .clicked()
+                            {
+                                surface_activator_clicked = true;
+                                self.toggle_surface(Surface::Paper);
+                            }
+                        });
+                    });
+            });
+
+        let mut pick_snakemake = false;
+        if self.overlays.is_open(Surface::Library) {
+            let library_response = egui::Window::new("library")
+                .title_bar(false)
+                .anchor(egui::Align2::LEFT_TOP, [68.0, 66.0])
+                .default_width(332.0)
+                .default_height(700.0)
+                .resizable(true)
+                .collapsible(false)
+                .frame(
+                    Frame::new()
+                        .fill(PANEL)
+                        .stroke(Stroke::new(1.0, GRAPHITE.border))
+                        .inner_margin(Margin::ZERO)
+                        .corner_radius(14),
+                )
+                .show(ctx, |ui| {
+                    ui.set_min_width(300.0);
+                    let header = Rect::from_min_size(
+                        ui.max_rect().min,
+                        Vec2::new(ui.available_width(), 38.0),
                     );
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
+                    ui.painter().rect_filled(
+                        header,
+                        CornerRadius::same(14),
+                        GRAPHITE.surface_raised,
+                    );
+                    ui.add_space(9.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        ui.label(
+                            egui::RichText::new("Library")
+                                .strong()
+                                .size(13.0)
+                                .color(TEXT),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.add_space(10.0);
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("×").size(15.0).color(MUTED),
+                                    )
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(Stroke::NONE),
+                                )
+                                .on_hover_text("Close Library")
+                                .clicked()
+                            {
+                                self.close_surface();
+                            }
                             ui.label(
                                 egui::RichText::new(format!("{} tools", self.catalog.ops.len()))
                                     .size(10.0)
                                     .color(MUTED),
                             );
-                        },
-                    );
-                });
-                ui.add_space(11.0);
-
-                ui.horizontal(|ui| {
-                    ui.add_space(10.0);
-                    Frame::new()
-                        .fill(Color32::from_rgb(42, 43, 51))
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(64, 65, 76)))
-                        .inner_margin(Margin::symmetric(8, 5))
-                        .corner_radius(6)
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.search)
-                                    .id(Id::new("palette_search"))
-                                    .hint_text("Search tools, sources, pipelines…")
-                                    .desired_width((ui.available_width() - 12.0).max(100.0))
-                                    .frame(false)
-                                    .font(FontId::proportional(12.0)),
-                            );
-                        });
-                });
-                ui.add_space(7.0);
-
-                ui.horizontal(|ui| {
-                    ui.add_space(10.0);
-                    let width = ((ui.available_width() - 12.0) / 3.0).max(58.0);
-                    for mode in PaletteMode::ALL {
-                        let selected = self.palette_mode == mode;
-                        let response = ui.add_sized(
-                            Vec2::new(width, 26.0),
-                            egui::Button::new(
-                                egui::RichText::new(mode.label())
-                                    .size(11.0)
-                                    .color(if selected { TEXT } else { MUTED }),
-                            )
-                            .fill(if selected {
-                                Color32::from_rgb(48, 46, 57)
-                            } else {
-                                Color32::TRANSPARENT
-                            })
-                            .corner_radius(5),
-                        );
-                        if response.clicked() {
-                            self.palette_mode = mode;
-                            self.search.clear();
-                        }
-                    }
-                });
-                ui.add_space(6.0);
-                ui.separator();
-
-                let mut quick_drop: Option<Operator> = None;
-                if self.search.is_empty() && self.palette_mode == PaletteMode::Build {
-                    ui.add_space(5.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(12.0);
-                        ui.label(
-                            egui::RichText::new("QUICK ADD")
-                                .size(9.5)
-                                .color(MUTED),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add_space(6.0);
-                        ui.vertical(|ui| {
-                            if draw_palette_action(
-                                ui,
-                                "+",
-                                "Import reads",
-                                "FASTQ, BAM, VCF or GTF",
-                                SELECT,
-                            )
-                            .clicked()
-                            {
-                                quick_drop = self.catalog.get("files.import").ok().cloned();
-                            }
-                            if draw_palette_action(
-                                ui,
-                                "ID",
-                                "Add accession",
-                                "SRA run or NCBI assembly",
-                                SELECT,
-                            )
-                            .clicked()
-                            {
-                                self.palette_mode = PaletteMode::Sources;
-                                self.focus_accession = true;
-                            }
-                            if draw_palette_action(
-                                ui,
-                                "nf",
-                                "Find a pipeline",
-                                &format!("{} released nf-core workflows", self.nfcore.len()),
-                                Color32::from_rgb(91, 174, 220),
-                            )
-                            .clicked()
-                            {
-                                self.palette_mode = PaletteMode::Pipelines;
-                                ui.memory_mut(|memory| {
-                                    memory.request_focus(Id::new("palette_search"));
-                                });
-                            }
                         });
                     });
-                    ui.add_space(2.0);
-                }
+                    ui.add_space(11.0);
 
-                let mut add_accession = false;
-                if self.search.is_empty() && self.palette_mode == PaletteMode::Sources {
-                    ui.add_space(7.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(12.0);
-                        ui.label(
-                            egui::RichText::new("PASTE AN ACCESSION")
-                                .size(9.5)
-                                .color(MUTED),
-                        );
-                    });
-                    ui.add_space(2.0);
                     ui.horizontal(|ui| {
                         ui.add_space(10.0);
                         Frame::new()
-                            .fill(Color32::from_rgb(37, 48, 44))
-                            .stroke(Stroke::new(1.0, SELECT.gamma_multiply(0.45)))
+                            .fill(GRAPHITE.control)
+                            .stroke(Stroke::new(1.0, GRAPHITE.border))
                             .inner_margin(Margin::symmetric(8, 5))
                             .corner_radius(6)
                             .show(ui, |ui| {
-                                let response = ui.add(
-                                    egui::TextEdit::singleline(&mut self.accession)
-                                        .id(Id::new("accession_entry"))
-                                        .hint_text("SRR…  ERR…  GCA…  GCF…")
-                                        .desired_width((ui.available_width() - 52.0).max(80.0))
+                                let search_response = ui.add(
+                                    egui::TextEdit::singleline(&mut self.search)
+                                        .id(Id::new("palette_search"))
+                                        .hint_text("Search everything…   Ctrl K")
+                                        .desired_width((ui.available_width() - 12.0).max(100.0))
                                         .frame(false)
                                         .font(FontId::proportional(12.0)),
                                 );
-                                if self.focus_accession {
-                                    response.request_focus();
-                                    self.focus_accession = false;
-                                }
-                                if response.has_focus()
-                                    && ui.input(|input| input.key_pressed(egui::Key::Enter))
-                                {
-                                    add_accession = true;
+                                if self.focus_library_search {
+                                    search_response.request_focus();
+                                    self.focus_library_search = false;
                                 }
                             });
-                        if ui
-                            .add(
+                    });
+                    ui.add_space(7.0);
+
+                    ui.horizontal(|ui| {
+                        ui.add_space(10.0);
+                        let width = ((ui.available_width() - 12.0) / 3.0).max(58.0);
+                        for mode in PaletteMode::ALL {
+                            let selected = self.library.mode() == mode;
+                            let response = ui.add_sized(
+                                Vec2::new(width, 26.0),
                                 egui::Button::new(
-                                    egui::RichText::new("Add").size(11.0).color(TEXT),
+                                    egui::RichText::new(mode.label())
+                                        .size(11.0)
+                                        .color(if selected { TEXT } else { MUTED }),
                                 )
-                                .fill(PANEL2)
+                                .fill(if selected {
+                                    GRAPHITE.surface_active
+                                } else {
+                                    Color32::TRANSPARENT
+                                })
                                 .corner_radius(5),
+                            );
+                            if response.clicked() {
+                                if let Err(error) = self.library.set_mode(mode) {
+                                    self.status = format!("Library state was not saved: {error}");
+                                }
+                                self.search.clear();
+                            }
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.separator();
+
+                    let mut quick_drop: Option<Operator> = None;
+                    if self.search.is_empty() && self.library.mode() == PaletteMode::Build {
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(12.0);
+                            ui.label(egui::RichText::new("QUICK ADD").size(9.5).color(MUTED));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add_space(6.0);
+                            ui.vertical(|ui| {
+                                if draw_palette_action(
+                                    ui,
+                                    "+",
+                                    "Import reads",
+                                    "FASTQ, BAM, VCF or GTF",
+                                    SELECT,
+                                )
+                                .clicked()
+                                {
+                                    quick_drop = self.catalog.get("files.import").ok().cloned();
+                                }
+                                if draw_palette_action(
+                                    ui,
+                                    "ID",
+                                    "Add accession",
+                                    "NCBI or Ensembl stable ID",
+                                    SELECT,
+                                )
+                                .clicked()
+                                {
+                                    if let Err(error) = self.library.set_mode(PaletteMode::Sources)
+                                    {
+                                        self.status =
+                                            format!("Library state was not saved: {error}");
+                                    }
+                                    self.focus_accession = true;
+                                }
+                                if draw_palette_action(
+                                    ui,
+                                    "nf",
+                                    "Find a pipeline",
+                                    &format!("{} released nf-core workflows", self.nfcore.len()),
+                                    Color32::from_rgb(91, 174, 220),
+                                )
+                                .clicked()
+                                {
+                                    if let Err(error) =
+                                        self.library.set_mode(PaletteMode::Pipelines)
+                                    {
+                                        self.status =
+                                            format!("Library state was not saved: {error}");
+                                    }
+                                    ui.memory_mut(|memory| {
+                                        memory.request_focus(Id::new("palette_search"));
+                                    });
+                                }
+                            });
+                        });
+                        ui.add_space(2.0);
+                    }
+
+                    let mut add_accession = false;
+                    if self.search.is_empty() && self.library.mode() == PaletteMode::Sources {
+                        ui.add_space(7.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(12.0);
+                            ui.label(egui::RichText::new("PUBLIC DATA").size(9.5).color(MUTED));
+                        });
+                        ui.add_space(2.0);
+                        ui.horizontal_wrapped(|ui| {
+                            ui.add_space(10.0);
+                            for (label, ready, help) in [
+                                (
+                                    "SRA",
+                                    self.source_tools.sra,
+                                    "prefetch + fasterq-dump · axial-ncbi",
+                                ),
+                                (
+                                    "Datasets",
+                                    self.source_tools.datasets,
+                                    "NCBI datasets CLI · axial-ncbi",
+                                ),
+                                (
+                                    "Ensembl",
+                                    self.source_tools.ensembl,
+                                    "Ensembl REST through curl",
+                                ),
+                            ] {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{} {label}",
+                                        if ready { "●" } else { "○" }
+                                    ))
+                                    .size(9.5)
+                                    .color(if ready {
+                                        SELECT
+                                    } else {
+                                        GRAPHITE.warning
+                                    }),
+                                )
+                                .on_hover_text(if ready {
+                                    format!("Ready · {help}")
+                                } else {
+                                    format!("Setup needed · {help}")
+                                });
+                            }
+                        });
+                        ui.add_space(3.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(10.0);
+                            Frame::new()
+                                .fill(GRAPHITE.control)
+                                .stroke(Stroke::new(1.0, SELECT.gamma_multiply(0.45)))
+                                .inner_margin(Margin::symmetric(9, 8))
+                                .corner_radius(7)
+                                .show(ui, |ui| {
+                                    ui.set_width((ui.available_width() - 2.0).max(120.0));
+                                    ui.label(
+                                        egui::RichText::new("PASTE AN ACCESSION OR RECORD URL")
+                                            .size(8.8)
+                                            .color(MUTED),
+                                    );
+                                    let response = ui.add(
+                                        egui::TextEdit::singleline(&mut self.accession)
+                                            .id(Id::new("accession_entry"))
+                                            .hint_text("SRR… · GCA_/GCF_… · ENSG/ENST/ENSP…")
+                                            .desired_width(ui.available_width())
+                                            .frame(false)
+                                            .font(FontId::monospace(12.0)),
+                                    );
+                                    if self.focus_accession {
+                                        response.request_focus();
+                                        self.focus_accession = false;
+                                    }
+                                    let parsed = sources::classify(&self.accession);
+                                    let valid = parsed.is_ok();
+                                    if response.has_focus()
+                                        && valid
+                                        && ui.input(|input| input.key_pressed(egui::Key::Enter))
+                                    {
+                                        add_accession = true;
+                                    }
+                                    ui.add_space(3.0);
+                                    match &parsed {
+                                        Ok(request) => {
+                                            ui.horizontal(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new(request.provider())
+                                                        .size(9.5)
+                                                        .color(SELECT),
+                                                );
+                                                ui.label(
+                                                    egui::RichText::new(&request.value)
+                                                        .size(10.0)
+                                                        .monospace()
+                                                        .color(TEXT),
+                                                );
+                                            });
+                                            ui.label(
+                                                egui::RichText::new(request.result())
+                                                    .size(9.5)
+                                                    .color(MUTED),
+                                            );
+                                        }
+                                        Err(error) if !self.accession.trim().is_empty() => {
+                                            ui.label(
+                                                egui::RichText::new(error)
+                                                    .size(9.5)
+                                                    .color(GRAPHITE.warning),
+                                            );
+                                        }
+                                        Err(_) => {
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "NCBI runs and assemblies · Ensembl stable IDs",
+                                                )
+                                                .size(9.5)
+                                                .color(MUTED),
+                                            );
+                                        }
+                                    }
+                                    ui.add_space(4.0);
+                                    let action = parsed
+                                        .as_ref()
+                                        .map(|request| request.action())
+                                        .unwrap_or("Add source");
+                                    if ui
+                                        .add_enabled(
+                                            valid,
+                                            egui::Button::new(
+                                                egui::RichText::new(action).size(11.0),
+                                            )
+                                            .fill(GRAPHITE.surface_active)
+                                            .corner_radius(5)
+                                            .min_size(Vec2::new(ui.available_width(), 26.0)),
+                                        )
+                                        .clicked()
+                                    {
+                                        add_accession = true;
+                                    }
+                                });
+                        });
+                        ui.add_space(5.0);
+                    }
+
+                    if self.search.is_empty() && self.library.mode() == PaletteMode::Pipelines {
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(12.0);
+                            ui.label(
+                                egui::RichText::new("WORKFLOW ENGINES")
+                                    .size(9.5)
+                                    .color(MUTED),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add_space(6.0);
+                            if draw_palette_action(
+                                ui,
+                                "SM",
+                                "Open Snakemake project",
+                                "Snakefile → typed runnable graph",
+                                Color32::from_rgb(84, 168, 111),
                             )
                             .clicked()
-                        {
-                            add_accession = true;
-                        }
-                    });
-                    ui.add_space(5.0);
-                }
-
-                if self.search.is_empty() && self.palette_mode == PaletteMode::Pipelines {
-                    ui.add_space(5.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(12.0);
-                        ui.label(
-                            egui::RichText::new("WORKFLOW ENGINES")
-                                .size(9.5)
-                                .color(MUTED),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.add_space(6.0);
-                        if draw_palette_action(
-                            ui,
-                            "SM",
-                            "Open Snakemake project",
-                            "Snakefile → typed runnable graph",
-                            Color32::from_rgb(84, 168, 111),
-                        )
-                        .clicked()
-                        {
-                            pick_snakemake = true;
-                        }
-                    });
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(12.0);
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "NF-CORE CATALOG · {}",
-                                self.nfcore.len()
-                            ))
-                            .size(9.5)
-                            .color(MUTED),
-                        );
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.add_space(8.0);
-                                if ui
-                                    .small_button("↻")
-                                    .on_hover_text("Refresh the official nf-core catalog")
-                                    .clicked()
-                                {
-                                    self.refresh_nfcore_catalog();
-                                }
-                            },
-                        );
-                    });
-                }
-
-                let sections = palette::sections(
-                    self.palette_mode,
-                    &self.catalog.ops,
-                    &self.nfcore,
-                    &self.search,
-                    &self.recent_ops,
-                    &self.favorite_ops,
-                );
-                let mut drop_click: Option<Operator> = None;
-                let mut toggle_favorite: Option<String> = None;
-                egui::ScrollArea::vertical()
-                    .id_salt("palette_scroll")
-                    .auto_shrink([false, false])
-                    .max_height((ui.available_height() - 28.0).max(100.0))
-                    .show(ui, |ui| {
+                            {
+                                pick_snakemake = true;
+                            }
+                        });
                         ui.add_space(4.0);
-                        for section in &sections {
-                            egui::CollapsingHeader::new(
-                                egui::RichText::new(format!(
-                                    "{}   {}",
-                                    section.title.to_uppercase(),
-                                    section.items.len()
-                                ))
-                                .size(9.5)
-                                .color(MUTED),
-                            )
-                            .default_open(section.open)
-                            .show(ui, |ui| {
-                                for item in &section.items {
-                                    let favorite = self.favorite_ops.contains(&item.operator.id);
-                                    let drag = ui.dnd_drag_source(
-                                        Id::new(("palette", item.operator.id.as_str())),
-                                        item.operator.id.clone(),
-                                        |ui| draw_palette_row(ui, item, favorite),
-                                    );
-                                    drag.response.clone().on_hover_ui(|ui| {
-                                        palette_tooltip(
-                                            ui,
-                                            item,
-                                            self.nfcore.get(&item.operator.id),
-                                        );
-                                    });
-                                    if drag.inner.favorite_clicked {
-                                        toggle_favorite = Some(item.operator.id.clone());
-                                    } else if drag.inner.clicked {
-                                        drop_click = Some(item.operator.clone());
-                                    }
-                                }
-                            });
-                        }
-                        if sections.iter().all(|section| section.items.is_empty()) {
+                        ui.horizontal(|ui| {
                             ui.add_space(12.0);
-                            ui.horizontal(|ui| {
-                                ui.add_space(12.0);
-                                ui.label(
-                                    egui::RichText::new("No matching tools")
-                                        .size(11.0)
-                                        .color(MUTED)
-                                        .italics(),
-                                );
-                            });
-                        }
-                    });
-
-                if let Some(id) = toggle_favorite {
-                    if !self.favorite_ops.remove(&id) {
-                        self.favorite_ops.insert(id);
-                    }
-                }
-                if let Some(operator) = quick_drop.or(drop_click) {
-                    self.drop_op(&operator, self.last_graph_pos);
-                }
-                if add_accession {
-                    self.insert_accession();
-                }
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.add_space(12.0);
-                    ui.label(
-                        egui::RichText::new(format!("★ {} favorites", self.favorite_ops.len()))
-                            .size(10.0)
-                            .color(MUTED),
-                    );
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            ui.add_space(10.0);
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "✓ {} installed",
-                                    self.catalog.ops.len()
+                                    "NF-CORE CATALOG · {}",
+                                    self.nfcore.len()
                                 ))
-                                .size(10.0)
+                                .size(9.5)
                                 .color(MUTED),
                             );
-                        },
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.add_space(8.0);
+                                    if ui
+                                        .small_button("↻")
+                                        .on_hover_text("Refresh the official nf-core catalog")
+                                        .clicked()
+                                    {
+                                        self.refresh_nfcore_catalog();
+                                    }
+                                },
+                            );
+                        });
+                    }
+
+                    let sections = palette::sections(
+                        self.library.mode(),
+                        &self.catalog.ops,
+                        &self.nfcore,
+                        &self.search,
+                        self.library.recent(),
+                        self.library.favorites(),
                     );
+                    let mut drop_click: Option<Operator> = None;
+                    let mut toggle_favorite: Option<String> = None;
+                    egui::ScrollArea::vertical()
+                        .id_salt("palette_scroll")
+                        .auto_shrink([false, false])
+                        .max_height((ui.available_height() - 28.0).max(100.0))
+                        .show(ui, |ui| {
+                            ui.add_space(4.0);
+                            for section in &sections {
+                                egui::CollapsingHeader::new(
+                                    egui::RichText::new(format!(
+                                        "{}   {}",
+                                        section.title.to_uppercase(),
+                                        section.items.len()
+                                    ))
+                                    .size(9.5)
+                                    .color(MUTED),
+                                )
+                                .default_open(section.open)
+                                .show(ui, |ui| {
+                                    for item in &section.items {
+                                        let favorite = self.library.is_favorite(&item.operator.id);
+                                        let drag = ui.dnd_drag_source(
+                                            Id::new(("palette", item.operator.id.as_str())),
+                                            item.operator.id.clone(),
+                                            |ui| draw_palette_row(ui, item, favorite),
+                                        );
+                                        drag.response.clone().on_hover_ui(|ui| {
+                                            palette_tooltip(
+                                                ui,
+                                                item,
+                                                self.nfcore.get(&item.operator.id),
+                                            );
+                                        });
+                                        if drag.inner.favorite_clicked {
+                                            toggle_favorite = Some(item.operator.id.clone());
+                                        } else if drag.inner.clicked {
+                                            drop_click = Some(item.operator.clone());
+                                        }
+                                    }
+                                });
+                            }
+                            if sections.iter().all(|section| section.items.is_empty()) {
+                                ui.add_space(12.0);
+                                ui.horizontal(|ui| {
+                                    ui.add_space(12.0);
+                                    ui.label(
+                                        egui::RichText::new("No matching tools")
+                                            .size(11.0)
+                                            .color(MUTED)
+                                            .italics(),
+                                    );
+                                });
+                            }
+                        });
+
+                    if let Some(id) = toggle_favorite {
+                        if let Err(error) = self.library.toggle_favorite(&id) {
+                            self.status = format!("Library state was not saved: {error}");
+                        }
+                    }
+                    if let Some(operator) = quick_drop.or(drop_click) {
+                        self.drop_op(&operator, self.last_graph_pos);
+                    }
+                    if add_accession {
+                        self.insert_accession();
+                    }
+
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        let favorite_count = self
+                            .library
+                            .favorites()
+                            .iter()
+                            .filter(|id| self.catalog.ops.contains_key(*id))
+                            .count();
+                        ui.label(
+                            egui::RichText::new(format!("★ {favorite_count} favorites"))
+                                .size(10.0)
+                                .color(MUTED),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(10.0);
+                            let (local, discovered) = palette::inventory_counts(&self.catalog.ops);
+                            ui.label(
+                                egui::RichText::new(format!("{local} local · {discovered} found"))
+                                    .size(10.0)
+                                    .color(MUTED),
+                            );
+                        });
+                    });
+                    ui.add_space(6.0);
                 });
-                ui.add_space(6.0);
-            });
+            let clicked_away =
+                library_response.is_some_and(|response| response.response.clicked_elsewhere());
+            self.overlays.dismiss_on_click_away(
+                Surface::Library,
+                surface_at_frame_start,
+                clicked_away,
+                surface_activator_clicked,
+            );
+        }
 
         if pick_snakemake {
             if let Some(path) = Self::pick_snakemake_directory() {
@@ -2503,181 +3241,350 @@ impl eframe::App for App {
         }
 
         let selected_id = self.selection.primary().map(str::to_owned);
+        let selected_nodes = self
+            .selection
+            .nodes()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let selected_viewer_action =
+            viewer_action(&self.viewer_off, selected_nodes.iter().map(String::as_str));
+        let selected_viewer_state = {
+            let hidden = selected_nodes
+                .iter()
+                .filter(|node| self.viewer_off.contains(node.as_str()))
+                .count();
+            if hidden == 0 {
+                "on"
+            } else if hidden == selected_nodes.len() {
+                "off"
+            } else {
+                "mixed"
+            }
+        };
         if self.rename_target != selected_id {
             self.rename_target = selected_id.clone();
             self.rename_buffer = selected_id.clone().unwrap_or_default();
         }
         let mut rename_request: Option<(String, String)> = None;
-        egui::SidePanel::right("params")
-            .default_width(268.0)
-            .resizable(true)
-            .frame(Frame::new().fill(PANEL).inner_margin(Margin::ZERO))
-            .show(ctx, |ui| {
-                if let Some(id) = &selected_id {
-                    if let Some(nidx) = self.graph.nodes.iter().position(|n| n.id == *id) {
-                        let op_id = self.graph.nodes[nidx].operator.clone();
-                        let node_name = self.graph.nodes[nidx].id.clone();
-                        let title = self
-                            .catalog
-                            .get(&op_id)
-                            .map(|o| o.title.clone())
-                            .unwrap_or_else(|_| op_id.clone());
-                        let hdr = Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.available_width(), 40.0));
-                        ui.painter().rect_filled(hdr, 0, ACCENT);
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.add_space(10.0);
-                            ui.vertical(|ui| {
-                                ui.label(egui::RichText::new(&title).size(11.0).color(HEADER_FG));
-                                let rename = ui.add(
-                                    egui::TextEdit::singleline(&mut self.rename_buffer)
-                                        .desired_width(150.0)
-                                        .font(FontId::proportional(15.0))
-                                        .text_color(Color32::WHITE)
-                                        .frame(false)
-                                        .margin(Margin::ZERO),
-                                );
-                                if (rename.lost_focus()
-                                    || (rename.has_focus()
-                                        && ui.input(|input| input.key_pressed(egui::Key::Enter))))
-                                    && self.rename_buffer != node_name
-                                {
-                                    rename_request =
-                                        Some((node_name.clone(), self.rename_buffer.clone()));
-                                }
-                            });
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.add_space(8.0);
-                                if ui
-                                    .add(
-                                        egui::Button::new(egui::RichText::new("Cook").size(11.0).color(HEADER_FG))
-                                            .fill(Color32::from_rgba_unmultiplied(255, 255, 255, 40)),
-                                    )
-                                    .clicked()
-                                {
-                                    self.cook();
-                                }
-                            });
-                        });
-                        ui.add_space(8.0);
-                        if let Ok(op) = self.catalog.get(&op_id).cloned() {
-                            let mut pages: Vec<String> = Vec::new();
-                            for spec in op.params.values() {
-                                let p = spec.page.clone().unwrap_or_else(|| title.clone());
-                                if !pages.contains(&p) {
-                                    pages.push(p);
-                                }
-                            }
-                            if !pages.iter().any(|p| p == "Common") {
-                                pages.push("Common".into());
-                            }
-                            if self.param_page.is_empty() || !pages.contains(&self.param_page) {
-                                self.param_page = pages[0].clone();
-                            }
-                            ui.horizontal(|ui| {
-                                ui.add_space(8.0);
-                                for p in &pages {
-                                    let on = self.param_page == *p;
-                                    let t = if on {
-                                        egui::RichText::new(p).size(12.0).color(TEXT)
-                                    } else {
-                                        egui::RichText::new(p).size(12.0).color(MUTED)
-                                    };
-                                    let r = ui.add(egui::Button::new(t).fill(Color32::TRANSPARENT));
-                                    if on {
-                                        let u = r.rect;
-                                        ui.painter().line_segment(
-                                            [Pos2::new(u.min.x, u.max.y - 1.0), Pos2::new(u.max.x, u.max.y - 1.0)],
-                                            Stroke::new(1.5, TEXT),
+        if selected_id.is_some() {
+            egui::Window::new("params")
+                .title_bar(false)
+                .anchor(egui::Align2::RIGHT_TOP, [-16.0, 66.0])
+                .default_width(326.0)
+                .default_height(560.0)
+                .resizable(true)
+                .collapsible(false)
+                .frame(
+                    Frame::new()
+                        .fill(GRAPHITE.surface)
+                        .stroke(Stroke::new(1.0, GRAPHITE.border))
+                        .inner_margin(Margin::ZERO)
+                        .corner_radius(14),
+                )
+                .show(ctx, |ui| {
+                    ui.set_min_width(300.0);
+                    if let Some(id) = &selected_id {
+                        if let Some(nidx) = self.graph.nodes.iter().position(|n| n.id == *id) {
+                            let op_id = self.graph.nodes[nidx].operator.clone();
+                            let node_name = self.graph.nodes[nidx].id.clone();
+                            let title = self
+                                .catalog
+                                .get(&op_id)
+                                .map(|o| o.title.clone())
+                                .unwrap_or_else(|_| op_id.clone());
+                            Frame::new()
+                                .fill(GRAPHITE.surface_raised)
+                                .stroke(Stroke::new(1.0, GRAPHITE.border))
+                                .inner_margin(Margin::symmetric(12, 10))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        let family = family_color(&op_id);
+                                        let (mark, _) = ui.allocate_exact_size(
+                                            Vec2::new(4.0, 20.0),
+                                            Sense::hover(),
                                         );
-                                    }
-                                    if r.clicked() {
-                                        self.param_page = p.clone();
+                                        ui.painter().rect_filled(mark, 2, family);
+                                        ui.vertical(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(&title)
+                                                    .size(12.0)
+                                                    .strong()
+                                                    .color(TEXT),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(&op_id)
+                                                    .size(9.5)
+                                                    .monospace()
+                                                    .color(MUTED),
+                                            );
+                                            if selected_nodes.len() > 1 {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "{} nodes selected",
+                                                        selected_nodes.len()
+                                                    ))
+                                                    .size(9.5)
+                                                    .color(ACCENT),
+                                                );
+                                            }
+                                        });
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .add(
+                                                        egui::Button::new(
+                                                            egui::RichText::new("Cook")
+                                                                .size(11.0)
+                                                                .strong()
+                                                                .color(GRAPHITE.on_accent),
+                                                        )
+                                                        .fill(GRAPHITE.accent_strong)
+                                                        .stroke(Stroke::NONE)
+                                                        .corner_radius(5),
+                                                    )
+                                                    .on_hover_text(
+                                                        "Cook the graph with current parameters",
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.cook();
+                                                }
+                                            },
+                                        );
+                                    });
+                                    ui.add_space(7.0);
+                                    ui.label(
+                                        egui::RichText::new("NODE NAME").size(8.5).color(MUTED),
+                                    );
+                                    Frame::new()
+                                        .fill(GRAPHITE.surface_sunken)
+                                        .stroke(Stroke::new(1.0, GRAPHITE.border))
+                                        .inner_margin(Margin::symmetric(8, 4))
+                                        .corner_radius(5)
+                                        .show(ui, |ui| {
+                                            let rename = ui.add(
+                                                egui::TextEdit::singleline(&mut self.rename_buffer)
+                                                    .desired_width(ui.available_width())
+                                                    .font(FontId::proportional(13.0))
+                                                    .text_color(TEXT)
+                                                    .frame(false)
+                                                    .margin(Margin::ZERO),
+                                            );
+                                            if (rename.lost_focus()
+                                                || (rename.has_focus()
+                                                    && ui.input(|input| {
+                                                        input.key_pressed(egui::Key::Enter)
+                                                    })))
+                                                && self.rename_buffer != node_name
+                                            {
+                                                rename_request = Some((
+                                                    node_name.clone(),
+                                                    self.rename_buffer.clone(),
+                                                ));
+                                            }
+                                        });
+                                });
+                            ui.add_space(4.0);
+                            if let Ok(op) = self.catalog.get(&op_id).cloned() {
+                                let mut pages: Vec<String> = Vec::new();
+                                for spec in op.params.values() {
+                                    let p = spec.page.clone().unwrap_or_else(|| title.clone());
+                                    if !pages.contains(&p) {
+                                        pages.push(p);
                                     }
                                 }
-                            });
-                            ui.add_space(2.0);
-                            ui.separator();
-                            egui::ScrollArea::vertical().show(ui, |ui| {
-                                ui.add_space(8.0);
-                                if self.param_page == "Common" {
-                                    common_page(ui, &op, !self.viewer_off.contains(id));
-                                    if let Some(note) = self.graph.nodes[nidx].note.clone() {
-                                        ui.add_space(10.0);
-                                        Frame::new()
-                                            .inner_margin(Margin::symmetric(10, 4))
-                                            .show(ui, |ui| {
-                                                ui.label(
-                                                    egui::RichText::new(note)
-                                                        .size(11.0)
-                                                        .color(ACCENT)
-                                                        .italics(),
-                                                );
-                                            });
+                                if !pages.iter().any(|p| p == "Common") {
+                                    pages.push("Common".into());
+                                }
+                                if self.param_page.is_empty() || !pages.contains(&self.param_page) {
+                                    self.param_page = pages[0].clone();
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.add_space(8.0);
+                                    for p in &pages {
+                                        let on = self.param_page == *p;
+                                        let t = if on {
+                                            egui::RichText::new(p).size(11.0).strong().color(ACCENT)
+                                        } else {
+                                            egui::RichText::new(p).size(11.0).color(MUTED)
+                                        };
+                                        let r = ui.add(
+                                            egui::Button::new(t)
+                                                .fill(Color32::TRANSPARENT)
+                                                .stroke(Stroke::NONE)
+                                                .frame(false),
+                                        );
+                                        if on {
+                                            let u = r.rect;
+                                            ui.painter().line_segment(
+                                                [
+                                                    Pos2::new(u.min.x, u.max.y - 1.0),
+                                                    Pos2::new(u.max.x, u.max.y - 1.0),
+                                                ],
+                                                Stroke::new(2.0, ACCENT),
+                                            );
+                                        }
+                                        if r.clicked() {
+                                            self.param_page = p.clone();
+                                        }
                                     }
-                                    if ui
-                                        .add(egui::Button::new("toggle viewer").fill(PANEL2))
-                                        .clicked()
-                                        && !self.viewer_off.remove(id)
-                                    {
-                                        self.viewer_off.insert(id.clone());
-                                    }
-                                } else {
-                                    let keys: Vec<String> = op
-                                        .params
-                                        .iter()
-                                        .filter(|(_, s)| {
-                                            s.page.clone().unwrap_or_else(|| title.clone()) == self.param_page
-                                        })
-                                        .map(|(k, _)| k.clone())
-                                        .collect();
-                                    if keys.is_empty() {
-                                        ui.horizontal(|ui| {
+                                });
+                                ui.add_space(4.0);
+                                ui.separator();
+                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                    ui.add_space(10.0);
+                                    if self.param_page == "Common" {
+                                        common_page(ui, &op, selected_viewer_state);
+                                        if let Some(note) = self.graph.nodes[nidx].note.clone() {
                                             ui.add_space(10.0);
-                                            ui.label(
-                                                egui::RichText::new("No parameters on this page.")
+                                            Frame::new()
+                                                .inner_margin(Margin::symmetric(10, 4))
+                                                .show(ui, |ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(note)
+                                                            .size(11.0)
+                                                            .color(ACCENT)
+                                                            .italics(),
+                                                    );
+                                                });
+                                        }
+                                        let viewer_label =
+                                            match (selected_viewer_action, selected_nodes.len()) {
+                                                (Some(ViewerAction::Show), 1) => {
+                                                    "Show viewer".into()
+                                                }
+                                                (Some(ViewerAction::Hide), 1) => {
+                                                    "Hide viewer".into()
+                                                }
+                                                (Some(ViewerAction::Show), count) => {
+                                                    format!("Show {count} selected viewers")
+                                                }
+                                                (Some(ViewerAction::Hide), count) => {
+                                                    format!("Hide {count} selected viewers")
+                                                }
+                                                (None, _) => "Viewer".into(),
+                                            };
+                                        if ui
+                                            .add_enabled(
+                                                selected_viewer_action.is_some(),
+                                                egui::Button::new(viewer_label)
+                                                    .fill(PANEL2)
+                                                    .min_size(Vec2::new(180.0, 26.0)),
+                                            )
+                                            .clicked()
+                                        {
+                                            if let Some(action) = selected_viewer_action {
+                                                apply_viewer_action(
+                                                    &mut self.viewer_off,
+                                                    selected_nodes.iter().map(String::as_str),
+                                                    action,
+                                                );
+                                                self.status = match action {
+                                                    ViewerAction::Show => format!(
+                                                        "showing {} selected node viewer{}",
+                                                        selected_nodes.len(),
+                                                        if selected_nodes.len() == 1 {
+                                                            ""
+                                                        } else {
+                                                            "s"
+                                                        }
+                                                    ),
+                                                    ViewerAction::Hide => format!(
+                                                        "hid {} selected node viewer{}",
+                                                        selected_nodes.len(),
+                                                        if selected_nodes.len() == 1 {
+                                                            ""
+                                                        } else {
+                                                            "s"
+                                                        }
+                                                    ),
+                                                };
+                                            }
+                                        }
+                                    } else {
+                                        let keys: Vec<String> = op
+                                            .params
+                                            .iter()
+                                            .filter(|(_, s)| {
+                                                s.page.clone().unwrap_or_else(|| title.clone())
+                                                    == self.param_page
+                                            })
+                                            .map(|(k, _)| k.clone())
+                                            .collect();
+                                        if keys.is_empty() {
+                                            ui.horizontal(|ui| {
+                                                ui.add_space(10.0);
+                                                ui.label(
+                                                    egui::RichText::new(
+                                                        "No parameters on this page.",
+                                                    )
                                                     .color(MUTED)
                                                     .italics()
                                                     .size(11.0),
-                                            );
-                                        });
-                                    }
-                                    for k in keys {
-                                        let spec = &op.params[&k];
-                                        let label = spec.label.clone().unwrap_or(k.clone());
-                                        let (edit, previous) = {
-                                            let node = &mut self.graph.nodes[nidx];
-                                            let entry = node.params.entry(k.clone()).or_insert_with(|| {
-                                                spec.default
-                                                    .clone()
-                                                    .unwrap_or(ParamValue::String(String::new()))
+                                                );
                                             });
-                                            let previous = entry.clone();
-                                            let edit = param_row(ui, &label, entry, spec.min, spec.max);
-                                            (edit, previous)
-                                        };
-                                        if edit.began {
-                                            let mut before = self.graph.clone();
-                                            before.nodes[nidx].params.insert(k.clone(), previous);
-                                            self.history.remember(&before);
                                         }
-                                        if edit.changed {
-                                            self.invalidate_cook();
-                                            self.status = format!("changed {node_name}.{k}");
+                                        for k in keys {
+                                            let spec = &op.params[&k];
+                                            let label = spec.label.clone().unwrap_or(k.clone());
+                                            let (edit, previous) = {
+                                                let node = &mut self.graph.nodes[nidx];
+                                                let entry = node
+                                                    .params
+                                                    .entry(k.clone())
+                                                    .or_insert_with(|| {
+                                                        spec.default.clone().unwrap_or(
+                                                            ParamValue::String(String::new()),
+                                                        )
+                                                    });
+                                                let previous = entry.clone();
+                                                let edit = param_row(
+                                                    ui, &label, entry, spec.min, spec.max,
+                                                );
+                                                (edit, previous)
+                                            };
+                                            if edit.began {
+                                                let mut before = self.graph.clone();
+                                                before.nodes[nidx]
+                                                    .params
+                                                    .insert(k.clone(), previous);
+                                                self.history.remember(&before);
+                                            }
+                                            if edit.changed {
+                                                self.invalidate_cook();
+                                                self.status = format!("changed {node_name}.{k}");
+                                            }
                                         }
                                     }
-                                }
-                            });
+                                });
+                            }
                         }
-                    }
-                } else {
-                    ui.add_space(16.0);
-                    ui.horizontal(|ui| {
+                    } else {
                         ui.add_space(12.0);
-                        ui.label(egui::RichText::new("select a node").color(MUTED).size(12.0));
-                    });
-                }
-            });
+                        Frame::new()
+                            .fill(GRAPHITE.surface_raised)
+                            .stroke(Stroke::new(1.0, GRAPHITE.border))
+                            .inner_margin(Margin::same(14))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new("Parameters")
+                                        .size(13.0)
+                                        .strong()
+                                        .color(TEXT),
+                                );
+                                ui.add_space(4.0);
+                                ui.label(
+                                egui::RichText::new(
+                                    "Select a node to edit its tool settings and common controls.",
+                                )
+                                .size(11.0)
+                                .color(MUTED),
+                            );
+                            });
+                    }
+                });
+        }
         if let Some((old, requested)) = rename_request {
             self.commit_rename(&old, &requested);
         }
@@ -2685,7 +3592,8 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(Frame::new().fill(BG))
             .show(ctx, |ui| {
-                let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
+                let (resp, painter) =
+                    ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
                 if self.auto_fit {
                     self.fit_view(resp.rect);
                 }
@@ -2743,6 +3651,14 @@ impl eframe::App for App {
                 }
 
                 draw_grid(&painter, resp.rect, self.pan, self.zoom);
+                draw_snap_guides(
+                    &painter,
+                    resp.rect,
+                    origin,
+                    self.pan,
+                    self.zoom,
+                    self.snap_guides,
+                );
 
                 if let Some(pos) = ctx.pointer_latest_pos() {
                     self.cursor = pos;
@@ -2772,18 +3688,27 @@ impl eframe::App for App {
                 });
 
                 for e in &self.graph.edges {
-                    let Some(a) = self.graph.node(&e.from_node) else { continue };
-                    let Some(b) = self.graph.node(&e.to_node) else { continue };
-                    let Some(ap) = a.port(&e.from_port, Direction::Out) else { continue };
-                    let Some(bp) = b.port(&e.to_port, Direction::In) else { continue };
+                    let Some(a) = self.graph.node(&e.from_node) else {
+                        continue;
+                    };
+                    let Some(b) = self.graph.node(&e.to_node) else {
+                        continue;
+                    };
+                    let Some(ap) = a.port(&e.from_port, Direction::Out) else {
+                        continue;
+                    };
+                    let Some(bp) = b.port(&e.to_port, Direction::In) else {
+                        continue;
+                    };
                     let p0 = self.port_pos(origin, a, ap);
                     let p1 = self.port_pos(origin, b, bp);
                     if !bezier_bounds(p0, p1).expand(16.0).intersects(resp.rect) {
                         continue;
                     }
-                    let failed = matches!(self.last_states.get(&e.from_node), Some(NodeState::Failed));
+                    let failed =
+                        matches!(self.last_states.get(&e.from_node), Some(NodeState::Failed));
                     let col = if failed {
-                        Color32::from_rgb(220, 80, 80)
+                        GRAPHITE.danger
                     } else {
                         port_color(ap.ty)
                     };
@@ -2794,6 +3719,7 @@ impl eframe::App for App {
 
                 self.hover_port = None;
                 let mut hit_port: Option<WireStart> = None;
+                let mut hit_continue: Option<(WireStart, Pos2)> = None;
                 let mut hit_node: Option<String> = None;
                 let mut hit_flag: Option<String> = None;
                 let mut hit_resize: Option<String> = None;
@@ -2823,59 +3749,94 @@ impl eframe::App for App {
                     let hovered = resp.hover_pos().map(|p| r.contains(p)).unwrap_or(false);
 
                     painter.rect_filled(
-                        r.translate(Vec2::new(0.0, 3.0 * z)),
-                        CornerRadius::same(6),
-                        Color32::from_rgba_unmultiplied(0, 0, 0, 72),
+                        r.translate(Vec2::new(0.0, 5.0 * z)),
+                        CornerRadius::same(12),
+                        Color32::from_rgba_unmultiplied(0, 0, 0, 96),
                     );
-                    painter.rect_filled(r, CornerRadius::same(6), NODE);
-                    painter.rect_filled(
-                        Rect::from_min_max(r.min, Pos2::new(r.min.x + STRIP * z, r.max.y)),
-                        0,
+                    painter.rect_filled(r, CornerRadius::same(12), NODE);
+
+                    let operator_title = self
+                        .catalog
+                        .get(&n.operator)
+                        .map(|operator| operator.title.as_str())
+                        .unwrap_or(n.operator.as_str());
+                    let title_at = Pos2::new(r.min.x, r.min.y - 19.0 * z);
+                    painter.circle_filled(
+                        title_at + Vec2::new(4.0 * z, 7.0 * z),
+                        2.5 * z,
                         family_color(&n.operator),
+                    );
+                    draw_label(
+                        &painter,
+                        title_at + Vec2::new(11.0 * z, 0.0),
+                        egui::Align2::LEFT_TOP,
+                        operator_title,
+                        font_px(11.0, z, 8.0, 12.0),
+                        if sel { TEXT } else { MUTED },
+                        Rect::from_min_size(
+                            title_at + Vec2::new(11.0 * z, 0.0),
+                            Vec2::new((r.width() - 11.0 * z).max(20.0), 16.0 * z),
+                        ),
                     );
 
                     let viewer_on = !self.viewer_off.contains(&n.id);
                     if viewer_on {
-                        let body = Rect::from_min_max(
-                            r.min + Vec2::new((STRIP + 2.0) * z, 3.0 * z),
-                            r.max - Vec2::new(4.0 * z, 4.0 * z),
-                        );
-                        painter.rect_filled(body, 1, Color32::from_rgb(16, 16, 18));
+                        let body = r.shrink(4.0 * z);
+                        painter.rect_filled(body, 9, GRAPHITE.surface_sunken);
                         let fq = self.fq_for(&n.id);
                         let clip = painter.with_clip_rect(body);
                         draw_viewer(&clip, body, n, fq, self.last_states.get(&n.id), z);
                     } else {
-                        let inner = r.shrink2(Vec2::new((STRIP + 6.0) * z, 3.0 * z));
+                        let inner = r.shrink2(Vec2::new(12.0 * z, 9.0 * z));
+                        let inputs = n
+                            .ports
+                            .iter()
+                            .filter(|port| port.dir == Direction::In)
+                            .count();
+                        let outputs = n.ports.len().saturating_sub(inputs);
                         draw_label(
                             &painter,
-                            r.min + Vec2::new((STRIP + 8.0) * z, 4.0 * z),
+                            inner.min,
                             egui::Align2::LEFT_TOP,
-                            &n.id,
-                            font_px(11.0, z, 8.0, 12.0),
+                            if is_workflow_operator(&n.operator) {
+                                "Required inputs"
+                            } else {
+                                operator_title
+                            },
+                            font_px(10.5, z, 8.0, 11.0),
                             TEXT,
+                            inner,
+                        );
+                        draw_label(
+                            &painter,
+                            inner.min + Vec2::new(0.0, 21.0 * z),
+                            egui::Align2::LEFT_TOP,
+                            &format!("{inputs} inputs  ·  {outputs} outputs"),
+                            font_px(9.0, z, 7.0, 10.0),
+                            MUTED,
                             inner,
                         );
                     }
 
                     // cook LED
                     let led = match self.last_states.get(&n.id) {
-                        Some(NodeState::Done) => Color32::from_rgb(70, 210, 110),
-                        Some(NodeState::Cached) => Color32::from_rgb(80, 160, 230),
-                        Some(NodeState::Failed) => Color32::from_rgb(220, 70, 70),
-                        Some(NodeState::Skipped) => Color32::from_rgb(140, 140, 90),
-                        _ if cooking => Color32::from_rgb(220, 180, 70),
-                        _ => Color32::from_rgb(50, 50, 54),
+                        Some(NodeState::Done) => GRAPHITE.success,
+                        Some(NodeState::Cached) => GRAPHITE.accent,
+                        Some(NodeState::Failed) => GRAPHITE.danger,
+                        Some(NodeState::Skipped) => GRAPHITE.text_muted,
+                        _ if cooking => GRAPHITE.warning,
+                        _ => GRAPHITE.border,
                     };
                     painter.circle_filled(r.max - Vec2::new(7.0 * z, 7.0 * z), 3.0 * z, led);
 
                     let stroke = if sel {
                         Stroke::new(1.8, SELECT)
                     } else if hovered {
-                        Stroke::new(1.0, Color32::from_rgb(110, 110, 118))
+                        Stroke::new(1.0, GRAPHITE.border_strong)
                     } else {
-                        Stroke::new(1.0, Color32::from_rgb(62, 62, 68))
+                        Stroke::new(1.0, GRAPHITE.border)
                     };
-                    painter.rect_stroke(r, 6, stroke, egui::StrokeKind::Outside);
+                    painter.rect_stroke(r, 12, stroke, egui::StrokeKind::Outside);
 
                     // name under — clipped to node width so it never rides into a neighbor
                     if viewer_on {
@@ -2911,16 +3872,24 @@ impl eframe::App for App {
                         flag,
                         0,
                         if viewer_on {
-                            Color32::from_rgb(70, 140, 90)
+                            GRAPHITE.success
                         } else {
-                            Color32::from_rgb(40, 40, 44)
+                            GRAPHITE.border
                         },
                     );
-                    painter.rect_stroke(flag, 0, Stroke::new(1.0, Color32::from_rgb(20, 20, 22)), egui::StrokeKind::Inside);
+                    painter.rect_stroke(
+                        flag,
+                        0,
+                        Stroke::new(1.0, GRAPHITE.chrome),
+                        egui::StrokeKind::Inside,
+                    );
 
                     // resize handle
                     if viewer_on && sel {
-                        let hz = Rect::from_min_size(r.max - Vec2::new(10.0 * z, 10.0 * z), Vec2::splat(10.0 * z));
+                        let hz = Rect::from_min_size(
+                            r.max - Vec2::new(10.0 * z, 10.0 * z),
+                            Vec2::splat(10.0 * z),
+                        );
                         painter.line_segment(
                             [Pos2::new(hz.min.x, hz.max.y), hz.max],
                             Stroke::new(1.0, MUTED),
@@ -2957,23 +3926,84 @@ impl eframe::App for App {
                                 if c.distance(self.cursor) < 18.0 * z {
                                     snap_cursor = c;
                                 }
-                            } else if p.dir != if *is_out { Direction::Out } else { Direction::In } {
+                            } else if p.dir
+                                != if *is_out {
+                                    Direction::Out
+                                } else {
+                                    Direction::In
+                                }
+                            {
                                 ring = Some(Color32::from_rgb(160, 50, 50));
                             }
                         }
                         painter.circle_filled(c, rad, col);
-                        painter.circle_stroke(c, rad, Stroke::new(1.0, Color32::from_rgb(16, 16, 18)));
+                        painter.circle_stroke(
+                            c,
+                            rad,
+                            Stroke::new(1.0, Color32::from_rgb(16, 16, 18)),
+                        );
                         if let Some(rc) = ring {
                             painter.circle_stroke(c, rad + 2.5 * z, Stroke::new(1.6, rc));
                         }
                         let hit_r = Rect::from_center_size(c, Vec2::splat(16.0 * z));
-                        if let Some(pos) = resp.hover_pos().or_else(|| resp.interact_pointer_pos()) {
+                        if let Some(pos) = resp.hover_pos().or_else(|| resp.interact_pointer_pos())
+                        {
                             if hit_r.contains(pos) {
                                 painter.circle_stroke(c, rad + 2.0, Stroke::new(1.4, SELECT));
-                                self.hover_port = Some((n.id.clone(), p.name.clone(), p.ty, p.dir == Direction::Out));
+                                self.hover_port = Some((
+                                    n.id.clone(),
+                                    p.name.clone(),
+                                    p.ty,
+                                    p.dir == Direction::Out,
+                                ));
                                 if resp.drag_started() && ui.input(|i| i.pointer.primary_down()) {
                                     hit_port = Some(WireStart::new(&n.id, &p.name, p.dir));
                                 }
+                            }
+                        }
+                        if p.dir == Direction::Out {
+                            let continue_at = c + Vec2::new(17.0 * z, 0.0);
+                            let continue_rect = Rect::from_center_size(
+                                continue_at,
+                                Vec2::splat((16.0 * z).max(12.0)),
+                            );
+                            let continue_hovered = resp
+                                .hover_pos()
+                                .or_else(|| resp.interact_pointer_pos())
+                                .is_some_and(|pos| continue_rect.contains(pos));
+                            if hovered || sel || continue_hovered {
+                                painter.circle_filled(
+                                    continue_at,
+                                    7.0 * z,
+                                    if continue_hovered {
+                                        GRAPHITE.accent
+                                    } else {
+                                        GRAPHITE.surface_raised
+                                    },
+                                );
+                                painter.circle_stroke(
+                                    continue_at,
+                                    7.0 * z,
+                                    Stroke::new(1.0, GRAPHITE.border_strong),
+                                );
+                                painter.text(
+                                    continue_at,
+                                    egui::Align2::CENTER_CENTER,
+                                    "+",
+                                    font_px(11.0, z, 8.0, 12.0),
+                                    if continue_hovered {
+                                        GRAPHITE.on_accent
+                                    } else {
+                                        TEXT
+                                    },
+                                );
+                            }
+                            if continue_hovered {
+                                hit_continue = Some((
+                                    WireStart::new(&n.id, &p.name, Direction::Out),
+                                    continue_at,
+                                ));
+                                ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
                             }
                         }
                     }
@@ -2984,7 +4014,11 @@ impl eframe::App for App {
                                 Pos2::new(r.center().x, r.max.y + 9.0 * z),
                                 Vec2::new(r.width(), 16.0 * z),
                             );
-                            if (r.contains(pos) || name_r.contains(pos)) && hit_port.is_none() && hit_flag.is_none() {
+                            if (r.contains(pos) || name_r.contains(pos))
+                                && hit_port.is_none()
+                                && hit_continue.is_none()
+                                && hit_flag.is_none()
+                            {
                                 hit_node = Some(n.id.clone());
                             }
                         }
@@ -2995,6 +4029,14 @@ impl eframe::App for App {
                                 info_hit = Some(n.id.clone());
                             }
                         }
+                    }
+                }
+
+                if resp.clicked() {
+                    if let Some((wire, screen_pos)) = hit_continue.clone() {
+                        let graph_pos =
+                            self.to_graph(origin, screen_pos + Vec2::new(86.0 * self.zoom, 0.0));
+                        self.open_op_create(graph_pos, screen_pos, Some(wire));
                     }
                 }
 
@@ -3029,18 +4071,35 @@ impl eframe::App for App {
                         self.resizing = Some(id.clone());
                         self.marquee = None;
                     } else if let Some(pos) = resp.interact_pointer_pos() {
-                        let hit = nodes.iter().rev().find(|n| self.node_rect(origin, n).contains(pos));
+                        let hit = nodes
+                            .iter()
+                            .rev()
+                            .find(|n| self.node_rect(origin, n).contains(pos));
                         if let Some(n) = hit {
                             if hit_flag.is_none() {
                                 let mode = ui.input(|input| selection_mode(input.modifiers));
-                                if mode != SelectionMode::Replace || !self.selection.contains(&n.id) {
+                                if mode != SelectionMode::Replace || !self.selection.contains(&n.id)
+                                {
                                     self.selection.select_node(&n.id, mode);
                                 }
                                 self.history.remember(&self.graph);
-                                self.dragging = self
-                                    .selection
-                                    .contains(&n.id)
-                                    .then(|| n.id.clone());
+                                self.dragging = self.selection.contains(&n.id).then(|| NodeDrag {
+                                    anchor: n.id.clone(),
+                                    start: self
+                                        .graph
+                                        .nodes
+                                        .iter()
+                                        .filter(|node| self.selection.contains(&node.id))
+                                        .map(|node| {
+                                            (
+                                                node.id.clone(),
+                                                Pos2::new(node.layout.x, node.layout.y),
+                                            )
+                                        })
+                                        .collect(),
+                                    accumulated: Vec2::ZERO,
+                                });
+                                self.snap_guides = SnapGuides::default();
                                 self.marquee = None;
                                 self.param_page.clear();
                             }
@@ -3060,14 +4119,54 @@ impl eframe::App for App {
                 {
                     let d = ui.input(|input| input.pointer.delta()) / self.zoom;
                     if let Some(id) = &self.resizing.clone() {
-                        let sz = self.sizes.entry(id.clone()).or_insert(Vec2::new(NODE_W, NODE_H));
+                        let sz = self
+                            .sizes
+                            .entry(id.clone())
+                            .or_insert(Vec2::new(NODE_W, NODE_H));
                         sz.x = (sz.x + d.x).clamp(90.0, 360.0);
                         sz.y = (sz.y + d.y).clamp(56.0, 280.0);
-                    } else if self.dragging.is_some() {
+                    } else if let Some(mut drag) = self.dragging.clone() {
+                        drag.accumulated =
+                            advance_drag_delta(drag.accumulated, resp.drag_delta() / self.zoom);
+                        let raw_delta = drag.accumulated;
+                        self.dragging = Some(drag.clone());
+                        let snapping_disabled = ui.input(|input| input.modifiers.alt);
+                        let snapped = if snapping_disabled {
+                            None
+                        } else {
+                            let anchor = self.graph.node(&drag.anchor).and_then(|node| {
+                                let start = drag.start.get(&drag.anchor)?;
+                                Some(Rect::from_min_size(*start, self.node_size(node)))
+                            });
+                            anchor.map(|anchor| {
+                                let stationary = self
+                                    .graph
+                                    .nodes
+                                    .iter()
+                                    .filter(|node| !drag.start.contains_key(&node.id))
+                                    .map(|node| {
+                                        Rect::from_min_size(
+                                            Pos2::new(node.layout.x, node.layout.y),
+                                            self.node_size(node),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
+                                snap_drag(
+                                    anchor,
+                                    raw_delta,
+                                    &stationary,
+                                    9.0 / self.zoom,
+                                    6.0 / self.zoom,
+                                )
+                            })
+                        };
+                        let delta = snapped.map_or(raw_delta, |snap| snap.delta);
+                        self.snap_guides =
+                            snapped.map_or_else(SnapGuides::default, |snap| snap.guides);
                         for node in &mut self.graph.nodes {
-                            if self.selection.contains(&node.id) {
-                                node.layout.x += d.x;
-                                node.layout.y += d.y;
+                            if let Some(start) = drag.start.get(&node.id) {
+                                node.layout.x = start.x + delta.x;
+                                node.layout.y = start.y + delta.y;
                             }
                         }
                     } else if let Some(marquee) = &mut self.marquee {
@@ -3094,8 +4193,10 @@ impl eframe::App for App {
                                 .iter()
                                 .flat_map(|node| {
                                     node.ports.iter().filter_map(|port| {
-                                        let distance = self.port_pos(origin, node, port).distance(pos);
-                                        let connection = wire.connection_to(&self.graph, &node.id, port)?;
+                                        let distance =
+                                            self.port_pos(origin, node, port).distance(pos);
+                                        let connection =
+                                            wire.connection_to(&self.graph, &node.id, port)?;
                                         (distance < 18.0 * self.zoom)
                                             .then_some((distance, connection))
                                     })
@@ -3120,10 +4221,15 @@ impl eframe::App for App {
                             .collect::<Vec<_>>();
                         self.selection.select_many(ids, marquee.mode);
                         self.param_page.clear();
-                        self.status = format!("selected {} node{}", self.selection.len(), if self.selection.len() == 1 { "" } else { "s" });
+                        self.status = format!(
+                            "selected {} node{}",
+                            self.selection.len(),
+                            if self.selection.len() == 1 { "" } else { "s" }
+                        );
                     }
                     self.wire = None;
                     self.dragging = None;
+                    self.snap_guides = SnapGuides::default();
                     self.resizing = None;
                     if moved_nodes {
                         self.autosave_due = Some(Instant::now());
@@ -3134,9 +4240,16 @@ impl eframe::App for App {
                     self.selection.select_node(id, mode);
                     self.param_page.clear();
                 }
-                if resp.clicked() && hit_node.is_none() && hit_port.is_none() && hit_flag.is_none() {
+                if resp.clicked()
+                    && hit_node.is_none()
+                    && hit_port.is_none()
+                    && hit_continue.is_none()
+                    && hit_flag.is_none()
+                {
                     if let Some(pos) = resp.interact_pointer_pos() {
-                        let on_node = nodes.iter().any(|n| self.node_rect(origin, n).contains(pos));
+                        let on_node = nodes
+                            .iter()
+                            .any(|n| self.node_rect(origin, n).contains(pos));
                         if !on_node {
                             if let Some(edge) = hovered_edge.clone() {
                                 self.selection.select_edge(edge);
@@ -3160,7 +4273,9 @@ impl eframe::App for App {
                 }
                 if resp.double_clicked() {
                     if let Some(pos) = resp.interact_pointer_pos() {
-                        let on_node = nodes.iter().any(|n| self.node_rect(origin, n).contains(pos));
+                        let on_node = nodes
+                            .iter()
+                            .any(|n| self.node_rect(origin, n).contains(pos));
                         if !on_node {
                             self.open_op_create(self.to_graph(origin, pos), pos, None);
                         }
@@ -3168,17 +4283,183 @@ impl eframe::App for App {
                 }
             });
 
-        if self.paper_ui {
+        if self.graph.nodes.is_empty() && !self.overlays.is_open(Surface::OpCreate) {
+            egui::Area::new(Id::new("empty_canvas_actions"))
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, -18.0])
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("Build a biological workflow")
+                                .size(18.0)
+                                .strong()
+                                .color(TEXT),
+                        );
+                        ui.add_space(5.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Start with data, continue from any output, and keep the canvas visible.",
+                            )
+                            .size(11.5)
+                            .color(MUTED),
+                        );
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            let action = |label: &str| {
+                                egui::Button::new(
+                                    egui::RichText::new(label).size(11.0).color(TEXT),
+                                )
+                                .fill(GRAPHITE.surface)
+                                .stroke(Stroke::new(1.0, GRAPHITE.border))
+                                .corner_radius(16)
+                            };
+                            if ui.add(action("  Import reads  ")).clicked() {
+                                if let Ok(operator) = self.catalog.get("files.import").cloned() {
+                                    self.drop_op(&operator, self.last_graph_pos);
+                                }
+                            }
+                            if ui.add(action("  Add accession  ")).clicked() {
+                                self.open_surface(Surface::Library);
+                                if let Err(error) = self.library.set_mode(PaletteMode::Sources) {
+                                    self.status = format!("Library state was not saved: {error}");
+                                }
+                                self.focus_accession = true;
+                            }
+                            if ui.add(action("  Find pipeline  ")).clicked() {
+                                self.open_surface(Surface::Library);
+                                if let Err(error) = self.library.set_mode(PaletteMode::Pipelines) {
+                                    self.status = format!("Library state was not saved: {error}");
+                                }
+                            }
+                            if ui.add(action("  Open Snakemake  ")).clicked() {
+                                if let Some(path) = Self::pick_snakemake_directory() {
+                                    self.insert_snakemake_project(path);
+                                }
+                            }
+                        });
+                        ui.add_space(10.0);
+                        ui.label(
+                            egui::RichText::new("Double-click anywhere or press Tab to add a node")
+                                .size(10.0)
+                                .color(MUTED),
+                        );
+                    });
+                });
+        }
+
+        if self.overlays.is_open(Surface::Machine) {
+            let mut refresh_profile = false;
+            let machine_response = egui::Window::new("machine_profile")
+                .title_bar(false)
+                .resizable(false)
+                .collapsible(false)
+                .anchor(egui::Align2::RIGHT_BOTTOM, [-16.0, -36.0])
+                .frame(
+                    Frame::new()
+                        .fill(GRAPHITE.surface_raised)
+                        .stroke(Stroke::new(1.0, GRAPHITE.border_strong))
+                        .inner_margin(Margin::same(14))
+                        .corner_radius(10),
+                )
+                .show(ctx, |ui| {
+                    ui.set_min_width(310.0);
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new("This machine")
+                                    .size(13.0)
+                                    .strong()
+                                    .color(TEXT),
+                            );
+                            ui.label(
+                                egui::RichText::new("Auto-detected · used to guide local runs")
+                                    .size(9.5)
+                                    .color(MUTED),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("Refresh").size(10.0).color(MUTED),
+                                    )
+                                    .fill(Color32::TRANSPARENT)
+                                    .stroke(Stroke::NONE),
+                                )
+                                .clicked()
+                            {
+                                refresh_profile = true;
+                            }
+                        });
+                    });
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    if let Some(profile) = &self.system_profile {
+                        machine_profile_row(ui, "CPU", &profile.cpu);
+                        machine_profile_row(
+                            ui,
+                            "TOPOLOGY",
+                            &format!(
+                                "{} physical cores · {} logical threads",
+                                profile.physical_cores, profile.logical_threads
+                            ),
+                        );
+                        machine_profile_row(
+                            ui,
+                            "MEMORY",
+                            &system_profile::format_memory(profile.memory_bytes),
+                        );
+                        machine_profile_row(
+                            ui,
+                            "GPU",
+                            &if profile.gpus.is_empty() {
+                                "No display adapter reported".into()
+                            } else {
+                                profile.gpus.join("\n")
+                            },
+                        );
+                        machine_profile_row(ui, "SYSTEM", &profile.os);
+                    } else if self.system_profile_rx.is_some() {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(
+                                egui::RichText::new("Detecting hardware…")
+                                    .size(11.0)
+                                    .color(MUTED),
+                            );
+                        });
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Hardware detection was unavailable.")
+                                .size(11.0)
+                                .color(MUTED),
+                        );
+                    }
+                });
+            let clicked_away =
+                machine_response.is_some_and(|response| response.response.clicked_elsewhere());
+            self.overlays.dismiss_on_click_away(
+                Surface::Machine,
+                surface_at_frame_start,
+                clicked_away,
+                surface_activator_clicked,
+            );
+            if refresh_profile {
+                self.refresh_system_profile();
+            }
+        }
+
+        if self.overlays.is_open(Surface::Paper) {
             let mut load_example = false;
             let mut pick = false;
-            egui::Window::new("paper")
+            let paper_response = egui::Window::new("paper")
                 .title_bar(false)
                 .resizable(false)
                 .collapsible(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, -30.0])
                 .frame(
                     Frame::new()
-                        .fill(Color32::from_rgb(30, 30, 34))
+                        .fill(GRAPHITE.surface_raised)
                         .stroke(Stroke::new(1.0, ACCENT.gamma_multiply(0.7)))
                         .inner_margin(Margin::same(14))
                         .corner_radius(4),
@@ -3196,9 +4477,10 @@ impl eframe::App for App {
                     if ui
                         .add(
                             egui::Button::new(
-                                egui::RichText::new("  Example: RNA-seq methods  ").color(Color32::BLACK),
+                                egui::RichText::new("  Example: RNA-seq methods  ")
+                                    .color(GRAPHITE.on_accent),
                             )
-                            .fill(SELECT)
+                            .fill(GRAPHITE.accent_strong)
                             .min_size(Vec2::new(340.0, 28.0)),
                         )
                         .clicked()
@@ -3217,8 +4499,20 @@ impl eframe::App for App {
                         pick = true;
                     }
                     ui.add_space(8.0);
-                    ui.label(egui::RichText::new("P to toggle  ·  esc to close").size(10.0).color(MUTED));
+                    ui.label(
+                        egui::RichText::new("Click outside, P, or esc to close")
+                            .size(10.0)
+                            .color(MUTED),
+                    );
                 });
+            let clicked_away =
+                paper_response.is_some_and(|response| response.response.clicked_elsewhere());
+            self.overlays.dismiss_on_click_away(
+                Surface::Paper,
+                surface_at_frame_start,
+                clicked_away,
+                surface_activator_clicked,
+            );
             if load_example {
                 self.ingest_path(Self::example_paper(), self.last_graph_pos);
             }
@@ -3229,20 +4523,20 @@ impl eframe::App for App {
             }
         }
 
-        if self.op_create {
+        if self.overlays.is_open(Surface::OpCreate) {
             let ops = self.filtered_ops(&self.op_create_q);
             let inserting = self.pending_insert.is_some();
             if self.op_create_i >= ops.len() && !ops.is_empty() {
                 self.op_create_i = ops.len() - 1;
             }
-            egui::Window::new("opcreate")
+            let op_create_response = egui::Window::new("opcreate")
                 .title_bar(false)
                 .resizable(false)
                 .collapsible(false)
                 .fixed_pos(self.op_create_screen)
                 .frame(
                     Frame::new()
-                        .fill(Color32::from_rgb(30, 30, 34))
+                        .fill(GRAPHITE.surface_raised)
                         .stroke(Stroke::new(1.0, ACCENT.gamma_multiply(0.6)))
                         .inner_margin(Margin::same(10))
                         .corner_radius(4),
@@ -3251,20 +4545,27 @@ impl eframe::App for App {
                     ui.set_min_width(320.0);
                     ui.label(
                         egui::RichText::new(if inserting {
-                            "Insert compatible operator"
+                            "Continue with"
                         } else {
-                            "Add operator"
+                            "Add a node"
                         })
                         .size(11.0)
                         .color(MUTED),
                     );
                     let te = ui.add(
                         egui::TextEdit::singleline(&mut self.op_create_q)
-                            .hint_text("type to filter  ·  enter to drop")
+                            .hint_text(if inserting {
+                                "Search compatible next steps"
+                            } else {
+                                "Search nodes and workflows"
+                            })
                             .desired_width(300.0)
                             .font(FontId::proportional(14.0)),
                     );
-                    te.request_focus();
+                    if self.focus_op_create {
+                        te.request_focus();
+                        self.focus_op_create = false;
+                    }
                     if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                         self.op_create_i = (self.op_create_i + 1).min(ops.len().saturating_sub(1));
                     }
@@ -3273,46 +4574,51 @@ impl eframe::App for App {
                     }
                     ui.add_space(4.0);
                     let mut chosen: Option<Operator> = None;
-                    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                        if ops.is_empty() {
-                            ui.label(
-                                egui::RichText::new(if inserting {
-                                    "No compatible operators match."
-                                } else {
-                                    "No operators match."
-                                })
-                                .size(12.0)
-                                .color(MUTED)
-                                .italics(),
-                            );
-                        }
-                        for (i, op) in ops.iter().enumerate() {
-                            let on = i == self.op_create_i;
-                            let fill = if on {
-                                Color32::from_rgb(70, 60, 90)
-                            } else {
-                                Color32::TRANSPARENT
-                            };
-                            let r = ui.add(
-                                egui::Button::new(
-                                    egui::RichText::new(format!(
-                                        "  {}    {}",
-                                        op.title,
-                                        op.palette.join(" / ")
-                                    ))
-                                    .color(if on { TEXT } else { MUTED })
-                                    .size(13.0),
-                                )
-                                .fill(fill)
-                                .min_size(Vec2::new(300.0, 22.0)),
-                            );
-                            let strip = Rect::from_min_size(r.rect.min, Vec2::new(3.0, r.rect.height()));
-                            ui.painter().rect_filled(strip, 0, family_color(&op.id));
-                            if r.clicked() {
-                                chosen = Some(op.clone());
+                    egui::ScrollArea::vertical()
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            if ops.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(if inserting {
+                                        "No compatible operators match."
+                                    } else {
+                                        "No operators match."
+                                    })
+                                    .size(12.0)
+                                    .color(MUTED)
+                                    .italics(),
+                                );
                             }
-                        }
-                    });
+                            for (i, op) in ops.iter().enumerate() {
+                                let on = i == self.op_create_i;
+                                let fill = if on {
+                                    GRAPHITE.surface_active
+                                } else {
+                                    Color32::TRANSPARENT
+                                };
+                                let r = ui.add(
+                                    egui::Button::new(
+                                        egui::RichText::new(format!(
+                                            "  {}    {}",
+                                            op.title,
+                                            op.palette.join(" / ")
+                                        ))
+                                        .color(if on { TEXT } else { MUTED })
+                                        .size(13.0),
+                                    )
+                                    .fill(fill)
+                                    .min_size(Vec2::new(300.0, 22.0)),
+                                );
+                                let strip = Rect::from_min_size(
+                                    r.rect.min,
+                                    Vec2::new(3.0, r.rect.height()),
+                                );
+                                ui.painter().rect_filled(strip, 0, family_color(&op.id));
+                                if r.clicked() {
+                                    chosen = Some(op.clone());
+                                }
+                            }
+                        });
                     if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         if let Some(op) = ops.get(self.op_create_i) {
                             chosen = Some(op.clone());
@@ -3329,6 +4635,16 @@ impl eframe::App for App {
                             .color(MUTED),
                     );
                 });
+            let clicked_away =
+                op_create_response.is_some_and(|response| response.response.clicked_elsewhere());
+            if self.overlays.dismiss_on_click_away(
+                Surface::OpCreate,
+                surface_at_frame_start,
+                clicked_away,
+                false,
+            ) {
+                self.pending_insert = None;
+            }
         }
 
         if let Some(id) = self.info.clone() {
@@ -3339,15 +4655,20 @@ impl eframe::App for App {
                     .anchor(egui::Align2::CENTER_TOP, [0.0, 48.0])
                     .frame(
                         Frame::new()
-                            .fill(Color32::from_rgb(26, 26, 30))
-                            .stroke(Stroke::new(1.0, Color32::from_rgb(80, 80, 88)))
+                            .fill(GRAPHITE.surface_raised)
+                            .stroke(Stroke::new(1.0, GRAPHITE.border_strong))
                             .inner_margin(Margin::same(10))
                             .corner_radius(3),
                     )
                     .show(ctx, |ui| {
                         ui.set_min_width(240.0);
                         ui.label(egui::RichText::new(&n.id).strong().size(14.0));
-                        ui.label(egui::RichText::new(&n.operator).size(11.0).color(MUTED).monospace());
+                        ui.label(
+                            egui::RichText::new(&n.operator)
+                                .size(11.0)
+                                .color(MUTED)
+                                .monospace(),
+                        );
                         let st = match self.last_states.get(&n.id) {
                             Some(NodeState::Done) => "done",
                             Some(NodeState::Cached) => "cached",
@@ -3355,7 +4676,11 @@ impl eframe::App for App {
                             Some(NodeState::Skipped) => "skipped",
                             None => "idle",
                         };
-                        ui.label(egui::RichText::new(format!("cook  {st}")).size(11.0).color(MUTED));
+                        ui.label(
+                            egui::RichText::new(format!("cook  {st}"))
+                                .size(11.0)
+                                .color(MUTED),
+                        );
                         if let Some(note) = &n.note {
                             ui.add_space(4.0);
                             ui.label(egui::RichText::new(note).size(11.0).color(ACCENT).italics());
@@ -3364,9 +4689,13 @@ impl eframe::App for App {
                         for p in &n.ports {
                             let d = if p.dir == Direction::In { "in " } else { "out" };
                             ui.label(
-                                egui::RichText::new(format!("{d}  {}  {}", p.name, type_name(p.ty)))
-                                    .size(11.0)
-                                    .color(port_color(p.ty)),
+                                egui::RichText::new(format!(
+                                    "{d}  {}  {}",
+                                    p.name,
+                                    type_name(p.ty)
+                                ))
+                                .size(11.0)
+                                .color(port_color(p.ty)),
                             );
                         }
                         if ui.button("close").clicked() {
@@ -3392,20 +4721,21 @@ fn param_row(
     max: Option<i64>,
 ) -> ParamEdit {
     let edit = ui.horizontal(|ui| {
-        ui.add_space(8.0);
+        ui.add_space(10.0);
         ui.add_sized(
-            Vec2::new(72.0, 18.0),
-            egui::Label::new(egui::RichText::new(label).color(MUTED).size(11.0)).halign(egui::Align::RIGHT),
+            Vec2::new(84.0, 24.0),
+            egui::Label::new(egui::RichText::new(label).color(MUTED).size(11.0))
+                .halign(egui::Align::RIGHT),
         );
-        ui.add_space(6.0);
+        ui.add_space(8.0);
         let response = match entry {
-            ParamValue::String(s) => {
-                ui.add(
-                    egui::TextEdit::singleline(s)
-                        .desired_width(ui.available_width() - 8.0)
-                        .font(FontId::proportional(12.0)),
-                )
-            }
+            ParamValue::String(s) => ui.add(
+                egui::TextEdit::singleline(s)
+                    .desired_width(ui.available_width() - 8.0)
+                    .font(FontId::proportional(12.0))
+                    .text_color(TEXT)
+                    .background_color(GRAPHITE.control),
+            ),
             ParamValue::Int(i) => {
                 let mut dv = egui::DragValue::new(i).speed(1.0);
                 if let Some(a) = min {
@@ -3421,49 +4751,77 @@ fn param_row(
             changed: response.changed(),
         }
     });
-    ui.add_space(3.0);
+    ui.add_space(5.0);
     edit.inner
 }
 
-fn common_page(ui: &mut egui::Ui, op: &Operator, viewer_on: bool) {
+fn common_page(ui: &mut egui::Ui, op: &Operator, viewer_state: &str) {
     ui.horizontal(|ui| {
-        ui.add_space(8.0);
+        ui.add_space(10.0);
         ui.add_sized(
-            Vec2::new(72.0, 18.0),
-            egui::Label::new(egui::RichText::new("operator").color(MUTED).size(11.0)).halign(egui::Align::RIGHT),
+            Vec2::new(84.0, 24.0),
+            egui::Label::new(egui::RichText::new("operator").color(MUTED).size(11.0))
+                .halign(egui::Align::RIGHT),
         );
         ui.add_space(8.0);
-        ui.label(egui::RichText::new(&op.id).size(12.0).monospace());
+        ui.label(
+            egui::RichText::new(&op.id)
+                .size(11.0)
+                .monospace()
+                .color(TEXT),
+        );
     });
-    ui.add_space(3.0);
+    ui.add_space(5.0);
     ui.horizontal(|ui| {
-        ui.add_space(8.0);
+        ui.add_space(10.0);
         ui.add_sized(
-            Vec2::new(72.0, 18.0),
-            egui::Label::new(egui::RichText::new("cost").color(MUTED).size(11.0)).halign(egui::Align::RIGHT),
+            Vec2::new(84.0, 24.0),
+            egui::Label::new(egui::RichText::new("cost").color(MUTED).size(11.0))
+                .halign(egui::Align::RIGHT),
         );
         ui.add_space(8.0);
-        ui.label(egui::RichText::new(match op.cost {
-            Cost::Low => "low",
-            Cost::High => "high",
-        }).size(12.0));
+        let (cost, color) = match op.cost {
+            Cost::Low => ("low", GRAPHITE.success),
+            Cost::High => ("high · explicit Cook", GRAPHITE.warning),
+        };
+        ui.label(egui::RichText::new(cost).size(11.0).color(color));
     });
-    ui.add_space(3.0);
+    ui.add_space(5.0);
     ui.horizontal(|ui| {
-        ui.add_space(8.0);
+        ui.add_space(10.0);
         ui.add_sized(
-            Vec2::new(72.0, 18.0),
-            egui::Label::new(egui::RichText::new("viewer").color(MUTED).size(11.0)).halign(egui::Align::RIGHT),
+            Vec2::new(84.0, 24.0),
+            egui::Label::new(egui::RichText::new("viewer").color(MUTED).size(11.0))
+                .halign(egui::Align::RIGHT),
         );
         ui.add_space(8.0);
-        ui.label(egui::RichText::new(if viewer_on { "on" } else { "off" }).size(12.0));
+        ui.label(
+            egui::RichText::new(viewer_state)
+                .size(11.0)
+                .color(match viewer_state {
+                    "on" => GRAPHITE.success,
+                    "mixed" => GRAPHITE.warning,
+                    _ => MUTED,
+                }),
+        );
     });
     if let Some(c) = &op.conda {
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.add_space(8.0);
-            ui.label(egui::RichText::new(format!("conda  {}  {}", c.name, c.spec.join(" "))).size(10.0).color(MUTED));
-        });
+        ui.add_space(10.0);
+        Frame::new()
+            .fill(GRAPHITE.surface_raised)
+            .stroke(Stroke::new(1.0, GRAPHITE.border))
+            .inner_margin(Margin::symmetric(10, 7))
+            .corner_radius(5)
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("ENVIRONMENT").size(8.5).color(MUTED));
+                ui.label(
+                    egui::RichText::new(&c.name)
+                        .size(11.0)
+                        .monospace()
+                        .color(TEXT),
+                );
+                ui.label(egui::RichText::new(c.spec.join(" ")).size(9.5).color(MUTED));
+            });
     }
 }
 
@@ -3503,6 +4861,33 @@ mod tests {
     }
 
     #[test]
+    fn dropped_fastq_mates_are_recognized_as_a_pair() {
+        let r1 = PathBuf::from("/reads/sample_S1_L001_R1_001.fastq.gz");
+        let r2 = PathBuf::from("/reads/sample_S1_L001_R2_001.fastq.gz");
+
+        assert_eq!(
+            paired_fastq_key(&r1),
+            Some(("sample_s1_l001__001.fastq.gz".into(), 1))
+        );
+        assert_eq!(
+            paired_fastq_key(&r2),
+            Some(("sample_s1_l001__001.fastq.gz".into(), 2))
+        );
+        assert_eq!(
+            pair_dropped_fastqs(vec![r2.clone(), r1.clone()]),
+            vec![(r1, r2)]
+        );
+    }
+
+    #[test]
+    fn workflow_operators_use_compact_cards() {
+        assert!(is_workflow_operator("nfcore.rnaseq"));
+        assert!(is_workflow_operator("workflow.snakemake"));
+        assert!(is_workflow_operator("runner.nextflow"));
+        assert!(!is_workflow_operator("qc.fastqc"));
+    }
+
+    #[test]
     fn parse_tiny_fastq() {
         let s = "@s\nACGT\n+\nIIII\n@t\nGGGG\n+\nHHHH\n";
         let fq = parse_fastq(s).unwrap();
@@ -3525,5 +4910,29 @@ mod tests {
 
         assert!(bezier_distance(from, to, on_curve) < 0.01);
         assert!(bezier_distance(from, to, Pos2::new(80.0, 180.0)) > 40.0);
+    }
+
+    #[test]
+    fn mixed_viewer_selection_resolves_to_hide_every_selected_viewer() {
+        let mut viewer_off = BTreeSet::from(["b".to_owned()]);
+        let selected = ["a", "b"];
+
+        let action = viewer_action(&viewer_off, selected).unwrap();
+        assert_eq!(action, ViewerAction::Hide);
+        apply_viewer_action(&mut viewer_off, selected, action);
+
+        assert!(selected.iter().all(|node| viewer_off.contains(*node)));
+    }
+
+    #[test]
+    fn an_all_hidden_selection_toggles_back_on_together() {
+        let mut viewer_off = BTreeSet::from(["a".to_owned(), "b".to_owned()]);
+        let selected = ["a", "b"];
+
+        let action = viewer_action(&viewer_off, selected).unwrap();
+        assert_eq!(action, ViewerAction::Show);
+        apply_viewer_action(&mut viewer_off, selected, action);
+
+        assert!(selected.iter().all(|node| !viewer_off.contains(*node)));
     }
 }

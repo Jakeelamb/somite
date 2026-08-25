@@ -1,22 +1,38 @@
-# Axial UI = TouchDesigner Network + Parameters
+# Axial UI = canvas-first biological workflow studio
 
 WYSIWID: what you see on the node is what it did. We copy TD’s **building** and **config**. We do not copy the timeline, 60 Hz, or Python expressions in v0.1.
 
-## Window (from your TD 2025.33070, 2026-08-24)
+## Window
 
 ```
-┌ Palette │ Network (/project1)              │ Parameters     ┐
-│ tree    │ grid + nodes with viewers        │ pages (tabs)   │
-│ search  │ selected node: green border      │ sliders/menus  │
-│ preview │ wires                            │               │
-└─────────┴──────────────────────────────────┴───────────────┘
-  (timeline at bottom — we do not copy)
+┌ project ───────────────────────────── Save  Fit  Cook ─┐
+│ ┌──┐                                                 │
+│ │ +│      canvas + artifact-rich nodes              │
+│ │ /│          ╰─ compatible continuation            │
+│ │ID│                          contextual inspector  │
+│ │nf│                                                 │
+│ └──┘                                                 │
+└ status ──────────────────────────────────────────────┘
 ```
 
-Observed: Palette left (Tools → showCooks, Icon/Info/Suggestions). Network center. `displace1` selected. Param dialog top-right: pages **Displace | Common**. Hint: "To Add Operators Double-click in a Network".
+- The canvas owns the window; navigation and configuration float above it only
+  when requested.
+- One selected node opens that node's inspector. Clearing selection removes it.
+- The rail opens Build, Sources, Pipelines, and Paper Drop without reserving a
+  permanent sidebar.
+- An empty project offers outcome-based starts instead of an empty tool tree.
+- The bottom-bar **Machine** tab opens a collapsed-by-default capability card.
+  Detection runs once off the render path and reports the CPU model, physical
+  cores, logical threads, total memory, display adapters, and operating system;
+  Refresh reruns detection on demand.
 
-- One selected node → that node's params. No form for the whole graph.
-- Palette is a **docked browser**, not a hidden Tab-only menu. Tab/double-click still works.
+## Studio color system
+
+Axial uses a near-black canvas with quiet dotted navigation marks. Surfaces are
+charcoal and appear only for active tools, menus, nodes, and inspectors. Warm
+white carries content; green marks selection, continuation, and success. Amber
+and red mean caution or active work and failure. Operator families, port types,
+and sequence bases keep categorical colors because their color carries data.
 
 ## Node (copy TD)
 
@@ -30,12 +46,22 @@ Left/bottom **flags**, not extra menus:
 | Lock | freeze output | later (= cache pin) |
 
 Connectors: **left = in, right = out**. Drag out → in. Type mismatch: no wire.
+Selecting or hovering a node reveals `+` beside each output. Clicking it opens
+**Continue with**, already filtered to operators that accept that output. The
+chosen operator is placed and wired in one action.
 
 Middle-click node: info popup (cook_time, skip, hash, size).
 
 Wires **animate while upstream is cooking**. Cached = still.
 
 Resize node by dragging the edge (bigger viewer).
+
+Viewer visibility is selection-aware. With multiple nodes selected, the Common
+page reports `on`, `off`, or `mixed` and its viewer action applies to the whole
+selection. A mixed selection resolves to **Hide selected viewers**; when every
+selected viewer is hidden, the action becomes **Show selected viewers**. The
+top-bar Show/Hide Viewers action applies the same rule to every node on the
+canvas.
 
 ## Parameters (copy TD)
 
@@ -58,12 +84,12 @@ v0.1: **constant mode only**. No expression/export/bind.
 
 `enable` when a param only makes sense if another is on (TD enable flag).
 
-## Library (TD OP Create, organized for biology)
+## Library and workflow catalog
 
 Double-click empty network or **Tab**: search operators, drop node. Not a wall of 1000 icons.
 
-The docked Library uses the same search-and-drop interaction without forcing
-every kind of work into one flat tree:
+The temporary Library overlay uses the same search-and-drop interaction without
+forcing every kind of work into one flat tree:
 
 - **Build** groups tools by intent: quality, align and map, quantify, assemble,
   analyze, and utilities.
@@ -71,22 +97,47 @@ every kind of work into one flat tree:
 - **Pipelines** opens local Snakemake projects and combines Axial's typed
   curated wrappers with the official nf-core catalog.
 
+Library, Paper Drop, and OP Create are one family of transient surfaces. Only
+one can be open at a time; choosing another rail action switches immediately.
+Clicking anywhere outside the active surface closes it, as do Escape and the
+surface's own toggle. Search focus is requested once when a surface opens so
+the fields never steal focus back while the user navigates results.
+
 One search spans all three modes. Recent tools and starred Favorites are
-session shortcuts, not new operator types. Rows show a compact purpose line;
-hover reveals the full description, typed ports, and topics. Quick Add routes
-directly to read import, accession entry, pipeline discovery, or a Snakemake
-project directory.
+shortcuts, not new operator types; they and the active mode persist in
+`.axial/library-state.json`. Rows show a compact purpose line; hover reveals the
+full description, typed ports, and topics. Quick Add routes directly to read
+import, accession entry, pipeline discovery, or a Snakemake project directory.
+The footer distinguishes local operator definitions from catalog discoveries;
+it never labels discovery as installation.
 
 Dragging a wire onto empty network opens OP Create filtered to compatible
 operators. Choosing one places it at the drop point and completes the wire in
-one action.
+one action. When identically named `r1` and `r2` ports exist at both ends,
+snapping either mate also snaps its free companion; an already occupied mate is
+never replaced implicitly.
 
-The Sources accession box recognizes public SRA run accessions (`SRR`, `ERR`,
-`DRR`) and NCBI assembly accessions (`GCA_`, `GCF_`). SRA insertion creates and
-wires the download and FASTQ-conversion nodes; assembly insertion creates and
-wires the data-package download and ZIP-unpack nodes. Pipelines searches the
+Dropping a recognized local FASTQ pair together (`R1`/`R2` or `_1`/`_2` naming)
+creates one Paired reads source with two visible output ports. fastp, STAR,
+HISAT2, BWA, Salmon, and Kraken2 preserve those streams. Their `r2` ports remain
+optional so the same nodes also support single-end reads.
+
+The Sources card accepts an accession or a copied record URL and previews the
+provider and resulting artifact before insertion. It recognizes public SRA run
+accessions (`SRR`, `ERR`, `DRR`), NCBI assemblies (`GCA_`, `GCF_`), and Ensembl
+gene/transcript/protein stable IDs. SRA insertion creates and wires the download
+and FASTQ-conversion nodes; assembly insertion creates and wires the NCBI
+Datasets package download and ZIP-unpack nodes; Ensembl insertion creates a
+REST-backed FASTA source with genomic, cDNA, or protein mode inferred from the
+stable ID. Small readiness indicators expose whether SRA Toolkit, Datasets, and
+curl are available. Nothing downloads until Cook. Pipelines searches the
 official cached nf-core catalog and every result is click- or drag-insertable.
-Discovery never auto-cooks high-cost downloads or pipelines.
+
+Catalog entries communicate purpose, release and provenance, typed inputs and
+outputs, and whether the operator is local or discovered. Axial deliberately
+does **not** claim runtime estimates: execution depends on input size, available
+cores, machine architecture, storage, cache state, and remote services. Cost is
+only a coarse low/high execution guard.
 
 Opening or dropping a directory with `Snakefile` or `workflow/Snakefile`
 creates a typed directory-import → Snakemake pair. The workflow engine receives
@@ -97,11 +148,17 @@ cores, dry-run, keep-going, printed commands, and Snakemake's Conda deployment.
 ## Canvas controls
 
 - Wheel/trackpad: pan in two axes.
-- Pinch or Ctrl/Cmd-wheel: zoom around the cursor.
+- Pinch or Ctrl/Cmd-wheel: zoom around the cursor. The persistent − / + canvas
+  controls provide the same bounded zoom for a mouse without gesture support;
+  click the percentage between them to reset to 100%.
 - Space + primary drag, middle drag, or secondary drag: pan.
 - Empty-space drag: marquee select. Shift adds; Ctrl/Cmd toggles.
-- Drag any selected node: move the whole selected group.
+- Drag any selected node: move the whole selected group. Nodes softly magnetize
+  to the 20-unit dot grid and to matching edges or centers on nearby nodes;
+  green guides show the active alignment. Hold Alt while dragging for free
+  placement.
 - Ctrl/Cmd-D: duplicate selected nodes and their internal wires.
+- Ctrl/Cmd-K: open and focus the global Library search from anywhere.
 - Click a wire: select it; Delete removes the selected wire or nodes.
 - Ctrl/Cmd-Z / Shift-Ctrl/Cmd-Z: undo / redo graph edits.
 - Edit the node name in the parameter header to rename it without breaking wires.

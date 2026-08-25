@@ -11,7 +11,8 @@
   },
   "ports": {
     "in": [
-      { "name": "fastq", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
+      { "name": "r1", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
+      { "name": "r2", "type": "Fastq", "union": ["Fastq", "FastqGz"], "optional": true },
       { "name": "index", "type": "Directory", "union": ["Directory", "Fasta", "FastaGz"], "optional": true }
     ],
     "out": [{ "name": "quant", "type": "Table" }]
@@ -20,7 +21,9 @@
     "salmon", "quant",
     "-i", "{input.index}",
     "-l", "{param.libtype}",
-    "-r", "{input.fastq}",
+    "?r2:-1", "?r2:{input.r1}",
+    "?r2:-2", "?r2:{input.r2}",
+    "?!r2:-r", "?!r2:{input.r1}",
     "-o", "{work}/out"
   ],
   "outputs": {

@@ -72,12 +72,24 @@ const MAG_COMPOUND_COVERS: &[&str] = &["class.kraken2"];
 /// Catalog bricks the methods section can name. nf-core compounds only if named.
 const BRICKS: &[(&str, &[&str])] = &[
     ("qc.fastqc", &["fastqc"]),
-    ("qc.fastp", &["fastp", "cutadapt", "trimmomatic", "trim galore", "trimgalore"]),
+    (
+        "qc.fastp",
+        &[
+            "fastp",
+            "cutadapt",
+            "trimmomatic",
+            "trim galore",
+            "trimgalore",
+        ],
+    ),
     ("align.star", &["star"]),
     ("align.hisat2", &["hisat2", "hisat"]),
     ("align.bwa", &["bwa-mem", "bwa mem", "bwa"]),
     ("align.minimap2", &["minimap2", "minimap"]),
-    ("quant.featurecounts", &["featurecounts", "feature counts", "rsubread"]),
+    (
+        "quant.featurecounts",
+        &["featurecounts", "feature counts", "rsubread"],
+    ),
     ("quant.salmon", &["salmon"]),
     ("quant.stringtie", &["stringtie"]),
     ("diff.deseq2", &["deseq2", "deseq"]),
@@ -266,7 +278,13 @@ pub fn reconstruct(catalog: &Catalog, text: &str) -> Reconstruction {
     if assay == Assay::SingleCell
         && !mentions(
             &low,
-            &["cellranger", "cell ranger", "seurat", "soupx", "doubletfinder"],
+            &[
+                "cellranger",
+                "cell ranger",
+                "seurat",
+                "soupx",
+                "doubletfinder",
+            ],
         )
     {
         scan = text;
@@ -331,7 +349,12 @@ fn build_bricks(
         None
     };
     let fasterq = if prefetch.is_some() {
-        add(&mut g, "sra.fasterq_dump", vec![], Some("SRA → FASTQ".into()))
+        add(
+            &mut g,
+            "sra.fasterq_dump",
+            vec![],
+            Some("SRA → FASTQ".into()),
+        )
     } else {
         None
     };
@@ -349,10 +372,22 @@ fn build_bricks(
         // domain-incompatible mention is evidence, not a runnable step.
         if matches!(
             (*op, assay),
-            ("align.star" | "align.hisat2" | "quant.featurecounts" | "quant.salmon"
-                | "quant.stringtie" | "diff.deseq2" | "nf.rnaseq", Assay::Variants | Assay::Metagenome)
-                | ("align.bwa" | "var.haplotypecaller" | "nf.sarek", Assay::RnaSeq | Assay::Metagenome)
-                | ("class.kraken2" | "nf.mag" | "nf.taxprofiler", Assay::RnaSeq | Assay::Variants)
+            (
+                "align.star"
+                    | "align.hisat2"
+                    | "quant.featurecounts"
+                    | "quant.salmon"
+                    | "quant.stringtie"
+                    | "diff.deseq2"
+                    | "nf.rnaseq",
+                Assay::Variants | Assay::Metagenome
+            ) | (
+                "align.bwa" | "var.haplotypecaller" | "nf.sarek",
+                Assay::RnaSeq | Assay::Metagenome
+            ) | (
+                "class.kraken2" | "nf.mag" | "nf.taxprofiler",
+                Assay::RnaSeq | Assay::Variants
+            )
         ) {
             continue;
         }
@@ -378,7 +413,16 @@ fn build_bricks(
             continue;
         }
         if *op == "diff.deseq2"
-            && !mentions(low, &["featurecounts", "feature counts", "rsubread", "salmon", "htseq"])
+            && !mentions(
+                low,
+                &[
+                    "featurecounts",
+                    "feature counts",
+                    "rsubread",
+                    "salmon",
+                    "htseq",
+                ],
+            )
         {
             continue;
         }
@@ -449,11 +493,11 @@ fn build_bricks(
     if prefetch.is_none()
         && g.nodes
             .iter()
-            .any(|n| {
-                n.operator != "gap.missing"
-                    || matches!(assay, Assay::Qc | Assay::SingleCell)
-            })
-        && !g.nodes.iter().any(|n| n.operator == "files.import")
+            .any(|n| n.operator != "gap.missing" || matches!(assay, Assay::Qc | Assay::SingleCell))
+        && !g
+            .nodes
+            .iter()
+            .any(|n| matches!(n.operator.as_str(), "files.import" | "files.import_paired"))
         && (assay == Assay::SingleCell
             || g.nodes.iter().any(|n| {
                 matches!(
@@ -472,11 +516,20 @@ fn build_bricks(
                 )
             }))
     {
+        let source = if mentioned(low, &["paired-end", "paired end", "paired reads"]) {
+            "files.import_paired"
+        } else {
+            "files.import"
+        };
         add(
             &mut g,
-            "files.import",
+            source,
             vec![],
-            Some("no SRA accession — drop a FASTQ on this node".into()),
+            Some(if source == "files.import_paired" {
+                "no SRA accession — drop the R1 and R2 FASTQs together".into()
+            } else {
+                "no SRA accession — drop a FASTQ on this node".into()
+            }),
         );
     }
 
@@ -522,7 +575,9 @@ fn build_bricks(
     };
 
     if g.nodes.is_empty() {
-        warnings.push("no tools or assay I could map. drop a methods section, not a cover page.".into());
+        warnings.push(
+            "no tools or assay I could map. drop a methods section, not a cover page.".into(),
+        );
     }
     if assay == Assay::Mixed {
         warnings.push(
@@ -534,9 +589,12 @@ fn build_bricks(
     if let (Some(a), Some(b)) = (&prefetch, &fasterq) {
         wire(&mut g, a, b);
     }
-    let reads = fasterq
-        .clone()
-        .or_else(|| g.nodes.iter().find(|n| n.operator == "files.import").map(|n| n.id.clone()));
+    let reads = fasterq.clone().or_else(|| {
+        g.nodes
+            .iter()
+            .find(|n| matches!(n.operator.as_str(), "files.import" | "files.import_paired"))
+            .map(|n| n.id.clone())
+    });
 
     if let Some(src) = &reads {
         for n in g.nodes.clone() {
@@ -550,7 +608,7 @@ fn build_bricks(
                     | "nf.mag"
                     | "nf.taxprofiler"
             ) {
-                wire(&mut g, src, &n.id);
+                wire_reads(&mut g, src, &n.id);
             }
         }
     }
@@ -562,8 +620,11 @@ fn build_bricks(
         .or(reads.clone());
     if let Some(src) = &trimmed {
         for n in g.nodes.clone() {
-            if matches!(n.operator.as_str(), "align.star" | "align.hisat2" | "align.bwa") {
-                wire(&mut g, src, &n.id);
+            if matches!(
+                n.operator.as_str(),
+                "align.star" | "align.hisat2" | "align.bwa"
+            ) {
+                wire_reads(&mut g, src, &n.id);
             }
         }
     }
@@ -571,7 +632,11 @@ fn build_bricks(
         for n in g.nodes.clone() {
             if matches!(
                 n.operator.as_str(),
-                "align.star" | "align.hisat2" | "align.bwa" | "quant.salmon" | "var.haplotypecaller"
+                "align.star"
+                    | "align.hisat2"
+                    | "align.bwa"
+                    | "quant.salmon"
+                    | "var.haplotypecaller"
             ) {
                 wire(&mut g, fa, &n.id);
             }
@@ -591,7 +656,10 @@ fn build_bricks(
     }
     if let Some(gt) = &gtf {
         for n in g.nodes.clone() {
-            if matches!(n.operator.as_str(), "quant.featurecounts" | "quant.stringtie") {
+            if matches!(
+                n.operator.as_str(),
+                "quant.featurecounts" | "quant.stringtie"
+            ) {
                 wire(&mut g, gt, &n.id);
             }
         }
@@ -603,11 +671,19 @@ fn build_bricks(
         .map(|n| n.id.clone());
     if let (Some(c), Some(de)) = (
         &counts,
-        g.nodes.iter().find(|n| n.operator == "diff.deseq2").map(|n| n.id.clone()),
+        g.nodes
+            .iter()
+            .find(|n| n.operator == "diff.deseq2")
+            .map(|n| n.id.clone()),
     ) {
         wire(&mut g, c, &de);
     }
-    if let Some(st) = g.nodes.iter().find(|n| n.operator == "quant.stringtie").map(|n| n.id.clone()) {
+    if let Some(st) = g
+        .nodes
+        .iter()
+        .find(|n| n.operator == "quant.stringtie")
+        .map(|n| n.id.clone())
+    {
         if let Some(bg) = g
             .nodes
             .iter()
@@ -617,7 +693,12 @@ fn build_bricks(
             wire(&mut g, &st, &bg);
         }
     }
-    if let Some(bw) = g.nodes.iter().find(|n| n.operator == "align.bwa").map(|n| n.id.clone()) {
+    if let Some(bw) = g
+        .nodes
+        .iter()
+        .find(|n| n.operator == "align.bwa")
+        .map(|n| n.id.clone())
+    {
         if let Some(pic) = g
             .nodes
             .iter()
@@ -636,9 +717,14 @@ fn build_bricks(
         }
     }
     if let (Some(src), Some(sh)) = (trimmed.as_ref().or(reads.as_ref()), &sheet) {
-        wire(&mut g, src, sh);
+        wire_reads(&mut g, src, sh);
     }
-    if let Some(nf) = g.nodes.iter().find(|n| n.operator == "nf.rnaseq").map(|n| n.id.clone()) {
+    if let Some(nf) = g
+        .nodes
+        .iter()
+        .find(|n| n.operator == "nf.rnaseq")
+        .map(|n| n.id.clone())
+    {
         if let Some(sh) = &sheet {
             wire(&mut g, sh, &nf);
         }
@@ -852,12 +938,22 @@ fn build_assembly(catalog: &Catalog, text: &str, low: &str) -> Reconstruction {
         None
     };
     let gs = if mentioned(low, &["genomescope"]) {
-        gap(&mut g, "Genomescope", snippet(text, "Genomescope"), gap_from_reads())
+        gap(
+            &mut g,
+            "Genomescope",
+            snippet(text, "Genomescope"),
+            gap_from_reads(),
+        )
     } else {
         None
     };
     let mut lineage = "arthropoda_odb10".to_string();
-    for lin in ["arthropoda_odb10", "eukaryota_odb10", "bacteria_odb10", "fungi_odb10"] {
+    for lin in [
+        "arthropoda_odb10",
+        "eukaryota_odb10",
+        "bacteria_odb10",
+        "fungi_odb10",
+    ] {
         if low.contains(lin) {
             lineage = lin.into();
             break;
@@ -902,7 +998,12 @@ fn build_assembly(catalog: &Catalog, text: &str, low: &str) -> Reconstruction {
         None
     };
     let blob = if mentioned(low, &["blobtools", "blobtoolkit"]) {
-        gap(&mut g, "Blobtools", snippet(text, "Blobtools"), gap_from_asm())
+        gap(
+            &mut g,
+            "Blobtools",
+            snippet(text, "Blobtools"),
+            gap_from_asm(),
+        )
     } else {
         None
     };
@@ -924,7 +1025,12 @@ fn build_assembly(catalog: &Catalog, text: &str, low: &str) -> Reconstruction {
         None
     };
     let mito = if mentioned(low, &["mitohifi"]) {
-        gap(&mut g, "MitoHiFi", snippet(text, "MitoHiFi"), gap_from_reads())
+        gap(
+            &mut g,
+            "MitoHiFi",
+            snippet(text, "MitoHiFi"),
+            gap_from_reads(),
+        )
     } else {
         None
     };
@@ -949,7 +1055,12 @@ fn build_assembly(catalog: &Catalog, text: &str, low: &str) -> Reconstruction {
         None
     };
     let aug = if mentioned(low, &["augustus"]) {
-        gap(&mut g, "Augustus", snippet(text, "Augustus"), gap_from_asm())
+        gap(
+            &mut g,
+            "Augustus",
+            snippet(text, "Augustus"),
+            gap_from_asm(),
+        )
     } else {
         None
     };
@@ -1103,7 +1214,11 @@ pub fn methods_window(text: &str) -> &str {
         "bibliography",
     ];
 
-    let front: String = text.chars().take(2048).collect::<String>().to_ascii_lowercase();
+    let front: String = text
+        .chars()
+        .take(2048)
+        .collect::<String>()
+        .to_ascii_lowercase();
     if front.contains("type methods")
         || (front.contains("subjects:") && front.contains("bioinformatics, methods"))
     {
@@ -1131,7 +1246,11 @@ pub fn methods_window(text: &str) -> &str {
     // Keep their body, but exclude a real references/bibliography heading.
     let end = find_heading(text, &["references", "bibliography"], 0).unwrap_or(text.len());
     let body = &text[..end];
-    if body.len() >= 200 { body } else { text }
+    if body.len() >= 200 {
+        body
+    } else {
+        text
+    }
 }
 
 fn next_line(text: &str, at: usize) -> usize {
@@ -1270,6 +1389,7 @@ fn short_leaf(op: &str, params: &[(&str, ParamValue)]) -> String {
         "asm.yahs" => "yahs".into(),
         "qc.busco" => "busco".into(),
         "files.import" => "import".into(),
+        "files.import_paired" => "reads".into(),
         "sheet.rnaseq" => "sheet".into(),
         "ensembl.fasta" => "fasta".into(),
         "ensembl.gtf" => "gtf".into(),
@@ -1303,14 +1423,19 @@ fn next_name(existing: &[String], op: &str, params: &[(&str, ParamValue)]) -> St
 }
 
 fn wire(g: &mut Graph, from: &str, to: &str) {
-    let Some(a) = g.node(from).cloned() else { return };
+    let Some(a) = g.node(from).cloned() else {
+        return;
+    };
     let Some(b) = g.node(to).cloned() else { return };
     for ap in a.ports.iter().filter(|p| p.dir == Direction::Out) {
         for bp in b.ports.iter().filter(|p| p.dir == Direction::In) {
             if !compatible(ap.ty, bp.ty, &bp.union) {
                 continue;
             }
-            if g.edges.iter().any(|e| e.to_node == to && e.to_port == bp.name) {
+            if g.edges
+                .iter()
+                .any(|e| e.to_node == to && e.to_port == bp.name)
+            {
                 continue;
             }
             g.edges.push(Edge {
@@ -1322,6 +1447,44 @@ fn wire(g: &mut Graph, from: &str, to: &str) {
             });
             return;
         }
+    }
+}
+
+/// Keep paired reads as two named streams whenever both operators expose the
+/// paired contract. Operators without r1/r2 ports retain the normal typed snap.
+fn wire_reads(g: &mut Graph, from: &str, to: &str) {
+    let Some(source) = g.node(from).cloned() else {
+        return;
+    };
+    let Some(target) = g.node(to).cloned() else {
+        return;
+    };
+    let mut connected = false;
+    for mate in ["r1", "r2"] {
+        let Some(output) = source.port(mate, Direction::Out) else {
+            continue;
+        };
+        let Some(input) = target.port(mate, Direction::In) else {
+            continue;
+        };
+        if !compatible(output.ty, input.ty, &input.union)
+            || g.edges
+                .iter()
+                .any(|edge| edge.to_node == to && edge.to_port == mate)
+        {
+            continue;
+        }
+        g.edges.push(Edge {
+            id: format!("e_{from}_{mate}_{to}_{mate}"),
+            from_node: from.into(),
+            from_port: mate.into(),
+            to_node: to.into(),
+            to_port: mate.into(),
+        });
+        connected = true;
+    }
+    if !connected {
+        wire(g, from, to);
     }
 }
 
@@ -1368,7 +1531,12 @@ fn gap_from_reads() -> Vec<Port> {
         p_in(
             "in",
             PortType::Fastq,
-            vec![PortType::Fastq, PortType::FastqGz, PortType::Fasta, PortType::FastaGz],
+            vec![
+                PortType::Fastq,
+                PortType::FastqGz,
+                PortType::Fasta,
+                PortType::FastaGz,
+            ],
         ),
         p_out("out", PortType::Directory),
     ]
@@ -1424,7 +1592,8 @@ fn layout(g: &mut Graph) {
             layer.insert(n.id.clone(), max_l + 1);
         }
     }
-    let mut cols: std::collections::BTreeMap<usize, Vec<String>> = std::collections::BTreeMap::new();
+    let mut cols: std::collections::BTreeMap<usize, Vec<String>> =
+        std::collections::BTreeMap::new();
     for n in &g.nodes {
         cols.entry(*layer.get(&n.id).unwrap_or(&0))
             .or_default()
@@ -1483,7 +1652,9 @@ were called with GATK Mutect2 following the sarek workflow.
 
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/papers").join(name),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testdata/papers")
+                .join(name),
         )
         .unwrap()
     }
@@ -1497,11 +1668,60 @@ were called with GATK Mutect2 following the sarek workflow.
         assert!(ops.contains(&"sra.fasterq_dump"));
         assert!(ops.contains(&"qc.fastqc"));
         assert!(ops.contains(&"qc.fastp"));
-        assert!(ops.contains(&"align.star"), "STAR is a brick, not buried in nf-core");
+        assert!(
+            ops.contains(&"align.star"),
+            "STAR is a brick, not buried in nf-core"
+        );
         assert!(ops.contains(&"quant.featurecounts"));
         assert!(ops.contains(&"diff.deseq2"));
-        assert!(!ops.contains(&"nf.rnaseq"), "paper did not name nf-core/rnaseq");
-        let pref = r.graph.nodes.iter().find(|n| n.operator == "sra.prefetch").unwrap();
+        assert!(
+            !ops.contains(&"nf.rnaseq"),
+            "paper did not name nf-core/rnaseq"
+        );
+        let fasterq = r
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.operator == "sra.fasterq_dump")
+            .unwrap();
+        let fastp = r
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.operator == "qc.fastp")
+            .unwrap();
+        let star = r
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.operator == "align.star")
+            .unwrap();
+        for mate in ["r1", "r2"] {
+            assert!(
+                r.graph.edges.iter().any(|edge| {
+                    edge.from_node == fasterq.id
+                        && edge.from_port == mate
+                        && edge.to_node == fastp.id
+                        && edge.to_port == mate
+                }),
+                "fasterq {mate} should remain a separate fastp input"
+            );
+            assert!(
+                r.graph.edges.iter().any(|edge| {
+                    edge.from_node == fastp.id
+                        && edge.from_port == mate
+                        && edge.to_node == star.id
+                        && edge.to_port == mate
+                }),
+                "trimmed {mate} should remain a separate STAR input"
+            );
+        }
+        let pref = r
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.operator == "sra.prefetch")
+            .unwrap();
         match pref.params.get("accession") {
             Some(ParamValue::String(s)) => assert_eq!(s, "SRR12345678"),
             _ => panic!("accession"),
@@ -1509,18 +1729,49 @@ were called with GATK Mutect2 following the sarek workflow.
         assert!(
             r.graph.edges.iter().any(|e| {
                 r.graph.node(&e.from_node).map(|n| n.operator.as_str()) == Some("align.star")
-                    && r.graph.node(&e.to_node).map(|n| n.operator.as_str()) == Some("quant.featurecounts")
+                    && r.graph.node(&e.to_node).map(|n| n.operator.as_str())
+                        == Some("quant.featurecounts")
             }),
             "STAR should snap to featureCounts"
         );
         assert!(
             r.graph.edges.iter().any(|e| {
-                r.graph.node(&e.from_node).map(|n| n.operator.as_str()) == Some("quant.featurecounts")
+                r.graph.node(&e.from_node).map(|n| n.operator.as_str())
+                    == Some("quant.featurecounts")
                     && r.graph.node(&e.to_node).map(|n| n.operator.as_str()) == Some("diff.deseq2")
             }),
             "counts should snap to DESeq2"
         );
         assert_wired(&r);
+    }
+
+    #[test]
+    fn local_paired_reads_remain_separate_without_an_accession() {
+        let r = reconstruct(
+            &cat(),
+            "Paired-end RNA-seq reads were trimmed with fastp and aligned to the genome with STAR.",
+        );
+        let source = r
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.operator == "files.import_paired")
+            .unwrap();
+        let fastp = r
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.operator == "qc.fastp")
+            .unwrap();
+        for mate in ["r1", "r2"] {
+            assert!(r.graph.edges.iter().any(|edge| {
+                edge.from_node == source.id
+                    && edge.from_port == mate
+                    && edge.to_node == fastp.id
+                    && edge.to_port == mate
+            }));
+        }
+        r.graph.validate().unwrap();
     }
 
     #[test]
@@ -1531,7 +1782,30 @@ were called with GATK Mutect2 following the sarek workflow.
         assert!(ops.contains(&"nf.rnaseq"), "{ops:?}");
         assert!(ops.contains(&"sheet.rnaseq"));
         assert!(ops.contains(&"qc.fastqc"));
-        assert!(!ops.contains(&"align.star"), "STAR lives inside nf-core/rnaseq");
+        let fasterq = r
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.operator == "sra.fasterq_dump")
+            .unwrap();
+        let sheet = r
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.operator == "sheet.rnaseq")
+            .unwrap();
+        for mate in ["r1", "r2"] {
+            assert!(r.graph.edges.iter().any(|edge| {
+                edge.from_node == fasterq.id
+                    && edge.from_port == mate
+                    && edge.to_node == sheet.id
+                    && edge.to_port == mate
+            }));
+        }
+        assert!(
+            !ops.contains(&"align.star"),
+            "STAR lives inside nf-core/rnaseq"
+        );
         assert_wired(&r);
     }
 
@@ -1570,7 +1844,8 @@ were called with GATK Mutect2 following the sarek workflow.
     #[test]
     fn assembly_paper_is_not_rnaseq() {
         let raw = std::fs::read_to_string(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/papers/aphis_assembly_methods.txt"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testdata/papers/aphis_assembly_methods.txt"),
         )
         .unwrap();
         let r = reconstruct(&cat(), &raw);
@@ -1578,7 +1853,10 @@ were called with GATK Mutect2 following the sarek workflow.
         r.graph.validate().unwrap();
         let ops: Vec<_> = r.graph.nodes.iter().map(|n| n.operator.as_str()).collect();
         assert!(ops.contains(&"asm.hifiasm"), "{ops:?}");
-        assert!(!ops.contains(&"nf.rnaseq"), "must not misread Iso-seq as bulk RNA-seq");
+        assert!(
+            !ops.contains(&"nf.rnaseq"),
+            "must not misread Iso-seq as bulk RNA-seq"
+        );
         assert!(ops.contains(&"asm.yahs"), "YaHS is a brick: {ops:?}");
         assert!(r.graph.edges.len() >= 2, "assembly steps should wire");
         for n in &r.graph.nodes {
@@ -1594,7 +1872,9 @@ were called with GATK Mutect2 following the sarek workflow.
             r.graph
                 .nodes
                 .iter()
-                .find(|n| n.operator == op || n.params.get("tool") == Some(&ParamValue::String(op.into())))
+                .find(|n| {
+                    n.operator == op || n.params.get("tool") == Some(&ParamValue::String(op.into()))
+                })
                 .map(|n| n.layout.x)
                 .unwrap()
         };
@@ -1602,13 +1882,18 @@ were called with GATK Mutect2 following the sarek workflow.
             r.graph
                 .nodes
                 .iter()
-                .find(|n| n.operator == op || n.params.get("tool") == Some(&ParamValue::String(op.into())))
+                .find(|n| {
+                    n.operator == op || n.params.get("tool") == Some(&ParamValue::String(op.into()))
+                })
                 .map(|n| n.layout.y)
                 .unwrap()
         };
         assert!(x("asm.hifiasm") > x("files.import"));
         assert!(x("asm.yahs") > x("asm.hifiasm"));
-        assert!(y("Iso-Seq") > y("files.import"), "annotation lane sits below assembly");
+        assert!(
+            y("Iso-Seq") > y("files.import"),
+            "annotation lane sits below assembly"
+        );
         assert!(ops.contains(&"asm.yahs"), "YaHS is a brick");
         assert!(ops.contains(&"qc.busco"), "BUSCO is a brick");
         assert!(ops.contains(&"align.minimap2"));
@@ -1635,9 +1920,11 @@ were called with GATK Mutect2 following the sarek workflow.
         assert!(ops.contains(&"align.hisat2"), "{ops:?}");
         assert!(ops.contains(&"quant.stringtie"));
         assert!(ops.contains(&"qc.fastqc"));
-        let has_ballgown = r.graph.nodes.iter().any(|n| {
-            n.params.get("tool") == Some(&ParamValue::String("Ballgown".into()))
-        });
+        let has_ballgown = r
+            .graph
+            .nodes
+            .iter()
+            .any(|n| n.params.get("tool") == Some(&ParamValue::String("Ballgown".into())));
         assert!(has_ballgown, "Ballgown is not a brick yet — gap");
         assert_wired(&r);
     }
@@ -1668,7 +1955,12 @@ were called with GATK Mutect2 following the sarek workflow.
             })
             .collect();
         assert!(tools.iter().any(|t| t.contains("FALCON")), "{tools:?}");
-        assert!(tools.iter().any(|t| t.contains("Purge") || t.contains("Salsa")), "{tools:?}");
+        assert!(
+            tools
+                .iter()
+                .any(|t| t.contains("Purge") || t.contains("Salsa")),
+            "{tools:?}"
+        );
         assert!(ops(&r).contains(&"qc.busco"));
         assert!(!ops(&r).contains(&"nf.rnaseq"));
         assert_wired(&r);
@@ -1740,10 +2032,18 @@ were called with GATK Mutect2 following the sarek workflow.
         let r = reconstruct(&cat(), text);
         assert_eq!(r.assay, Assay::Mixed);
         let actual = ops(&r);
-        for op in ["align.hisat2", "quant.stringtie", "align.bwa", "var.haplotypecaller"] {
+        for op in [
+            "align.hisat2",
+            "quant.stringtie",
+            "align.bwa",
+            "var.haplotypecaller",
+        ] {
             assert!(actual.contains(&op), "missing {op}: {actual:?}");
         }
-        assert!(r.warnings.iter().any(|w| w.contains("multiple assay workflows")));
+        assert!(r
+            .warnings
+            .iter()
+            .any(|w| w.contains("multiple assay workflows")));
         r.graph.validate().unwrap();
     }
 
@@ -1850,10 +2150,18 @@ were called with GATK Mutect2 following the sarek workflow.
             assert_eq!(&r.assay, assay, "{}", path.display());
             let actual = ops(&r);
             for op in *required {
-                assert!(actual.contains(op), "{} missing {op}: {actual:?}", path.display());
+                assert!(
+                    actual.contains(op),
+                    "{} missing {op}: {actual:?}",
+                    path.display()
+                );
             }
             for op in *forbidden {
-                assert!(!actual.contains(op), "{} invented {op}: {actual:?}", path.display());
+                assert!(
+                    !actual.contains(op),
+                    "{} invented {op}: {actual:?}",
+                    path.display()
+                );
             }
             if relative.contains("scrnabox") {
                 let gaps: Vec<_> = r
@@ -1866,7 +2174,11 @@ were called with GATK Mutect2 following the sarek workflow.
                     })
                     .collect();
                 for tool in ["Cell Ranger", "SoupX", "Seurat", "DoubletFinder"] {
-                    assert!(gaps.contains(&tool), "{} missing {tool}: {gaps:?}", path.display());
+                    assert!(
+                        gaps.contains(&tool),
+                        "{} missing {tool}: {gaps:?}",
+                        path.display()
+                    );
                 }
             }
             r.graph.validate().unwrap();
@@ -1885,7 +2197,8 @@ were called with GATK Mutect2 following the sarek workflow.
 
     #[test]
     fn extract_plain_methods_file() {
-        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/papers/rnaseq_methods.txt");
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/papers/rnaseq_methods.txt");
         let e = extract_from_path(&p).unwrap();
         assert_eq!(e.via, ExtractVia::Utf8);
         assert!(e.text.to_ascii_lowercase().contains("fastqc"));
@@ -1943,7 +2256,12 @@ were called with GATK Mutect2 following the sarek workflow.
             return;
         }
         let e = extract_from_path(&pdf).expect("ocr extract");
-        assert_eq!(e.via, ExtractVia::Tesseract, "expected scan path, got {:?}", e.via);
+        assert_eq!(
+            e.via,
+            ExtractVia::Tesseract,
+            "expected scan path, got {:?}",
+            e.via
+        );
         let low = e.text.to_ascii_lowercase();
         assert!(
             low.contains("rna") && (low.contains("srr") || low.contains("deseq")),
@@ -1954,7 +2272,8 @@ were called with GATK Mutect2 following the sarek workflow.
         assert_eq!(r.assay, Assay::RnaSeq);
         let ops: Vec<_> = r.graph.nodes.iter().map(|n| n.operator.as_str()).collect();
         assert!(
-            ops.iter().any(|o| matches!(*o, "qc.fastqc" | "align.star" | "diff.deseq2")),
+            ops.iter()
+                .any(|o| matches!(*o, "qc.fastqc" | "align.star" | "diff.deseq2")),
             "ocr graph missed the RNA tools: {ops:?} text={:?}",
             e.text
         );

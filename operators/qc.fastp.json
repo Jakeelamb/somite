@@ -10,13 +10,22 @@
     "threads": { "type": "int", "label": "Threads", "page": "fastp", "default": 4 }
   },
   "ports": {
-    "in": [{ "name": "fastq", "type": "Fastq", "union": ["Fastq", "FastqGz"] }],
-    "out": [{ "name": "out", "type": "FastqGz" }]
+    "in": [
+      { "name": "r1", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
+      { "name": "r2", "type": "Fastq", "union": ["Fastq", "FastqGz"], "optional": true }
+    ],
+    "out": [
+      { "name": "r1", "type": "FastqGz" },
+      { "name": "r2", "type": "FastqGz", "optional": true }
+    ]
   },
   "argv": [
-    "fastp", "-i", "{input.fastq}", "-o", "{work}/out/clean.fastq.gz", "-w", "{param.threads}"
+    "fastp", "-i", "{input.r1}", "-o", "{work}/out/clean_R1.fastq.gz",
+    "?r2:-I", "?r2:{input.r2}", "?r2:-O", "?r2:{work}/out/clean_R2.fastq.gz",
+    "-w", "{param.threads}"
   ],
   "outputs": {
-    "out": { "glob": "{work}/out/clean.fastq.gz", "type": "FastqGz" }
+    "r1": { "glob": "{work}/out/clean_R1.fastq.gz", "type": "FastqGz" },
+    "r2": { "glob": "{work}/out/clean_R2.fastq.gz", "type": "FastqGz", "optional": true }
   }
 }
