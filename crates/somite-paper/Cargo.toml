@@ -1,0 +1,14 @@
+[package]
+name = "somite-paper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Drop a paper, emit a Somite graph. Same IR as the canvas."
+
+[dependencies]
+somite-ir = { path = "../somite-ir" }
+somite-ops = { path = "../somite-ops" }
+thiserror = "2"
+
+[dev-dependencies]
+somite-ops = { path = "../somite-ops" }

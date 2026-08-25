@@ -1,5 +1,5 @@
 /target
-**/.axial/
+**/.somite/
 *.swp
 .DS_Store
 testdata/papers/pdf/

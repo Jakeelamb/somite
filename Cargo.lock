@@ -36,96 +36,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
-name = "axial-bundle"
-version = "0.1.0"
-dependencies = [
- "axial-ir",
- "axial-ops",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "zip",
-]
-
-[[package]]
-name = "axial-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axial-cook",
- "axial-ir",
- "axial-ops",
- "axial-paper",
- "serde_json",
-]
-
-[[package]]
-name = "axial-cook"
-version = "0.1.0"
-dependencies = [
- "axial-ir",
- "axial-ops",
- "blake3",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "axial-ir"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "axial-ops"
-version = "0.1.0"
-dependencies = [
- "axial-ir",
- "serde",
- "serde_json",
- "thiserror",
-]
-
-[[package]]
-name = "axial-paper"
-version = "0.1.0"
-dependencies = [
- "axial-ir",
- "axial-ops",
- "thiserror",
-]
-
-[[package]]
-name = "axial-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axial-bundle",
- "axial-cook",
- "axial-ir",
- "axial-ops",
- "axial-paper",
- "axum",
- "http-body-util",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "axum"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -834,6 +744,96 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "somite-bundle"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "somite-ir",
+ "somite-ops",
+ "tempfile",
+ "thiserror",
+ "zip",
+]
+
+[[package]]
+name = "somite-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "somite-cook",
+ "somite-ir",
+ "somite-ops",
+ "somite-paper",
+]
+
+[[package]]
+name = "somite-cook"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+ "serde_json",
+ "somite-ir",
+ "somite-ops",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "somite-ir"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "somite-ops"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "somite-ir",
+ "thiserror",
+]
+
+[[package]]
+name = "somite-paper"
+version = "0.1.0"
+dependencies = [
+ "somite-ir",
+ "somite-ops",
+ "thiserror",
+]
+
+[[package]]
+name = "somite-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "somite-bundle",
+ "somite-cook",
+ "somite-ir",
+ "somite-ops",
+ "somite-paper",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

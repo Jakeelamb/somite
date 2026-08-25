@@ -21,7 +21,7 @@ export type PortType =
 
 export type ParamValue = string | number | boolean;
 
-export type AxialPort = {
+export type SomitePort = {
   name: string;
   dir: "in" | "out";
   ty: PortType;
@@ -29,16 +29,16 @@ export type AxialPort = {
   optional?: boolean;
 };
 
-export type AxialGraphNode = {
+export type SomiteGraphNode = {
   id: string;
   operator: string;
-  ports: AxialPort[];
+  ports: SomitePort[];
   params?: Record<string, ParamValue>;
   layout: { x: number; y: number };
   note?: string;
 };
 
-export type AxialEdge = {
+export type SomiteEdge = {
   id: string;
   from_node: string;
   from_port: string;
@@ -46,10 +46,10 @@ export type AxialEdge = {
   to_port: string;
 };
 
-export type AxialGraph = {
+export type SomiteGraph = {
   schema_version: number;
-  nodes: AxialGraphNode[];
-  edges: AxialEdge[];
+  nodes: SomiteGraphNode[];
+  edges: SomiteEdge[];
 };
 
 export type ParamSpec = {
@@ -96,14 +96,14 @@ export type WorkflowGraphResponse = {
   engine: "nextflow" | "snakemake";
   workflow: string;
   revision: string;
-  graph: AxialGraph;
+  graph: SomiteGraph;
   cached: boolean;
 };
 
 export type ProjectSession = {
   project_name: string;
   graph_path: string;
-  graph: AxialGraph;
+  graph: SomiteGraph;
   operators: Operator[];
   recovered_autosave: boolean;
 };
@@ -145,7 +145,7 @@ export type PaperCandidate = {
   name: string;
   role: "primary" | "parallel" | "alternative";
   assay: string;
-  graph: AxialGraph;
+  graph: SomiteGraph;
   warnings: string[];
   evidence: PaperEvidence[];
 };

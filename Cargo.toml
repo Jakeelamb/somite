@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/axial-ir",
-    "crates/axial-ops",
-    "crates/axial-cook",
-    "crates/axial-paper",
-    "crates/axial-cli",
-    "crates/axial-server",
-    "crates/axial-bundle",
+    "crates/somite-ir",
+    "crates/somite-ops",
+    "crates/somite-cook",
+    "crates/somite-paper",
+    "crates/somite-cli",
+    "crates/somite-server",
+    "crates/somite-bundle",
 ]
 
 [workspace.package]

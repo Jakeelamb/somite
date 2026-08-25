@@ -1,8 +1,8 @@
-# Axial catalog
+# Somite catalog
 
 Not a boutique. Not a Galaxy shed we maintain. **Examples + a generator.** Users wrap the tools they already run. Stars below are demand signal for *examples*, not a porting queue. See [operator-contract.md](./operator-contract.md).
 
-Proof that agents can compile when the format exists: Jake's agent on HoX, `nf-core/rnaseq 3.26.0 (HoX-native)`, `hox-nfcore.adapter: bulk-rna-v1`. Axial's job is the wrap path, not to hand-build `bulk-rna-v1` for every pipeline.
+Proof that agents can compile when the format exists: Jake's agent on HoX, `nf-core/rnaseq 3.26.0 (HoX-native)`, `hox-nfcore.adapter: bulk-rna-v1`. Somite's job is the wrap path, not to hand-build `bulk-rna-v1` for every pipeline.
 
 ---
 
@@ -30,7 +30,7 @@ short-lived; a slow Ensembl response must not block available NCBI results.
 
 ### Tier 1 — wrap generator (this is the catalog)
 
-`axial ops wrap`. Shipped JSON is **copy-paste for the generator**, not a porting queue.
+`somite ops wrap`. Shipped JSON is **copy-paste for the generator**, not a porting queue.
 
 | id | Snap | Why it is an example |
 |---|---|---|
@@ -49,7 +49,7 @@ The canvas may discover every released, non-archived pipeline from nf-core's
 official catalog. Dropping one asks Nextflow for its process graph and expands
 that graph into movable, connectable `workflow.reference` nodes. This exposes
 the pipeline's structure without claiming that every process has been converted
-into an independently executable Axial brick. The selected release is pinned in
+into an independently executable Somite brick. The selected release is pinned in
 the reference metadata.
 
 Read-consuming boundary processes expose separate typed `r1` and optional `r2`
@@ -83,7 +83,7 @@ configuration, targets, licenses, and output conventions, so this structural
 view is not presented as a uniform typed execution API. Local execution remains
 the explicit `files.import_directory → smk.workflow` boundary above.
 
-### Tier 3 — never Axial's job
+### Tier 3 — never Somite's job
 
 - Galaxy tool shed we host
 - HoX boutique of eight optimized natives

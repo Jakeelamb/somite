@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
-import { AxialApp } from "./AxialApp";
+import { SomiteApp } from "./SomiteApp";
 
 export const metadata: Metadata = {
-  title: "Axial — Visual Bioinformatics",
+  title: "Somite — Visual Bioinformatics",
   description: "Build typed bioinformatics workflows on an infinite canvas.",
 };
 
@@ -12,5 +12,5 @@ export default async function Home({
   searchParams: Promise<{ q?: string | string[] }>;
 }) {
   const { q } = await searchParams;
-  return <AxialApp initialQuery={typeof q === "string" ? q : ""} />;
+  return <SomiteApp initialQuery={typeof q === "string" ? q : ""} />;
 }

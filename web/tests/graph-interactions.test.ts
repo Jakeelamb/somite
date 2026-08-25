@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { compatibleOperatorPorts, continuationEdge, nextContinuationPosition, operatorContinues, type PendingConnection } from "../app/graphInteractions.ts";
-import type { AxialGraphNode, Operator } from "../app/types.ts";
+import type { SomiteGraphNode, Operator } from "../app/types.ts";
 
 const fastp: Operator = {
   id: "qc.fastp",
@@ -19,7 +19,7 @@ const fastp: Operator = {
   },
 };
 
-const node: AxialGraphNode = { id: "fastp1", operator: fastp.id, ports: [], params: {}, layout: { x: 200, y: 100 } };
+const node: SomiteGraphNode = { id: "fastp1", operator: fastp.id, ports: [], params: {}, layout: { x: 200, y: 100 } };
 
 test("continuation matches the native input-union rule and prefers the same port name", () => {
   const pending: PendingConnection = { nodeId: "reads1", port: { name: "r1", dir: "out", ty: "FastqGz" }, position: { x: 200, y: 100 } };

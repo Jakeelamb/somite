@@ -13,24 +13,24 @@ async function render() {
   );
 }
 
-test("server-renders the Axial web shell", async () => {
+test("server-renders the Somite web shell", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
   const html = await response.text();
-  assert.match(html, /<title>Axial — Visual Bioinformatics<\/title>/i);
+  assert.match(html, /<title>Somite — Visual Bioinformatics<\/title>/i);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|Starter Project/i);
 });
 
 test("starter preview is removed and the real canvas is wired", async () => {
   const [page, app, panels, css, packageJson] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/AxialApp.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/SomiteApp.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/WorkspacePanels.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
   ]);
-  assert.match(page, /<AxialApp initialQuery=/);
+  assert.match(page, /<SomiteApp initialQuery=/);
   assert.match(app, /ReactFlowProvider/);
   assert.match(app, /api\/graph\/validate/);
   assert.match(app, /api\/run/);

@@ -18,7 +18,7 @@ import { useEffect, useMemo, useState, type RefObject } from "react";
 import { classifySource, type SourceRequest, type SourceSearchResponse, type SourceSearchResult } from "./sourceBuilder";
 import { operatorContinues, type PendingConnection } from "./graphInteractions";
 import type {
-  AxialGraphNode,
+  SomiteGraphNode,
   Operator,
   ParamSpec,
   ParamValue,
@@ -51,7 +51,7 @@ function sectionTitle(operator: Operator, mode: LibraryMode) {
   }
   if (mode === "pipelines") {
     if (operator.id.startsWith("smk.")) return "Snakemake";
-    return operator.palette.includes("Catalog") ? "nf-core Catalog" : "Curated for Axial";
+    return operator.palette.includes("Catalog") ? "nf-core Catalog" : "Curated for Somite";
   }
   const prefix = operator.id.split(".")[0];
   return ({
@@ -389,7 +389,7 @@ export function LibraryPanel({
               {open && <div className="studio-operator-list">
                 {section.operators.map((operator) => (
                   <div className="studio-operator-row" key={operator.id} draggable onDragStart={(event) => {
-                    event.dataTransfer.setData("application/axial-operator", operator.id);
+                    event.dataTransfer.setData("application/somite-operator", operator.id);
                     event.dataTransfer.effectAllowed = "copy";
                   }}>
                     <button type="button" className="operator-add" onClick={() => onAddOperator(operator)}>
@@ -487,7 +487,7 @@ export function PaperPanel({ review, active, loading, onFile, onExample, onActiv
   return (
     <section className="floating-panel paper-window" aria-label="Paper Reconstruction">
       <header className="floating-panel-head"><div><strong>Paper Drop</strong><span>{review ? `${review.candidates.length} workflow${review.candidates.length === 1 ? "" : "s"}` : "methods → graph"}</span></div><button type="button" aria-label="Close Paper Reconstruction" onClick={onClose}><X size={15} /></button></header>
-      <div className="paper-intro"><FileSearch size={20} aria-hidden="true" /><span><strong>Rebuild the methods</strong><small>Axial separates paper evidence, inferred wiring, and tools that still need adapters.</small></span></div>
+      <div className="paper-intro"><FileSearch size={20} aria-hidden="true" /><span><strong>Rebuild the methods</strong><small>Somite separates paper evidence, inferred wiring, and tools that still need adapters.</small></span></div>
       <label className={`paper-upload ${loading ? "busy" : ""}`}>
         {loading ? <span className="spin"><LoaderMark /></span> : <FileInput size={15} aria-hidden="true" />}
         <span>{loading ? "Reading methods…" : review ? "Choose another paper" : "Choose PDF or text"}</span>
@@ -532,7 +532,7 @@ export function InspectorPanel({
   toggleViewers,
   close,
 }: {
-  node: AxialGraphNode;
+  node: SomiteGraphNode;
   selectedCount: number;
   operator: Operator;
   hiddenViewerCount: number;
@@ -590,7 +590,7 @@ export function InspectorPanel({
         <span className="section-kicker">Ports</span>
         {node.ports.map((port) => <div key={`${port.dir}-${port.name}`}><i style={{ background: portColor[port.ty] ?? "#8b949b" }} /><strong>{port.name}</strong><span>{port.ty}</span><small>{port.dir}</small></div>)}
       </div>
-      <div className="migration-note"><Play size={14} aria-hidden="true" /><span>{operator.kind === "reference" ? "Imported workflow structure. Replace or promote this component to a native Axial tool before standalone execution." : "Run uses the native Rust executor and content-addressed cache. Downloads and high-cost tools start only when you explicitly run the graph."}</span></div>
+      <div className="migration-note"><Play size={14} aria-hidden="true" /><span>{operator.kind === "reference" ? "Imported workflow structure. Replace or promote this component to a native Somite tool before standalone execution." : "Run uses the native Rust executor and content-addressed cache. Downloads and high-cost tools start only when you explicitly run the graph."}</span></div>
     </section>
   );
 }
@@ -600,7 +600,7 @@ function isFileParameter(operator: string, key: string) {
 }
 
 function ParameterControl({ node, name, spec, value, update, beginEdit, browse }: {
-  node: AxialGraphNode;
+  node: SomiteGraphNode;
   name: string;
   spec: ParamSpec;
   value: ParamValue;
