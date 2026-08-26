@@ -1,305 +1,168 @@
-# Somite Operator Contract
+# Somite operator contract
 
-The snap is the type. If two nodes will not wire, the ports are wrong — not the canvas.
+An Operator is the reviewed Interface between a visible Somite Node and one
+tool Implementation. The graph owns workflow structure. Operator metadata owns
+the command, parameters, typed ports, output collection rules, and Pixi package
+requirements for one node.
 
-**Somite is a bridge, not a boutique.** HoX ships a few tools they tastefully optimized. A solo cannot do that for STAR, GATK, Kraken, SPAdes, and the next 150 CLIs. Users bring the tools they already have. Somite makes them snap. Agents hack the dirty I/O. Jake does not hand-port the universe.
+Package metadata is not an Operator. A Conda package can reveal that a binary
+exists; it does not define safe arguments, input cardinality, artifact types,
+or outputs.
 
-This is the ruling document for wrapping a CLI, an nf-core module, or an nf-core pipeline. Full JSON grammar: [somite-design.md](./somite-design.md). Examples: [catalog.md](./catalog.md).
+## Artifact ports
 
-Keywords MUST / MUST NOT / SHOULD as in RFC 2119.
+Ports use the closed `PortType` enum in `somite-ir`. Equal types connect. An
+input may declare an explicit union such as `Fastq | FastqGz`. A scalar input
+accepts at most one edge. Paired reads remain separate `r1` and `r2` ports.
 
----
+`Directory` is not a wildcard. Use it only when the directory itself is the
+tool's real artifact contract. Do not use it to avoid defining files.
 
-## Product: the bridge
+Collections, scatter/gather, tuple metadata, and streaming channels are not in
+Graph schema v1. An Operator that requires them is an adapter gap, not a reason
+to hide semantics in a shell command.
 
-| HoX | Somite |
-|---|---|
-| Few native tools, curated hard | Existing CLIs + nf-core, wrapped |
-| You live in their resource ontology | Default snap is **artifact type** (`FastqGz`, `Bam`, `Vcf`) |
-| Tasteful optimization is the product | The **wrap generator** is the product |
-| Catalog is the moat | Convention is the moat (JSON + closed types + staging). Agents fill it. |
+## JSON shape
 
-DHH (2026-08-23): "Don't fork, just build on top. Make a tailoring script." The tailoring script is generated. Convention over configuration so a solo (or a user, or an agent) can wrap `fastp` in minutes, not tastefully rewrite it.
-
-Untyped "connect anything" is still Galaxy. The bridge is typed **files**, not a second biology ontology you must learn before FastQC will wire.
-
----
-
-## Three scales (do not mix them)
-
-| Scale | What it is | HoX analogue | DHH analogue | Somite |
-|---|---|---|---|---|
-| **Brick** | One command whose I/O already matches the type list | a module over the warehouse | convention | `kind: external` / in-process |
-| **Adapter** | Generated glue that *makes* a hostile tool match the type list | ingest → canonical record | tailoring script, maybe later core | `kind: adapter` (Rust or 20-line CLI we own) |
-| **Compound** | A graph with published ports | an app over the same substrate | a Technique | `kind: compound` / `nf.run` |
-
-Default canvas: **bricks the user wrapped**. FastQC → fastp → STAR is three JSON files, not a HoX-native RNA product. Detach of a 75-module pipeline is v1 and optional.
-
-A compiled scientific DAG (`Assembly + Features + Reads → …`) is a **user/agent trick**, proven on HoX, not Somite's catalog job. We ship the generator so they can do it. We do not spend a year tastefully optimizing salmon.
-
-**Modify the I/O, not the science.** No `star-somite`. If STAR's BAM is missing `@RG`, generate `adapt.star_bam`. The aligner stays upstream. If the adapter is good, it can become a shipped example (DHH: "maybe we just put it in core"). Core stays tiny.
-
-### Proof: an agent compiled nf-core/rnaseq on HoX (console, 2026-08-24)
-
-Jake's agent, not a HoX-shipped pipeline. Title: `nf-core/rnaseq 3.26.0 (HoX-native)`. Tag `hox-nfcore.adapter: bulk-rna-v1`. Git `1f03b53ef799e298f60c8`. Five nodes:
-
-```
-[Reference Assembly] → assembly ─┐
-[Gene Features]      → features ─┼→ [Pseudoalignment] → [Feature Counts]
-[Reads]              → reads    ─┘
-```
-
-HoX provided kinds. The agent compiled. That is the proof that **format + agent** beats **Jake curates 8 tools**.
-
-Steal the *move*, not the boutique. On Somite the default format is artifact types, so wrapping `fastqc` does not require inventing `Reads`. Kinds are an optional overlay when someone (agent, user) compiles a pipeline into a scientific DAG. Somite does not owe `adapt.bulk_rna` as a product. Ship `somite ops wrap` so anyone can make that graph.
-
-Physical files in CAS. Default snap is **artifact type**. Kind is opt-in.
-
----
-
-## The snap rule
-
-An edge is legal iff `compatible(src, dst)`:
-
-- Equal artifact types: yes.
-- `Union` on an **input** only: yes if any member matches.
-- `FastqGz → Fastq`: **no**. Do not silent-gunzip. FastQC takes `Union[Fastq, FastqGz]`.
-- `Directory` is **not** a wildcard. Only `nf.run` / pipeline compounds may emit `Directory`.
-- No `Any`. No untyped `File`.
-- Paired-end is two ports (`r1`, `r2`), not a list. Scatter is v1.
-
-Closed **artifact** types (bytes on disk — grow only with a wedge need):
-
-```
-Sra, Fastq, FastqGz, Fasta, FastaGz, Gtf, GtfGz,
-Bam, Bai, Vcf, VcfGz, Table, Json, Html, Image, Directory, Text,
-Preview
+```json
+{
+  "id": "qc.fastp",
+  "title": "fastp",
+  "palette": ["QC"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "fastp",
+  "pixi": ["bioconda::fastp"],
+  "params": {
+    "threads": {
+      "type": "int",
+      "label": "Threads",
+      "default": 4,
+      "min": 1,
+      "max": 64
+    }
+  },
+  "ports": {
+    "in": [
+      { "name": "r1", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
+      { "name": "r2", "type": "Fastq", "union": ["Fastq", "FastqGz"], "optional": true }
+    ],
+    "out": [
+      { "name": "r1", "type": "FastqGz" },
+      { "name": "r2", "type": "FastqGz", "optional": true }
+    ]
+  },
+  "argv": [
+    "fastp", "-i", "{input.r1}", "-o", "{work}/out/clean_R1.fastq.gz",
+    "?r2:-I", "?r2:{input.r2}", "?r2:-O", "?r2:{work}/out/clean_R2.fastq.gz",
+    "-w", "{param.threads}"
+  ],
+  "outputs": {
+    "r1": { "glob": "{work}/out/clean_R1.fastq.gz", "type": "FastqGz" },
+    "r2": { "glob": "{work}/out/clean_R2.fastq.gz", "type": "FastqGz", "optional": true }
+  }
+}
 ```
 
-`Gtf` is a real file, not a boutique kind.
+Unknown JSON fields are rejected.
 
-Value types: `String, Int, Float, Bool, Accession, Json`.
+## Kinds
 
-**`compatible()` defaults to artifact type.** That is how existing tools snap. `FastqGz` wires to FastQC, fastp, STAR, Kraken without a `Reads` ontology.
+### `external`
 
-**Kind is optional.** A compiled graph MAY tag ports `Assembly` / `Features` / `Reads` / `Pseudoalignment` / `Counts` (or others a user invents in their project). Kind-to-kind edges extra-check. Missing kind = artifact-only. Somite does not maintain a biology ontology. Users who want HoX-style DAGs add kinds in the wrap, or an agent does.
+One typed tool invocation. `bin` and the first command token identify the real
+tool. The production compiler emits one static Nextflow process for the Node.
 
-New artifact type = design change (CAS, staging, sniff). New kind = a string in a JSON file. Cheap on purpose.
+### `inprocess`
 
----
+A trusted Somite boundary that does not spawn a tool. The first compiler slice
+supports only `files.import` and `files.import_paired`; all other in-process
+operators fail compilation until explicitly lowered.
 
-## MUST (every operator)
+### `reference`
 
-1. **Typed ports.** Every file the tool reads or writes is a named port with a type from the closed list. Params are scalars, not files (unless the file is a path the user types and `files.import` already ingested).
-2. **JSON schema, deny unknown fields.** `operators/<id>.json`. Overlay: project > `~/.config/somite/operators/` > shipped.
-3. **argv is execve tokens.** No `/bin/sh -c`. Tokens MAY mix `{param.x}`, `{input.x}`, `{work}/out`. `{flag.x}` omits the whole token when false. Prefix a token with `?r2:` to include it only when input `r2` is bound, or `?!r2:` only when it is unbound; this keeps one honest wrapper for paired- and single-end CLI forms.
-4. **Outputs are globs** after spawn, then ingested to CAS. One match, or `optional: true`. Two+ = `GlobMulti`. `exclude` is allowed (see `fasterq-dump` unpaired).
-5. **Do not write `$HOME`.** Out dir is `{work}/out`. SRA: always `-O`. FastQC: `-o` directory MUST exist (supervisor `mkdir -p`).
-6. **Exit 0 means success** unless `success_exit_codes` says otherwise.
-7. **One command.** One binary, or one `nextflow run`. Pipes are two bricks (nf-core module granularity). Exception: a documented multi-tool brick (`bwa mem \| samtools sort`) with a name that says so.
-8. **`cost: high` or `low`.** High never viewer-pulls. Genomics CLIs are high. Preview extractors are low.
-9. **Do not fork the scientific tool.** Own an **adapter** if I/O is dirty. If argv cannot express the tool, the adapter *is* the modification. Somite does not import Python. Agents generate adapters; humans review the type contract.
-10. **Deterministic enough to hash.** Same inputs + params + schema → same cook key. Do not embed timestamps in output names if you can help it; glob the stable suffix. Adapters MUST be in the cook key (schema hash).
-11. **Declare managed packages when they exist.** `pixi` lists the channel and
-    package requirements for the one graph-wide Pixi workspace. A package
-    declaration makes an operator installable; it does not replace the typed
-    ports, argv, or output globs that make the operator valid.
+Visible imported structure or paper evidence with no executable contract.
+References are editable and connectable where their conservative ports allow,
+but compilation fails until they are replaced by reviewed Operators.
 
-## Pixi execution and export
+## Parameters
 
-A Somite graph is portable only with its operator contracts and tool
-requirements. Somite writes one Pixi manifest for the graph. The web exporter
-emits that manifest with the graph, every referenced operator JSON, a tool
-audit, and a Pixi launcher. `pixi run` resolves, locks, installs, activates, and
-runs the managed tools.
+Supported scalar parameter types are `bool`, `int`, `float`, and `string`.
+Declare defaults, required values, and integer ranges in metadata. Compilation
+validates type and range before generating a process.
 
-The exporter MUST NOT silently turn a discovered package into a node.
-`gap.missing` means the paper named a method that still needs a reviewed adapter
-contract.
+Placeholders are data, never shell source:
 
----
+- `{param.name}` passes a scalar through a Nextflow environment input;
+- `{flag.name}` emits `--name` only when a Boolean is true;
+- `{input.port}` uses the controlled staged basename;
+- `?port:token` includes a token only when an optional input is bound;
+- `?!port:token` includes it only when the input is unbound;
+- `{work}/out` and `{work}/tmp` resolve inside the task directory.
 
-## MUST NOT
+Somite renders a Bash array and executes `"${argv[@]}"`. Operator tokens are
+never concatenated into `bash -c`, `eval`, pipes, redirects, or command
+substitutions.
 
-- Untyped `File` / `path` ports.
-- Kitchen-sink "this node runs any command."
-- Shadow a shipped `(id, version)` with a different tool.
-- Put sequence bytes in `Preview`. Preview is a cheap PNG/TSV-head/log.
-- Emit `Directory` from a brick. Unpack a pipeline directory with a **typed unpacker brick**, or leave it as the pipeline's published `Directory`.
-- Require the user to hand-write a samplesheet when the inputs are already wired FastQs. That is our job (`sheet.build`). The sheet is a `Table`, not a ritual.
+## Outputs
 
----
+Every output port needs one `outputs` entry with the same type. Globs must stay
+under the controlled task directory. Absolute paths, parent traversal, and
+unresolved placeholders are rejected.
 
-## How to wrap a CLI (~5 minutes)
+Before a process succeeds, generated validation requires every non-optional
+output, rejects zero-byte files, verifies gzip integrity for compressed genomic
+types, and verifies that `Directory` outputs are directories. This is artifact
+integrity, not a claim that a scientific result is biologically correct.
 
-Copy `operators/qc.fastqc.json`. Change `id`, `bin`, ports, argv, globs. Drop it in `$PROJECT/operators/` or send a PR.
+`OutputSpec.exclude` is not lowered yet and therefore fails compilation. It
+must not be silently ignored.
 
-Checklist:
+## Pixi environment
 
-| Question | If no |
-|---|---|
-| Can I pass input files as argv? | Add `-i` / positional. Cwd-only tools get a glue script. |
-| Can I set the output directory? | `-o {work}/out` or `--outdir`. If the tool writes next to the input, glob `{work}/in/...` is forbidden (inputs are read-only). Glue script copies. |
-| Are output names glob-able? | `*_fastqc.html`, not random UUIDs. |
-| Does it sniff extensions? | Good. Somite stages `{work}/in/<port>/<basename>` so it sees `SRR.fastq.gz`, not a hex blob. |
-| Does it refuse overwrite? | Fine. Each cook is a fresh attempt dir. |
-| Does it need a samplesheet? | See Sheet, below. Do not make the user invent CSV. |
+`pixi` lists the package requirements needed by the tool. Channel-qualified
+requirements are preferred. The compiler creates one graph-wide Pixi manifest,
+pins the validated Nextflow and OpenJDK versions, and merges all tool packages.
+The first `pixi run` writes `pixi.lock`; a frozen run package must retain that
+lockfile.
 
-You do **not** rewrite FastQC, STAR, or Kraken. You declare ports. If the binary will not honor them, generate an adapter.
+Containers and per-node environments are intentionally deferred. An Operator
+must not invoke Conda, Pixi, Docker, Apptainer, Nextflow, Snakemake, or another
+workflow/package engine itself.
 
-### `somite ops wrap` (the solo scaling path)
+## nf-core modules
 
-This is the product. Not a tasteful STAR port.
+Exact nf-core source reuse is a separate Adapter Implementation, not a generic
+external Operator. A future source-backed Adapter must:
 
-```text
-somite ops wrap --bin fastp --in FastqGz --out FastqGz
-somite ops wrap --from-nf-module path/to/meta.yml
-```
+1. pin the upstream module source and revision;
+2. preserve the module script rather than translating it;
+3. map the complete channel Interface, including metadata values;
+4. map every generated process alias back to one visible Somite Node;
+5. pass the upstream nf-test fixture and a Somite composition fixture; and
+6. emit provenance for the pinned source.
 
-Or on the canvas: drop a binary / paste `--help`. Agent (v0.2) returns `operator.json` + glue if needed. User accepts. Cook. If it snaps, ship it in `$PROJECT/operators/`.
+The initial compiler does not yet expose this Adapter kind. Imported nf-core
+processes therefore remain references until promoted.
 
-MUST: emit closed artifact types, argv tokens, globs, a one-file fixture test. SHOULD: guess types from extensions in `--help`. MUST NOT: invent a new artifact type without failing loud. Kind tags are optional in the wrap.
+## Snakemake workflows
 
-Jake does not run this for every tool. Users and agents do. Somite ships the convention and a handful of examples so the generator has something to copy.
+The Snakemake Workflow Catalog is an import and testing ecosystem. Imported
+rules remain structural references. Snakemake fixtures may help audit generic
+Operators, but production compilation rejects nested `snakemake` commands.
 
----
+## Submission checklist
 
-## How to wrap an nf-core module
+A catalog contribution includes:
 
-nf-core modules already have `meta.yml` (channel structure, `pattern`, optional EDAM). That is their contract. Ours is stricter on *types*.
+1. `operators/<family>.<name>.json`;
+2. closed typed ports and explicit optionality;
+3. parameter types, defaults, and bounds;
+4. tokenized argv with no shell wrapper;
+5. output rules that remain under `{work}`;
+6. Pixi package requirements; and
+7. a tiny fixture proving command construction and output collection.
 
-Map:
-
-| nf-core `meta.yml` | Somite |
-|---|---|
-| `type: file` + `pattern: "*.fastq.gz"` | artifact `FastqGz` |
-| `*.bam` / `*.cram` | `Bam` (CRAM is not in v0.1 — add `Cram` when a wedge needs it, do not silent-alias) |
-| `*.vcf.gz` | `VcfGz` |
-| `*.{fa,fasta}` | `Fasta` |
-| `type: map` (`meta`, `meta2`) | **Drop.** Provenance is the cache, not a Groovy map. `meta.id` → node name / param. `meta.single_end` → whether `r2` is bound. |
-| `type: boolean` / `val` | Param |
-| `versions.yml` | Ignore, or optional `Text` |
-| `optional: true` | `"optional": true` |
-
-Prefer calling the **tool binary** (`fastqc`, `star`, `kraken2`) over `nextflow run` of a one-module pipeline. Nextflow is for compounds (whole pipelines), not ordinary bricks.
-
-A later `somite ops import-nf-module` MAY generate the JSON from `meta.yml`. Until then, hand-write. The mapping above is the generator spec.
-
----
-
-## How to wrap an nf-core pipeline
-
-Three legal paths, user's choice. Somite does not pick a tasteful cut for them.
-
-1. **Compound (blunt):** `nextflow run nf-core/<name> -r <pin> --input {input.sheet} --outdir {work}/out`. Out is `Directory`. Pixi installs Nextflow itself; a pipeline still needs reviewed Pixi package requirements before Somite can promise its internal tasks are runnable. Exception to the no-Directory rule.
-2. **Bricks (Lego):** wrap the modules you actually want (`fastp`, `star`, `salmon`) as JSON. Build the graph yourself. This is the default we optimize for.
-3. **Compile (agent):** same move as `bulk-rna-v1` on HoX. Agent emits a small graph with optional kinds. Somite does not maintain that graph as a product.
-
-Pin `-r`. `nextflow_schema.json` → params. Do not wrap `nf-core/fetchngs`; use SRA bricks.
-
----
-
-## How to run a Snakemake workflow
-
-The checked-in `smk.workflow` operator is the workflow-engine analogue of a
-blunt `nextflow run`, with one important staging rule:
-
-1. Import the project directory through `files.import_directory`.
-2. Wire its `Directory` output to `smk.workflow.workflow`.
-3. Somite copies that directory into the cook attempt before running
-   `snakemake --directory <copy> --cores <n>`.
-4. Somite ingests the completed copy as `run: Directory`.
-
-Directory inputs MUST be staged as copies, not CAS symlinks, because Snakemake
-normally writes results and `.snakemake` metadata beside the workflow. The
-source directory and CAS object MUST remain immutable. `dry_run`, `keep_going`,
-and `printshellcmds` map to Snakemake CLI flags; no shell wrapper or second
-execution engine is involved. Pixi supplies the Snakemake executable.
-
-A catalog workflow is not automatically a typed Somite operator. Its repository
-must first be reviewed for configuration, target, input, output, revision, and
-license expectations. Once those are explicit, wrap it as a more specific
-`smk.<name>` operator or compile its useful tools into Somite bricks.
-
----
-
-## Sheet (the anti-Lego, solved)
-
-Almost every nf-core pipeline takes a CSV samplesheet. That is a form, not a snap.
-
-**Sheet** = a `Table` artifact whose columns match a named schema.
-
-| Pipeline | Columns (canonical) |
-|---|---|
-| `nf-core/rnaseq` | `sample,fastq_1,fastq_2,strandedness` |
-| `nf-core/sarek` | `patient,sample,lane,fastq_1,fastq_2` (+ tumor/normal as documented) |
-| `nf-core/ampliseq` | per current pipeline docs (sample, fastq_1, fastq_2, …) |
-
-Brick `sheet.build`:
-
-- Inputs: `r1: FastqGz`, optional `r2`, params for the extra columns (`sample`, `strandedness`, …).
-- Output: `sheet: Table`.
-- v0.1: **one sample**. N samples is scatter (v1 IR decision). Until then, N rows is a hand-imported CSV via `files.import` typed `Table`.
-
-The pipeline node then takes `sheet`, not raw FASTQs. FASTQ → sheet.build → nf.rnaseq is three snaps. That is the magic.
-
----
-
-## What Somite will change vs what you change
-
-| Who | What |
-|---|---|
-| **You / agent** | `operator.json`. Adapter source if the CLI is hostile. Generated, reviewed, in-repo. |
-| **Somite** | Staging (real basenames), CAS, cook key (includes adapter schema), typecheck, supervisor. |
-| **Nobody** | A long-lived fork of STAR/GATK/Kraken. |
-
-Convention over configuration (DHH, 20 years, now training data for agents): one adapter template. Agent fills argv, globs, types. Human sees a small file, not a jungle.
-
-If a tool cannot comply even with an adapter (GUI-only, no CLI, nondeterministic blobs as the only output), it is not a Somite operator.
-
-## Adapter (the hack, not the boutique)
-
-An adapter is glue **the user or an agent writes** so a hostile binary never has to know Somite exists. Somite may ship examples. Somite does not tastefully rewrite the field.
-
-MUST:
-
-- Live in `$PROJECT/adapters/<id>/` (or shipped `adapters/` if it is an example) with `operator.json` + glue (`main.rs` preferred, or a 20-line script as `bin`).
-- Speak closed **artifact** types on ports. Kind tags optional. Inside, call the upstream binary.
-- Deterministic. No clock in output names.
-- In the cook key (schema + glue bytes). Upstream binary not hashed (Decision 21).
-- Transform on the way in/out: samplesheet, `@RG`, FASTQ pair, BAM→BAI, FastQC PNG, unpack a `Directory`.
-- Never reimplement STAR. Never "Somite-STAR."
-
-SHOULD be generated from `--help` + one fixture. Cap ~80 lines. Over that: the artifact type is wrong, or you actually need a new one.
-
-The stud is `FastqGz` / `Bam` / `Vcf`. The adapter is the sleeve. HoX put sleeves in a warehouse and shipped eight of them. We put sleeves in the cook and let anyone generate the next one.
-
----
-
-## Submitting to the catalog
-
-1. `operators/<id>.json` in a PR. `id` is `family.name` (`qc.fastqc`, `align.star`, `nf.rnaseq`).
-2. Lint: schema, closed types, argv interpolator, glob, no unknown fields.
-3. Curated bricks and compounds get a CI fixture (tiny FASTQ, fake bin, or `SOMITE_LIVE_SRA=1`). JSON-only drops from users do not run on our CI.
-4. We will reject: untyped ports, `Directory` from a brick, shell wrappers, kitchen-sink nodes, a second FastQC with a different `id` that is the same tool.
-
-This is **not** a Galaxy tool shed and **not** an nf-core modules mirror. The catalog is curated. The JSON drop path exists so you can wrap *your* lab tool today without a vote.
-
----
-
-## Lego, in one picture
-
-```mermaid
-flowchart LR
-  SRA["sra.prefetch"] -->|Sra| FQ["sra.fasterq_dump"]
-  FQ -->|Fastq r1| IMP["or files.import"]
-  IMP -->|FastqGz| QC["qc.fastqc"]
-  IMP -->|FastqGz| TRIM["qc.fastp"]
-  TRIM -->|FastqGz| QC
-  TRIM -->|FastqGz| SH["sheet.build"]
-  SH -->|Table| RNA["nf.rnaseq"]
-  RNA -->|Directory| UN["unpack.rnaseq"]
-  UN -->|Table counts| DA["nf.differentialabundance"]
-```
-
-Every arrow is a type. No arrow is a prayer. `nf.differentialabundance` does not take a BAM; it takes a counts `Table`. If you want BAM, you unpack it, or you snap `align.star` as a brick and never enter the pipeline compound.
+Agents may propose contracts from `--help`, Bioconda recipes, nf-core
+`meta.yml`, or existing workflow tests. Those are evidence sources. Promotion
+still requires the contract and fixture to pass independently.

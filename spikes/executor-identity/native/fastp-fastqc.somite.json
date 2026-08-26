@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "nodes": [
+    {
+      "id": "reads",
+      "operator": "files.import_paired",
+      "ports": [
+        { "name": "r1", "dir": "out", "ty": "Fastq" },
+        { "name": "r2", "dir": "out", "ty": "Fastq" }
+      ],
+      "params": {
+        "r1": "fixtures/paired_R1.fastq",
+        "r2": "fixtures/paired_R2.fastq"
+      },
+      "layout": { "x": 40.0, "y": 160.0 }
+    },
+    {
+      "id": "fastp",
+      "operator": "qc.fastp",
+      "ports": [
+        { "name": "r1", "dir": "in", "ty": "Fastq", "union": ["Fastq", "FastqGz"] },
+        { "name": "r2", "dir": "in", "ty": "Fastq", "union": ["Fastq", "FastqGz"] },
+        { "name": "r1", "dir": "out", "ty": "FastqGz" },
+        { "name": "r2", "dir": "out", "ty": "FastqGz" }
+      ],
+      "params": { "threads": 1 },
+      "layout": { "x": 280.0, "y": 160.0 }
+    },
+    {
+      "id": "fastqc",
+      "operator": "qc.fastqc_paired",
+      "ports": [
+        { "name": "r1", "dir": "in", "ty": "Fastq", "union": ["Fastq", "FastqGz"] },
+        { "name": "r2", "dir": "in", "ty": "Fastq", "union": ["Fastq", "FastqGz"] },
+        { "name": "report_r1", "dir": "out", "ty": "Html" },
+        { "name": "report_r2", "dir": "out", "ty": "Html" }
+      ],
+      "layout": { "x": 540.0, "y": 160.0 }
+    }
+  ],
+  "edges": [
+    {
+      "id": "reads-r1-to-fastp",
+      "from_node": "reads",
+      "from_port": "r1",
+      "to_node": "fastp",
+      "to_port": "r1"
+    },
+    {
+      "id": "reads-r2-to-fastp",
+      "from_node": "reads",
+      "from_port": "r2",
+      "to_node": "fastp",
+      "to_port": "r2"
+    },
+    {
+      "id": "fastp-r1-to-fastqc",
+      "from_node": "fastp",
+      "from_port": "r1",
+      "to_node": "fastqc",
+      "to_port": "r1"
+    },
+    {
+      "id": "fastp-r2-to-fastqc",
+      "from_node": "fastp",
+      "from_port": "r2",
+      "to_node": "fastqc",
+      "to_port": "r2"
+    }
+  ]
+}

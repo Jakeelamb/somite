@@ -1,11 +1,9 @@
 {
   "id": "nf.rnaseq",
-  "title": "nf-core/rnaseq",
-  "palette": ["nf-core", "RNA"],
-  "kind": "external",
-  "cost": "high",
-  "bin": "nextflow",
-  "pixi": ["bioconda::nextflow"],
+  "title": "nf-core/rnaseq reference",
+  "palette": ["References", "nf-core"],
+  "kind": "reference",
+  "cost": "low",
   "params": {
     "revision": { "type": "string", "label": "Version", "page": "Pipeline", "default": "3.26.0" },
     "stub_run": { "type": "bool", "label": "Stub run", "page": "Pipeline", "default": false }
@@ -17,24 +15,5 @@
       { "name": "gtf", "type": "Gtf", "union": ["Gtf", "GtfGz"], "optional": true }
     ],
     "out": [{ "name": "results", "type": "Directory" }]
-  },
-  "argv": [
-    "nextflow",
-    "run",
-    "nf-core/rnaseq",
-    "-r",
-    "{param.revision}",
-    "--input",
-    "{input.sheet}",
-    "--fasta",
-    "{input.fasta}",
-    "--gtf",
-    "{input.gtf}",
-    "--outdir",
-    "{work}/out",
-    "{flag.stub_run}"
-  ],
-  "outputs": {
-    "results": { "glob": "{work}/out", "type": "Directory", "optional": true }
   }
 }

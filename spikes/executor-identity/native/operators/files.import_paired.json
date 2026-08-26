@@ -1,0 +1,20 @@
+{
+  "id": "files.import_paired",
+  "title": "Paired reads",
+  "palette": ["Files"],
+  "kind": "inprocess",
+  "cost": "low",
+  "params": {
+    "r1": { "type": "string", "label": "R1 path", "page": "Reads", "required": true },
+    "r2": { "type": "string", "label": "R2 path", "page": "Reads", "required": true }
+  },
+  "ports": {
+    "in": [],
+    "out": [
+      { "name": "r1", "type": "Fastq" },
+      { "name": "r2", "type": "Fastq" }
+    ]
+  },
+  "argv": [],
+  "outputs": {}
+}

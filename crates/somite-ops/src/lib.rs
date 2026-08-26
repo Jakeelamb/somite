@@ -621,47 +621,23 @@ mod tests {
     }
 
     #[test]
-    fn snakemake_workflow_renders_native_cli_arguments() {
+    fn nested_workflow_engines_are_non_executable_references() {
         let catalog =
             Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
                 .unwrap();
-        let operator = catalog.get("smk.workflow").unwrap();
-        let params = BTreeMap::from([
-            (
-                "snakefile".into(),
-                ParamValue::String("workflow/Snakefile".into()),
-            ),
-            ("cores".into(), ParamValue::Int(8)),
-            ("dry_run".into(), ParamValue::Bool(false)),
-            ("keep_going".into(), ParamValue::Bool(true)),
-            ("printshellcmds".into(), ParamValue::Bool(true)),
-        ]);
-        let inputs = BTreeMap::from([("workflow".into(), PathBuf::from("/w/in/workflow/project"))]);
-        let work = PathBuf::from("/w");
-        let out = work.join("out");
-        let tmp = work.join("tmp");
-        let bindings = Bindings {
-            params: &params,
-            inputs: &inputs,
-            work_out: &out,
-            work_tmp: &tmp,
-            work: &work,
-        };
-
-        assert_eq!(
-            render_argv(operator, &bindings).unwrap(),
-            vec![
-                "snakemake",
-                "--snakefile",
-                "/w/in/workflow/project/workflow/Snakefile",
-                "--directory",
-                "/w/in/workflow/project",
-                "--cores",
-                "8",
-                "--keep-going",
-                "--printshellcmds",
-            ]
-        );
+        for id in [
+            "smk.workflow",
+            "nf.rnaseq",
+            "nf.sarek",
+            "nf.mag",
+            "nf.taxprofiler",
+        ] {
+            let operator = catalog.get(id).unwrap();
+            assert_eq!(operator.kind, OpKind::Reference, "{id}");
+            assert!(operator.bin.is_none(), "{id}");
+            assert!(operator.argv.is_empty(), "{id}");
+            assert!(operator.pixi.is_empty(), "{id}");
+        }
     }
 
     #[test]

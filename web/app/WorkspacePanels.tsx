@@ -590,7 +590,7 @@ export function InspectorPanel({
         <span className="section-kicker">Ports</span>
         {node.ports.map((port) => <div key={`${port.dir}-${port.name}`}><i style={{ background: portColor[port.ty] ?? "#8b949b" }} /><strong>{port.name}</strong><span>{port.ty}</span><small>{port.dir}</small></div>)}
       </div>
-      <div className="migration-note"><Play size={14} aria-hidden="true" /><span>{operator.kind === "reference" ? "Imported workflow structure. Replace or promote this component to a native Somite tool before standalone execution." : "Run uses the native Rust executor and content-addressed cache. Downloads and high-cost tools start only when you explicitly run the graph."}</span></div>
+      <div className="migration-note"><Play size={14} aria-hidden="true" /><span>{operator.kind === "reference" ? "Imported workflow structure. Add a reviewed tool or source-backed module Adapter before compiling." : "Production packages compile this node to Nextflow in one Pixi environment. Web Run remains the native oracle during the transition."}</span></div>
     </section>
   );
 }

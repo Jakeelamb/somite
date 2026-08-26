@@ -1,11 +1,9 @@
 {
   "id": "smk.workflow",
-  "title": "Snakemake workflow",
-  "palette": ["Snakemake", "Workflow"],
-  "kind": "external",
-  "cost": "high",
-  "bin": "snakemake",
-  "pixi": ["bioconda::snakemake-minimal"],
+  "title": "Snakemake workflow reference",
+  "palette": ["References", "Snakemake"],
+  "kind": "reference",
+  "cost": "low",
   "params": {
     "snakefile": { "type": "string", "label": "Snakefile", "page": "Workflow", "default": "workflow/Snakefile", "required": true },
     "cores": { "type": "int", "label": "Cores", "page": "Execution", "default": 4, "min": 1, "max": 256 },
@@ -16,17 +14,5 @@
   "ports": {
     "in": [{ "name": "workflow", "type": "Directory" }],
     "out": [{ "name": "run", "type": "Directory" }]
-  },
-  "argv": [
-    "snakemake",
-    "--snakefile", "{input.workflow}/{param.snakefile}",
-    "--directory", "{input.workflow}",
-    "--cores", "{param.cores}",
-    "{flag.dry_run}",
-    "{flag.keep_going}",
-    "{flag.printshellcmds}"
-  ],
-  "outputs": {
-    "run": { "glob": "{input.workflow}", "type": "Directory" }
   }
 }

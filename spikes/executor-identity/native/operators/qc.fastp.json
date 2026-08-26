@@ -1,0 +1,31 @@
+{
+  "id": "qc.fastp",
+  "title": "fastp",
+  "palette": ["QC"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "fastp",
+  "pixi": ["bioconda::fastp"],
+  "params": {
+    "threads": { "type": "int", "label": "Threads", "page": "fastp", "default": 1 }
+  },
+  "ports": {
+    "in": [
+      { "name": "r1", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
+      { "name": "r2", "type": "Fastq", "union": ["Fastq", "FastqGz"] }
+    ],
+    "out": [
+      { "name": "r1", "type": "FastqGz" },
+      { "name": "r2", "type": "FastqGz" }
+    ]
+  },
+  "argv": [
+    "fastp", "-i", "{input.r1}", "-o", "{work}/out/clean_R1.fastq.gz",
+    "-I", "{input.r2}", "-O", "{work}/out/clean_R2.fastq.gz",
+    "-w", "{param.threads}"
+  ],
+  "outputs": {
+    "r1": { "glob": "{work}/out/clean_R1.fastq.gz", "type": "FastqGz" },
+    "r2": { "glob": "{work}/out/clean_R2.fastq.gz", "type": "FastqGz" }
+  }
+}

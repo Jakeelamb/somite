@@ -1,23 +1,14 @@
 {
   "id": "nf.taxprofiler",
-  "title": "nf-core/taxprofiler",
-  "palette": ["nf-core", "Metagenomics"],
-  "kind": "external",
-  "cost": "high",
-  "bin": "nextflow",
-  "pixi": ["bioconda::nextflow"],
+  "title": "nf-core/taxprofiler reference",
+  "palette": ["References", "nf-core"],
+  "kind": "reference",
+  "cost": "low",
   "params": {
     "revision": { "type": "string", "label": "Version", "page": "Pipeline", "default": "2.0.1" }
   },
   "ports": {
     "in": [{ "name": "sheet", "type": "Table" }],
     "out": [{ "name": "results", "type": "Directory", "optional": true }]
-  },
-  "argv": [
-    "nextflow", "run", "nf-core/taxprofiler", "-r", "{param.revision}",
-    "--input", "{input.sheet}", "--outdir", "{work}/out"
-  ],
-  "outputs": {
-    "results": { "glob": "{work}/out", "type": "Directory", "optional": true }
   }
 }

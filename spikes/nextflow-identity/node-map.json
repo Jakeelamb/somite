@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "nodes": [
+    {
+      "somite_node_id": "fastp",
+      "nextflow_process": "SOMITE_NODE_FASTP",
+      "source": "modules/nf-core/fastp/main.nf",
+      "source_process": "FASTP",
+      "source_commit": "fcc9c9adc59e6b0bfb91fc4b8855de00c81a9bd5"
+    },
+    {
+      "somite_node_id": "fastqc",
+      "nextflow_process": "SOMITE_NODE_FASTQC",
+      "source": "modules/nf-core/fastqc/main.nf",
+      "source_process": "FASTQC",
+      "source_commit": "fcc9c9adc59e6b0bfb91fc4b8855de00c81a9bd5"
+    }
+  ]
+}

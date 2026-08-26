@@ -126,6 +126,8 @@ pub enum IrError {
     Cycle,
     #[error("self-edge {0}")]
     SelfEdge(String),
+    #[error("multiple edges target scalar input {node}.{port}")]
+    MultipleInputs { node: String, port: String },
 }
 
 impl Graph {
@@ -143,6 +145,7 @@ impl Graph {
                 return Err(IrError::DuplicateId(n.id.clone()));
             }
         }
+        let mut bound_inputs = BTreeSet::new();
         for e in &self.edges {
             if !ids.insert(e.id.clone()) {
                 return Err(IrError::DuplicateId(e.id.clone()));
@@ -175,6 +178,12 @@ impl Graph {
                 return Err(IrError::Type {
                     from: format!("{}.{}:{:?}", e.from_node, e.from_port, src_p.ty),
                     to: format!("{}.{}:{:?}", e.to_node, e.to_port, dst_p.ty),
+                });
+            }
+            if !bound_inputs.insert((e.to_node.as_str(), e.to_port.as_str())) {
+                return Err(IrError::MultipleInputs {
+                    node: e.to_node.clone(),
+                    port: e.to_port.clone(),
                 });
             }
         }
@@ -347,6 +356,40 @@ mod tests {
             edges: vec![e("e1", "a", "bam", "b", "fastq")],
         };
         assert!(matches!(g.validate(), Err(IrError::Type { .. })));
+    }
+
+    #[test]
+    fn scalar_input_rejects_multiple_edges() {
+        let g = Graph {
+            schema_version: SCHEMA_VERSION,
+            nodes: vec![
+                n(
+                    "r1",
+                    "files.import",
+                    vec![out("fastq", PortType::Fastq)],
+                    0.0,
+                ),
+                n(
+                    "r2",
+                    "files.import",
+                    vec![out("fastq", PortType::Fastq)],
+                    0.0,
+                ),
+                n("qc", "qc.fastqc", vec![inn("fastq", PortType::Fastq)], 1.0),
+            ],
+            edges: vec![
+                e("e1", "r1", "fastq", "qc", "fastq"),
+                e("e2", "r2", "fastq", "qc", "fastq"),
+            ],
+        };
+
+        assert_eq!(
+            g.validate(),
+            Err(IrError::MultipleInputs {
+                node: "qc".into(),
+                port: "fastq".into(),
+            })
+        );
     }
 
     #[test]

@@ -33,8 +33,19 @@ node. The graph type-checks the declared artifact kind, not a filename suffix.
 **Run** — one request to realize a graph or a node cone, with timestamps and
 provenance.
 
-**Cook** — the engine action that realizes a node's outputs. A verified cache
-hit skips the external process.
+**Compilation** — deterministic lowering of a validated Graph into a runnable
+workflow package. Generated engine syntax is an artifact, never a second
+source of truth.
+
+**Run package** — generated Nextflow, node source map, operator contracts,
+parameters, and Pixi manifest needed to execute one Graph revision. Its first
+Pixi resolution materializes the lockfile that must travel with a frozen run.
+
+**Node source map** — the explicit mapping from every executable Node to its
+generated process identity and, when applicable, its pinned upstream source.
+
+**Cook** — the temporary native-oracle action that realizes a node's outputs.
+It is not Somite's long-term production execution identity.
 
 **Cache** — the artifact store and cook index. A cook key covers the operator
 contract, parameters, and input hashes.
@@ -56,6 +67,9 @@ Somite contract.
 **Structural workflow reference** — a node reconstructed from an engine-authored
 workflow such as nf-core or Snakemake. It makes the imported DAG transparent
 but is not independently executable until promoted to a native operator.
+
+**Source-backed module** — a pinned upstream module with a reviewed Adapter
+that maps its complete Interface into visible Somite ports and parameters.
 
 **Compound** — a reusable graph with published input and output ports.
 
@@ -79,3 +93,4 @@ gaps.
 - Package metadata alone never substitutes for an operator contract.
 - Imported structure and paper inference are labeled honestly.
 - All persisted graph writes are validated by the Rust graph model.
+- Generated engine syntax never introduces an unmapped executable node.

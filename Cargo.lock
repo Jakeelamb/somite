@@ -767,8 +767,10 @@ dependencies = [
  "serde_json",
  "somite-cook",
  "somite-ir",
+ "somite-nextflow",
  "somite-ops",
  "somite-paper",
+ "tempfile",
 ]
 
 [[package]]
@@ -791,6 +793,17 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "somite-nextflow"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "somite-ir",
+ "somite-ops",
  "thiserror",
 ]
 

@@ -1,110 +1,101 @@
 # Somite catalog
 
-Not a boutique. Not a Galaxy shed we maintain. **Examples + a generator.** Users wrap the tools they already run. Stars below are demand signal for *examples*, not a porting queue. See [operator-contract.md](./operator-contract.md).
+Somite has one Library with three evidence-backed entry points: data Sources,
+typed Tools, and imported Pipeline structure. They all create the same Graph;
+they do not create separate execution modes.
 
-Proof that agents can compile when the format exists: Jake's agent on HoX, `nf-core/rnaseq 3.26.0 (HoX-native)`, `hox-nfcore.adapter: bulk-rna-v1`. Somite's job is the wrap path, not to hand-build `bulk-rna-v1` for every pipeline.
+See [the operator contract](operator-contract.md) for the executable boundary.
 
----
+## Data Sources
 
-## Tiers
+The source launcher searches NCBI SRA, NCBI assemblies, and Ensembl, and also
+accepts exact accessions or local paths. A suggestion identifies its provider
+and artifact role before it creates a visible source Node.
 
-### Tier 0 — v0.1-cli (must cook without a window)
+Examples:
 
-| id | Kind | Why |
-|---|---|---|
-| `files.import` | in-process | Source. Path relative to the graph file → CAS. |
-| `sra.prefetch` | brick | NCBI data plane. Always `-O`. |
-| `sra.fasterq_dump` | brick | `--split-3`. Optional r2 / unpaired. |
-| `ncbi.datasets_assembly` | brick | GCA/GCF → genome and annotation package. |
-| `ensembl.sequence` | brick | Ensembl stable ID → inferred genomic/cDNA/protein FASTA. |
-| `qc.fastqc` | brick | Wedge inspect. Glob `per_base_quality.png` → `Preview`. |
+| Operator | Interface |
+|---|---|
+| `files.import` | local file to one typed artifact |
+| `files.import_paired` | separate local R1 and R2 artifacts |
+| `sra.prefetch` | SRA accession to an SRA artifact |
+| `sra.fasterq_dump` | SRA artifact to R1, optional R2, and optional unpaired reads |
+| `ncbi.datasets_assembly` | GCA or GCF accession to an assembly package |
+| `ensembl.sequence` | stable Ensembl ID to FASTA |
 
-Acceptance: fixture FASTQ → FastQC PNG in CAS; second cook skips. Live SRA optional.
+Provider discovery and data transfer remain separate. Search metadata never
+pretends that a remote dataset has already been downloaded or validated.
 
-The Sources launcher accepts exact accessions immediately and also searches
-NCBI SRA, NCBI reference assemblies, and Ensembl from ordinary terms such as
-`human`, `mouse RNA-seq`, or `human BRCA2`. Suggestions identify their provider
-and artifact role (`Reads`, `Genome`, `Reference`, `Gene`) before creating the
-same explicit source nodes listed above. Provider calls are independent and
-short-lived; a slow Ensembl response must not block available NCBI results.
+## Typed Tools
 
-### Tier 1 — wrap generator (this is the catalog)
+Checked-in Operators are curated examples and immediately usable contracts,
+not a promise that Somite manually maintains every bioinformatics package.
 
-`somite ops wrap`. Shipped JSON is **copy-paste for the generator**, not a porting queue.
+| Operator | Interface |
+|---|---|
+| `qc.fastp` | R1 plus optional R2 to trimmed R1 plus optional R2 |
+| `qc.fastqc` | FASTQ to HTML plus optional preview |
+| `align.star` | reads plus reference to BAM |
+| `align.bwa` | reads plus reference to BAM |
+| `quant.salmon` | reads plus index to abundance table |
+| `samtools.index` | BAM to BAI |
+| `class.kraken2` | reads plus database to classification table |
 
-| id | Snap | Why it is an example |
-|---|---|---|
-| `qc.fastp` | `r1 + r2? → trimmed r1 + r2?` | Paired mates remain separate; single-end remains valid |
-| `sheet.build` | `FastqGz → Table` | Hostile I/O. Adapter, not a boutique module |
-| `align.star` | `r1 + r2? + genome → Bam` | Heavy binary, still JSON + staging |
-| `quant.salmon` | `r1 + r2? + index → Table` | Selects paired or single CLI form from the bound ports |
-| `samtools.index` | `Bam → Bai` | Tiny glob |
-| `class.kraken2` | `r1 + r2? + db → Table` | Adds `--paired` only when r2 is bound |
+The scalable catalog path is contract generation and audit:
 
-`hisat2`, `spades`, a lab Python script: wrap it. Do not wait for a tier.
+1. inspect a binary's `--help`, package recipe, and trusted workflow uses;
+2. propose typed ports, parameters, argv tokens, outputs, and Pixi packages;
+3. run a tiny fixture in an isolated Pixi environment;
+4. inspect artifacts and record the evidence receipt; and
+5. review before promotion into `operators/`.
 
-### Tier 2 — nf-core workflow references, not native ports
+Agents can perform steps 1 through 4 in parallel. A package name or generated
+guess alone never passes step 5.
 
-The canvas may discover every released, non-archived pipeline from nf-core's
-official catalog. Dropping one asks Nextflow for its process graph and expands
-that graph into movable, connectable `workflow.reference` nodes. This exposes
-the pipeline's structure without claiming that every process has been converted
-into an independently executable Somite brick. The selected release is pinned in
-the reference metadata.
+## nf-core Pipeline catalog
 
-Read-consuming boundary processes expose separate typed `r1` and optional `r2`
-inputs when the engine graph establishes that boundary. Internal reference
-nodes keep conservative structural ports, so an imported FASTQ cannot be wired
-arbitrarily into the middle of a pipeline. Checked-in `nf.*` adapters remain
-available to execution and paper tooling, but a catalog drop expands the
-catalog's selected workflow rather than collapsing it into that adapter.
+The Pipeline panel searches released nf-core workflows. Dropping one resolves
+its selected revision and expands the process graph into movable
+`workflow.reference` Nodes. This provides transparency without claiming every
+process is independently executable.
 
-rnaseq 1356★, sarek 594, scrnaseq 350, mag 316, ampliseq 257, taxprofiler 192, …
+Read-consuming boundary processes may expose separate `r1` and optional `r2`
+ports when the engine graph supports that conclusion. Internal nodes keep
+conservative structural ports; arbitrary wires into the middle of a pipeline
+are not enabled by guesswork.
 
-User paths: replace reference nodes with wrapped bricks, run the original
-workflow as a compound boundary, or agent-compile a small native graph (the HoX
-`bulk-rna-v1` move). Reference expansion is a transparency and editing surface;
-standalone execution still requires explicit promotion to native operators.
+Compilation fails at references. A node becomes executable only when it is
+replaced by either:
 
-`fetchngs` is not ingest. Use SRA bricks.
+- a generic typed Operator compiled into a static Nextflow process; or
+- a future source-backed Adapter that preserves a pinned nf-core module and
+  maps its complete channel Interface.
 
-### Tier 2b — Snakemake projects
+Somite never nests `nextflow run nf-core/<pipeline>` as an opaque canvas node.
 
-`files.import_directory → smk.workflow` is the native local-project boundary.
-The Library accepts a project containing `Snakefile` or `workflow/Snakefile`,
-stages it as a writable copy, and invokes `snakemake --directory <copy>` with
-explicit cores and execution flags. The completed project returns as a typed
-`Directory`; the original and CAS copy remain unchanged.
+## Snakemake Workflow catalog
 
-The Library also searches the Snakemake Workflow Catalog. When a released
-catalog entry has a graph-ready rulegraph, dropping it expands that engine graph
-into editable `workflow.reference` nodes. Repositories retain their own
-configuration, targets, licenses, and output conventions, so this structural
-view is not presented as a uniform typed execution API. Local execution remains
-the explicit `files.import_directory → smk.workflow` boundary above.
+The Pipeline panel also searches the Snakemake Workflow Catalog. When a
+revision exposes a usable rule graph, Somite imports its rules and dependencies
+as structural references.
 
-### Tier 3 — never Somite's job
+Snakemake is an evidence and testing ecosystem, not a second production engine.
+Its fixtures can help audit typed Operators. Generated production workflows do
+not invoke `snakemake`.
 
-- Galaxy tool shed we host
-- HoX boutique of eight optimized natives
-- Every nf-core module mirrored
-- HPC executor wrappers
-- A second canvas
+## Version and provenance rules
 
----
+- Imported workflows record the selected upstream revision.
+- Source-backed modules must pin source content and revision.
+- Tool package constraints enter the generated Pixi manifest.
+- The first successful Pixi resolution creates the lockfile that freezes exact
+  builds.
+- The node source map records every visible Node, every edge, and every emitted
+  Nextflow process identity.
 
-## Shared binaries (why wrap-once still pays)
+## Explicit non-goals
 
-The same CLIs sit under many pipelines: fastqc, fastp, samtools, star, salmon, bwa, kraken2, spades. Wrap as bricks. A user who hates Nextflow snaps FASTQ → fastp → STAR → Salmon. A user who wants the gold DAG wraps `nextflow run`. Both legal. Neither requires Jake to tastefully optimize salmon.
-
----
-
-## Metagenomics (two questions, user wraps both)
-
-taxprofiler = what's in the soup (`FastqGz → Table`). mag = recover genomes (`FastqGz → Fasta` bins). ampliseq = 16S, not shotgun. Do not collapse them. Do not native-port them.
-
----
-
-## Version pins
-
-Cook key includes the resolved operator schema. The schema MUST pin `nf-core/<name>` **version**. A pipeline bump is a new operator `version:` and a new cook. Do not hash the Nextflow binary (same lie as prefetch: distro rebuilds must not bust the cache). Optional `tool_version` probe is session-cached, not in the key (design Decision 21).
+Somite is not a hosted Galaxy ToolShed, a mirror of every nf-core module, or a
+second package repository. It supplies a strict contract, a compiler, audit
+fixtures, and a community contribution path so useful tools can be added
+without hand-editing the application.

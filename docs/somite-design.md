@@ -1,8 +1,8 @@
 # Somite architecture
 
 Somite is a web-first node canvas for building reproducible bioinformatics
-workflows. The product has one canvas, one graph model, one executor, and one
-managed environment system: Pixi.
+workflows. The product has one canvas, one graph model, one target execution
+engine, and one managed environment system: Nextflow and Pixi respectively.
 
 ## Product shape
 
@@ -18,7 +18,8 @@ web/ React canvas
 somite-server
       ├── somite-ir       graph types and invariants
       ├── somite-ops      operator contracts and Pixi manifest rendering
-      ├── somite-cook     staging, Pixi execution, and artifact cache
+      ├── somite-nextflow pure Graph-to-DSL2 compilation
+      ├── somite-cook     temporary native differential oracle
       ├── somite-paper    methods extraction and evidence-backed reconstruction
       └── somite-bundle   portable Pixi run bundles
 ```
@@ -38,6 +39,7 @@ Invariants:
 - graph IDs are unique;
 - edges reference existing nodes and ports;
 - source and destination port types are compatible;
+- each scalar input has at most one source edge;
 - the graph is acyclic;
 - graph JSON is the persisted and exported source of truth.
 
@@ -60,20 +62,30 @@ Package discovery is not operator discovery. A package does not define typed
 ports, arguments, or outputs. Paper-only methods remain adapter gaps until a
 reviewed operator contract exists.
 
+### `somite-nextflow`
+
+Interface: `compile(graph, catalog, options)`.
+
+The compiler is a pure Module: it performs no filesystem, process, or network
+I/O and either returns the complete run package or an error. Its output is
+deterministic DSL2, `nextflow.config`, parameters, a node/edge source map, and a
+Pixi manifest pinned to the selected Nextflow and OpenJDK versions. External
+Operators become static processes with stable aliases. File imports become
+input channels rather than hidden tasks.
+
+Compiled processes use Nextflow deep caching and validate required artifacts
+before task completion. The first implementation supports scalar ports and
+single or paired local imports. It rejects structural references, nested
+workflow engines, output exclusion rules, and all other semantics it cannot
+lower exactly.
+
 ### `somite-cook`
 
 Interface: `cook_graph(project, catalog, graph)`.
 
-Before running external nodes, the cook engine writes one graph-wide
-`.somite/pixi.toml`. Packaged tools always execute through `pixi run`, which
-resolves the environment, updates `.somite/pixi.lock`, installs packages when
-needed, and activates them. Operators without package declarations may call a
-real system binary; missing declarations produce an actionable error.
-
-Inputs are staged from the content-addressed store into isolated work
-directories. Outputs are matched using the operator contract and ingested back
-into the store. The cook key includes operator schema, parameters, and input
-artifact hashes.
+This is the temporary native oracle, not the target production engine. It
+remains available for differential tests until Somite has a cancellable web run
+handle and an offline locked replay for generated Nextflow packages.
 
 ### `somite-paper`
 
@@ -99,8 +111,9 @@ README.md
 run.sh
 ```
 
-`run.sh` executes the graph through the bundled Pixi manifest. The generated
-lock belongs beside that manifest and freezes exact package builds.
+The existing ZIP launcher still executes the native oracle. It must move to the
+generated Nextflow run package before the web export is presented as the
+production execution path.
 
 ### `somite-server`
 
@@ -148,8 +161,8 @@ Generated state stays under `.somite/`. Operator contracts remain in
 
 - maintaining a second desktop GUI;
 - supporting multiple competing environment managers;
-- claiming that engine-authored structural workflow references are translated
-  native executable nodes;
+- claiming that engine-authored structural workflow references are executable
+  before they have reviewed contracts;
 - treating a package name as a complete operator;
 - embedding scientific file bytes in the graph JSON;
 - inventing outputs or tool provenance that the source does not establish.

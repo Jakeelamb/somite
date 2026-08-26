@@ -1,0 +1,27 @@
+{
+  "id": "qc.fastqc_paired",
+  "title": "FastQC paired reports",
+  "palette": ["QC"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "fastqc",
+  "pixi": ["bioconda::fastqc"],
+  "params": {},
+  "ports": {
+    "in": [
+      { "name": "r1", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
+      { "name": "r2", "type": "Fastq", "union": ["Fastq", "FastqGz"] }
+    ],
+    "out": [
+      { "name": "report_r1", "type": "Html" },
+      { "name": "report_r2", "type": "Html" }
+    ]
+  },
+  "argv": [
+    "fastqc", "{input.r1}", "{input.r2}", "-o", "{work}/out", "--extract"
+  ],
+  "outputs": {
+    "report_r1": { "glob": "{work}/out/clean_R1_fastqc.html", "type": "Html" },
+    "report_r2": { "glob": "{work}/out/clean_R2_fastqc.html", "type": "Html" }
+  }
+}
