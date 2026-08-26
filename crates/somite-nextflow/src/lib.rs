@@ -100,6 +100,9 @@ pub fn compile(
     graph
         .validate()
         .map_err(|error| CompileError::InvalidGraph(error.to_string()))?;
+    catalog
+        .verify_graph(graph)
+        .map_err(|error| CompileError::InvalidGraph(error.to_string()))?;
     validate_options(options)?;
 
     let mut params_inputs = Map::new();
@@ -160,6 +163,7 @@ pub fn compile(
                     node.id.clone(),
                     NodeMapEntry {
                         operator: node.operator.clone(),
+                        operator_revision: node.operator_revision.clone(),
                         process: Some(compiled.process_name),
                         kind: "process",
                     },
@@ -200,6 +204,7 @@ pub fn compile(
 #[derive(Serialize)]
 struct NodeMapEntry {
     operator: String,
+    operator_revision: String,
     process: Option<String>,
     kind: &'static str,
 }
@@ -298,6 +303,7 @@ fn compile_import(
         node.id.clone(),
         NodeMapEntry {
             operator: node.operator.clone(),
+            operator_revision: node.operator_revision.clone(),
             process: None,
             kind: "input",
         },
@@ -830,7 +836,8 @@ fn sorted_edges(graph: &Graph) -> Vec<somite_ir::Edge> {
 }
 
 fn render_config() -> String {
-    "process {\n    cache = 'deep'\n    errorStrategy = 'terminate'\n}\n".into()
+    "process {\n    cache = 'deep'\n    errorStrategy = 'terminate'\n}\n\ntrace {\n    enabled = true\n    file = '.somite/trace.tsv'\n    fields = 'name,status,exit,hash'\n    overwrite = true\n}\n"
+        .into()
 }
 
 fn render_pixi(options: &CompileOptions, packages: &BTreeSet<String>) -> String {

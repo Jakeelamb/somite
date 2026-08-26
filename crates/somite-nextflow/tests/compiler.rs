@@ -15,7 +15,7 @@ fn options() -> CompileOptions {
 }
 
 fn paired_fixture() -> (Graph, Catalog) {
-    let graph = serde_json::from_str(include_str!(
+    let mut graph = serde_json::from_str(include_str!(
         "../../../spikes/executor-identity/native/fastp-fastqc.somite.json"
     ))
     .expect("paired graph fixture");
@@ -28,6 +28,7 @@ fn paired_fixture() -> (Graph, Catalog) {
         let operator: Operator = serde_json::from_str(raw).expect("operator fixture");
         catalog.ops.insert(operator.id.clone(), operator);
     }
+    catalog.pin_graph(&mut graph).expect("pin paired graph");
     (graph, catalog)
 }
 
@@ -38,6 +39,12 @@ fn compiles_paired_fastp_fastqc_to_the_golden_workflow() {
 
     assert_eq!(compiled.main_nf, include_str!("golden/paired-main.nf"));
     assert!(compiled.nextflow_config.contains("cache = 'deep'"));
+    assert!(compiled
+        .nextflow_config
+        .contains("file = '.somite/trace.tsv'"));
+    assert!(compiled
+        .nextflow_config
+        .contains("fields = 'name,status,exit,hash'"));
     assert!(compiled.main_nf.contains("Somite: empty output"));
     assert!(compiled.main_nf.contains("gzip -t --"));
     assert!(compiled.pixi_toml.contains("nextflow = \"==26.04.4\""));
@@ -87,6 +94,7 @@ fn hostile_values_remain_json_data_and_bash_env_values() {
         .get_mut("threads")
         .expect("threads")
         .ty = "string".into();
+    graph.nodes[1].operator_revision = catalog.revision("qc.fastp").unwrap();
     let mut hostile_options = options();
     hostile_options.output_dir = "results/'\" $(touch ALSO_NOT)".into();
 
@@ -119,9 +127,10 @@ fn rejects_unsupported_execution_honestly() {
         argv: vec![],
         outputs: BTreeMap::new(),
     };
-    catalog.ops.insert(reference.id.clone(), reference);
+    catalog.ops.insert(reference.id.clone(), reference.clone());
     let mut rejected = graph.clone();
     rejected.nodes[1].operator = "reference".into();
+    rejected.nodes[1].operator_revision = reference.revision().unwrap();
     assert!(matches!(
         compile(&rejected, &catalog, &options()),
         Err(CompileError::ReferenceNode { .. })
@@ -134,7 +143,8 @@ fn rejects_unsupported_execution_honestly() {
         .ops
         .insert(unsupported.id.clone(), unsupported.clone());
     let mut inprocess_graph = graph.clone();
-    inprocess_graph.nodes[0].operator = unsupported.id;
+    inprocess_graph.nodes[0].operator = unsupported.id.clone();
+    inprocess_graph.nodes[0].operator_revision = unsupported.revision().unwrap();
     assert!(matches!(
         compile(&inprocess_graph, &inprocess_catalog, &options()),
         Err(CompileError::UnsupportedInprocess { .. })
@@ -148,7 +158,8 @@ fn rejects_unsupported_execution_honestly() {
         nested.argv[0] = binary.into();
         nested_catalog.ops.insert(nested.id.clone(), nested.clone());
         let mut nested_graph = graph.clone();
-        nested_graph.nodes[1].operator = nested.id;
+        nested_graph.nodes[1].operator = nested.id.clone();
+        nested_graph.nodes[1].operator_revision = nested.revision().unwrap();
         assert!(matches!(
             compile(&nested_graph, &nested_catalog, &options()),
             Err(CompileError::NestedEngine { .. })
@@ -174,8 +185,10 @@ fn rejects_unsupported_execution_honestly() {
         .expect("r1 output")
         .exclude
         .push("ignored.fastq.gz".into());
+    let mut excluded_graph = graph.clone();
+    excluded_graph.nodes[1].operator_revision = excluded_catalog.revision("qc.fastp").unwrap();
     assert!(matches!(
-        compile(&graph, &excluded_catalog, &options()),
+        compile(&excluded_graph, &excluded_catalog, &options()),
         Err(CompileError::InvalidOutput { .. })
     ));
 
@@ -188,7 +201,8 @@ fn rejects_unsupported_execution_honestly() {
         .ops
         .insert(indirect.id.clone(), indirect.clone());
     let mut indirect_graph = graph;
-    indirect_graph.nodes[1].operator = indirect.id;
+    indirect_graph.nodes[1].operator = indirect.id.clone();
+    indirect_graph.nodes[1].operator_revision = indirect.revision().unwrap();
     assert!(matches!(
         compile(&indirect_graph, &indirect_catalog, &options()),
         Err(CompileError::NestedEngine { .. })

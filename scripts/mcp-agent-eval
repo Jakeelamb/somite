@@ -1,0 +1,258 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+model=${1:-gpt-5.6-luna}
+effort=${2:-low}
+port=${3:-7391}
+scenario=${4:-baseline}
+run_name=$(date -u +%Y%m%dT%H%M%SZ)-${model//[^a-zA-Z0-9._-]/-}-$effort-$scenario
+output_dir="$project_root/.somite/mcp-agent-evals/$run_name"
+graph_path="$output_dir/graph.somite.json"
+server_url="http://127.0.0.1:$port"
+capability=$(openssl rand -hex 32)
+server_pid=
+
+cleanup() {
+  if [[ -n "$server_pid" ]]; then
+    kill "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+for command in cargo curl jq npx openssl; do
+  command -v "$command" >/dev/null || {
+    echo "missing required command: $command" >&2
+    exit 1
+  }
+done
+
+if ! [[ "$port" =~ ^[0-9]+$ ]] || ((port < 1024 || port > 65535)); then
+  echo "port must be an integer from 1024 through 65535" >&2
+  exit 1
+fi
+if [[ "$scenario" != baseline && "$scenario" != stale ]]; then
+  echo "scenario must be baseline or stale" >&2
+  exit 1
+fi
+
+mkdir -p "$output_dir"
+install -m 0644 "$project_root/testdata/mcp_agent_empty.somite.json" "$graph_path"
+
+cargo build --manifest-path "$project_root/Cargo.toml" -p somite-server
+SOMITE_MCP_RUNTIME_CAPABILITY="$capability" \
+SOMITE_PROJECT_ROOT="$project_root" \
+SOMITE_GRAPH="$graph_path" \
+SOMITE_WEB_ADDR="127.0.0.1:$port" \
+  "$project_root/target/debug/somite-server" >"$output_dir/server.log" 2>&1 &
+server_pid=$!
+
+for _ in $(seq 1 100); do
+  if curl --fail --silent "$server_url/api/health" >"$output_dir/health.json"; then
+    break
+  fi
+  sleep 0.1
+done
+curl --fail --silent "$server_url/api/health" >/dev/null
+
+curl --fail --silent --request POST "$server_url/api/agent/connect" \
+  --header 'content-type: application/json' \
+  --data '{"command":"npx -y @agentclientprotocol/codex-acp@1.6.2"}' \
+  >"$output_dir/connect.json"
+
+for _ in $(seq 1 300); do
+  curl --fail --silent "$server_url/api/agent/events" >"$output_dir/events.json"
+  if jq -e '.connected and (.connecting | not)' "$output_dir/events.json" >/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
+jq -e '.connected and (.connecting | not)' "$output_dir/events.json" >/dev/null
+
+configure() {
+  local config_id=$1
+  local value=$2
+  jq -n --arg config_id "$config_id" --arg value "$value" \
+    '{config_id: $config_id, value: $value}' >"$output_dir/config-request.json"
+  curl --fail --silent --request POST "$server_url/api/agent/config" \
+    --header 'content-type: application/json' \
+    --data-binary @"$output_dir/config-request.json" \
+    >"$output_dir/config-$config_id.json"
+}
+
+configure model "$model"
+configure reasoning_effort "$effort"
+
+install -m 0644 "$project_root/testdata/mcp_agent_prompt.txt" "$output_dir/prompt.txt"
+
+curl --fail --silent "$server_url/api/agent/graph" \
+  --header "authorization: Bearer $capability" >"$output_dir/initial-workflow.json"
+jq -n --rawfile message "$output_dir/prompt.txt" \
+  --slurpfile workflow "$output_dir/initial-workflow.json" \
+  '{message: $message, graph: $workflow[0].graph}' >"$output_dir/prompt-request.json"
+curl --fail --silent --request POST "$server_url/api/agent/prompt" \
+  --header 'content-type: application/json' \
+  --data-binary @"$output_dir/prompt-request.json" >/dev/null
+
+if [[ "$scenario" == stale ]]; then
+  injected=false
+  for _ in $(seq 1 400); do
+    curl --fail --silent "$server_url/api/agent/events" >"$output_dir/events.json"
+    if jq -e 'any(.events[];
+      .kind == "tool" and .title == "somite.workflow.get" and
+      ((.detail // "") | contains("200 OK")))' "$output_dir/events.json" >/dev/null; then
+      curl --fail --silent "$server_url/api/agent/graph" \
+        --header "authorization: Bearer $capability" \
+        >"$output_dir/pre-injection-workflow.json"
+      jq '{
+        base_state_revision: .state_revision,
+        idempotency_key: "eval-concurrent-edit-1",
+        summary: "Concurrent human edit during MCP evaluation",
+        operations: [{
+          op: "add_operator",
+          node_id: "concurrent_marker",
+          operator_id: "files.import",
+          params: {path: "fixtures/concurrent.fastq.gz"},
+          x: -280,
+          y: -160
+        }]
+      }' "$output_dir/pre-injection-workflow.json" >"$output_dir/injection-request.json"
+      curl --fail --silent --request POST "$server_url/api/agent/transactions" \
+        --header 'content-type: application/json' \
+        --header "authorization: Bearer $capability" \
+        --data-binary @"$output_dir/injection-request.json" \
+        >"$output_dir/injection-response.json"
+      injected=true
+      break
+    fi
+    sleep 0.05
+  done
+  if [[ "$injected" != true ]]; then
+    echo "could not inject the stale-state scenario before the agent edit" >&2
+    exit 1
+  fi
+fi
+
+handled_permissions='[]'
+finished=false
+for _ in $(seq 1 900); do
+  curl --fail --silent "$server_url/api/agent/events" >"$output_dir/events.json"
+  while IFS=$'\t' read -r permission_id option_id title; do
+    [[ -n "$permission_id" ]] || continue
+    if jq -e --arg id "$permission_id" 'index($id) != null' <<<"$handled_permissions" >/dev/null; then
+      continue
+    fi
+    if [[ "$title" != Approve\ somite.* ]]; then
+      echo "refusing to auto-approve non-Somite permission: $title" >&2
+      exit 1
+    fi
+    jq -n --arg option_id "$option_id" '{option_id: $option_id}' \
+      >"$output_dir/permission-request.json"
+    curl --fail --silent --request POST \
+      "$server_url/api/agent/permissions/$permission_id" \
+      --header 'content-type: application/json' \
+      --data-binary @"$output_dir/permission-request.json" >/dev/null
+    handled_permissions=$(jq -c --arg id "$permission_id" '. + [$id]' <<<"$handled_permissions")
+  done < <(
+    jq -r '.events[]
+      | select(.kind == "permission" and .permission_id != null)
+      | [.permission_id,
+         ((.permission_choices[] | select(.kind == "allow_once") | .option_id) // ""),
+         .title]
+      | @tsv' "$output_dir/events.json"
+  )
+
+  if jq -e '(.busy | not) and ([.events[].kind] | index("user") != null)' \
+    "$output_dir/events.json" >/dev/null; then
+    finished=true
+    break
+  fi
+  sleep 1
+done
+
+if [[ "$finished" != true ]]; then
+  echo "agent turn did not finish within 15 minutes" >&2
+  exit 1
+fi
+
+curl --fail --silent "$server_url/api/agent/transcript" >"$output_dir/transcript.json"
+curl --fail --silent "$server_url/api/agent/graph" \
+  --header "authorization: Bearer $capability" >"$output_dir/final-workflow.json"
+curl --fail --silent --request POST "$server_url/api/agent/disconnect" >/dev/null
+
+jq -n \
+  --arg model "$model" \
+  --arg effort "$effort" \
+  --arg scenario "$scenario" \
+  --arg output_dir "$output_dir" \
+  --slurpfile transcript "$output_dir/transcript.json" \
+  --slurpfile workflow "$output_dir/final-workflow.json" '
+  ($workflow[0].graph.nodes | map(select(.operator == "files.import_paired"))) as $sources |
+  ($workflow[0].graph.nodes | map(select(.operator == "qc.fastp"))) as $fastp |
+  ($sources[0].id // "") as $source_id |
+  ($fastp[0].id // "") as $fastp_id |
+  ($workflow[0].graph.edges // []) as $edges |
+  {
+    schema_version: 1,
+    model: $model,
+    reasoning_effort: $effort,
+    scenario: $scenario,
+    output_dir: $output_dir,
+    checks: {
+      paired_source: (($sources | length) == 1),
+      exact_paths: (($sources[0].params.r1 // "") == "fixtures/eval_R1.fastq.gz" and
+                    ($sources[0].params.r2 // "") == "fixtures/eval_R2.fastq.gz"),
+      fastp: (($fastp | length) == 1 and ($fastp[0].params.threads // 0) == 2),
+      r1_edge: any($edges[];
+        .from_node == $source_id and .from_port == "r1" and
+        .to_node == $fastp_id and .to_port == "r1"),
+      r2_edge: any($edges[];
+        .from_node == $source_id and .from_port == "r2" and
+        .to_node == $fastp_id and .to_port == "r2"),
+      inspected_before_edit: (
+        [$transcript[0].tool_calls[].title] as $titles |
+        (($titles | index("somite.workflow.get")) // 9999) <
+        (($titles | index("somite.graph.apply_transaction")) // -1)),
+      validation_attempted: any($transcript[0].tool_calls[]?;
+        (.title // "") | contains("validation.start")),
+      terminal_status_polled: any($transcript[0].tool_calls[]?;
+        (.title // "") | contains("run.status")),
+      long_poll_used: any($transcript[0].tool_calls[]?;
+        ((.title // "") | contains("run.status")) and
+        ((.input.arguments.wait_ms // 0) >= 1000)),
+      single_successful_agent_edit: ([
+        $transcript[0].tool_calls[]? |
+        select((.title // "") == "somite.graph.apply_transaction" and
+          .output.result.structuredContent.replayed == false)
+      ] | length) == 1,
+      stale_recovered: (if $scenario == "stale" then
+        (any($transcript[0].tool_calls[]?;
+          (.output.result.structuredContent.error.code // "") == "stale_state_revision") and
+         any($workflow[0].graph.nodes[]?; .id == "concurrent_marker"))
+        else true end),
+      validation_passed: any($transcript[0].tool_calls[]?;
+        ((.title // "") | contains("run.status")) and
+        (.output.result.structuredContent.phase // "") == "completed" and
+        (.output.result.structuredContent.evidence_receipt.result // "") == "passed"),
+      mcp_only: all($transcript[0].tool_calls[]?;
+        (.title // "") | startswith("somite."))
+    },
+    metrics: {
+      tool_calls: ($transcript[0].tool_calls | length),
+      catalog_searches: ([$transcript[0].tool_calls[]? |
+        select((.title // "") | contains("catalog.search"))] | length),
+      status_polls: ([$transcript[0].tool_calls[]? |
+        select((.title // "") | contains("run.status"))] | length),
+      permission_prompts: ([$transcript[0].tool_calls[]?.permissions[]?] | length),
+      final_nodes: ($workflow[0].graph.nodes | length),
+      final_edges: ($workflow[0].graph.edges | length)
+    },
+    final_state_revision: $workflow[0].state_revision,
+    final_graph_revision: $workflow[0].graph_revision,
+    wall_time_ms: ($transcript[0].finished_at_unix_ms - $transcript[0].started_at_unix_ms)
+  }
+  | .passed = ([.checks[]] | all)
+  ' >"$output_dir/score.json"
+
+jq . "$output_dir/score.json"

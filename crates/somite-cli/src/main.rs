@@ -3,12 +3,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use somite_cook::{cook_graph, NodeState, Project};
-use somite_ir::{Graph, ParamValue};
-use somite_nextflow::{
-    compile, CompileOptions, CompiledWorkflow, PINNED_NEXTFLOW_VERSION, PINNED_OPENJDK_VERSION,
+use somite_bundle::{
+    absolutize_import_paths, create_frozen_package, pixi_executable, ExportTarget,
 };
-use somite_ops::{current_pixi_platform, Catalog};
+use somite_cook::{cook_graph, NodeState, Project};
+use somite_ir::Graph;
+use somite_ops::{current_pixi_platform, snakemake_local, Catalog};
 use somite_paper::{extract_from_path, reconstruct};
 
 fn operators_dir() -> PathBuf {
@@ -27,8 +27,10 @@ fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     let cmd = args.next().unwrap_or_else(|| "help".into());
     match cmd.as_str() {
-        "cook" => {
-            let graph_path = args.next().context("somite cook <graph.somite.json>")?;
+        "cook-oracle" => {
+            let graph_path = args
+                .next()
+                .context("somite cook-oracle <graph.somite.json>")?;
             cook_cmd(Path::new(&graph_path))?;
         }
         "compile" => {
@@ -45,6 +47,16 @@ fn main() -> Result<()> {
                 .next()
                 .context("somite paper <methods.txt|paper.pdf>")?;
             paper_cmd(Path::new(&paper_path))?;
+        }
+        "import-snakemake" => {
+            let project = args.next().context(
+                "somite import-snakemake <project-or-Snakefile> <output.somite.json> [targets...]",
+            )?;
+            let output = args.next().context(
+                "somite import-snakemake <project-or-Snakefile> <output.somite.json> [targets...]",
+            )?;
+            let targets = args.collect::<Vec<_>>();
+            import_snakemake_cmd(Path::new(&project), Path::new(&output), &targets)?;
         }
         "palette" => {
             let cat = Catalog::load_dir(&operators_dir())?;
@@ -69,9 +81,12 @@ fn main() -> Result<()> {
             }
         }
         "help" | "-h" | "--help" => {
-            println!("somite cook <graph.json>          run the graph");
             println!("somite compile <graph> <dir>     build a Nextflow/Pixi run package");
+            println!("somite cook-oracle <graph>       test the native reference oracle");
             println!("somite paper <methods.txt|pdf>    rebuild graph from a paper");
+            println!(
+                "somite import-snakemake <project> <graph> [targets...]  visualize local rules"
+            );
             println!("somite palette                    list NCBI / Ensembl / nf-core / QC");
             println!("somite env                        list Pixi package requirements");
         }
@@ -80,11 +95,38 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn import_snakemake_cmd(project: &Path, output: &Path, targets: &[String]) -> Result<()> {
+    let catalog = Catalog::load_dir(&operators_dir())?;
+    let reference_revision = catalog.revision("workflow.reference")?;
+    let pixi = pixi_executable();
+    let imported = snakemake_local::import(project, targets, pixi.as_deref(), &reference_revision)?;
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create output directory {}", parent.display()))?;
+    }
+    fs::write(output, serde_json::to_vec_pretty(&imported.graph)?)
+        .with_context(|| format!("write graph {}", output.display()))?;
+    println!(
+        "imported {} rules and {} dependencies from {} via {} into {}",
+        imported.graph.nodes.len(),
+        imported.graph.edges.len(),
+        imported.snakefile.display(),
+        imported.runner,
+        output.display()
+    );
+    Ok(())
+}
+
 fn compile_cmd(graph_path: &Path, output: &Path) -> Result<()> {
     let raw = fs::read_to_string(graph_path)
         .with_context(|| format!("read graph {}", graph_path.display()))?;
-    let source_graph: Graph = serde_json::from_str(&raw)
+    let mut source_graph: Graph = serde_json::from_str(&raw)
         .with_context(|| format!("parse graph {}", graph_path.display()))?;
+    let catalog = Catalog::load_dir(&operators_dir())?;
+    catalog.pin_graph(&mut source_graph)?;
     let mut runnable_graph = source_graph.clone();
     let cwd = env::current_dir()?;
     let graph_dir = graph_path.parent().unwrap_or(Path::new("."));
@@ -106,16 +148,13 @@ fn compile_cmd(graph_path: &Path, output: &Path) -> Result<()> {
         .filter(|name| !name.is_empty())
         .unwrap_or("somite-workflow")
         .to_owned();
-    let options = CompileOptions {
-        workflow_name,
-        output_dir: "results".into(),
-        platforms: vec![current_pixi_platform().into()],
-        nextflow_version: PINNED_NEXTFLOW_VERSION.into(),
-        openjdk_version: PINNED_OPENJDK_VERSION.into(),
-    };
-    let catalog = Catalog::load_dir(&operators_dir())?;
-    let compiled = compile(&runnable_graph, &catalog, &options)?;
-    write_run_package(output, &source_graph, &compiled)?;
+    let package = create_frozen_package(
+        &runnable_graph,
+        &catalog,
+        &ExportTarget::new(workflow_name, current_pixi_platform()),
+        output,
+        |_| false,
+    )?;
 
     let display_output = if output.is_absolute() {
         output.to_path_buf()
@@ -132,89 +171,13 @@ fn compile_cmd(graph_path: &Path, output: &Path) -> Result<()> {
         "run: pixi run --manifest-path {} run",
         display_output.join("pixi.toml").display()
     );
+    println!("closure: {}", package.closure.closure_digest);
     Ok(())
-}
-
-fn absolutize_import_paths(graph: &mut Graph, project_base: &Path, graph_base: &Path) {
-    for node in &mut graph.nodes {
-        let parameters: &[&str] = match node.operator.as_str() {
-            "files.import" => &["path"],
-            "files.import_paired" => &["r1", "r2"],
-            _ => continue,
-        };
-        for parameter in parameters {
-            let Some(ParamValue::String(value)) = node.params.get_mut(*parameter) else {
-                continue;
-            };
-            let path = Path::new(value);
-            if path.is_relative() {
-                let project_candidate = project_base.join(path);
-                let graph_candidate = graph_base.join(path);
-                let resolved = if project_candidate.exists() || !graph_candidate.exists() {
-                    project_candidate
-                } else {
-                    graph_candidate
-                };
-                *value = resolved.display().to_string();
-            }
-        }
-    }
-}
-
-fn write_run_package(output: &Path, graph: &Graph, compiled: &CompiledWorkflow) -> Result<()> {
-    if output.exists() {
-        bail!("output path already exists: {}", output.display());
-    }
-    let parent = output.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)
-        .with_context(|| format!("create output parent {}", parent.display()))?;
-    let file_name = output
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("somite-run");
-    let staging = parent.join(format!(
-        ".{file_name}.somite-compile-{}",
-        std::process::id()
-    ));
-    if staging.exists() {
-        bail!("staging path already exists: {}", staging.display());
-    }
-    fs::create_dir(&staging)
-        .with_context(|| format!("create staging directory {}", staging.display()))?;
-
-    let mut graph_json = serde_json::to_string_pretty(graph)?;
-    graph_json.push('\n');
-    let files = [
-        ("main.nf", compiled.main_nf.as_str()),
-        ("nextflow.config", compiled.nextflow_config.as_str()),
-        ("params.json", compiled.params_json.as_str()),
-        ("node-map.json", compiled.node_map_json.as_str()),
-        ("pixi.toml", compiled.pixi_toml.as_str()),
-        ("workflow.somite.json", graph_json.as_str()),
-    ];
-    let result = (|| -> Result<()> {
-        for (name, contents) in files {
-            fs::write(staging.join(name), contents)
-                .with_context(|| format!("write generated {name}"))?;
-        }
-        fs::rename(&staging, output).with_context(|| {
-            format!(
-                "move completed run package from {} to {}",
-                staging.display(),
-                output.display()
-            )
-        })?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_dir_all(&staging);
-    }
-    result
 }
 
 fn cook_cmd(graph_path: &Path) -> Result<()> {
     let raw = fs::read_to_string(graph_path)?;
-    let g: Graph = serde_json::from_str(&raw)?;
+    let mut g: Graph = serde_json::from_str(&raw)?;
     let cwd = env::current_dir()?;
     let project_root = if cwd.join("operators").is_dir() || cwd.join("testdata").is_dir() {
         cwd
@@ -223,6 +186,7 @@ fn cook_cmd(graph_path: &Path) -> Result<()> {
     };
     let project = Project::open(&project_root)?;
     let cat = Catalog::load_dir(&operators_dir())?;
+    cat.pin_graph(&mut g)?;
     let report = cook_graph(&project, &cat, &g)?;
     for (id, st) in &report.states {
         let tag = match st {
@@ -272,6 +236,8 @@ fn paper_cmd(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use somite_ir::ParamValue;
+
     use super::*;
 
     fn fixture_graph() -> Graph {
@@ -279,16 +245,6 @@ mod tests {
             "../../../spikes/executor-identity/native/fastp-fastqc.somite.json"
         ))
         .expect("paired graph fixture")
-    }
-
-    fn compiled_fixture() -> CompiledWorkflow {
-        CompiledWorkflow {
-            main_nf: "nextflow.enable.dsl=2\n".into(),
-            nextflow_config: "process.cache = 'deep'\n".into(),
-            params_json: "{}\n".into(),
-            node_map_json: "{}\n".into(),
-            pixi_toml: "[workspace]\nname = \"test\"\n".into(),
-        }
     }
 
     #[test]
@@ -335,25 +291,5 @@ mod tests {
                     .to_string()
             ))
         );
-    }
-
-    #[test]
-    fn run_package_is_complete_and_never_overwrites() {
-        let root = tempfile::tempdir().expect("temporary directory");
-        let output = root.path().join("compiled");
-        write_run_package(&output, &fixture_graph(), &compiled_fixture())
-            .expect("write run package");
-
-        for name in [
-            "main.nf",
-            "nextflow.config",
-            "params.json",
-            "node-map.json",
-            "pixi.toml",
-            "workflow.somite.json",
-        ] {
-            assert!(output.join(name).is_file(), "missing {name}");
-        }
-        assert!(write_run_package(&output, &fixture_graph(), &compiled_fixture()).is_err());
     }
 }

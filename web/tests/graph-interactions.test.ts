@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { compatibleOperatorPorts, continuationEdge, nextContinuationPosition, operatorContinues, type PendingConnection } from "../app/graphInteractions.ts";
+import { edgeLifecycleState, semanticGraphKey } from "../app/validationState.ts";
 import type { SomiteGraphNode, Operator } from "../app/types.ts";
 
 const fastp: Operator = {
@@ -19,7 +20,7 @@ const fastp: Operator = {
   },
 };
 
-const node: SomiteGraphNode = { id: "fastp1", operator: fastp.id, ports: [], params: {}, layout: { x: 200, y: 100 } };
+const node: SomiteGraphNode = { id: "fastp1", operator: fastp.id, operator_revision: "test-revision", ports: [], params: {}, layout: { x: 200, y: 100 } };
 
 test("continuation matches the native input-union rule and prefers the same port name", () => {
   const pending: PendingConnection = { nodeId: "reads1", port: { name: "r1", dir: "out", ty: "FastqGz" }, position: { x: 200, y: 100 } };
@@ -55,4 +56,20 @@ test("incompatible types never enter continuation results", () => {
 test("one-click continuation chooses the next clear vertical lane", () => {
   assert.deepEqual(nextContinuationPosition({ x: 100, y: 100 }, "out", [{ x: 340, y: 100 }]), { x: 340, y: 280 });
   assert.deepEqual(nextContinuationPosition({ x: 340, y: 100 }, "in", []), { x: 100, y: 100 });
+});
+
+test("validation edges expose progress and terminal evidence without color-only ambiguity", () => {
+  const edge = { id: "edge1", from_node: "source1", from_port: "out", to_node: "tool1", to_port: "in" };
+  assert.equal(edgeLifecycleState(edge, { source1: "done", tool1: "queued" }), "queued");
+  assert.equal(edgeLifecycleState(edge, { source1: "done", tool1: "running" }), "running");
+  assert.equal(edgeLifecycleState(edge, { source1: "done", tool1: "done" }), "done");
+  assert.equal(edgeLifecycleState(edge, { source1: "done", tool1: "failed" }), "failed");
+});
+
+test("validation identity ignores layout but invalidates parameter changes", () => {
+  const graph = { schema_version: 2, nodes: [{ ...node, params: { threads: 2 } }], edges: [] };
+  const moved = { ...graph, nodes: [{ ...graph.nodes[0], layout: { x: 900, y: -20 } }] };
+  const changed = { ...graph, nodes: [{ ...graph.nodes[0], params: { threads: 4 } }] };
+  assert.equal(semanticGraphKey(graph), semanticGraphKey(moved));
+  assert.notEqual(semanticGraphKey(graph), semanticGraphKey(changed));
 });

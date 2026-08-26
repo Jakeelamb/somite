@@ -49,6 +49,11 @@ The scalable catalog path is contract generation and audit:
 4. inspect artifacts and record the evidence receipt; and
 5. review before promotion into `operators/`.
 
+The first automated fixture pack covers local single- and paired-end FASTQ
+graphs. It is deliberately not a universal biological test corpus: unsupported
+source kinds remain unvalidated until a representative pack and binding policy
+are added.
+
 Agents can perform steps 1 through 4 in parallel. A package name or generated
 guess alone never passes step 5.
 
@@ -82,6 +87,28 @@ as structural references.
 Snakemake is an evidence and testing ecosystem, not a second production engine.
 Its fixtures can help audit typed Operators. Generated production workflows do
 not invoke `snakemake`.
+
+## Local Snakemake workflows
+
+The Pipeline panel can also open a local project directory, `Snakefile`, or
+`.smk` entrypoint. Somite locates `workflow/Snakefile` before a root
+`Snakefile`, uses the project's declared Pixi environment when present, and
+asks Snakemake for an engine-authored `--rulegraph`. Optional target rule names
+select independent branches. This is a read-only preview: no workflow jobs run.
+
+Each rule becomes a structural reference node. Fan-in rules receive one stable
+scalar input port per dependency, and FASTQ-facing boundary rules expose
+separate R1 and R2 inputs. The import records the source path plus the current
+Git revision and visibly marks a dirty worktree. Custom graph launches use a
+graph-scoped autosave, so previewing a workflow cannot recover or overwrite an
+unrelated canvas autosave.
+
+The same path is available without the web app:
+
+```bash
+cargo run -p somite-cli -- import-snakemake \
+  path/to/project output.somite.json target_a target_b
+```
 
 ## Version and provenance rules
 

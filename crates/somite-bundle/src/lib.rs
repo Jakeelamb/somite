@@ -1,11 +1,16 @@
-//! Build a portable graph bundle behind one export interface.
+//! Freeze and archive one target-specific Graph-to-Nextflow/Pixi run package.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::io::{Cursor, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use somite_ir::{Graph, ParamValue};
-use somite_ops::{pixi_manifest, Catalog, OpKind, Operator};
 use serde::Serialize;
+use somite_ir::{Graph, ParamValue};
+use somite_linker::{freeze, link, EvidenceIndex, LinkOptions, RunClosure};
+use somite_nextflow::{compile, CompileOptions, PINNED_NEXTFLOW_VERSION, PINNED_OPENJDK_VERSION};
+use somite_ops::{Catalog, OpKind, Operator};
 use thiserror::Error;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -22,6 +27,16 @@ pub enum BundleError {
     Zip(#[from] zip::result::ZipError),
     #[error("zip io: {0}")]
     Io(#[from] std::io::Error),
+    #[error("compile: {0}")]
+    Compile(#[from] somite_nextflow::CompileError),
+    #[error("link: {0}")]
+    Link(#[from] somite_linker::LinkError),
+    #[error("output path already exists: {0}")]
+    DestinationExists(String),
+    #[error("Pixi is required to freeze a run package")]
+    PixiMissing,
+    #[error("Pixi lock failed: {0}")]
+    PixiLock(String),
 }
 
 #[derive(Debug, Clone)]
@@ -71,26 +86,277 @@ pub struct BundlePlan {
     pub adapter_count: usize,
 }
 
-#[derive(Debug)]
-pub struct ExportBundle {
+#[derive(Debug, Clone)]
+pub struct FrozenPackage {
     pub plan: BundlePlan,
-    pub bytes: Vec<u8>,
+    pub closure: RunClosure,
+    pub directory: PathBuf,
 }
 
-/// Produce the complete portable bundle. The probe is the only machine-specific
-/// input; all resolution and archive behaviour stays behind this interface.
-pub fn build_bundle(
+/// Compile, link, resolve, and atomically publish one frozen production package.
+pub fn create_frozen_package(
+    graph: &Graph,
+    catalog: &Catalog,
+    target: &ExportTarget,
+    destination: &Path,
+    binary_available: impl Fn(&str) -> bool,
+) -> Result<FrozenPackage, BundleError> {
+    create_frozen_package_with_lock(
+        graph,
+        catalog,
+        target,
+        destination,
+        binary_available,
+        resolve_pixi_lock,
+    )
+}
+
+/// Freeze with an explicitly selected Pixi executable.
+///
+/// Local runtimes use this to keep discovery, locking, and execution on the
+/// same installed Pixi binary.
+pub fn create_frozen_package_with_pixi(
+    graph: &Graph,
+    catalog: &Catalog,
+    target: &ExportTarget,
+    destination: &Path,
+    binary_available: impl Fn(&str) -> bool,
+    pixi: &Path,
+) -> Result<FrozenPackage, BundleError> {
+    create_frozen_package_with_lock(
+        graph,
+        catalog,
+        target,
+        destination,
+        binary_available,
+        |package| resolve_pixi_lock_at(package, pixi),
+    )
+}
+
+fn create_frozen_package_with_lock(
+    graph: &Graph,
+    catalog: &Catalog,
+    target: &ExportTarget,
+    destination: &Path,
+    binary_available: impl Fn(&str) -> bool,
+    resolve_lock: impl FnOnce(&Path) -> Result<Vec<u8>, BundleError>,
+) -> Result<FrozenPackage, BundleError> {
+    graph.validate()?;
+    catalog.verify_graph(graph)?;
+    if destination.exists() {
+        return Err(BundleError::DestinationExists(
+            destination.display().to_string(),
+        ));
+    }
+    let operators = used_operators(graph, catalog)?;
+    let plan = build_plan(graph, &operators, target, binary_available);
+    let options = CompileOptions {
+        workflow_name: target.project_name.clone(),
+        output_dir: "results".into(),
+        platforms: vec![target.platform.clone()],
+        nextflow_version: PINNED_NEXTFLOW_VERSION.into(),
+        openjdk_version: PINNED_OPENJDK_VERSION.into(),
+    };
+    let compiled = compile(graph, catalog, &options)?;
+    let linked = link(
+        graph,
+        catalog,
+        compiled.pixi_toml.as_bytes(),
+        &LinkOptions {
+            target_platform: target.platform.clone(),
+            compiler_identity: format!("somite-nextflow@{}", env!("CARGO_PKG_VERSION")),
+            nextflow_identity: format!("nextflow@{PINNED_NEXTFLOW_VERSION}"),
+            openjdk_identity: format!("openjdk@{PINNED_OPENJDK_VERSION}"),
+        },
+    )?;
+
+    let parent = destination.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("somite-run");
+    let staging = parent.join(format!(
+        ".{file_name}.somite-package-{}",
+        std::process::id()
+    ));
+    if staging.exists() {
+        return Err(BundleError::DestinationExists(
+            staging.display().to_string(),
+        ));
+    }
+    fs::create_dir(&staging)?;
+
+    let result = (|| -> Result<RunClosure, BundleError> {
+        write_text(&staging, "main.nf", &compiled.main_nf)?;
+        write_text(&staging, "nextflow.config", &compiled.nextflow_config)?;
+        write_text(&staging, "params.json", &compiled.params_json)?;
+        write_text(&staging, "node-map.json", &compiled.node_map_json)?;
+        write_text(&staging, "pixi.toml", &compiled.pixi_toml)?;
+        write_json(&staging, "workflow.somite.json", graph)?;
+        write_json(&staging, "toolchain/tools.json", &plan)?;
+        write_json(&staging, "evidence/index.json", &EvidenceIndex::default())?;
+        write_text(&staging, "README.md", &frozen_readme())?;
+        for manifest in &linked.operator_manifests {
+            write_json(
+                &staging,
+                &format!("operators/{}.json", manifest.operator_id),
+                manifest,
+            )?;
+        }
+
+        let lock = resolve_lock(&staging)?;
+        if !staging.join("pixi.lock").is_file() {
+            fs::write(staging.join("pixi.lock"), &lock)?;
+        }
+        let closure = freeze(&linked.draft, &lock)?;
+        write_json(&staging, "run-closure.json", &closure)?;
+        fs::rename(&staging, destination)?;
+        Ok(closure)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+    }
+    let closure = result?;
+    Ok(FrozenPackage {
+        plan,
+        closure,
+        directory: destination.to_path_buf(),
+    })
+}
+
+/// Archive only the immutable files in a freshly frozen package.
+pub fn archive_frozen_package(package: &FrozenPackage) -> Result<Vec<u8>, BundleError> {
+    let mut files = BTreeMap::new();
+    collect_files(&package.directory, &package.directory, &mut files)?;
+    write_zip(files)
+}
+
+pub fn pixi_executable() -> Option<PathBuf> {
+    std::env::var_os("PATH")
+        .as_deref()
+        .into_iter()
+        .flat_map(std::env::split_paths)
+        .map(|directory| directory.join("pixi"))
+        .find(|path| path.is_file())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".pixi/bin/pixi"))
+                .filter(|path| path.is_file())
+        })
+}
+
+/// Resolve project- or graph-relative import paths before freezing a package.
+///
+/// This is shared by every production entry point so the CLI and web runtime
+/// compile identical input identities.
+pub fn absolutize_import_paths(graph: &mut Graph, project_base: &Path, graph_base: &Path) {
+    for node in &mut graph.nodes {
+        let parameters: &[&str] = match node.operator.as_str() {
+            "files.import" => &["path"],
+            "files.import_paired" => &["r1", "r2"],
+            _ => continue,
+        };
+        for parameter in parameters {
+            let Some(ParamValue::String(value)) = node.params.get_mut(*parameter) else {
+                continue;
+            };
+            let path = Path::new(value);
+            if path.is_relative() {
+                let project_candidate = project_base.join(path);
+                let graph_candidate = graph_base.join(path);
+                let resolved = if project_candidate.exists() || !graph_candidate.exists() {
+                    project_candidate
+                } else {
+                    graph_candidate
+                };
+                *value = resolved.display().to_string();
+            }
+        }
+    }
+}
+
+fn resolve_pixi_lock(package: &Path) -> Result<Vec<u8>, BundleError> {
+    let pixi = pixi_executable().ok_or(BundleError::PixiMissing)?;
+    resolve_pixi_lock_at(package, &pixi)
+}
+
+fn resolve_pixi_lock_at(package: &Path, pixi: &Path) -> Result<Vec<u8>, BundleError> {
+    let output = Command::new(pixi)
+        .args(["lock", "--no-install", "--no-progress", "--manifest-path"])
+        .arg(package.join("pixi.toml"))
+        .output()?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("Pixi could not resolve the environment")
+            .to_owned();
+        return Err(BundleError::PixiLock(detail));
+    }
+    fs::read(package.join("pixi.lock")).map_err(BundleError::from)
+}
+
+fn write_text(root: &Path, relative: &str, contents: &str) -> Result<(), BundleError> {
+    let destination = root.join(relative);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(destination, contents)?;
+    Ok(())
+}
+
+fn write_json(root: &Path, relative: &str, value: &impl Serialize) -> Result<(), BundleError> {
+    let mut encoded = serde_json::to_vec_pretty(value)?;
+    encoded.push(b'\n');
+    let destination = root.join(relative);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(destination, encoded)?;
+    Ok(())
+}
+
+fn collect_files(
+    root: &Path,
+    directory: &Path,
+    files: &mut BTreeMap<String, Vec<u8>>,
+) -> Result<(), BundleError> {
+    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(root, &path, files)?;
+        } else if path.is_file() {
+            let relative = path
+                .strip_prefix(root)
+                .expect("collected package path remains under root")
+                .to_string_lossy()
+                .replace('\\', "/");
+            files.insert(relative, fs::read(path)?);
+        }
+    }
+    Ok(())
+}
+
+fn frozen_readme() -> String {
+    "# Frozen Somite run\n\nThis package contains one pinned Somite Graph revision, exact Operator revisions, generated Nextflow DSL2, and a resolved Pixi lock. Run it with:\n\n```bash\npixi run --frozen run\n```\n\n`run-closure.json` identifies the target-specific executable closure. Validation evidence is stored separately under `evidence/`.\n".into()
+}
+
+/// Inspect the exact tools a frozen package will contain without resolving it.
+pub fn plan_frozen_package(
     graph: &Graph,
     catalog: &Catalog,
     target: &ExportTarget,
     binary_available: impl Fn(&str) -> bool,
-) -> Result<ExportBundle, BundleError> {
+) -> Result<BundlePlan, BundleError> {
     graph.validate()?;
+    catalog.verify_graph(graph)?;
     let operators = used_operators(graph, catalog)?;
-    let plan = build_plan(graph, &operators, target, binary_available);
-    let files = bundle_files(graph, &operators, &plan)?;
-    let bytes = write_zip(files)?;
-    Ok(ExportBundle { plan, bytes })
+    Ok(build_plan(graph, &operators, target, binary_available))
 }
 
 fn used_operators<'a>(
@@ -133,7 +399,7 @@ fn build_plan(
         .filter(|tool| tool.state == ToolState::AdapterNeeded)
         .count();
     BundlePlan {
-        filename: format!("{}.somite.zip", safe_name(&target.project_name)),
+        filename: format!("{}.somite-run.zip", safe_name(&target.project_name)),
         platform: target.platform.clone(),
         channels: vec!["conda-forge".to_owned(), "bioconda".to_owned()],
         packages: packages.into_iter().collect(),
@@ -183,7 +449,7 @@ fn tool_requirement(
             binary: None,
             packages: Vec::new(),
             state: ToolState::AdapterNeeded,
-            detail: "Imported workflow structure; convert this component to a native Somite tool before standalone execution.".to_owned(),
+            detail: "Imported workflow structure; convert this component to a reviewed Somite operator before standalone execution.".to_owned(),
         };
     }
     if operator.kind == OpKind::Inprocess {
@@ -222,46 +488,6 @@ fn tool_requirement(
     }
 }
 
-fn bundle_files(
-    graph: &Graph,
-    operators: &[&Operator],
-    plan: &BundlePlan,
-) -> Result<BTreeMap<String, Vec<u8>>, BundleError> {
-    let mut files = BTreeMap::new();
-    files.insert(
-        "workflow.somite.json".to_owned(),
-        serde_json::to_vec_pretty(graph)?,
-    );
-    files.insert(
-        "toolchain/tools.json".to_owned(),
-        serde_json::to_vec_pretty(plan)?,
-    );
-    files.insert(
-        "toolchain/pixi.toml".to_owned(),
-        pixi_manifest("somite-workflow", &plan.platform, operators.iter().copied()).into_bytes(),
-    );
-    files.insert("README.md".to_owned(), bundle_readme(plan).into_bytes());
-    files.insert("run.sh".to_owned(), run_script().as_bytes().to_vec());
-    for operator in operators {
-        files.insert(
-            format!("operators/{}.json", operator.id),
-            serde_json::to_vec_pretty(operator)?,
-        );
-    }
-    Ok(files)
-}
-
-fn bundle_readme(plan: &BundlePlan) -> String {
-    format!(
-        "# Somite portable workflow\n\nThis bundle contains the graph, exact operator schemas, and one Pixi toolchain.\n\n1. Install Pixi once.\n2. Run `./run.sh` with the Somite CLI installed.\n3. Keep the generated `toolchain/pixi.lock` with this bundle to freeze exact builds.\n\n`pixi run` resolves, installs, locks, and activates every declared workflow tool automatically.\n\nReady/built-in tools: {}. Installable tools: {}. Tools needing an adapter: {}.\nSee `toolchain/tools.json` for every requirement.\n",
-        plan.ready_count, plan.installable_count, plan.adapter_count
-    )
-}
-
-fn run_script() -> &'static str {
-    "#!/usr/bin/env bash\nset -euo pipefail\ncommand -v pixi >/dev/null || { echo 'Pixi is required: https://pixi.sh' >&2; exit 1; }\ncommand -v somite >/dev/null || { echo 'Somite CLI is required' >&2; exit 1; }\nexec somite cook workflow.somite.json\n"
-}
-
 fn safe_name(name: &str) -> String {
     let safe = name
         .chars()
@@ -289,12 +515,7 @@ fn write_zip(files: BTreeMap<String, Vec<u8>>) -> Result<Vec<u8>, BundleError> {
         .compression_method(CompressionMethod::Stored)
         .unix_permissions(0o644);
     for (name, contents) in files {
-        let file_options = if name == "run.sh" {
-            options.unix_permissions(0o755)
-        } else {
-            options
-        };
-        archive.start_file(name, file_options)?;
+        archive.start_file(name, options)?;
         archive.write_all(&contents)?;
     }
     Ok(archive.finish()?.into_inner())
@@ -302,9 +523,7 @@ fn write_zip(files: BTreeMap<String, Vec<u8>>) -> Result<Vec<u8>, BundleError> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
-
-    use somite_ir::{Direction, Layout, Node, Port, PortType, SCHEMA_VERSION};
+    use somite_ir::{Layout, Node, SCHEMA_VERSION};
     use somite_ops::Operator;
     use zip::ZipArchive;
 
@@ -314,17 +533,12 @@ mod tests {
         serde_json::from_str(raw).expect("operator fixture")
     }
 
-    fn node(id: &str, op: &str) -> Node {
+    fn node(id: &str, op: &Operator) -> Node {
         Node {
             id: id.to_owned(),
-            operator: op.to_owned(),
-            ports: vec![Port {
-                name: "out".to_owned(),
-                dir: Direction::Out,
-                ty: PortType::Directory,
-                union: Vec::new(),
-                optional: true,
-            }],
+            operator: op.id.clone(),
+            operator_revision: op.revision().expect("operator revision"),
+            ports: op.ir_ports(),
             params: BTreeMap::new(),
             layout: Layout { x: 0.0, y: 0.0 },
             note: None,
@@ -332,49 +546,69 @@ mod tests {
     }
 
     #[test]
-    fn bundle_contains_graph_operators_and_one_pixi_environment() {
-        let fastqc = operator(
-            r#"{"id":"qc.fastqc","title":"FastQC","palette":[],"kind":"external","bin":"fastqc","pixi":["bioconda::fastqc"],"ports":{"out":[{"name":"out","type":"Directory","optional":true}]}}"#,
+    fn frozen_package_and_archive_share_one_complete_nextflow_path() {
+        let echo = operator(
+            r#"{"id":"test.echo","title":"Echo","palette":[],"kind":"external","bin":"echo","pixi":["coreutils"],"ports":{},"argv":["hello"]}"#,
         );
         let mut catalog = Catalog::default();
-        catalog.ops.insert(fastqc.id.clone(), fastqc);
+        catalog.ops.insert(echo.id.clone(), echo.clone());
         let graph = Graph {
             schema_version: SCHEMA_VERSION,
-            nodes: vec![node("fastqc1", "qc.fastqc")],
+            nodes: vec![node("echo1", &echo)],
             edges: Vec::new(),
         };
-        let bundle = build_bundle(
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let destination = temporary.path().join("frozen");
+        let package = create_frozen_package_with_lock(
             &graph,
             &catalog,
             &ExportTarget::new("RNA seq", "linux-64"),
+            &destination,
             |_| false,
+            |_| Ok(b"version: 6\n".to_vec()),
         )
-        .expect("bundle");
-        assert_eq!(bundle.plan.filename, "RNA-seq.somite.zip");
-        assert_eq!(bundle.plan.installable_count, 1);
-        let mut zip = ZipArchive::new(Cursor::new(bundle.bytes)).expect("zip");
+        .expect("frozen package");
+        assert_eq!(package.plan.filename, "RNA-seq.somite-run.zip");
+        assert_eq!(package.plan.installable_count, 1);
+        assert!(package.closure.closure_digest.starts_with("blake3:"));
         for name in [
+            "main.nf",
+            "nextflow.config",
+            "params.json",
+            "node-map.json",
+            "pixi.toml",
+            "pixi.lock",
             "workflow.somite.json",
-            "operators/qc.fastqc.json",
-            "toolchain/pixi.toml",
+            "run-closure.json",
+            "evidence/index.json",
+            "operators/test.echo.json",
+        ] {
+            assert!(destination.join(name).is_file(), "missing {name}");
+        }
+
+        let bytes = archive_frozen_package(&package).expect("archive");
+        let mut zip = ZipArchive::new(Cursor::new(bytes)).expect("zip");
+        for name in [
+            "main.nf",
+            "pixi.lock",
+            "run-closure.json",
+            "workflow.somite.json",
+            "operators/test.echo.json",
             "toolchain/tools.json",
-            "run.sh",
         ] {
             assert!(zip.by_name(name).is_ok(), "missing {name}");
         }
-        let mut pixi = String::new();
-        zip.by_name("toolchain/pixi.toml")
-            .expect("pixi manifest")
-            .read_to_string(&mut pixi)
-            .expect("read pixi manifest");
-        assert!(pixi.contains("\"fastqc\" = { version = \"*\", channel = \"bioconda\" }"));
-        let mut launcher = String::new();
-        zip.by_name("run.sh")
-            .expect("launcher")
-            .read_to_string(&mut launcher)
-            .expect("read launcher");
-        assert!(launcher.contains("exec somite cook workflow.somite.json"));
-        assert!(!launcher.contains("pixi run"));
+        assert!(zip.by_name("run.sh").is_err());
+
+        let duplicate = create_frozen_package_with_lock(
+            &graph,
+            &catalog,
+            &ExportTarget::new("RNA seq", "linux-64"),
+            &destination,
+            |_| false,
+            |_| Ok(b"version: 6\n".to_vec()),
+        );
+        assert!(matches!(duplicate, Err(BundleError::DestinationExists(_))));
     }
 
     #[test]
@@ -383,8 +617,8 @@ mod tests {
             r#"{"id":"gap.missing","title":"Needs tool adapter","palette":[],"kind":"inprocess","ports":{"out":[{"name":"out","type":"Directory","optional":true}]},"params":{"tool":{"type":"string"}}}"#,
         );
         let mut catalog = Catalog::default();
-        catalog.ops.insert(gap.id.clone(), gap);
-        let mut gap_node = node("gap1", "gap.missing");
+        catalog.ops.insert(gap.id.clone(), gap.clone());
+        let mut gap_node = node("gap1", &gap);
         gap_node.params.insert(
             "tool".to_owned(),
             ParamValue::String("Trimmomatic".to_owned()),
@@ -394,15 +628,15 @@ mod tests {
             nodes: vec![gap_node],
             edges: Vec::new(),
         };
-        let bundle = build_bundle(
+        let plan = plan_frozen_package(
             &graph,
             &catalog,
             &ExportTarget::new("paper", "linux-64"),
             |_| true,
         )
-        .expect("bundle");
-        assert_eq!(bundle.plan.adapter_count, 1);
-        assert_eq!(bundle.plan.tools[0].state, ToolState::AdapterNeeded);
-        assert_eq!(bundle.plan.tools[0].title, "Trimmomatic");
+        .expect("plan");
+        assert_eq!(plan.adapter_count, 1);
+        assert_eq!(plan.tools[0].state, ToolState::AdapterNeeded);
+        assert_eq!(plan.tools[0].title, "Trimmomatic");
     }
 }

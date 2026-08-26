@@ -153,7 +153,10 @@ fn sra_result(record: &Value) -> Option<SearchResult> {
         description: format!("{organism} · {strategy}"),
         provider: "NCBI SRA".to_owned(),
         data_kind: "Reads".to_owned(),
-        tags: vec![strategy, if paired { "Paired" } else { "Single" }.to_owned()],
+        tags: vec![
+            strategy,
+            if paired { "Paired" } else { "Single" }.to_owned(),
+        ],
         request: SourceRequest {
             kind: "sra".to_owned(),
             value: accession,
@@ -184,8 +187,8 @@ fn assembly_result(record: &Value) -> Option<SearchResult> {
 
 fn ensembl_genome_result(record: &Value) -> Option<SearchResult> {
     let accession = string_field(record, "assembly_accession")?;
-    let display = string_field(record, "display_name")
-        .or_else(|| string_field(record, "scientific_name"))?;
+    let display =
+        string_field(record, "display_name").or_else(|| string_field(record, "scientific_name"))?;
     let assembly = string_field(record, "assembly_name").unwrap_or_else(|| accession.clone());
     let genebuild = string_field(record, "genebuild").unwrap_or_else(|| "Ensembl".to_owned());
     Some(SearchResult {
@@ -204,8 +207,8 @@ fn ensembl_feature_result(record: &Value) -> Option<SearchResult> {
     let accession = string_field(record, "id")?;
     let object_type = string_field(record, "object_type").unwrap_or_else(|| "Gene".to_owned());
     let title = string_field(record, "display_name").unwrap_or_else(|| accession.clone());
-    let description = string_field(record, "description")
-        .unwrap_or_else(|| format!("Ensembl {object_type}"));
+    let description =
+        string_field(record, "description").unwrap_or_else(|| format!("Ensembl {object_type}"));
     let lower = object_type.to_ascii_lowercase();
     let (kind, sequence_type, data_kind) = if lower.contains("transcript") {
         ("ensembl-transcript", "cdna", "Transcript")
@@ -247,8 +250,17 @@ fn assembly_request(accession: String, provider: &str) -> SourceRequest {
 fn ncbi_term(query: &str) -> String {
     let lower = query.to_ascii_lowercase();
     let assay_words = [
-        "rna", "seq", "wgs", "liver", "cancer", "tumor", "illumina", "nanopore", "chip",
-        "atac", "single cell",
+        "rna",
+        "seq",
+        "wgs",
+        "liver",
+        "cancer",
+        "tumor",
+        "illumina",
+        "nanopore",
+        "chip",
+        "atac",
+        "single cell",
     ];
     if query
         .chars()
@@ -265,13 +277,17 @@ fn gene_query(query: &str) -> Option<(String, String)> {
     let parts = query.split_whitespace().collect::<Vec<_>>();
     match parts.as_slice() {
         [symbol]
-            if symbol.chars().any(|character| character.is_ascii_uppercase())
+            if symbol
+                .chars()
+                .any(|character| character.is_ascii_uppercase())
                 || symbol.chars().any(|character| character.is_ascii_digit()) =>
         {
             Some(("human".to_owned(), symbol.to_ascii_uppercase()))
         }
         [species @ .., symbol]
-            if symbol.chars().any(|character| character.is_ascii_uppercase())
+            if symbol
+                .chars()
+                .any(|character| character.is_ascii_uppercase())
                 || symbol.chars().any(|character| character.is_ascii_digit()) =>
         {
             Some((species.join("_"), symbol.to_ascii_uppercase()))
@@ -281,7 +297,11 @@ fn gene_query(query: &str) -> Option<(String, String)> {
 }
 
 fn string_field(record: &Value, field: &str) -> Option<String> {
-    record.get(field)?.as_str().filter(|value| !value.is_empty()).map(str::to_owned)
+    record
+        .get(field)?
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn curl_json(url: &str, timeout_seconds: u64) -> Result<String, String> {

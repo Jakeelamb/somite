@@ -8,6 +8,19 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let mut arguments = env::args().skip(1);
+    if arguments.next().as_deref() == Some("mcp") {
+        let flag = arguments.next().context("mcp requires --server-url")?;
+        anyhow::ensure!(flag == "--server-url", "mcp requires --server-url");
+        let server_url = arguments
+            .next()
+            .context("mcp requires a local server URL")?;
+        anyhow::ensure!(arguments.next().is_none(), "unexpected mcp arguments");
+        let runtime_capability = env::var("SOMITE_MCP_RUNTIME_CAPABILITY")
+            .context("mcp requires SOMITE_MCP_RUNTIME_CAPABILITY")?;
+        return somite_server::serve_mcp_stdio(server_url, runtime_capability).await;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()

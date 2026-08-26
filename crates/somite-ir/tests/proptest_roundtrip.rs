@@ -1,5 +1,5 @@
-use somite_ir::{Direction, Graph, Layout, Node, Port, PortType, SCHEMA_VERSION};
 use proptest::prelude::*;
+use somite_ir::{Direction, Graph, Layout, Node, Port, PortType, SCHEMA_VERSION};
 
 proptest! {
     #[test]
@@ -8,6 +8,7 @@ proptest! {
             .map(|i| Node {
                 id: format!("n_{i:032x}"),
                 operator: "files.import".into(),
+                operator_revision: "test-revision".into(),
                 ports: vec![Port {
                     name: "out".into(),
                     dir: Direction::Out,

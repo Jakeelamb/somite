@@ -3,7 +3,7 @@ name = "somite-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "somite cook / app"
+description = "Somite compiler and development oracle"
 default-run = "somite"
 
 [[bin]]
@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 somite-ir = { path = "../somite-ir" }
 somite-ops = { path = "../somite-ops" }
-somite-nextflow = { path = "../somite-nextflow" }
+somite-bundle = { path = "../somite-bundle" }
 somite-cook = { path = "../somite-cook" }
 somite-paper = { path = "../somite-paper" }
 serde_json = "1"

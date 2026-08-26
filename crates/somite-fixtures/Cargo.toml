@@ -1,0 +1,16 @@
+[package]
+name = "somite-fixtures"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Content-addressed representative validation fixtures for Somite"
+
+[dependencies]
+somite-ir = { path = "../somite-ir" }
+somite-linker = { path = "../somite-linker" }
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

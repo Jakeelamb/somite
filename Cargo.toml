@@ -4,6 +4,8 @@ members = [
     "crates/somite-ir",
     "crates/somite-ops",
     "crates/somite-nextflow",
+    "crates/somite-linker",
+    "crates/somite-fixtures",
     "crates/somite-cook",
     "crates/somite-paper",
     "crates/somite-cli",

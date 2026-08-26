@@ -23,6 +23,7 @@ import {
 } from "@xyflow/react";
 import {
   Check,
+  Bot,
   CloudUpload,
   Cpu,
   Eye,
@@ -36,6 +37,8 @@ import {
   Play,
   Redo2,
   Save,
+  ShieldCheck,
+  Square,
   Sun,
   Undo2,
   Waypoints,
@@ -52,6 +55,7 @@ import React, {
   useState,
 } from "react";
 import {
+  AgentPanel,
   InspectorPanel,
   LibraryPanel,
   MachinePanel,
@@ -62,6 +66,8 @@ import {
 import type { SourceRequest } from "./sourceBuilder";
 import { continuationEdge, nextContinuationPosition, type PendingConnection } from "./graphInteractions";
 import type {
+  AgentDiscovery,
+  AgentSnapshot,
   SomiteEdge,
   SomiteGraph,
   SomiteGraphNode,
@@ -75,13 +81,18 @@ import type {
   PaperReview,
   ExportPlan,
   ProjectSession,
-  RunResponse,
+  RunNodeState,
+  RunStartResponse,
+  RunStatusResponse,
   SystemProfile,
   UploadResult,
+  ValidationEvidenceResponse,
   WorkflowGraphResponse,
 } from "./types";
 import { portColor } from "./visual";
+import { edgeLifecycleState, evidenceNodeState, semanticGraphKey } from "./validationState";
 import { SOMITE_SERVER, jsonRequest } from "./api";
+import { mergeAgentSnapshots, unseenAgentTransactions } from "./agentState";
 
 const SNAP: [number, number] = [20, 20];
 const HISTORY_LIMIT = 80;
@@ -94,10 +105,10 @@ type SomiteNodeData = Record<string, unknown> & {
   title: string;
   cost: "low" | "high";
   viewerHidden: boolean;
-  runState: "idle" | "running" | "cached" | "done" | "failed" | "skipped";
+  runState: "idle" | RunNodeState;
 };
 type SomiteFlowNode = Node<SomiteNodeData, "somite">;
-type SomiteFlowEdge = Edge<{ somite: SomiteEdge; portType: string }, "typed">;
+type SomiteFlowEdge = Edge<{ somite: SomiteEdge; portType: string; validationState: "idle" | RunNodeState }, "typed">;
 type History = { past: SomiteGraph[]; future: SomiteGraph[] };
 type Theme = "dark" | "light";
 type ContinueFromPort = (nodeId: string, port: SomitePort) => void;
@@ -209,7 +220,10 @@ function TypedEdgeBase({
   data,
 }: EdgeProps<SomiteFlowEdge>) {
   const [path] = getBezierPath({ sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, curvature: 0.42 });
-  return <BaseEdge path={path} markerEnd={markerEnd} style={{ stroke: portColor[data?.portType ?? ""] ?? "#8b949b", strokeWidth: selected ? 3 : 2.1, opacity: selected ? 1 : .82 }} />;
+  const state = data?.validationState ?? "idle";
+  const stroke = state === "done" || state === "cached" ? "var(--success)" : state === "failed" || state === "cancelled" ? "var(--danger)" : state === "running" || state === "queued" ? "var(--warning)" : state === "skipped" ? "var(--muted)" : portColor[data?.portType ?? ""] ?? "#8b949b";
+  const dash = state === "failed" || state === "cancelled" ? "7 4" : state === "running" || state === "queued" ? "5 5" : state === "skipped" ? "2 5" : undefined;
+  return <BaseEdge path={path} markerEnd={markerEnd} style={{ stroke, strokeDasharray: dash, strokeWidth: selected ? 3 : state === "done" || state === "cached" ? 2.6 : 2.1, opacity: selected ? 1 : state === "skipped" ? .48 : .86 }} />;
 }
 
 const TypedEdge = memo(TypedEdgeBase);
@@ -241,7 +255,7 @@ function flowEdge(edge: SomiteEdge, graphNodes: SomiteGraphNode[]): SomiteFlowEd
     targetHandle: edge.to_port,
     type: "typed",
     markerEnd: { type: MarkerType.ArrowClosed, width: 13, height: 13 },
-    data: { somite: edge, portType: edgePortType(edge, graphNodes) },
+    data: { somite: edge, portType: edgePortType(edge, graphNodes), validationState: "idle" },
   };
 }
 
@@ -266,7 +280,7 @@ function pairedCompanion(edge: SomiteEdge, graphNodes: SomiteGraphNode[]): Somit
 
 function somiteGraph(nodes: SomiteFlowNode[], edges: SomiteFlowEdge[]): SomiteGraph {
   return {
-    schema_version: 1,
+    schema_version: 2,
     nodes: nodes.map((node) => ({ ...node.data.graphNode, layout: { x: node.position.x, y: node.position.y } })),
     edges: edges.map((edge) => edge.data?.somite).filter((edge): edge is SomiteEdge => Boolean(edge)),
   };
@@ -289,6 +303,7 @@ function makeGraphNode(operator: Operator, id: string, position: { x: number; y:
   return {
     id,
     operator: operator.id,
+    operator_revision: operator.revision ?? "",
     ports: [
       ...operator.ports.in.map((port) => ({ name: port.name, dir: "in" as const, ty: port.type, ...(port.union?.length ? { union: port.union } : {}), ...(port.optional ? { optional: true } : {}) })),
       ...operator.ports.out.map((port) => ({ name: port.name, dir: "out" as const, ty: port.type, ...(port.union?.length ? { union: port.union } : {}), ...(port.optional ? { optional: true } : {}) })),
@@ -349,6 +364,10 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const [exportLoading, setExportLoading] = useState(false);
   const [exportDownloading, setExportDownloading] = useState(false);
   const [paperVisible, setPaperVisible] = useState(false);
+  const [agentVisible, setAgentVisible] = useState(false);
+  const [agentSnapshot, setAgentSnapshot] = useState<AgentSnapshot>({ connected: false, connecting: false, busy: false, config_options: [], cursor: 0, events: [] });
+  const [agentDiscovery, setAgentDiscovery] = useState<AgentDiscovery | null>(null);
+  const [agentDiscoveryLoading, setAgentDiscoveryLoading] = useState(false);
   const [paperReview, setPaperReview] = useState<PaperReview | null>(null);
   const [activePaperCandidate, setActivePaperCandidate] = useState(0);
   const [paperLoading, setPaperLoading] = useState(false);
@@ -362,7 +381,8 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const [dirty, setDirty] = useState(false);
   const [status, setStatus] = useState("Connecting to the local Somite engine…");
   const [saving, setSaving] = useState(false);
-  const [running, setRunning] = useState(false);
+  const [activeIntent, setActiveIntent] = useState<"run" | "validation" | null>(null);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [zoom, setZoom] = useState(1);
   const [theme, setTheme] = useState<Theme>("dark");
   const [snapGuides, setSnapGuides] = useState<{ x?: number; y?: number }>({});
@@ -374,6 +394,12 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const dragSnapshotRef = useRef<SomiteGraph | null>(null);
   const paramHistoryKeyRef = useRef<string | null>(null);
   const connectionStartRef = useRef<Pick<PendingConnection, "nodeId" | "port"> | null>(null);
+  const semanticKeyRef = useRef("");
+  const agentCursorRef = useRef(0);
+  const appliedAgentTransactionsRef = useRef(new Set<string>());
+  const previousSemanticKeyRef = useRef("");
+  const graphSnapshotRef = useRef<SomiteGraph>({ schema_version: 2, nodes: [], edges: [] });
+  const running = activeIntent !== null;
 
   const availableOperators = useMemo(() => {
     const operators = new Map<string, Operator>();
@@ -384,6 +410,38 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   }, [nfcoreCatalog, session, snakemakeCatalog]);
   const operatorMap = useMemo(() => new Map(availableOperators.map((operator) => [operator.id, operator])), [availableOperators]);
   const snapshot = useCallback(() => somiteGraph(nodes, edges), [edges, nodes]);
+  const semanticKey = useMemo(() => semanticGraphKey(somiteGraph(nodes, edges)), [edges, nodes]);
+  semanticKeyRef.current = semanticKey;
+  graphSnapshotRef.current = somiteGraph(nodes, edges);
+
+  useEffect(() => {
+    const previous = previousSemanticKeyRef.current;
+    previousSemanticKeyRef.current = semanticKey;
+    if (!previous || previous === semanticKey) return;
+    setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, runState: "idle" } })));
+    setEdges((current) => current.map((edge) => ({ ...edge, animated: false, data: edge.data ? { ...edge.data, validationState: "idle" } : edge.data })));
+  }, [semanticKey, setEdges, setNodes]);
+
+  useEffect(() => {
+    if (!session || activeIntent) return;
+    const requestedKey = semanticKey;
+    const graph = graphSnapshotRef.current;
+    const timeout = window.setTimeout(() => {
+      void jsonRequest<ValidationEvidenceResponse>("/api/validations/status", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(graph) })
+        .then((evidence) => {
+          if (semanticKeyRef.current !== requestedKey || !evidence.receipt) return;
+          const nodeStates = Object.fromEntries(Object.entries(evidence.receipt.node_results).map(([node, result]) => [node, evidenceNodeState(result)])) as Record<string, RunNodeState>;
+          setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, runState: nodeStates[node.id] ?? "idle" } })));
+          setEdges((current) => current.map((edge) => {
+            const result = evidence.receipt?.edge_results[edge.id];
+            const validationState = result ? evidenceNodeState(result) : "idle";
+            return { ...edge, data: edge.data ? { ...edge.data, validationState } : edge.data };
+          }));
+        })
+        .catch(() => undefined);
+    }, 240);
+    return () => window.clearTimeout(timeout);
+  }, [activeIntent, semanticKey, session, setEdges, setNodes]);
 
   const remember = useCallback((graph = snapshot()) => {
     setHistory((current) => ({ past: [...current.past.slice(-(HISTORY_LIMIT - 1)), graph], future: [] }));
@@ -397,6 +455,60 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     setSelectedIds([]);
     setDirty(true);
   }, [nodes, operatorMap, setEdges, setNodes]);
+
+  const mergeAgentSnapshot = useCallback((incoming: AgentSnapshot) => {
+    agentCursorRef.current = Math.max(agentCursorRef.current, incoming.cursor);
+    setAgentSnapshot((current) => mergeAgentSnapshots(current, incoming));
+  }, []);
+
+  const refreshAgentDiscovery = useCallback(async () => {
+    setAgentDiscoveryLoading(true);
+    try {
+      setAgentDiscovery(await jsonRequest<AgentDiscovery>("/api/agent/discover"));
+    } catch (error) {
+      setStatus(`Agent scan failed — ${errorMessage(error)}`);
+    } finally {
+      setAgentDiscoveryLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!session || (!agentVisible && !agentSnapshot.connected && !agentSnapshot.connecting)) return;
+    let stopped = false;
+    const poll = async () => {
+      try {
+        const incoming = await jsonRequest<AgentSnapshot>(`/api/agent/events?after=${agentCursorRef.current}`);
+        if (stopped) return;
+        const transactions = unseenAgentTransactions(incoming.events, appliedAgentTransactionsRef.current);
+        if (transactions.length) {
+          const precedingGraphs: SomiteGraph[] = [];
+          let nextGraph = graphSnapshotRef.current;
+          for (const transaction of transactions) {
+            precedingGraphs.push(nextGraph);
+            nextGraph = transaction.graph;
+          }
+          setHistory((current) => ({
+            past: [...current.past, ...precedingGraphs].slice(-HISTORY_LIMIT),
+            future: [],
+          }));
+          restoreGraph(nextGraph);
+          const last = transactions.at(-1)!;
+          setStatus(transactions.length === 1
+            ? `Agent applied “${last.summary}” · Undo available`
+            : `Agent applied ${transactions.length} transactions · Undo each from the history`);
+        }
+        for (const transaction of transactions) {
+          appliedAgentTransactionsRef.current.add(transaction.transaction_id);
+        }
+        mergeAgentSnapshot(incoming);
+      } catch {
+        // The agent boundary is optional; normal canvas work remains available.
+      }
+    };
+    void poll();
+    const interval = window.setInterval(() => void poll(), 450);
+    return () => { stopped = true; window.clearInterval(interval); };
+  }, [agentSnapshot.connected, agentSnapshot.connecting, agentVisible, mergeAgentSnapshot, restoreGraph, session]);
 
   const undo = useCallback(() => {
     const previous = history.past.at(-1);
@@ -440,6 +552,8 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       .then((loaded) => {
         const operators = new Map(loaded.operators.map((operator) => [operator.id, operator]));
         setSession(loaded);
+        agentCursorRef.current = loaded.agent_cursor;
+        setAgentSnapshot((current) => ({ ...current, cursor: loaded.agent_cursor }));
         setNodes(loaded.graph.nodes.map((node) => flowNode(node, operators)));
         setEdges((loaded.graph.edges ?? []).map((edge) => flowEdge(edge, loaded.graph.nodes)));
         setStatus(loaded.recovered_autosave ? "Recovered the last autosave" : "Tab add · drag ports to wire · space-drag pan · F fit");
@@ -456,6 +570,86 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   // Loading must happen exactly once or a setter identity change can turn the
   // project bootstrap into a fetch -> set state -> fetch render loop.
   // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const connectAgent = useCallback(async (command: string) => {
+    try {
+      const connected = await jsonRequest<AgentSnapshot>("/api/agent/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ command }),
+      });
+      mergeAgentSnapshot(connected);
+      setStatus("Connecting your ACP agent…");
+    } catch (error) {
+      setStatus(`Agent connection failed — ${errorMessage(error)}`);
+    }
+  }, [mergeAgentSnapshot]);
+
+  const promptAgent = useCallback(async (message: string) => {
+    try {
+      await jsonRequest<void>("/api/agent/prompt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message, graph: graphSnapshotRef.current }),
+      });
+      setAgentSnapshot((current) => ({ ...current, busy: true }));
+      setStatus("Agent is working with the Somite tools…");
+    } catch (error) {
+      setStatus(`Agent prompt failed — ${errorMessage(error)}`);
+      throw error;
+    }
+  }, []);
+
+  const configureAgent = useCallback(async (configId: string, value: string | boolean) => {
+    try {
+      const configured = await jsonRequest<AgentSnapshot>("/api/agent/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ config_id: configId, value }),
+      });
+      mergeAgentSnapshot(configured);
+      setStatus("Agent configuration updated");
+    } catch (error) {
+      setStatus(`Agent configuration failed — ${errorMessage(error)}`);
+    }
+  }, [mergeAgentSnapshot]);
+
+  const cancelAgent = useCallback(async () => {
+    try {
+      await jsonRequest<void>("/api/agent/cancel", { method: "POST" });
+      setStatus("Cancelling the agent turn…");
+    } catch (error) {
+      setStatus(`Could not cancel agent — ${errorMessage(error)}`);
+    }
+  }, []);
+
+  const disconnectAgent = useCallback(async () => {
+    try {
+      await jsonRequest<void>("/api/agent/disconnect", { method: "POST" });
+      setStatus("Disconnecting the ACP agent…");
+    } catch (error) {
+      setStatus(`Could not disconnect agent — ${errorMessage(error)}`);
+    }
+  }, []);
+
+  const answerAgentPermission = useCallback(async (permissionId: string, optionId?: string) => {
+    try {
+      await jsonRequest<void>(`/api/agent/permissions/${encodeURIComponent(permissionId)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ option_id: optionId }),
+      });
+      setAgentSnapshot((current) => ({
+        ...current,
+        events: current.events.map((event) => event.permission_id === permissionId
+          ? { ...event, permission_choices: [], status: optionId ? "answered" : "cancelled" }
+          : event),
+      }));
+      setStatus(optionId ? "Agent permission answered" : "Agent action cancelled");
+    } catch (error) {
+      setStatus(`Permission response failed — ${errorMessage(error)}`);
+    }
   }, []);
 
   useEffect(() => {
@@ -530,6 +724,61 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     window.setTimeout(() => searchInputRef.current?.focus(), 0);
   }, [edges, nodes]);
 
+  const insertImportedGraph = useCallback((imported: WorkflowGraphResponse, target: { x: number; y: number }, title: string, recentId?: string) => {
+    remember();
+    const occupied = new Set(nodes.map((node) => node.id));
+    const idMap = new Map<string, string>();
+    for (const source of imported.graph.nodes) {
+      let id = source.id;
+      let suffix = 2;
+      while (occupied.has(id)) id = `${source.id}-${suffix++}`;
+      occupied.add(id);
+      idMap.set(source.id, id);
+    }
+    const minX = Math.min(...imported.graph.nodes.map((node) => node.layout.x));
+    const minY = Math.min(...imported.graph.nodes.map((node) => node.layout.y));
+    const created = imported.graph.nodes.map((source) => ({
+      ...source,
+      id: idMap.get(source.id) ?? source.id,
+      layout: { x: target.x + source.layout.x - minX, y: target.y + source.layout.y - minY },
+    }));
+    const createdEdges = imported.graph.edges.map((edge, index) => ({
+      ...edge,
+      id: `e-${idMap.get(edge.from_node)}-out-${idMap.get(edge.to_node)}-in-${index}`,
+      from_node: idMap.get(edge.from_node) ?? edge.from_node,
+      to_node: idMap.get(edge.to_node) ?? edge.to_node,
+    }));
+    const graphNodes = [...nodes.map((node) => node.data.graphNode), ...created];
+    const createdFlowNodes = created.map((node) => flowNode(node, operatorMap, true));
+    setNodes((current) => [...current.map((node) => ({ ...node, selected: false })), ...createdFlowNodes]);
+    setEdges((current) => [...current, ...createdEdges.map((edge) => flowEdge(edge, graphNodes))]);
+    setSelectedIds([]);
+    if (recentId) setRecent((current) => [recentId, ...current.filter((value) => value !== recentId)].slice(0, 6));
+    setLibraryVisible(false);
+    setPendingAddPosition(null);
+    setPendingConnection(null);
+    setDirty(true);
+    setStatus(`${title} · ${created.length} rules · ${createdEdges.length} dependencies`);
+    window.setTimeout(() => void flow?.fitView({ nodes: createdFlowNodes, padding: 0.16, duration: 520, maxZoom: 0.9 }), 0);
+  }, [flow, nodes, operatorMap, remember, setEdges, setNodes]);
+
+  const importLocalSnakemake = useCallback(async (path: string, targets: string[]) => {
+    const target = pendingAddPosition ?? canvasCenter();
+    setStatus(`Reading ${path} with Snakemake…`);
+    try {
+      const imported = await jsonRequest<WorkflowGraphResponse>("/api/workflows/snakemake/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path, targets }),
+      });
+      const label = path.split("/").filter(Boolean).at(-1) ?? "Local Snakemake workflow";
+      insertImportedGraph(imported, target, `Opened ${label} ${imported.revision}`);
+    } catch (error) {
+      setStatus(`Could not open local Snakemake workflow — ${errorMessage(error)}`);
+      throw error;
+    }
+  }, [canvasCenter, insertImportedGraph, pendingAddPosition]);
+
   const addOperator = useCallback((operator: Operator, position?: { x: number; y: number }, params?: Record<string, ParamValue>) => {
     if (operator.palette.includes("Catalog")) {
       const revision = operator.params.revision?.default;
@@ -556,40 +805,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ workflow, revision }),
       }).then((imported) => {
-        remember();
-        const occupied = new Set(nodes.map((node) => node.id));
-        const idMap = new Map<string, string>();
-        for (const source of imported.graph.nodes) {
-          let id = source.id;
-          let suffix = 2;
-          while (occupied.has(id)) id = `${source.id}-${suffix++}`;
-          occupied.add(id);
-          idMap.set(source.id, id);
-        }
-        const minX = Math.min(...imported.graph.nodes.map((node) => node.layout.x));
-        const minY = Math.min(...imported.graph.nodes.map((node) => node.layout.y));
-        const created = imported.graph.nodes.map((source) => ({
-          ...source,
-          id: idMap.get(source.id) ?? source.id,
-          layout: { x: target.x + source.layout.x - minX, y: target.y + source.layout.y - minY },
-        }));
-        const createdEdges = imported.graph.edges.map((edge, index) => ({
-          ...edge,
-          id: `e-${idMap.get(edge.from_node)}-out-${idMap.get(edge.to_node)}-in-${index}`,
-          from_node: idMap.get(edge.from_node) ?? edge.from_node,
-          to_node: idMap.get(edge.to_node) ?? edge.to_node,
-        }));
-        const graphNodes = [...nodes.map((node) => node.data.graphNode), ...created];
-        const createdFlowNodes = created.map((node) => flowNode(node, operatorMap, true));
-        setNodes((current) => [...current.map((node) => ({ ...node, selected: false })), ...createdFlowNodes]);
-        setEdges((current) => [...current, ...createdEdges.map((edge) => flowEdge(edge, graphNodes))]);
-        setSelectedIds([]);
-        setRecent((current) => [operator.id, ...current.filter((value) => value !== operator.id)].slice(0, 6));
-        setLibraryVisible(false);
-        setPendingAddPosition(null);
-        setDirty(true);
-        setStatus(`Expanded ${operator.title} ${revision} · ${created.length} processes · ${createdEdges.length} dependencies${imported.cached ? " · cached" : ""}`);
-        window.setTimeout(() => void flow?.fitView({ nodes: createdFlowNodes, padding: 0.16, duration: 520, maxZoom: 0.9 }), 0);
+        insertImportedGraph(imported, target, `Expanded ${operator.title} ${revision}${imported.cached ? " · cached" : ""}`, operator.id);
       }).catch((error) => setStatus(`Could not expand ${operator.title} — ${errorMessage(error)}`));
       return;
     }
@@ -613,7 +829,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     if (connected) setLibraryVisible(false);
     setDirty(true);
     setStatus(connected ? `${id} connected${companion ? " · paired R1 + R2" : ""}` : `Dropped ${id}`);
-  }, [canvasCenter, edges, flow, nodes, operatorMap, pendingAddPosition, pendingConnection, remember, setEdges, setNodes]);
+  }, [canvasCenter, edges, insertImportedGraph, nodes, operatorMap, pendingAddPosition, pendingConnection, remember, setEdges, setNodes]);
 
   const addSource = useCallback((request: SourceRequest) => {
     const center = canvasCenter();
@@ -833,6 +1049,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     }
     setToolchainVisible(true);
     setMachineVisible(false);
+    setAgentVisible(false);
     setLibraryVisible(false);
     setPaperVisible(false);
     setPendingConnection(null);
@@ -851,7 +1068,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
 
   const downloadBundle = useCallback(async () => {
     setExportDownloading(true);
-    setStatus("Building portable run bundle…");
+    setStatus("Freezing the Pixi/Nextflow run project…");
     try {
       const response = await fetch(`${SOMITE_SERVER}/api/export`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(snapshot()) });
       if (!response.ok) {
@@ -862,7 +1079,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;
-      anchor.download = exportPlan?.filename ?? `${session?.project_name ?? "somite-workflow"}.somite.zip`;
+      anchor.download = exportPlan?.filename ?? `${session?.project_name ?? "somite-workflow"}.somite-run.zip`;
       anchor.click();
       URL.revokeObjectURL(url);
       setStatus(`Exported ${anchor.download} · ${exportPlan?.tools.length ?? 0} tool contracts`);
@@ -873,27 +1090,66 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     }
   }, [exportPlan, session, snapshot]);
 
-  const runGraph = useCallback(async () => {
+  const executeGraph = useCallback(async (intent: "run" | "validation") => {
     if (running) return;
-    setRunning(true);
-    setStatus("Running workflow…");
-    setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, runState: "running" } })));
-    setEdges((current) => current.map((edge) => ({ ...edge, animated: true })));
+    const requestedKey = semanticKey;
+    const graph = snapshot();
+    setActiveIntent(intent);
+    setStatus(intent === "validation" ? "Binding representative FASTQ fixtures…" : "Freezing the exact Pixi environment…");
+    setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, runState: "queued" } })));
+    setEdges((current) => current.map((edge) => ({ ...edge, animated: true, data: intent === "validation" && edge.data ? { ...edge.data, validationState: "queued" } : edge.data })));
     try {
-      const report = await jsonRequest<RunResponse>("/api/run", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(snapshot()) });
-      setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, runState: report.states[node.id] ?? "idle" } })));
+      const endpoint = intent === "validation" ? "/api/validations" : "/api/runs";
+      const started = await jsonRequest<RunStartResponse>(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(graph) });
+      setActiveRunId(started.run_id);
+      let report: RunStatusResponse;
+      do {
+        await new Promise((resolve) => window.setTimeout(resolve, 350));
+        report = await jsonRequest<RunStatusResponse>(`/api/runs/${encodeURIComponent(started.run_id)}`);
+        if (semanticKeyRef.current !== requestedKey) {
+          await jsonRequest<RunStatusResponse>(`/api/runs/${encodeURIComponent(started.run_id)}/cancel`, { method: "POST" }).catch(() => undefined);
+          setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, runState: "idle" } })));
+          setEdges((current) => current.map((edge) => ({ ...edge, animated: false, data: edge.data ? { ...edge.data, validationState: "idle" } : edge.data })));
+          setStatus("Graph changed · stale execution stopped and evidence invalidated");
+          return;
+        }
+        setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, runState: report.states[node.id] ?? node.data.runState } })));
+        if (intent === "validation") setEdges((current) => current.map((edge) => ({ ...edge, data: edge.data ? { ...edge.data, validationState: edgeLifecycleState(edge.data.somite, report.states) } : edge.data })));
+        const counts = Object.values(report.states).reduce<Record<string, number>>((result, state) => ({ ...result, [state]: (result[state] ?? 0) + 1 }), {});
+        if (report.phase === "preparing") setStatus(intent === "validation" ? "Freezing the fixture-bound validation closure…" : "Freezing the exact Pixi environment…");
+        else if (report.phase === "running") setStatus(`${intent === "validation" ? "Validating" : "Nextflow running"} · ${counts.done ?? 0} done · ${counts.running ?? 0} active · ${counts.queued ?? 0} queued`);
+        else if (report.phase === "finalizing") setStatus("Recording scoped evidence receipt…");
+        else if (report.phase === "cancelling") setStatus("Stopping Nextflow…");
+      } while (!(["completed", "failed", "cancelled"] as const).includes(report.phase as "completed" | "failed" | "cancelled"));
+
       const counts = Object.values(report.states).reduce<Record<string, number>>((result, state) => ({ ...result, [state]: (result[state] ?? 0) + 1 }), {});
-      const errors = Object.entries(report.errors);
-      if (errors.length) setStatus(`Run finished with ${errors.length} error${errors.length === 1 ? "" : "s"} · ${errors[0][0]}: ${errors[0][1]}`);
-      else setStatus(`Run complete · ${counts.done ?? 0} done · ${counts.cached ?? 0} cached · ${counts.skipped ?? 0} skipped`);
+      if (report.phase === "completed" && intent === "validation") setStatus(`Validated with ${report.evidence_receipt?.fixture_digests.length ?? 0} fixture${report.evidence_receipt?.fixture_digests.length === 1 ? "" : "s"} · ${counts.done ?? 0} nodes passed`);
+      else if (report.phase === "completed") setStatus(`Run complete · ${counts.done ?? 0} done · ${counts.cached ?? 0} cached`);
+      else if (report.phase === "cancelled") setStatus(`${intent === "validation" ? "Validation" : "Run"} cancelled`);
+      else setStatus(`${intent === "validation" ? "Validation" : "Run"} failed — ${report.error?.split("\n").at(-1) ?? `exit ${report.exit_code ?? "unknown"}`}`);
     } catch (error) {
       setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, runState: "failed" } })));
-      setStatus(`Run failed — ${errorMessage(error)}`);
+      if (intent === "validation") setEdges((current) => current.map((edge) => ({ ...edge, data: edge.data ? { ...edge.data, validationState: "failed" } : edge.data })));
+      setStatus(`${intent === "validation" ? "Validation" : "Run"} failed — ${errorMessage(error)}`);
     } finally {
       setEdges((current) => current.map((edge) => ({ ...edge, animated: false })));
-      setRunning(false);
+      setActiveRunId(null);
+      setActiveIntent(null);
     }
-  }, [running, setEdges, setNodes, snapshot]);
+  }, [running, semanticKey, setEdges, setNodes, snapshot]);
+
+  const runGraph = useCallback(() => executeGraph("run"), [executeGraph]);
+  const validateGraphWithFixtures = useCallback(() => executeGraph("validation"), [executeGraph]);
+
+  const cancelRun = useCallback(async () => {
+    if (!activeRunId) return;
+    setStatus("Stopping Nextflow…");
+    try {
+      await jsonRequest<RunStatusResponse>(`/api/runs/${encodeURIComponent(activeRunId)}/cancel`, { method: "POST" });
+    } catch (error) {
+      setStatus(`Could not cancel run — ${errorMessage(error)}`);
+    }
+  }, [activeRunId]);
 
   const beginParamEdit = useCallback((key: string) => {
     const historyKey = `${selectedIds.at(-1) ?? ""}.${key}`;
@@ -940,7 +1196,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       const somite = edge.data?.somite;
       if (!somite) return edge;
       const renamed = { ...somite, from_node: somite.from_node === old ? next : somite.from_node, to_node: somite.to_node === old ? next : somite.to_node };
-      return { ...edge, id: renamed.id.replaceAll(old, next), source: edge.source === old ? next : edge.source, target: edge.target === old ? next : edge.target, data: { somite: { ...renamed, id: renamed.id.replaceAll(old, next) }, portType: edge.data?.portType ?? "Text" } };
+      return { ...edge, id: renamed.id.replaceAll(old, next), source: edge.source === old ? next : edge.source, target: edge.target === old ? next : edge.target, data: { somite: { ...renamed, id: renamed.id.replaceAll(old, next) }, portType: edge.data?.portType ?? "Text", validationState: "idle" } };
     }));
     setSelectedIds((current) => current.map((id) => id === old ? next : id));
     setDirty(true);
@@ -1066,7 +1322,8 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
             <button type="button" className="studio-button" onClick={() => void flow?.fitView({ padding: .22, duration: 260, maxZoom: 1 })}>Fit</button>
             <button type="button" className="studio-button" onClick={() => void save()} disabled={saving || !dirty}>{saving ? <span className="spin"><LoaderCircle size={14} /></span> : dirty ? <Save size={14} /> : <Check size={14} />}<span>{saving ? "Saving…" : dirty ? "Save" : "Saved"}</span></button>
             <button type="button" className={`studio-button ${toolchainVisible ? "active" : ""}`} onClick={() => void toggleToolchain()} title="Environment and Export"><PackageOpen size={14} aria-hidden="true" /><span>Export</span></button>
-            <button type="button" className="run-button" disabled={running} onClick={() => void runGraph()} title="Run workflow (F5 or Ctrl/Cmd Enter)">{running ? <><span className="spin"><LoaderCircle size={14} /></span>Running…</> : <><Play size={14} />Run</>}</button>
+            <button type="button" className="studio-button validation-button" disabled={running} onClick={() => void validateGraphWithFixtures()} title="Validate with small representative fixtures">{activeIntent === "validation" ? <span className="spin"><LoaderCircle size={14} /></span> : <ShieldCheck size={14} />}<span>{activeIntent === "validation" ? "Validating…" : "Validate"}</span></button>
+            <button type="button" className={`run-button ${running ? "is-running" : ""}`} disabled={running && !activeRunId} onClick={() => void (running ? cancelRun() : runGraph())} title={running ? "Cancel active Nextflow run" : "Run workflow (F5 or Ctrl/Cmd Enter)"}>{running ? activeRunId ? <><Square size={12} fill="currentColor" />Cancel</> : <><span className="spin"><LoaderCircle size={14} /></span>Preparing…</> : <><Play size={14} />Run</>}</button>
           </div>
         </header>
 
@@ -1076,6 +1333,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
           setPendingAddPosition(flow.screenToFlowPosition({ x: event.clientX, y: event.clientY }, { snapToGrid: true }));
           setPaperVisible(false);
           setToolchainVisible(false);
+          setAgentVisible(false);
           setLibraryMode("build");
           setLibraryVisible(true);
           window.setTimeout(() => searchInputRef.current?.focus(), 0);
@@ -1084,6 +1342,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
           if (machineVisible) setMachineVisible(false);
           if (paperVisible) setPaperVisible(false);
           if (toolchainVisible) setToolchainVisible(false);
+          if (agentVisible) setAgentVisible(false);
         }}>
           {snapGuides.x !== undefined && <div className="snap-guide vertical" style={{ left: snapGuides.x }} />}
           {snapGuides.y !== undefined && <div className="snap-guide horizontal" style={{ top: snapGuides.y }} />}
@@ -1165,9 +1424,10 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
           <button type="button" className={libraryVisible && libraryMode === "sources" ? "active" : ""} aria-label="Add Data Source" title="Sources" onClick={(event) => { event.stopPropagation(); setPaperVisible(false); setToolchainVisible(false); setPendingConnection(null); setLibraryMode("sources"); setLibraryVisible(true); }}><span>ID</span></button>
           <button type="button" className={libraryVisible && libraryMode === "pipelines" ? "active" : ""} aria-label="Find a Workflow" title="Pipelines" onClick={(event) => { event.stopPropagation(); setPaperVisible(false); setToolchainVisible(false); setPendingConnection(null); setLibraryMode("pipelines"); setLibraryVisible(true); }}><span>nf</span></button>
           <button type="button" className={paperVisible ? "active" : ""} aria-label="Rebuild from a Paper" title="Paper Drop" onClick={(event) => { event.stopPropagation(); setPendingConnection(null); setLibraryVisible(false); setToolchainVisible(false); setPaperVisible((visible) => !visible); }}><FileSearch size={15} aria-hidden="true" /></button>
+          <button type="button" className={agentVisible ? "active agent-toggle" : "agent-toggle"} aria-label="Open Workflow Agent" title="Workflow Agent" onClick={(event) => { event.stopPropagation(); setToolchainVisible(false); setMachineVisible(false); const opening = !agentVisible; setAgentVisible(opening); if (opening && !agentSnapshot.connected && !agentDiscovery && !agentDiscoveryLoading) void refreshAgentDiscovery(); }}><Bot size={16} aria-hidden="true" />{(agentSnapshot.connected || agentSnapshot.connecting) && <i className={agentSnapshot.busy ? "busy" : "ready"} />}</button>
         </aside>
 
-        {libraryVisible && <div className="panel-layer" onPointerDown={(event) => event.stopPropagation()}><LibraryPanel operators={availableOperators} mode={libraryMode} query={query} filterQuery={deferredQuery} favorites={favorites} recent={recent} categoryOpen={categoryOpen} searchInputRef={searchInputRef} toolReadiness={system?.tools} localCount={session.operators.length} catalogCount={nfcoreCatalog?.entries.length ?? 0} catalogStatus={nfcoreStatus} snakemakeCount={snakemakeCatalog?.entries.length ?? 0} snakemakeGraphCount={snakemakeCatalog?.entries.filter((entry) => entry.expandable).length ?? 0} snakemakeStatus={snakemakeStatus} continuation={pendingConnection} onMode={(mode) => { setPendingConnection(null); setLibraryMode(mode); setQuery(""); }} onQuery={setQuery} onClose={() => { setLibraryVisible(false); setPendingConnection(null); }} onAddOperator={addOperator} onAddSource={addSource} onToggleFavorite={(id) => setFavorites((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; })} onToggleCategory={(title, open) => setCategoryOpen((current) => ({ ...current, [title]: open }))} /></div>}
+        {libraryVisible && <div className="panel-layer" onPointerDown={(event) => event.stopPropagation()}><LibraryPanel operators={availableOperators} mode={libraryMode} query={query} filterQuery={deferredQuery} favorites={favorites} recent={recent} categoryOpen={categoryOpen} searchInputRef={searchInputRef} toolReadiness={system?.tools} localCount={session.operators.length} catalogCount={nfcoreCatalog?.entries.length ?? 0} catalogStatus={nfcoreStatus} snakemakeCount={snakemakeCatalog?.entries.length ?? 0} snakemakeGraphCount={snakemakeCatalog?.entries.filter((entry) => entry.expandable).length ?? 0} snakemakeStatus={snakemakeStatus} continuation={pendingConnection} onMode={(mode) => { setPendingConnection(null); setLibraryMode(mode); setQuery(""); }} onQuery={setQuery} onClose={() => { setLibraryVisible(false); setPendingConnection(null); }} onAddOperator={addOperator} onAddSource={addSource} onImportSnakemake={importLocalSnakemake} onToggleFavorite={(id) => setFavorites((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; })} onToggleCategory={(title, open) => setCategoryOpen((current) => ({ ...current, [title]: open }))} /></div>}
 
         {selectedNode && selectedOperator && <div className="inspector-layer" onPointerDown={(event) => event.stopPropagation()}><InspectorPanel key={selectedNode.id} node={selectedNode.data.graphNode} selectedCount={selectedIds.length} operator={selectedOperator} hiddenViewerCount={selectedHiddenCount} updateParam={updateParam} beginParamEdit={beginParamEdit} browseParam={browseParam} rename={renameSelected} toggleViewers={toggleSelectedViewers} close={() => { setSelectedIds([]); flow?.setNodes((current) => current.map((node) => ({ ...node, selected: false }))); }} /></div>}
 
@@ -1177,12 +1437,14 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
 
         {paperVisible && <div className="paper-layer" onPointerDown={(event) => event.stopPropagation()}><PaperPanel review={paperReview} active={activePaperCandidate} loading={paperLoading} onFile={rebuildPaper} onExample={openExamplePaper} onActivate={(index) => { const candidate = paperReview?.candidates[index]; if (candidate) installPaperCandidate(candidate, index); }} onEvidence={focusPaperEvidence} onClose={() => setPaperVisible(false)} /></div>}
 
+        {agentVisible && <div className="agent-layer" onPointerDown={(event) => event.stopPropagation()}><AgentPanel snapshot={agentSnapshot} discovery={agentDiscovery} discoveryLoading={agentDiscoveryLoading} onRefreshDiscovery={refreshAgentDiscovery} onConnect={connectAgent} onConfig={configureAgent} onPrompt={promptAgent} onCancel={cancelAgent} onDisconnect={disconnectAgent} onPermission={answerAgentPermission} onClose={() => setAgentVisible(false)} /></div>}
+
         <footer className="statusbar studio-statusbar" aria-live="polite">
           <span className={`engine-light ${statusError ? "error" : ""}`} />
           <span className="status-copy">{status}</span>
           <span className="status-spacer" />
           <span>{countFormatter.format(nodes.length)} nodes</span><span>{countFormatter.format(edges.length)} wires</span>
-          <button type="button" className={machineVisible ? "active" : ""} onClick={(event) => { event.stopPropagation(); setToolchainVisible(false); setMachineVisible((visible) => !visible); }}><Cpu size={12} aria-hidden="true" />Machine</button>
+          <button type="button" className={machineVisible ? "active" : ""} onClick={(event) => { event.stopPropagation(); setToolchainVisible(false); setAgentVisible(false); setMachineVisible((visible) => !visible); }}><Cpu size={12} aria-hidden="true" />Machine</button>
           <div className="zoom-cluster">
             <button type="button" aria-label="Zoom Out" onClick={() => void flow?.zoomOut({ duration: 120 })}><Minus size={13} /></button>
             <button type="button" aria-label="Reset Zoom to 100%" onClick={() => void flow?.zoomTo(1, { duration: 160 })}>{Math.round(zoom * 100)}%</button>

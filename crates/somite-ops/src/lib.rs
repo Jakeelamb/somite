@@ -2,14 +2,17 @@
 
 pub mod nfcore;
 pub mod snakemake;
+pub mod snakemake_local;
 pub mod workflow;
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use somite_ir::{Direction, ParamValue, Port, PortType};
 use serde::{Deserialize, Serialize};
+use somite_ir::{
+    Direction, Graph, ParamValue, Port, PortType, LEGACY_SCHEMA_VERSION, SCHEMA_VERSION,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -24,6 +27,21 @@ pub enum OpsError {
     },
     #[error("unknown operator {0}")]
     Unknown(String),
+    #[error("duplicate operator id {0}")]
+    Duplicate(String),
+    #[error("node {node} pins operator {operator} revision {actual}, expected {expected}")]
+    RevisionMismatch {
+        node: String,
+        operator: String,
+        actual: String,
+        expected: String,
+    },
+    #[error("graph schema {0} cannot be migrated")]
+    GraphSchema(u32),
+    #[error("invalid graph after pinning: {0}")]
+    InvalidGraph(String),
+    #[error("operator revision serialization: {0}")]
+    RevisionSerialization(#[from] serde_json::Error),
     #[error("argv: {0}")]
     Argv(String),
 }
@@ -190,6 +208,59 @@ fn safe_workspace_name(name: &str) -> String {
 }
 
 impl Operator {
+    /// Content identity for fields that can change execution semantics.
+    /// Human catalog metadata (`title` and `palette`) is deliberately excluded.
+    pub fn revision(&self) -> Result<String, OpsError> {
+        #[derive(Serialize)]
+        struct RevisionParam<'a> {
+            ty: &'a str,
+            default: &'a Option<ParamValue>,
+            required: bool,
+            min: Option<i64>,
+            max: Option<i64>,
+        }
+
+        #[derive(Serialize)]
+        struct RevisionMaterial<'a> {
+            id: &'a str,
+            kind: OpKind,
+            bin: &'a Option<String>,
+            pixi: &'a [String],
+            params: BTreeMap<&'a str, RevisionParam<'a>>,
+            ports: &'a PortsSpec,
+            argv: &'a [String],
+            outputs: &'a BTreeMap<String, OutputSpec>,
+        }
+
+        let material = RevisionMaterial {
+            id: &self.id,
+            kind: self.kind,
+            bin: &self.bin,
+            pixi: &self.pixi,
+            params: self
+                .params
+                .iter()
+                .map(|(name, spec)| {
+                    (
+                        name.as_str(),
+                        RevisionParam {
+                            ty: &spec.ty,
+                            default: &spec.default,
+                            required: spec.required,
+                            min: spec.min,
+                            max: spec.max,
+                        },
+                    )
+                })
+                .collect(),
+            ports: &self.ports,
+            argv: &self.argv,
+            outputs: &self.outputs,
+        };
+        let encoded = serde_json::to_vec(&material)?;
+        Ok(format!("blake3:{}", blake3::hash(&encoded).to_hex()))
+    }
+
     pub fn ir_ports(&self) -> Vec<Port> {
         let mut p = Vec::new();
         for i in &self.ports.r#in {
@@ -236,13 +307,61 @@ impl Catalog {
                 path: p.display().to_string(),
                 src,
             })?;
-            c.ops.insert(op.id.clone(), op);
+            if c.ops.insert(op.id.clone(), op.clone()).is_some() {
+                return Err(OpsError::Duplicate(op.id));
+            }
         }
         Ok(c)
     }
 
     pub fn get(&self, id: &str) -> Result<&Operator, OpsError> {
         self.ops.get(id).ok_or_else(|| OpsError::Unknown(id.into()))
+    }
+
+    pub fn revision(&self, id: &str) -> Result<String, OpsError> {
+        self.get(id)?.revision()
+    }
+
+    /// Content identity for the complete searchable catalog, including human
+    /// titles and palette metadata as well as execution contracts.
+    pub fn catalog_revision(&self) -> Result<String, OpsError> {
+        let encoded = serde_json::to_vec(&self.ops)?;
+        Ok(format!("blake3:{}", blake3::hash(&encoded).to_hex()))
+    }
+
+    /// Upgrade a schema-v1 graph or verify every existing schema-v2 pin.
+    pub fn pin_graph(&self, graph: &mut Graph) -> Result<(), OpsError> {
+        match graph.schema_version {
+            LEGACY_SCHEMA_VERSION => {
+                for node in &mut graph.nodes {
+                    node.operator_revision = self.revision(&node.operator)?;
+                }
+                graph.schema_version = SCHEMA_VERSION;
+            }
+            SCHEMA_VERSION => self.verify_graph(graph)?,
+            other => return Err(OpsError::GraphSchema(other)),
+        }
+        graph
+            .validate()
+            .map_err(|error| OpsError::InvalidGraph(error.to_string()))
+    }
+
+    pub fn verify_graph(&self, graph: &Graph) -> Result<(), OpsError> {
+        if graph.schema_version != SCHEMA_VERSION {
+            return Err(OpsError::GraphSchema(graph.schema_version));
+        }
+        for node in &graph.nodes {
+            let expected = self.revision(&node.operator)?;
+            if node.operator_revision != expected {
+                return Err(OpsError::RevisionMismatch {
+                    node: node.id.clone(),
+                    operator: node.operator.clone(),
+                    actual: node.operator_revision.clone(),
+                    expected,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Palette tree: group path (joined palette vec) → operators.
@@ -368,6 +487,7 @@ fn subst(tok: &str, b: &Bindings<'_>) -> Result<String, OpsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use somite_ir::{Graph, Layout, Node, LEGACY_SCHEMA_VERSION, SCHEMA_VERSION};
 
     #[test]
     fn subst_mixed() {
@@ -658,5 +778,62 @@ mod tests {
         assert!(manifest.contains("\"fastqc\" = { version = \"*\", channel = \"bioconda\" }"));
         assert!(manifest.contains("\"star\" = { version = \"*\", channel = \"bioconda\" }"));
         assert_eq!(manifest.matches("\"fastqc\"").count(), 1);
+    }
+
+    #[test]
+    fn operator_revision_ignores_presentation_but_covers_execution() {
+        let catalog =
+            Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
+                .unwrap();
+        let operator = catalog.get("qc.fastqc").unwrap();
+        let revision = operator.revision().unwrap();
+
+        let mut renamed = operator.clone();
+        renamed.title = "A clearer FastQC label".into();
+        renamed.palette = vec!["Different".into(), "Grouping".into()];
+        renamed.cost = Cost::Low;
+        renamed
+            .params
+            .values_mut()
+            .for_each(|parameter| parameter.label = Some("Friendlier label".into()));
+        assert_eq!(renamed.revision().unwrap(), revision);
+
+        let mut changed = operator.clone();
+        changed.argv.push("--quiet".into());
+        assert_ne!(changed.revision().unwrap(), revision);
+    }
+
+    #[test]
+    fn legacy_graphs_migrate_once_and_stale_v2_pins_fail() {
+        let catalog =
+            Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
+                .unwrap();
+        let operator = catalog.get("qc.fastqc").unwrap();
+        let mut graph = Graph {
+            schema_version: LEGACY_SCHEMA_VERSION,
+            nodes: vec![Node {
+                id: "fastqc1".into(),
+                operator: operator.id.clone(),
+                operator_revision: String::new(),
+                ports: operator.ir_ports(),
+                params: BTreeMap::new(),
+                layout: Layout { x: 0.0, y: 0.0 },
+                note: None,
+            }],
+            edges: Vec::new(),
+        };
+
+        catalog.pin_graph(&mut graph).unwrap();
+        assert_eq!(graph.schema_version, SCHEMA_VERSION);
+        assert_eq!(
+            graph.nodes[0].operator_revision,
+            operator.revision().unwrap()
+        );
+
+        graph.nodes[0].operator_revision = "blake3:stale".into();
+        assert!(matches!(
+            catalog.pin_graph(&mut graph),
+            Err(OpsError::RevisionMismatch { .. })
+        ));
     }
 }

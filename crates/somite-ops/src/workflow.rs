@@ -21,6 +21,7 @@ pub fn graph_from_dot(
     flavor: DotFlavor,
     workflow: &str,
     revision: &str,
+    reference_operator_revision: &str,
     dot: &str,
 ) -> Result<Graph, String> {
     let mut dot_nodes = BTreeMap::<String, DotNode>::new();
@@ -77,6 +78,7 @@ pub fn graph_from_dot(
     build_graph(
         workflow,
         revision,
+        reference_operator_revision,
         flavor,
         dot_nodes,
         components,
@@ -129,7 +131,7 @@ pub fn upgrade_reference_ports(graph: &mut Graph) -> usize {
             continue;
         };
         if accepts_reads(component) {
-            node.ports = component_ports(DotFlavor::Nextflow, component, true);
+            node.ports = component_ports(DotFlavor::Nextflow, component, true, 0);
             upgraded += 1;
         }
     }
@@ -193,6 +195,7 @@ fn collapse_intermediates(
 fn build_graph(
     workflow: &str,
     revision: &str,
+    reference_operator_revision: &str,
     flavor: DotFlavor,
     dot_nodes: BTreeMap<String, DotNode>,
     components: BTreeSet<String>,
@@ -212,6 +215,13 @@ fn build_graph(
         ids.insert(dot_id.clone(), id);
     }
     let ranks = ranks(&components, &component_edges);
+    let incoming_counts = component_edges.iter().fold(
+        BTreeMap::<String, usize>::new(),
+        |mut counts, (_, target)| {
+            *counts.entry(target.clone()).or_default() += 1;
+            counts
+        },
+    );
     let targets = component_edges
         .iter()
         .map(|(_, target)| target.as_str())
@@ -225,7 +235,13 @@ fn build_graph(
         nodes.push(Node {
             id: ids[dot_id].clone(),
             operator: "workflow.reference".to_owned(),
-            ports: component_ports(flavor, &label, !targets.contains(dot_id.as_str())),
+            operator_revision: reference_operator_revision.to_owned(),
+            ports: component_ports(
+                flavor,
+                &label,
+                !targets.contains(dot_id.as_str()),
+                *incoming_counts.get(dot_id).unwrap_or(&0),
+            ),
             params: BTreeMap::from([
                 (
                     "engine".to_owned(),
@@ -255,17 +271,25 @@ fn build_graph(
         });
         *row += 1;
     }
+    let mut input_slots = BTreeMap::<String, usize>::new();
     let edges = component_edges
         .into_iter()
         .filter_map(|(from, to)| {
             let from_node = ids.get(&from)?.clone();
             let to_node = ids.get(&to)?.clone();
+            let input_slot = input_slots.entry(to_node.clone()).or_default();
+            let to_port = if *input_slot == 0 {
+                "in".to_owned()
+            } else {
+                format!("in_{}", *input_slot + 1)
+            };
+            *input_slot += 1;
             Some(Edge {
-                id: format!("e-{from_node}-out-{to_node}-in"),
+                id: format!("e-{from_node}-out-{to_node}-{to_port}"),
                 from_node,
                 from_port: "out".to_owned(),
                 to_node,
-                to_port: "in".to_owned(),
+                to_port,
             })
         })
         .collect();
@@ -278,8 +302,13 @@ fn build_graph(
     Ok(graph)
 }
 
-fn component_ports(flavor: DotFlavor, label: &str, boundary: bool) -> Vec<Port> {
-    let mut ports = if flavor == DotFlavor::Nextflow && boundary && accepts_reads(label) {
+fn component_ports(
+    _flavor: DotFlavor,
+    label: &str,
+    boundary: bool,
+    incoming_count: usize,
+) -> Vec<Port> {
+    let mut ports = if boundary && accepts_reads(label) {
         vec![
             Port {
                 name: "r1".to_owned(),
@@ -297,13 +326,19 @@ fn component_ports(flavor: DotFlavor, label: &str, boundary: bool) -> Vec<Port> 
             },
         ]
     } else {
-        vec![Port {
-            name: "in".to_owned(),
-            dir: Direction::In,
-            ty: PortType::Directory,
-            union: Vec::new(),
-            optional: true,
-        }]
+        (0..incoming_count.max(1))
+            .map(|index| Port {
+                name: if index == 0 {
+                    "in".to_owned()
+                } else {
+                    format!("in_{}", index + 1)
+                },
+                dir: Direction::In,
+                ty: PortType::Directory,
+                union: Vec::new(),
+                optional: true,
+            })
+            .collect()
     };
     ports.push(Port {
         name: "out".to_owned(),
@@ -316,7 +351,11 @@ fn component_ports(flavor: DotFlavor, label: &str, boundary: bool) -> Vec<Port> 
 }
 
 fn accepts_reads(label: &str) -> bool {
-    let component = label.rsplit(':').next().unwrap_or(label).to_ascii_uppercase();
+    let component = label
+        .rsplit(':')
+        .next()
+        .unwrap_or(label)
+        .to_ascii_uppercase();
     [
         "FASTQ",
         "FASTQC",
@@ -406,8 +445,14 @@ mod tests {
           v2 -> v3;
           v3 -> v4 [label="reads"];
         }"#;
-        let graph =
-            graph_from_dot(DotFlavor::Nextflow, "nf-core/demo", "1.2.3", dot).expect("graph");
+        let graph = graph_from_dot(
+            DotFlavor::Nextflow,
+            "nf-core/demo",
+            "1.2.3",
+            "test-revision",
+            dot,
+        )
+        .expect("graph");
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(graph.edges.len(), 1);
         assert_eq!(graph.edges[0].from_node, "fastqc");
@@ -421,12 +466,48 @@ mod tests {
           1[label = "align reads", color = "0.2 0.6 0.85"];
           1 -> 0
         }"#;
-        let graph =
-            graph_from_dot(DotFlavor::Snakemake, "owner/workflow", "v1", dot).expect("graph");
+        let graph = graph_from_dot(
+            DotFlavor::Snakemake,
+            "owner/workflow",
+            "v1",
+            "test-revision",
+            dot,
+        )
+        .expect("graph");
         assert_eq!(graph.nodes.len(), 2);
         assert_eq!(graph.edges.len(), 1);
         assert_eq!(graph.edges[0].from_node, "align-reads");
         assert_eq!(graph.edges[0].to_node, "all");
+    }
+
+    #[test]
+    fn workflow_fan_in_gets_one_scalar_port_per_dependency() {
+        let dot = r#"digraph snakemake_dag {
+          0[label = "prepare_a"];
+          1[label = "prepare_b"];
+          2[label = "all"];
+          0 -> 2
+          1 -> 2
+        }"#;
+        let graph = graph_from_dot(
+            DotFlavor::Snakemake,
+            "owner/workflow",
+            "v1",
+            "test-revision",
+            dot,
+        )
+        .expect("graph");
+        let target = graph.node("all").expect("target rule");
+        assert!(target.port("in", Direction::In).is_some());
+        assert!(target.port("in_2", Direction::In).is_some());
+        assert_eq!(
+            graph
+                .edges
+                .iter()
+                .map(|edge| edge.to_port.as_str())
+                .collect::<Vec<_>>(),
+            vec!["in", "in_2"]
+        );
     }
 
     #[test]
@@ -440,8 +521,14 @@ mod tests {
           v1 -> v2;
           v2 -> v3;
         }"#;
-        let graph = graph_from_dot(DotFlavor::Nextflow, "nf-core/demo", "1.2.3", dot)
-            .expect("graph");
+        let graph = graph_from_dot(
+            DotFlavor::Nextflow,
+            "nf-core/demo",
+            "1.2.3",
+            "test-revision",
+            dot,
+        )
+        .expect("graph");
         let entry = graph.node("cat-fastq").expect("read entry");
         let r1 = entry.port("r1", Direction::In).expect("r1 input");
         let r2 = entry.port("r2", Direction::In).expect("r2 input");
@@ -450,8 +537,14 @@ mod tests {
         assert!(r2.optional);
 
         let downstream = graph.node("fastqc").expect("downstream process");
-        let input = downstream.port("in", Direction::In).expect("internal input");
-        assert!(!somite_ir::compatible(PortType::Fastq, input.ty, &input.union));
+        let input = downstream
+            .port("in", Direction::In)
+            .expect("internal input");
+        assert!(!somite_ir::compatible(
+            PortType::Fastq,
+            input.ty,
+            &input.union
+        ));
     }
 
     #[test]
@@ -463,14 +556,20 @@ mod tests {
           v0 -> v1;
           v1 -> v2;
         }"#;
-        let mut graph = graph_from_dot(DotFlavor::Nextflow, "nf-core/demo", "1.2.3", dot)
-            .expect("graph");
+        let mut graph = graph_from_dot(
+            DotFlavor::Nextflow,
+            "nf-core/demo",
+            "1.2.3",
+            "test-revision",
+            dot,
+        )
+        .expect("graph");
         graph
             .nodes
             .iter_mut()
             .find(|node| node.id == "cat-fastq")
             .expect("boundary")
-            .ports = component_ports(DotFlavor::Nextflow, "generic", false);
+            .ports = component_ports(DotFlavor::Nextflow, "generic", false, 1);
 
         assert_eq!(upgrade_reference_ports(&mut graph), 1);
         assert!(graph

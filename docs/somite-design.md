@@ -19,13 +19,23 @@ somite-server
       ├── somite-ir       graph types and invariants
       ├── somite-ops      operator contracts and Pixi manifest rendering
       ├── somite-nextflow pure Graph-to-DSL2 compilation
-      ├── somite-cook     temporary native differential oracle
+      ├── somite-linker   immutable revisions, run closures, evidence receipts
+      ├── somite-fixtures content-addressed representative biological data
+      ├── somite-cook     explicit native differential oracle
       ├── somite-paper    methods extraction and evidence-backed reconstruction
-      └── somite-bundle   portable Pixi run bundles
+      ├── somite-bundle   frozen Pixi/Nextflow run packages
+      ├── ACP bridge      one optional user-provided agent session
+      └── MCP server      typed, revision-safe Somite capabilities
 ```
 
 The CLI is a headless client of the same Rust modules. There is no native GUI
 or alternate desktop implementation.
+
+The agent is also a client. ACP carries one user-provided conversation into the
+workspace; stdio MCP carries explicit Somite tool calls back. Somite supplies
+neither a model nor behavioral modes. Graph mutations are compare-and-swap
+transactions that enter the same browser history as human edits. See
+[agent-protocol.md](agent-protocol.md).
 
 ## Deep modules
 
@@ -83,9 +93,28 @@ lower exactly.
 
 Interface: `cook_graph(project, catalog, graph)`.
 
-This is the temporary native oracle, not the target production engine. It
-remains available for differential tests until Somite has a cancellable web run
-handle and an offline locked replay for generated Nextflow packages.
+This is an explicit differential-test oracle, not a production engine. The web
+server never calls it. Developers may invoke `somite cook-oracle` when comparing
+native reference behavior with compiled Nextflow behavior.
+
+### `somite-linker`
+
+Interface: `link(graph, catalog, environment, options)` and
+`freeze(draft, pixi_lock)`.
+
+The linker keeps immutable operator identity, target-specific executable
+closure identity, and validation evidence separate. Layout-only edits do not
+change the semantic graph revision or run closure.
+
+### `somite-fixtures`
+
+Interface: `bind_representative_fastq(graph, fixture_store)`.
+
+The first fixture family covers local single- and paired-end FASTQ source
+graphs. Objects are stored once by content digest. Binding returns both the
+actual runnable Graph and a path-independent configuration digest. Any source
+operator outside the supported family fails closed instead of reaching a
+network.
 
 ### `somite-paper`
 
@@ -98,32 +127,40 @@ compared methods remain separate candidate graphs.
 
 ### `somite-bundle`
 
-Interface: `build_bundle(graph, catalog, target, binary_probe)`.
+Interface: `create_frozen_package(graph, catalog, target, destination,
+binary_probe)` and `archive_frozen_package(package)`.
 
 The output ZIP contains only what is needed to inspect and run the graph:
 
 ```text
+main.nf
+nextflow.config
+params.json
+node-map.json
+pixi.toml
+pixi.lock
 workflow.somite.json
 operators/<used-id>.json
-toolchain/pixi.toml
+run-closure.json
+evidence/index.json
 toolchain/tools.json
-README.md
-run.sh
 ```
 
-The existing ZIP launcher still executes the native oracle. It must move to the
-generated Nextflow run package before the web export is presented as the
-production execution path.
+The CLI, web runner, and web export all call this one freezer. The archive has
+no native launcher and runs with `pixi run --frozen run`.
 
 ### `somite-server`
 
 Interface: localhost endpoints for session state, graph validation and saving,
-autosave recovery, uploads, execution, paper reconstruction, catalog discovery,
-system detection, export planning, and ZIP export.
+autosave recovery, uploads, cancellable Nextflow run supervision, paper
+reconstruction, catalog discovery, system detection, export planning, frozen
+ZIP export, agent transactions, evidence lookup, and ACP activity.
 
 The server validates all graph writes. Uploaded files are copied into the
 project, and the browser receives project-relative paths rather than arbitrary
-server filesystem access.
+server filesystem access. `POST /api/runs` creates a background run; status and
+cancellation use the run-scoped endpoints while Nextflow trace data maps back
+to graph node IDs.
 
 ## Web interaction contract
 
@@ -140,6 +177,9 @@ server filesystem access.
 - Multi-selection moves, duplicates, deletes, and toggles viewers as a group.
 - Clicking outside a temporary panel closes it.
 - Saves and autosaves are server-validated.
+- The always-available Bot button opens one optional bring-your-own ACP agent.
+- Agent messages, tools, permissions, and transactions remain visible; each
+  transaction is one undoable canvas edit.
 
 ## Project data
 
@@ -147,20 +187,23 @@ server filesystem access.
 .somite/
   web.somite.json       editable working graph
   autosave.somite.json  validated recovery graph
-  pixi.toml            graph-wide generated environment
-  pixi.lock            exact resolved builds
-  cache/                artifacts and cook indexes
   catalog/              cached external catalog data
   uploads/              browser-imported files
+  fixtures/objects/     content-addressed representative data
+  evidence/             append-only receipts and index
+  compiled/<revision>/  reusable content-addressed agent compile output
+  runs/<run-id>/        frozen closure, logs, trace, work, and results
+  exports/              ephemeral staging; empty after each download
 ```
 
 Generated state stays under `.somite/`. Operator contracts remain in
-`operators/`, and portable bundles carry copies of only the contracts they use.
+`operators/`, and frozen archives carry copies of only the contracts they use.
 
 ## Non-goals
 
 - maintaining a second desktop GUI;
 - supporting multiple competing environment managers;
+- bundling a model, model provider, or a second set of agent modes;
 - claiming that engine-authored structural workflow references are executable
   before they have reviewed contracts;
 - treating a package name as a complete operator;

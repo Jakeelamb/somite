@@ -41,6 +41,7 @@ fn import_then_skip() {
         nodes: vec![Node {
             id: "n1".into(),
             operator: "files.import".into(),
+            operator_revision: cat.revision("files.import").unwrap(),
             ports: vec![Port {
                 name: "file".into(),
                 dir: Direction::Out,
@@ -82,6 +83,7 @@ fn paired_import_keeps_mates_as_two_artifacts() {
         nodes: vec![Node {
             id: "reads1".into(),
             operator: operator.id.clone(),
+            operator_revision: operator.revision().unwrap(),
             ports: operator.ir_ports(),
             params: BTreeMap::from([
                 (
@@ -119,6 +121,7 @@ fn unbound_required_input_is_skipped() {
         nodes: vec![Node {
             id: "fastqc1".into(),
             operator: "qc.fastqc".into(),
+            operator_revision: op.revision().unwrap(),
             ports: op.ir_ports(),
             params: BTreeMap::new(),
             layout: Layout { x: 0.0, y: 0.0 },
@@ -150,6 +153,7 @@ fn import_then_rnaseq_sheet() {
             Node {
                 id: "import1".into(),
                 operator: "files.import".into(),
+                operator_revision: imp.revision().unwrap(),
                 ports: imp.ir_ports(),
                 params: {
                     let mut m = BTreeMap::new();
@@ -162,6 +166,7 @@ fn import_then_rnaseq_sheet() {
             Node {
                 id: "sheet1".into(),
                 operator: "sheet.rnaseq".into(),
+                operator_revision: sh.revision().unwrap(),
                 ports: sh.ir_ports(),
                 params: BTreeMap::new(),
                 layout: Layout { x: 200.0, y: 0.0 },
@@ -219,6 +224,7 @@ fn imports_a_workflow_directory_as_a_typed_artifact() {
         nodes: vec![Node {
             id: "workflow1".into(),
             operator: operator.id.clone(),
+            operator_revision: operator.revision().unwrap(),
             ports: operator.ir_ports(),
             params: BTreeMap::from([(
                 "path".into(),

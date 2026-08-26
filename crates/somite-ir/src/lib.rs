@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
+pub const LEGACY_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -76,6 +77,12 @@ pub enum ParamValue {
 pub struct Node {
     pub id: String,
     pub operator: String,
+    /// Immutable execution-semantic revision of `operator`.
+    ///
+    /// Schema v1 graphs omit this field and must be migrated through the exact
+    /// operator catalog before they are validated or persisted again.
+    #[serde(default)]
+    pub operator_revision: String,
     pub ports: Vec<Port>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, ParamValue>,
@@ -112,6 +119,8 @@ pub struct Graph {
 pub enum IrError {
     #[error("schema_version {0} != {SCHEMA_VERSION}")]
     Schema(u32),
+    #[error("node {node} does not pin an operator revision")]
+    UnpinnedOperator { node: String },
     #[error("duplicate id {0}")]
     DuplicateId(String),
     #[error("unknown node {0}")]
@@ -141,6 +150,9 @@ impl Graph {
         }
         let mut ids = BTreeSet::new();
         for n in &self.nodes {
+            if n.operator_revision.trim().is_empty() {
+                return Err(IrError::UnpinnedOperator { node: n.id.clone() });
+            }
             if !ids.insert(n.id.clone()) {
                 return Err(IrError::DuplicateId(n.id.clone()));
             }
@@ -159,18 +171,20 @@ impl Graph {
             let dst_n = self
                 .node(&e.to_node)
                 .ok_or_else(|| IrError::UnknownNode(e.to_node.clone()))?;
-            let src_p = src_n
-                .port(&e.from_port, Direction::Out)
-                .ok_or_else(|| IrError::UnknownPort {
-                    node: e.from_node.clone(),
-                    port: e.from_port.clone(),
-                })?;
-            let dst_p = dst_n
-                .port(&e.to_port, Direction::In)
-                .ok_or_else(|| IrError::UnknownPort {
-                    node: e.to_node.clone(),
-                    port: e.to_port.clone(),
-                })?;
+            let src_p =
+                src_n
+                    .port(&e.from_port, Direction::Out)
+                    .ok_or_else(|| IrError::UnknownPort {
+                        node: e.from_node.clone(),
+                        port: e.from_port.clone(),
+                    })?;
+            let dst_p =
+                dst_n
+                    .port(&e.to_port, Direction::In)
+                    .ok_or_else(|| IrError::UnknownPort {
+                        node: e.to_node.clone(),
+                        port: e.to_port.clone(),
+                    })?;
             if src_p.dir != Direction::Out || dst_p.dir != Direction::In {
                 return Err(IrError::Direction(e.id.clone()));
             }
@@ -273,6 +287,7 @@ mod tests {
         Node {
             id: id.into(),
             operator: op.into(),
+            operator_revision: "test-revision".into(),
             ports,
             params: BTreeMap::new(),
             layout: Layout { x, y: 0.0 },
@@ -325,7 +340,12 @@ mod tests {
         let g = Graph {
             schema_version: SCHEMA_VERSION,
             nodes: vec![
-                n("n_src", "files.import", vec![out("fastq", PortType::FastqGz)], 0.0),
+                n(
+                    "n_src",
+                    "files.import",
+                    vec![out("fastq", PortType::FastqGz)],
+                    0.0,
+                ),
                 n(
                     "n_qc",
                     "qc.fastqc",
@@ -419,7 +439,12 @@ mod tests {
     fn json_roundtrip() {
         let g = Graph {
             schema_version: SCHEMA_VERSION,
-            nodes: vec![n("n_a", "files.import", vec![out("fastq", PortType::FastqGz)], 0.0)],
+            nodes: vec![n(
+                "n_a",
+                "files.import",
+                vec![out("fastq", PortType::FastqGz)],
+                0.0,
+            )],
             edges: vec![],
         };
         let s = serde_json::to_string(&g).unwrap();

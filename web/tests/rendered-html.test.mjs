@@ -40,7 +40,15 @@ test("starter preview is removed and the real canvas is wired", async () => {
   assert.match(app, /onConnectEnd=/);
   assert.match(app, /ContinuationContext/);
   assert.match(app, /focusPaperEvidence/);
+  assert.match(app, /api\/agent\/events/);
+  assert.match(app, /api\/agent\/discover/);
+  assert.match(app, /api\/agent\/config/);
+  assert.match(app, /api\/workflows\/snakemake\/import/);
+  assert.match(app, /unseenAgentTransactions/);
   assert.match(panels, /Compatible Tools/);
+  assert.match(panels, /Choose an agent/);
+  assert.match(panels, /More compatible agents/);
+  assert.match(panels, /Open a local Snakemake project/);
   assert.match(panels, /Show .* on canvas/);
   assert.match(app, /beforeunload/);
   assert.match(app, /aria-live="polite"/);

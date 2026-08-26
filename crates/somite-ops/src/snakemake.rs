@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 use std::process::Command;
 
-use somite_ir::ParamValue;
 use serde::{Deserialize, Serialize};
+use somite_ir::ParamValue;
 
 use crate::{Cost, OpKind, Operator, ParamSpec, PortsSpec};
 

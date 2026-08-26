@@ -489,6 +489,7 @@ fn build_bricks(
         g.nodes.push(Node {
             id: id.clone(),
             operator: op.into(),
+            operator_revision: oper.revision().ok()?,
             ports: oper.ir_ports(),
             params: pmap,
             layout: Layout { x: 0.0, y: 0.0 },
@@ -1138,6 +1139,7 @@ fn build_assembly(
         g.nodes.push(Node {
             id: id.clone(),
             operator: op.into(),
+            operator_revision: oper.revision().ok()?,
             ports: oper.ir_ports(),
             params: pmap,
             layout: Layout { x: 0.0, y: 0.0 },

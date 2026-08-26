@@ -32,6 +32,7 @@ export type SomitePort = {
 export type SomiteGraphNode = {
   id: string;
   operator: string;
+  operator_revision: string;
   ports: SomitePort[];
   params?: Record<string, ParamValue>;
   layout: { x: number; y: number };
@@ -71,6 +72,7 @@ export type PortSpec = {
 
 export type Operator = {
   id: string;
+  revision?: string;
   title: string;
   palette: string[];
   kind: "external" | "inprocess" | "reference";
@@ -106,12 +108,135 @@ export type ProjectSession = {
   graph: SomiteGraph;
   operators: Operator[];
   recovered_autosave: boolean;
+  agent_cursor: number;
 };
 
-export type RunResponse = {
-  states: Record<string, "cached" | "done" | "failed" | "skipped">;
-  artifacts: Record<string, Record<string, { basename: string; declared_type: PortType; size: number; hash: string }>>;
-  errors: Record<string, string>;
+export type AgentPermissionChoice = {
+  option_id: string;
+  name: string;
+  kind: "allow_once" | "allow_always" | "reject_once" | "reject_always" | "other";
+};
+
+export type AgentTransaction = {
+  transaction_id: string;
+  previous_state_revision: string;
+  state_revision: string;
+  graph_revision: string;
+  summary: string;
+  graph: SomiteGraph;
+};
+
+export type AgentEvent = {
+  cursor: number;
+  recorded_at_unix_ms: number;
+  kind: "status" | "user" | "message" | "tool" | "transaction" | "permission" | "error";
+  title: string;
+  detail?: string;
+  status?: string;
+  transaction?: AgentTransaction;
+  permission_id?: string;
+  tool_call_id?: string;
+  permission_choices?: AgentPermissionChoice[];
+};
+
+export type AgentConfigSelectChoice = {
+  value: string;
+  name: string;
+  description?: string;
+};
+
+export type AgentConfigSelectGroup = {
+  group: string;
+  name: string;
+  options: AgentConfigSelectChoice[];
+};
+
+export type AgentConfigOption = {
+  id: string;
+  name: string;
+  description?: string;
+  category?: "model" | "model_config" | "mode" | "thought_level" | string;
+} & ({
+  type: "select";
+  currentValue: string;
+  options: AgentConfigSelectChoice[] | AgentConfigSelectGroup[];
+} | {
+  type: "boolean";
+  currentValue: boolean;
+});
+
+export type DiscoveredAgent = {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  command?: string;
+  availability: "installed" | "ready" | "unavailable";
+  availability_detail: string;
+  repository?: string;
+  website?: string;
+  icon?: string;
+};
+
+export type AgentDiscovery = {
+  registry_url: string;
+  registry_status: "live" | "offline_cache" | "unavailable";
+  agents: DiscoveredAgent[];
+};
+
+export type AgentSnapshot = {
+  connected: boolean;
+  connecting: boolean;
+  busy: boolean;
+  agent_name?: string;
+  config_options: AgentConfigOption[];
+  cursor: number;
+  events: AgentEvent[];
+};
+
+export type RunPhase = "preparing" | "running" | "finalizing" | "completed" | "failed" | "cancelling" | "cancelled";
+
+export type RunNodeState = "queued" | "running" | "cached" | "done" | "failed" | "skipped" | "cancelled";
+
+export type RunStartResponse = {
+  run_id: string;
+  phase: RunPhase;
+  replayed: boolean;
+};
+
+export type RunStatusResponse = RunStartResponse & {
+  states: Record<string, RunNodeState>;
+  closure_digest?: string;
+  exit_code?: number;
+  error?: string;
+  evidence_receipt?: EvidenceReceipt;
+  progress: { completed: number; total: number; unit: string; message: string };
+};
+
+export type EvidenceResult = "passed" | "failed" | "inconclusive";
+
+export type EvidenceReceipt = {
+  receipt_digest: string;
+  recorded_at_unix_ms: number;
+  subject_digest: string;
+  observed_closure_digest?: string;
+  kind: string;
+  scope: string;
+  configuration_digest: string;
+  fixture_digests: string[];
+  verifier: string;
+  result: EvidenceResult;
+  node_results: Record<string, EvidenceResult>;
+  edge_results: Record<string, EvidenceResult>;
+  artifact_digests: string[];
+  log_digests: string[];
+};
+
+export type ValidationEvidenceResponse = {
+  subject_digest: string;
+  configuration_digest: string;
+  fixture_pack: string;
+  receipt?: EvidenceReceipt;
 };
 
 export type PaperEvidence = {

@@ -5,6 +5,12 @@ tool Implementation. The graph owns workflow structure. Operator metadata owns
 the command, parameters, typed ports, output collection rules, and Pixi package
 requirements for one node.
 
+Every Graph Node stores the Operator's stable ID and an immutable revision
+digest. The digest covers execution-semantic fields and excludes human title
+and palette placement. Loading, saving, compiling, and executing a schema-v2
+Graph reject a revision that does not match the supplied Operator manifest.
+Schema-v1 Graphs are upgraded through the exact catalog before further use.
+
 Package metadata is not an Operator. A Conda package can reveal that a binary
 exists; it does not define safe arguments, input cardinality, artifact types,
 or outputs.
@@ -123,8 +129,9 @@ must not be silently ignored.
 `pixi` lists the package requirements needed by the tool. Channel-qualified
 requirements are preferred. The compiler creates one graph-wide Pixi manifest,
 pins the validated Nextflow and OpenJDK versions, and merges all tool packages.
-The first `pixi run` writes `pixi.lock`; a frozen run package must retain that
-lockfile.
+`somite compile` resolves and retains `pixi.lock` before publishing the run
+package. A package without the exact target lock is a draft, not a frozen Run
+closure.
 
 Containers and per-node environments are intentionally deferred. An Operator
 must not invoke Conda, Pixi, Docker, Apptainer, Nextflow, Snakemake, or another

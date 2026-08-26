@@ -10,3 +10,7 @@ somite-ir = { path = "../somite-ir" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+blake3 = "1"
+
+[dev-dependencies]
+tempfile = "3"

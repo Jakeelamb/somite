@@ -23,6 +23,7 @@ const readout = IBM_Plex_Mono({
 export const metadata: Metadata = {
   title: "Somite — Visual Bioinformatics",
   description: "Build typed bioinformatics workflows on an infinite canvas.",
+  icons: { icon: "/favicon.svg" },
 };
 
 export const viewport: Viewport = {

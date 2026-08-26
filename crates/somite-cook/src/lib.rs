@@ -6,11 +6,11 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::{Deserialize, Serialize};
 use somite_ir::{Direction, Graph, Node, ParamValue, PortType};
 use somite_ops::{
     current_pixi_platform, pixi_manifest, render_argv, Bindings, Catalog, Cost, OpKind, Operator,
 };
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -387,6 +387,7 @@ pub fn cook_graph(
     graph: &Graph,
 ) -> Result<CookReport, CookError> {
     graph.validate()?;
+    catalog.verify_graph(graph)?;
     prepare_pixi_workspace(project, catalog, graph)?;
     let mut report = CookReport::default();
     let mut produced: BTreeMap<(String, String), ArtifactMeta> = BTreeMap::new();
