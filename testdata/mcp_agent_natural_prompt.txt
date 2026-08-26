@@ -1,0 +1,1 @@
+On the current canvas, build a paired-end read quality-control workflow from fixtures/eval_R1.fastq.gz and fixtures/eval_R2.fastq.gz. Use fastp with 2 threads, connect both mates correctly, validate the result, and tell me whether it passes.

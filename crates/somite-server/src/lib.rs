@@ -562,6 +562,16 @@ impl WebProject {
             .to_owned()
     }
 
+    fn workflow_name(&self, graph: &Graph) -> String {
+        graph
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.project_name())
+    }
+
     fn next_id(&self, prefix: &str) -> String {
         let epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -808,17 +818,10 @@ struct SourceSearchQuery {
     provider: String,
 }
 
-#[derive(Debug, Serialize)]
-struct SourceSearchResponse {
-    query: String,
-    provider: String,
-    results: Vec<source_search::SearchResult>,
-}
-
 async fn search_sources(
     State(project): State<Arc<WebProject>>,
     Query(request): Query<SourceSearchQuery>,
-) -> Result<Json<SourceSearchResponse>, ServerError> {
+) -> Result<Json<source_search::SearchResponse>, ServerError> {
     let query = request.q.trim();
     if !(2..=120).contains(&query.len())
         || query.chars().any(char::is_control)
@@ -835,7 +838,7 @@ async fn search_sources(
         .filter(|(created, _)| created.elapsed() < Duration::from_secs(600))
         .cloned()
     {
-        return Ok(Json(SourceSearchResponse {
+        return Ok(Json(source_search::SearchResponse {
             query: query.to_owned(),
             provider: request.provider,
             results,
@@ -857,7 +860,7 @@ async fn search_sources(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(key, (Instant::now(), results.clone()));
-    Ok(Json(SourceSearchResponse {
+    Ok(Json(source_search::SearchResponse {
         query: owned_query,
         provider,
         results,
@@ -2458,7 +2461,7 @@ fn production_inputs(
     catalog.pin_graph(&mut graph)?;
     let graph_base = project.graph_path.parent().unwrap_or(&project.root);
     absolutize_import_paths(&mut graph, &project.root, graph_base);
-    let target = ExportTarget::new(project.project_name(), current_pixi_platform());
+    let target = ExportTarget::new(project.workflow_name(&graph), current_pixi_platform());
     Ok((graph, catalog, target))
 }
 
@@ -2495,7 +2498,10 @@ fn validation_inputs(
             )
         })
         .collect();
-    let target = ExportTarget::new(project.project_name(), current_pixi_platform());
+    let target = ExportTarget::new(
+        project.workflow_name(&source_graph),
+        current_pixi_platform(),
+    );
     let validation = ValidationContext {
         subject_digest,
         configuration_digest,
@@ -3826,7 +3832,7 @@ mod tests {
     #[tokio::test]
     async fn export_endpoints_return_a_plan_and_downloadable_zip() {
         let (temp, project) = fixture_project();
-        let graph = r#"{"schema_version":1,"nodes":[],"edges":[]}"#;
+        let graph = r#"{"schema_version":1,"name":"RNA seq review","nodes":[],"edges":[]}"#;
         let router = app(project);
         let plan_response = router
             .clone()
@@ -3848,6 +3854,7 @@ mod tests {
             .expect("body")
             .to_bytes();
         let plan: serde_json::Value = serde_json::from_slice(&plan_body).expect("plan json");
+        assert_eq!(plan["filename"], "RNA-seq-review.somite-run.zip");
         assert_eq!(plan["platform"], current_pixi_platform());
         assert_eq!(plan["tools"], serde_json::json!([]));
 
@@ -3873,7 +3880,10 @@ mod tests {
             .get(header::CONTENT_DISPOSITION)
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default();
-        assert!(disposition.ends_with(".somite-run.zip\""));
+        assert_eq!(
+            disposition,
+            "attachment; filename=\"RNA-seq-review.somite-run.zip\""
+        );
         let zip_body = zip_response
             .into_body()
             .collect()

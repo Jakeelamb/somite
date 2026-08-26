@@ -165,6 +165,7 @@ mod tests {
     fn paired(path_one: &str, path_two: &str) -> Graph {
         Graph {
             schema_version: SCHEMA_VERSION,
+            name: None,
             nodes: vec![Node {
                 id: "reads1".into(),
                 operator: "files.import_paired".into(),

@@ -38,6 +38,7 @@ fn import_then_skip() {
     assert!(cat.get("files.import").is_ok());
     let g = Graph {
         schema_version: SCHEMA_VERSION,
+        name: None,
         nodes: vec![Node {
             id: "n1".into(),
             operator: "files.import".into(),
@@ -80,6 +81,7 @@ fn paired_import_keeps_mates_as_two_artifacts() {
     let operator = catalog.get("files.import_paired").unwrap();
     let graph = Graph {
         schema_version: SCHEMA_VERSION,
+        name: None,
         nodes: vec![Node {
             id: "reads1".into(),
             operator: operator.id.clone(),
@@ -118,6 +120,7 @@ fn unbound_required_input_is_skipped() {
     let op = cat.get("qc.fastqc").unwrap();
     let g = Graph {
         schema_version: SCHEMA_VERSION,
+        name: None,
         nodes: vec![Node {
             id: "fastqc1".into(),
             operator: "qc.fastqc".into(),
@@ -149,6 +152,7 @@ fn import_then_rnaseq_sheet() {
     let sh = cat.get("sheet.rnaseq").unwrap();
     let g = Graph {
         schema_version: SCHEMA_VERSION,
+        name: None,
         nodes: vec![
             Node {
                 id: "import1".into(),
@@ -221,6 +225,7 @@ fn imports_a_workflow_directory_as_a_typed_artifact() {
     let operator = catalog.get("files.import_directory").unwrap();
     let graph = Graph {
         schema_version: SCHEMA_VERSION,
+        name: None,
         nodes: vec![Node {
             id: "workflow1".into(),
             operator: operator.id.clone(),

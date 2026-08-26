@@ -49,6 +49,7 @@ export type SomiteEdge = {
 
 export type SomiteGraph = {
   schema_version: number;
+  name?: string;
   nodes: SomiteGraphNode[];
   edges: SomiteEdge[];
 };

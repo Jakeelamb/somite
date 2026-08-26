@@ -295,6 +295,7 @@ fn build_graph(
         .collect();
     let graph = Graph {
         schema_version: SCHEMA_VERSION,
+        name: None,
         nodes,
         edges,
     };

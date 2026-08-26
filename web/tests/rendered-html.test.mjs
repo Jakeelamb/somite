@@ -48,7 +48,13 @@ test("starter preview is removed and the real canvas is wired", async () => {
   assert.match(panels, /Compatible Tools/);
   assert.match(panels, /Choose an agent/);
   assert.match(panels, /More compatible agents/);
-  assert.match(panels, /Open a local Snakemake project/);
+  assert.match(panels, /Open a local project/);
+  assert.match(panels, /Search tools, data, workflows/);
+  assert.doesNotMatch(panels, /Library Modes|Quick Add|Workflow Engines|Open a local Snakemake project/);
+  assert.match(app, /className="canvas-toolbar"/);
+  assert.match(app, /aria-label="Workflow name"/);
+  assert.match(app, /maxLength=\{100\}/);
+  assert.match(app, /Renamed workflow to/);
   assert.match(panels, /Show .* on canvas/);
   assert.match(app, /beforeunload/);
   assert.match(app, /aria-live="polite"/);

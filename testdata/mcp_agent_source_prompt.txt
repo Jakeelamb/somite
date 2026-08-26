@@ -1,0 +1,1 @@
+Build a reference-guided assembly workflow for human reads using the latest NCBI reference genome. Work as far as the current scientific choices and reviewed Somite capabilities safely allow.

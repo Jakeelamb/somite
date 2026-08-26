@@ -32,8 +32,8 @@ if ! [[ "$port" =~ ^[0-9]+$ ]] || ((port < 1024 || port > 65535)); then
   echo "port must be an integer from 1024 through 65535" >&2
   exit 1
 fi
-if [[ "$scenario" != baseline && "$scenario" != stale ]]; then
-  echo "scenario must be baseline or stale" >&2
+if [[ "$scenario" != baseline && "$scenario" != natural && "$scenario" != source && "$scenario" != stale ]]; then
+  echo "scenario must be baseline, natural, source, or stale" >&2
   exit 1
 fi
 
@@ -84,7 +84,13 @@ configure() {
 configure model "$model"
 configure reasoning_effort "$effort"
 
-install -m 0644 "$project_root/testdata/mcp_agent_prompt.txt" "$output_dir/prompt.txt"
+prompt_fixture="$project_root/testdata/mcp_agent_prompt.txt"
+if [[ "$scenario" == natural ]]; then
+  prompt_fixture="$project_root/testdata/mcp_agent_natural_prompt.txt"
+elif [[ "$scenario" == source ]]; then
+  prompt_fixture="$project_root/testdata/mcp_agent_source_prompt.txt"
+fi
+install -m 0644 "$prompt_fixture" "$output_dir/prompt.txt"
 
 curl --fail --silent "$server_url/api/agent/graph" \
   --header "authorization: Bearer $capability" >"$output_dir/initial-workflow.json"
@@ -239,9 +245,12 @@ jq -n \
         (.title // "") | startswith("somite."))
     },
     metrics: {
+      first_tool: ($transcript[0].tool_calls[0].title // null),
       tool_calls: ($transcript[0].tool_calls | length),
       catalog_searches: ([$transcript[0].tool_calls[]? |
         select((.title // "") | contains("catalog.search"))] | length),
+      source_searches: ([$transcript[0].tool_calls[]? |
+        select((.title // "") | contains("source.search"))] | length),
       status_polls: ([$transcript[0].tool_calls[]? |
         select((.title // "") | contains("run.status"))] | length),
       permission_prompts: ([$transcript[0].tool_calls[]?.permissions[]?] | length),
@@ -252,6 +261,30 @@ jq -n \
     final_graph_revision: $workflow[0].graph_revision,
     wall_time_ms: ($transcript[0].finished_at_unix_ms - $transcript[0].started_at_unix_ms)
   }
+  | if $scenario == "source" then
+      .checks = {
+        inspected_before_edit: (
+          [$transcript[0].tool_calls[].title] as $titles |
+          (($titles | index("somite.workflow.get")) // 9999) <
+          (($titles | index("somite.graph.apply_transaction")) // 9999)),
+        native_ncbi_search: any($transcript[0].tool_calls[]?;
+          (.title // "") == "somite.source.search" and
+          (.input.arguments.provider // "") == "ncbi"),
+        current_reference_found: any($transcript[0].tool_calls[]?;
+          (.title // "") == "somite.source.search" and
+          any(.output.result.structuredContent.results[]?;
+            ((.provider // "") | startswith("NCBI")) and
+            (.data_kind // "") == "Reference" and
+            (.request.kind // "") == "assembly" and
+            ((.accession // "") | length) > 0)),
+        catalog_search_attempted: any($transcript[0].tool_calls[]?;
+          (.title // "") == "somite.catalog.search"),
+        mcp_only: all($transcript[0].tool_calls[]?;
+          (.title // "") | startswith("somite.")),
+        answer_returned: any($transcript[0].messages[]?;
+          .role == "assistant" and ((.text // "") | length) > 0)
+      }
+    else . end
   | .passed = ([.checks[]] | all)
   ' >"$output_dir/score.json"
 

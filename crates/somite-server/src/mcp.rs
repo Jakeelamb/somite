@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::GraphTransaction;
+use crate::{source_search, GraphTransaction};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -300,6 +300,30 @@ pub struct CatalogSearchInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceProvider {
+    Ncbi,
+    Ensembl,
+}
+
+impl SourceProvider {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ncbi => "ncbi",
+            Self::Ensembl => "ensembl",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SourceSearchInput {
+    /// Scientific entity, accession, organism, assembly, run, or gene to look up.
+    pub query: String,
+    /// Authoritative provider to search.
+    pub provider: SourceProvider,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct RunInput {
     /// Run identifier returned by a start tool.
     pub run_id: String,
@@ -464,6 +488,52 @@ impl SomiteMcp {
             format!(
                 "/api/agent/catalog?q={}&limit={limit}{cursor}",
                 percent_encode(query),
+            ),
+            None,
+        )
+        .await
+    }
+
+    /// Search current NCBI or Ensembl records without leaving Somite. Use this
+    /// for reads, reference assemblies, organisms, accessions, and genes before
+    /// generic web research. Results include provenance and a structured source
+    /// request whose ordered `operator_ids` identify Somite's compatible native
+    /// source recipe. Search those exact ids to obtain their immutable contracts.
+    #[tool(
+        name = "somite.source.search",
+        annotations(
+            title = "Search scientific sources",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    pub async fn search_sources(
+        &self,
+        Parameters(input): Parameters<SourceSearchInput>,
+    ) -> Result<Json<source_search::SearchResponse>, CallToolResult> {
+        let query = input.query.trim();
+        if !(2..=120).contains(&query.len()) || query.chars().any(char::is_control) {
+            return Err(tool_error(
+                "invalid_source_query",
+                "Query must contain 2 to 120 printable bytes.".to_owned(),
+                false,
+                Some(
+                    "Use a scientific entity, accession, organism, assembly, run, or gene."
+                        .to_owned(),
+                ),
+                None,
+                None,
+            ));
+        }
+        self.request(
+            Some("somite.source.search"),
+            "GET",
+            format!(
+                "/api/sources/search?q={}&provider={}",
+                percent_encode(query),
+                input.provider.as_str(),
             ),
             None,
         )
@@ -695,7 +765,7 @@ impl ServerHandler for SomiteMcp {
                 Implementation::new("somite", env!("CARGO_PKG_VERSION")).with_title("Somite"),
             )
             .with_instructions(
-                "Somite is a typed visual bioinformatics workflow compiler. Before each edit, call somite.workflow.get and pass its state_revision as base_state_revision. Search exact operator contracts; never invent operator ids, ports, or parameters. Give each intended edit, run, or validation a fresh idempotency_key; reuse it only to retry the identical call after a lost response. Apply one small coherent atomic transaction. If it is stale, inspect again, re-check intent, and retry once with a new key. After validation.start, call run.status with wait_ms up to 25000 until it reaches a terminal phase. Never claim a workflow is runnable unless validation completed successfully.".to_owned(),
+                "Somite is a typed visual bioinformatics workflow compiler. Before each edit, call somite.workflow.get and pass its state_revision as base_state_revision. Search exact operator contracts; never invent operator ids, ports, or parameters. Use somite.source.search for current NCBI or Ensembl reads, assemblies, genes, and references before generic web research. Give each intended edit, run, or validation a fresh idempotency_key; reuse it only to retry the identical call after a lost response. Apply one small coherent atomic transaction. If it is stale, inspect again, re-check intent, and retry once with a new key. After validation.start, call run.status with wait_ms up to 25000 until it reaches a terminal phase. Never claim a workflow is runnable unless validation completed successfully.".to_owned(),
             )
     }
 }

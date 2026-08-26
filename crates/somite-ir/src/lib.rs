@@ -7,6 +7,7 @@ use thiserror::Error;
 
 pub const SCHEMA_VERSION: u32 = 2;
 pub const LEGACY_SCHEMA_VERSION: u32 = 1;
+pub const MAX_GRAPH_NAME_CHARS: usize = 100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -110,6 +111,10 @@ pub struct Edge {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Graph {
     pub schema_version: u32,
+    /// User-controlled document name. It travels with the graph but does not
+    /// participate in executable identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub nodes: Vec<Node>,
     #[serde(default)]
     pub edges: Vec<Edge>,
@@ -119,6 +124,8 @@ pub struct Graph {
 pub enum IrError {
     #[error("schema_version {0} != {SCHEMA_VERSION}")]
     Schema(u32),
+    #[error("graph name must be 1 to {MAX_GRAPH_NAME_CHARS} characters and contain no control characters")]
+    InvalidGraphName,
     #[error("node {node} does not pin an operator revision")]
     UnpinnedOperator { node: String },
     #[error("duplicate id {0}")]
@@ -147,6 +154,14 @@ impl Graph {
     pub fn validate(&self) -> Result<(), IrError> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(IrError::Schema(self.schema_version));
+        }
+        if self.name.as_ref().is_some_and(|name| {
+            let trimmed = name.trim();
+            trimmed.is_empty()
+                || trimmed.chars().count() > MAX_GRAPH_NAME_CHARS
+                || trimmed.chars().any(char::is_control)
+        }) {
+            return Err(IrError::InvalidGraphName);
         }
         let mut ids = BTreeSet::new();
         for n in &self.nodes {
@@ -339,6 +354,7 @@ mod tests {
     fn snap_fastq_to_fastqc() {
         let g = Graph {
             schema_version: SCHEMA_VERSION,
+            name: None,
             nodes: vec![
                 n(
                     "n_src",
@@ -369,6 +385,7 @@ mod tests {
     fn refuse_bam_into_fastqc() {
         let g = Graph {
             schema_version: SCHEMA_VERSION,
+            name: None,
             nodes: vec![
                 n("a", "align.star", vec![out("bam", PortType::Bam)], 0.0),
                 n("b", "qc.fastqc", vec![inn("fastq", PortType::FastqGz)], 1.0),
@@ -382,6 +399,7 @@ mod tests {
     fn scalar_input_rejects_multiple_edges() {
         let g = Graph {
             schema_version: SCHEMA_VERSION,
+            name: None,
             nodes: vec![
                 n(
                     "r1",
@@ -416,6 +434,7 @@ mod tests {
     fn cycle_is_illegal() {
         let g = Graph {
             schema_version: SCHEMA_VERSION,
+            name: None,
             nodes: vec![
                 n(
                     "a",
@@ -439,6 +458,7 @@ mod tests {
     fn json_roundtrip() {
         let g = Graph {
             schema_version: SCHEMA_VERSION,
+            name: Some("RNA-seq QC".into()),
             nodes: vec![n(
                 "n_a",
                 "files.import",
@@ -454,9 +474,26 @@ mod tests {
     }
 
     #[test]
+    fn graph_name_is_optional_but_must_be_a_usable_document_title() {
+        let unnamed: Graph =
+            serde_json::from_str(r#"{"schema_version":2,"nodes":[],"edges":[]}"#).unwrap();
+        assert_eq!(unnamed.name, None);
+        unnamed.validate().unwrap();
+
+        let mut invalid = unnamed.clone();
+        invalid.name = Some("   ".into());
+        assert_eq!(invalid.validate(), Err(IrError::InvalidGraphName));
+        invalid.name = Some("x".repeat(MAX_GRAPH_NAME_CHARS + 1));
+        assert_eq!(invalid.validate(), Err(IrError::InvalidGraphName));
+        invalid.name = Some("line\nbreak".into());
+        assert_eq!(invalid.validate(), Err(IrError::InvalidGraphName));
+    }
+
+    #[test]
     fn empty_ok() {
         Graph {
             schema_version: SCHEMA_VERSION,
+            name: None,
             nodes: vec![],
             edges: vec![],
         }
@@ -468,6 +505,7 @@ mod tests {
     fn dangling_edge() {
         let g = Graph {
             schema_version: SCHEMA_VERSION,
+            name: None,
             nodes: vec![n("n_a", "x", vec![out("o", PortType::Text)], 0.0)],
             edges: vec![e("e1", "n_a", "o", "missing", "i")],
         };

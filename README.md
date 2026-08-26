@@ -25,7 +25,9 @@ scripts/somite-web path/to/workflow.somite.json
 
 The canvas supports typed connections, magnetic alignment, multi-selection,
 pan and deep zoom, undo/redo, light and dark themes, file picking, autosave, and
-group viewer controls. **Run** freezes the graph to its exact Pixi/Nextflow
+group viewer controls. The workflow name is editable directly in the top bar,
+travels with the graph, and becomes the safe exported-package filename; it is
+separate from the local project folder. **Run** freezes the graph to its exact Pixi/Nextflow
 closure, then shows live queued/running/completed state and supports
 cancellation. **Validate** substitutes small content-addressed FASTQ fixtures,
 runs that same production path, and records configuration-scoped evidence.
@@ -33,20 +35,21 @@ Export downloads the same frozen production package.
 
 ## Build workflows
 
-The Library provides three complementary entry points:
+The Library is one universal add surface. Its search spans typed operators,
+public data, and workflow catalogs without forcing the user to choose a source
+type first. Empty-search sections group entries by their role on the graph:
+data and inputs, quality control, alignment and assembly, measurement and
+analysis, workflow catalog, and utilities. NCBI and Ensembl results appear
+alongside matching tools and workflows; paired reads remain separate R1 and R2
+streams.
 
-- **Build** searches typed operators with declared ports, parameters, Pixi
-  packages, commands, and output collection rules.
-- **Sources** searches NCBI and Ensembl without leaving the canvas. It recognizes
-  SRA runs, NCBI assemblies, Ensembl stable IDs, and local files. Paired reads
-  remain separate R1 and R2 streams.
-- **Pipelines** searches nf-core and Snakemake catalogs. Imported workflows
-  expand into editable structural nodes and edges so their internal DAG is
-  visible. Engine-authored references are clearly marked and are not presented
-  as independently executable tools until they have reviewed Somite
-  contracts. The same panel opens a local Snakemake project or Snakefile through
-  its declared Pixi environment; optional target rules select which branches
-  appear on the canvas.
+The Project panel is the engine-neutral entry point for local workflow
+projects. Somite detects a supported project and adds its visible structure to
+the canvas. The current adapter recognizes Snakemake projects and Snakefiles
+through their declared Pixi environment. Imported nf-core and Snakemake
+workflows expand into editable structural nodes and edges; engine-authored
+references remain clearly marked and are not presented as independently
+executable tools until they have reviewed Somite contracts.
 
 Paper Drop reconstructs one or more candidate graphs from methods text or a
 PDF. The evidence view distinguishes text-supported tools, compatibility
@@ -61,8 +64,11 @@ entries come from the official ACP Registry; an arbitrary ACP command remains
 available under the advanced disclosure. Once connected, model and mode choices
 come from that agent's live ACP session rather than a separate Somite provider
 setup. Somite bundles no model and adds no agent modes. The agent receives a
-documented MCP tool server for graph inspection, exact catalog search, atomic graph transactions,
-production compilation and run/validation control, and evidence lookup.
+Somite-owned workflow contract plus a documented MCP tool server for graph
+inspection, exact catalog search, native NCBI/Ensembl source research, atomic
+graph transactions, production compilation and run/validation control, and
+evidence lookup. Ordinary workflow turns start with these tools; a generic
+browser is reserved for current evidence Somite cannot provide.
 Messages, tool activity, permission requests, and graph edits stream into one
 visible feed. Each successful agent transaction appears on the canvas as one
 normal undoable edit; stale revisions fail instead of overwriting newer graph

@@ -41,14 +41,14 @@ pub enum BundleError {
 
 #[derive(Debug, Clone)]
 pub struct ExportTarget {
-    pub project_name: String,
+    pub archive_name: String,
     pub platform: String,
 }
 
 impl ExportTarget {
-    pub fn new(project_name: impl Into<String>, platform: impl Into<String>) -> Self {
+    pub fn new(archive_name: impl Into<String>, platform: impl Into<String>) -> Self {
         Self {
-            project_name: project_name.into(),
+            archive_name: archive_name.into(),
             platform: platform.into(),
         }
     }
@@ -151,7 +151,9 @@ fn create_frozen_package_with_lock(
     let operators = used_operators(graph, catalog)?;
     let plan = build_plan(graph, &operators, target, binary_available);
     let options = CompileOptions {
-        workflow_name: target.project_name.clone(),
+        // This is stable execution metadata. The user-controlled Graph name is
+        // deliberately restricted to the archive filename below.
+        workflow_name: "somite-workflow".into(),
         output_dir: "results".into(),
         platforms: vec![target.platform.clone()],
         nextflow_version: PINNED_NEXTFLOW_VERSION.into(),
@@ -399,7 +401,7 @@ fn build_plan(
         .filter(|tool| tool.state == ToolState::AdapterNeeded)
         .count();
     BundlePlan {
-        filename: format!("{}.somite-run.zip", safe_name(&target.project_name)),
+        filename: format!("{}.somite-run.zip", safe_name(&target.archive_name)),
         platform: target.platform.clone(),
         channels: vec!["conda-forge".to_owned(), "bioconda".to_owned()],
         packages: packages.into_iter().collect(),
@@ -554,6 +556,7 @@ mod tests {
         catalog.ops.insert(echo.id.clone(), echo.clone());
         let graph = Graph {
             schema_version: SCHEMA_VERSION,
+            name: None,
             nodes: vec![node("echo1", &echo)],
             edges: Vec::new(),
         };
@@ -571,6 +574,19 @@ mod tests {
         assert_eq!(package.plan.filename, "RNA-seq.somite-run.zip");
         assert_eq!(package.plan.installable_count, 1);
         assert!(package.closure.closure_digest.starts_with("blake3:"));
+        let mut renamed_graph = graph.clone();
+        renamed_graph.name = Some("Renamed workflow".into());
+        let renamed = create_frozen_package_with_lock(
+            &renamed_graph,
+            &catalog,
+            &ExportTarget::new("Renamed workflow", "linux-64"),
+            &temporary.path().join("renamed"),
+            |_| false,
+            |_| Ok(b"version: 6\n".to_vec()),
+        )
+        .expect("renamed frozen package");
+        assert_eq!(renamed.plan.filename, "Renamed-workflow.somite-run.zip");
+        assert_eq!(renamed.closure, package.closure);
         for name in [
             "main.nf",
             "nextflow.config",
@@ -625,6 +641,7 @@ mod tests {
         );
         let graph = Graph {
             schema_version: SCHEMA_VERSION,
+            name: None,
             nodes: vec![gap_node],
             edges: Vec::new(),
         };

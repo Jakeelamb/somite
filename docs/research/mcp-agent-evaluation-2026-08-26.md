@@ -3,9 +3,12 @@
 ## Verdict
 
 Somite's MCP surface passed the fixed paired-end workflow task with four model
-configurations and a forced concurrent-edit scenario. The current evidence is
-strong for this bounded graph-building path, not for every possible workflow,
-operator, model provider, or MCP transport.
+configurations and a forced concurrent-edit scenario. It now also passes two
+natural-language routing cases that contain no instructions about MCP, shell,
+filesystem, or tool choice: one complete paired-read QC build and one current
+NCBI human-reference request. The current evidence is strong for these bounded
+paths, not for every possible workflow, operator, model provider, or MCP
+transport.
 
 The final baseline needs five to seven MCP calls: exact catalog discovery,
 state inspection, one atomic edit, one idempotent validation start, and one
@@ -19,14 +22,18 @@ receipt for both nodes and both edges.
 | GPT-5.6 Sol, high | baseline | 7 | 2 | 1 | 70.680 s | 12/12 checks passed |
 | GPT-5.4 Mini, low | baseline | 5 | 1 | 1 | 45.450 s | 12/12 checks passed |
 | GPT-5.6 Luna, low | forced stale state | 8 | 2 | 1 | 50.583 s | 13/13 checks passed |
+| GPT-5.6 Luna, low | natural QC request | 6 | 2 | 1 | 38.102 s | 12/12 checks passed |
+| GPT-5.6 Luna, low | natural NCBI reference request | 14 | 11 | 0 | 36.311 s | 6/6 routing checks passed |
 
-Wall time includes agent generation, two explicit ACP permission decisions,
-Pixi preparation, Nextflow execution, and evidence persistence. It is not a
-model-only latency benchmark.
+Wall time includes agent generation, any ACP permission decisions, and, for the
+validated QC cases, Pixi preparation, Nextflow execution, and evidence
+persistence. It is not a model-only latency benchmark. The NCBI case issued its
+catalog discovery in three parallel batches and needed one canvas permission.
 
-## Fixed task and deterministic checks
+## Tasks and deterministic checks
 
-Every baseline starts from an empty canvas and receives the same blind prompt:
+Every original baseline starts from an empty canvas and receives the same fixed
+prompt:
 
 1. Work only through Somite MCP tools.
 2. Discover exact contracts rather than inventing identifiers.
@@ -42,10 +49,22 @@ successful agent edit, MCP-only tool use, and a passing evidence receipt. The
 stale scenario also injects one concurrent human edit after inspection and
 checks structured stale-state recovery plus preservation of that edit.
 
+The `natural` scenario states only the desired paired-read paths, fastp setting,
+and validation outcome. It applies the same 12 structural, ordering, namespace,
+and evidence checks without telling the agent how to use tools. The `source`
+scenario asks for a reference-guided human assembly using the latest NCBI
+reference. It checks inspect-before-edit, native NCBI search, a returned current
+reference record, catalog discovery, MCP-only tool use, and an honest response.
+The resulting partial canvas contains the native
+`ncbi.datasets_assembly -> archive.unzip` recipe and stops for an SRA accession
+or paired FASTQ paths; it is not scored or presented as a runnable assembly.
+
 Run it from the repository root:
 
 ```bash
 scripts/mcp-agent-eval gpt-5.6-luna low 7391 baseline
+scripts/mcp-agent-eval gpt-5.6-luna low 7393 natural
+scripts/mcp-agent-eval gpt-5.6-luna low 7394 source
 scripts/mcp-agent-eval gpt-5.6-luna low 7395 stale
 ```
 
@@ -62,6 +81,10 @@ runs:
 
 | Observation | Root cause | Correction |
 | --- | --- | --- |
+| A natural human-reference request made seven generic shell calls and zero Somite calls. | ACP received the user's text unchanged, so MCP server instructions were only advisory and the repository looked like the default work product. | Every turn now receives an app-owned workflow contract while the visible user message remains unchanged. |
+| The agent needed generic research to identify current NCBI or Ensembl data. | Source search existed only as a web route. | `somite.source.search` exposes the same provider boundary with a typed result, provenance, and an ordered native operator recipe. |
+| Codex sometimes read repository instructions before its first Somite call. | The ACP adapter process inherited the server cwd before the isolated `session/new` cwd arrived. | Both the adapter process and ACP session now start in the same disposable empty workspace; the project is accessed through MCP. |
+| A verbose reference query returned no assembly and caused repeated source searches. | Generic query words were incorrectly treated as part of the NCBI organism name, and every query searched both SRA and Assembly. | Source intent now routes assembly and read queries directly and normalizes phrases such as `latest human reference genome` to the organism subject. |
 | Luna used `graph_revision` as the transaction base and received a stale error. | The workflow tool description contradicted the transaction contract. | Tools and server instructions now distinguish full `state_revision` from semantic `graph_revision`; the stale error includes exact recovery fields. |
 | A natural paired-read query needed seven searches. | Search indexed too little metadata and returned weak partial matches beside complete matches. | Search now indexes ports, artifact types, aliases, labels, Pixi packages, and outputs; complete multi-term matches suppress partial matches. The Inspector query now returns one exact match. |
 | Validation approval briefly appeared as generic `agent action`. | ACP delivered the permission request before the matching tool update. | Permission handling waits up to 200 ms for the update keyed by `tool_call_id`, then emits the exact tool name and edit summary. |
@@ -72,7 +95,7 @@ runs:
 
 ## Protocol and Inspector evidence
 
-The official MCP Inspector enumerated nine tools from Somite's real stdio
+The official MCP Inspector enumerated ten tools from Somite's real stdio
 process. Every tool had an object input schema, a concrete output schema, and
 all four security-relevant annotations. No output property remained an
 unconstrained `true` schema. A real Inspector call for
@@ -104,6 +127,10 @@ real external-client requirement.
 - The fixed task covers a small, valid paired-end graph. More cases should test
   invalid ports, unsupported fixture families, large imported workflows,
   pagination, cancellation during execution, and recovery after process loss.
+- The NCBI case proves native current-reference discovery and a safe partial
+  source recipe. It does not prove a complete human reference-guided assembly;
+  that still requires actual reads and reviewed archive-to-FASTA and downstream
+  consensus contracts.
 - MCP call results contain both compatibility text and structured content, so
   large catalog contracts still consume substantial transcript space.
 - JSON Schema validators may warn about Schemars' nonstandard `uint` format

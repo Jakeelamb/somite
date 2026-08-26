@@ -16,7 +16,7 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::util::MatchDispatch;
-use agent_client_protocol::{AcpAgent, Agent, ConnectionTo, SessionMessage};
+use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, ConnectionTo, SessionMessage};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,6 +29,19 @@ use tokio::sync::{mpsc, oneshot};
 const EVENT_LIMIT: usize = 4_096;
 const MAX_OPERATIONS: usize = 64;
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
+const WORKFLOW_AGENT_CONTRACT: &str = r#"You are the Workflow Agent embedded in Somite. The current Somite canvas is the work product.
+
+Work through the Somite MCP tools immediately. Do not inspect or modify the Somite repository, run shell commands, read project files directly, or create workflow JSON by hand. Do not use developer tools to discover capabilities that Somite already exposes.
+
+Begin by inspecting the current workflow. Search exact catalog contracts instead of inventing operator ids, ports, parameters, or revisions. When current NCBI or Ensembl data is relevant, use Somite source search before leaving the application. If a source result includes ordered operator_ids, treat them as Somite's native source recipe and search those exact ids. Independent workflow, catalog, and source lookups should be issued without unnecessary narration and in parallel when the agent supports it.
+
+Generic web research is allowed only when the request genuinely requires current external evidence that no Somite tool can provide. Prefer authoritative primary sources, state what was learned, and return immediately to the Somite tools. Never use generic web research to inspect Somite's repository or operator contracts.
+
+Apply a small coherent canvas transaction as soon as the available information supports one. Do not ask for confirmation before ordinary reversible canvas edits. Ask one concise question only when a missing scientific choice would materially change the valid graph and Somite cannot represent a safe useful subset first. If a required reviewed contract is missing, report the exact MCP-visible blocker; do not work around it by editing the repository. A representative-validation rejection for an unsupported source family is a blocker, not a reason to replace a scientifically correct source operator. Never claim a workflow is runnable unless validation completed successfully.
+
+Do not narrate a plan before the first relevant Somite tool call. Keep the final response short and centered on canvas changes, exact blockers, revisions, and validation evidence.
+
+User request:"#;
 
 #[derive(Debug, Error)]
 pub enum AgentError {
@@ -795,7 +808,7 @@ impl AgentBridge {
             AgentError::NotConnected
         })?;
         if sender
-            .send(AgentCommand::Prompt(prompt.to_owned()))
+            .send(AgentCommand::Prompt(workflow_agent_prompt(prompt)))
             .is_err()
         {
             self.state.lock().expect("agent state").busy = false;
@@ -931,6 +944,10 @@ impl AgentBridge {
     }
 }
 
+fn workflow_agent_prompt(prompt: &str) -> String {
+    format!("{WORKFLOW_AGENT_CONTRACT}\n\n{prompt}")
+}
+
 async fn run_agent(
     agent: AcpAgent,
     commands: mpsc::UnboundedReceiver<AgentCommand>,
@@ -947,6 +964,27 @@ async fn run_agent(
     } = context;
     let permission_state = state.clone();
     let permission_waiters = permissions.clone();
+    let agent_workspace = tempfile::Builder::new()
+        .prefix("somite-workflow-agent-")
+        .tempdir()
+        .map_err(|error| format!("could not create isolated workflow-agent workspace: {error}"))?;
+    let launch = agent.into_config();
+    let command = launch
+        .command()
+        .to_str()
+        .ok_or_else(|| "ACP agent command is not valid UTF-8".to_owned())?;
+    let mut isolated_args = vec![
+        "--chdir".to_owned(),
+        agent_workspace.path().display().to_string(),
+        "--".to_owned(),
+        command.to_owned(),
+    ];
+    isolated_args.extend(launch.arguments().iter().cloned());
+    let agent = AcpAgent::new(
+        AcpAgentConfig::new("env")
+            .args(isolated_args)
+            .envs(launch.environment().clone()),
+    );
     agent_client_protocol::Client
         .builder()
         .on_receive_request(
@@ -1020,6 +1058,7 @@ async fn run_agent(
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(agent, move |connection: ConnectionTo<Agent>| async move {
+            let agent_workspace = agent_workspace;
             let mut commands = commands;
             let initialize = InitializeRequest::new(ProtocolVersion::V1)
                 .client_capabilities(ClientCapabilities::new().session(
@@ -1054,7 +1093,7 @@ async fn run_agent(
             );
             let mut session = connection
                 .build_session_from(
-                    NewSessionRequest::new(&project_root).mcp_servers(vec![mcp_server]),
+                    NewSessionRequest::new(agent_workspace.path()).mcp_servers(vec![mcp_server]),
                 )
                 .block_task()
                 .start_session()
@@ -1675,6 +1714,7 @@ mod tests {
     fn empty_graph() -> Graph {
         Graph {
             schema_version: SCHEMA_VERSION,
+            name: None,
             nodes: Vec::new(),
             edges: Vec::new(),
         }
@@ -1974,12 +2014,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawned_acp_v1_agent_connects_streams_a_message_and_finishes_a_turn() {
+    async fn spawned_acp_v1_agent_receives_the_workflow_contract_and_keeps_user_text_visible() {
         let temporary = TempDir::new().expect("temporary ACP fixture");
         let fixture = temporary.path().join("fake-acp-agent");
         std::fs::write(
             &fixture,
             r#"#!/bin/sh
+pwd > "$(dirname "$0")/captured-process-cwd.txt"
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([^,}]*\).*/\1/p')
   case "$line" in
@@ -1987,12 +2028,14 @@ while IFS= read -r line; do
       printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{},\"authMethods\":[],\"agentInfo\":{\"name\":\"somite-fixture\",\"title\":\"Fixture Agent\",\"version\":\"1\"}}}"
       ;;
     *'"method":"session/new"'*)
+      printf '%s\n' "$line" > "$(dirname "$0")/captured-session.json"
       printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"sessionId\":\"session-1\",\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"fast\",\"options\":[{\"value\":\"fast\",\"name\":\"Fast\"},{\"value\":\"precise\",\"name\":\"Precise\"}]}]}}"
       ;;
     *'"method":"session/set_config_option"'*)
       printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"precise\",\"options\":[{\"value\":\"fast\",\"name\":\"Fast\"},{\"value\":\"precise\",\"name\":\"Precise\"}]}]}}"
       ;;
     *'"method":"session/prompt"'*)
+      printf '%s\n' "$line" > "$(dirname "$0")/captured-prompt.json"
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Built with Somite."}}}}'
       printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{\"stopReason\":\"end_turn\"}}"
       ;;
@@ -2081,7 +2124,40 @@ done
         .expect("transcript json");
         assert_eq!(transcript["schema_version"], 1);
         assert_eq!(transcript["agent_name"], "Fixture Agent");
+        assert_eq!(transcript["messages"][0]["text"], "Build a tiny workflow");
         assert_eq!(transcript["messages"][1]["text"], "Built with Somite.");
+
+        let captured_session: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(temporary.path().join("captured-session.json"))
+                .expect("captured ACP session"),
+        )
+        .expect("captured ACP session json");
+        let session_cwd = captured_session
+            .pointer("/params/cwd")
+            .and_then(Value::as_str)
+            .expect("ACP session cwd");
+        assert!(
+            !Path::new(session_cwd).starts_with(temporary.path()),
+            "workflow agent should not inherit the project instruction tree: {session_cwd}"
+        );
+        let process_cwd =
+            std::fs::read_to_string(temporary.path().join("captured-process-cwd.txt"))
+                .expect("captured ACP process cwd");
+        assert_eq!(process_cwd.trim(), session_cwd);
+
+        let captured: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(temporary.path().join("captured-prompt.json"))
+                .expect("captured ACP prompt"),
+        )
+        .expect("captured ACP prompt json");
+        let delivered = captured
+            .pointer("/params/prompt/0/text")
+            .and_then(Value::as_str)
+            .expect("delivered workflow-agent prompt");
+        assert!(delivered.contains("Work through the Somite MCP tools immediately"));
+        assert!(delivered.contains("Do not inspect or modify the Somite repository"));
+        assert!(delivered.contains("Generic web research is allowed only"));
+        assert!(delivered.ends_with("Build a tiny workflow"));
 
         bridge.disconnect().await.expect("disconnect ACP fixture");
     }

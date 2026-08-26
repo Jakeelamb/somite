@@ -165,15 +165,24 @@ to graph node IDs.
 ## Web interaction contract
 
 - The canvas is the primary surface.
-- Library, Paper, Machine, and Export are temporary mutually exclusive panels.
+- Add, Project, Paper, Machine, and Export are temporary mutually exclusive
+  panels. Add searches operators, public data, and workflow catalogs through
+  one surface; Project detects supported local workflow projects without
+  exposing an engine selector.
+- A centered canvas toolbar keeps add, file import, fit, and viewer controls
+  within pointer reach.
 - Connections are typed; incompatible ports never connect.
 - Paired reads have separate R1 and R2 ports and snap together when possible.
 - The source launcher resolves exact accessions locally and searches NCBI and
   Ensembl into provider- and artifact-tagged suggestions.
 - Node dragging uses a magnetic grid and neighbor alignment.
 - Pan and zoom work with mouse, trackpad, keyboard, and canvas controls; the
-  overview range reaches 2% for very large imported workflows.
+  overview range reaches 2% for very large imported workflows. Pinch gestures
+  over application chrome never invoke browser page zoom or hide controls.
 - A compact sun/crescent control switches the persisted light or dark theme.
+- The top bar exposes the workflow name as an inline editable document title.
+  The name persists with the graph and drives export naming without changing
+  executable identity.
 - Multi-selection moves, duplicates, deletes, and toggles viewers as a group.
 - Clicking outside a temporary panel closes it.
 - Saves and autosaves are server-validated.

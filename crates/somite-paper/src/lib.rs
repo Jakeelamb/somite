@@ -467,6 +467,7 @@ fn build_bricks(
     let mut warnings = Vec::new();
     let mut g = Graph {
         schema_version: SCHEMA_VERSION,
+        name: None,
         nodes: vec![],
         edges: vec![],
     };
@@ -1118,6 +1119,7 @@ fn build_assembly(
     let mut warnings = Vec::new();
     let mut g = Graph {
         schema_version: SCHEMA_VERSION,
+        name: None,
         nodes: vec![],
         edges: vec![],
     };

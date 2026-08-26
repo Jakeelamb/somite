@@ -8,11 +8,14 @@ and Somite remains useful when no agent is connected.
 ## Protocol split
 
 ACP is the conversation boundary between the web workspace and the user's
-agent. Somite negotiates stable ACP v1, creates one session rooted at the
-project directory, sends prompts, renders streamed messages and tool activity,
-surfaces permission requests, and supports cancellation. The session receives
-Somite's MCP server in its `session/new` request, using ACP's mandatory stdio
-MCP transport.
+agent. Somite negotiates stable ACP v1, launches the agent and creates its
+session in one disposable empty workspace, sends prompts, renders streamed
+messages and tool activity, surfaces permission requests, and supports
+cancellation. This prevents repository instructions and direct filesystem
+inspection from silently displacing the native workflow tools. The real project
+remains reachable through Somite's capability surface, and normalized
+transcripts are still persisted there. The session receives Somite's MCP server
+in its `session/new` request, using ACP's mandatory stdio MCP transport.
 
 MCP is the capability boundary between the agent and Somite. The server is the
 same `somite-server` executable in a protocol-only mode:
@@ -54,12 +57,21 @@ agent. Models, modes, and boolean options are changed through ACP's stable
 request. Somite does not maintain a second provider list, copy credentials, or
 pretend that every agent exposes the same options.
 
+Every user turn also receives a concise Somite-owned workflow contract before
+the user's unchanged message. It tells the agent to act on the canvas through
+MCP immediately, use exact catalog contracts, make ordinary reversible edits
+without a confirmation round trip, and reserve generic web research for current
+external evidence that Somite cannot supply. The visible activity feed and
+persisted transcript retain only the user's original message, not this internal
+routing context.
+
 ## Tool surface
 
 | Tool | Effect |
 | --- | --- |
 | `somite.workflow.get` | Read the current typed graph, full state revision, and semantic revision. |
 | `somite.catalog.search` | Search exact operator contracts, ports, parameters, Pixi packages, and revisions with deterministic ranking and opaque pagination. |
+| `somite.source.search` | Search current NCBI or Ensembl reads, reference assemblies, organisms, accessions, and genes with structured provenance and ordered native source-recipe operators. |
 | `somite.graph.apply_transaction` | Apply up to 64 graph operations atomically against a compare-and-swap base revision. |
 | `somite.workflow.compile` | Freeze the current graph through the production Pixi/Nextflow compiler into a content-addressed package. |
 | `somite.validation.start` | Start the production runner with a supported representative fixture binding. |
@@ -69,8 +81,11 @@ pretend that every agent exposes the same options.
 | `somite.evidence.lookup` | Read immutable receipts for a graph revision. |
 
 The tool annotations identify reads, writes, destructive actions, idempotence,
-and open-world behavior. The server instructions require an agent to inspect
-the graph, search rather than invent contracts, make small edits, and validate.
+and open-world behavior. Workflow and catalog reads are closed-world; source
+search is explicitly open-world because it queries NCBI or Ensembl through
+Somite's existing provider boundary. The server instructions require an agent
+to inspect the graph, search rather than invent contracts, prefer native source
+search over a generic browser, make small edits, and validate.
 Every tool has a concrete output schema. Expected catalog, edit, compile, run,
 and validation failures return structured `isError: true` tool results with a
 stable code and a recovery action instead of being disguised as transport
@@ -136,8 +151,8 @@ one history entry for each, so normal Undo reverses them individually.
 
 ## Trust and visibility
 
-- The command is parsed and launched directly as a local subprocess; Somite
-  does not pass it through a shell.
+- The command is parsed and launched as a local subprocess in the disposable
+  agent workspace; Somite does not pass it through a shell.
 - Discovered launch commands come from the official ACP Registry, are checked
   against a conservative token allowlist, and remain visible before launch.
 - The agent command is not saved in the project.
@@ -184,6 +199,8 @@ permissions, and writes a deterministic score plus redacted evidence:
 
 ```bash
 scripts/mcp-agent-eval gpt-5.6-luna low 7391 baseline
+scripts/mcp-agent-eval gpt-5.6-luna low 7393 natural
+scripts/mcp-agent-eval gpt-5.6-luna low 7394 source
 scripts/mcp-agent-eval gpt-5.6-luna low 7395 stale
 ```
 

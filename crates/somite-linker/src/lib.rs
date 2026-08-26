@@ -394,6 +394,7 @@ mod tests {
         catalog.ops.insert(operator.id.clone(), operator);
         let graph = Graph {
             schema_version: SCHEMA_VERSION,
+            name: None,
             nodes: vec![Node {
                 id: "echo1".into(),
                 operator: "test.echo".into(),
@@ -418,9 +419,10 @@ mod tests {
     }
 
     #[test]
-    fn layout_and_notes_do_not_change_the_semantic_graph_revision() {
+    fn name_layout_and_notes_do_not_change_the_semantic_graph_revision() {
         let (graph, _) = fixture();
         let mut moved = graph.clone();
+        moved.name = Some("Renamed workflow".into());
         moved.nodes[0].layout = Layout { x: 800.0, y: -40.0 };
         moved.nodes[0].note = Some("presentation only".into());
         assert_eq!(

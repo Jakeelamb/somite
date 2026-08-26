@@ -1,7 +1,6 @@
 "use client";
 
 import {
-  Check,
   ChevronDown,
   CircleStop,
   Cpu,
@@ -36,8 +35,6 @@ import type {
 } from "./types";
 import { OperatorGlyph, portColor } from "./visual";
 import { jsonRequest } from "./api";
-
-export type LibraryMode = "build" | "sources" | "pipelines";
 
 function groupedAgentEvents(events: AgentEvent[]) {
   return events.reduce<AgentEvent[]>((grouped, event) => {
@@ -198,32 +195,24 @@ function isPipeline(operator: Operator) {
   return operator.id.startsWith("nf.") || operator.id.startsWith("smk.");
 }
 
-function sectionTitle(operator: Operator, mode: LibraryMode) {
-  if (mode === "sources") {
-    if (operator.id.startsWith("sra.") || operator.id.startsWith("ncbi.")) return "NCBI & SRA";
-    if (operator.id.startsWith("ensembl.")) return "Ensembl Accessions";
-    return "Local Files";
-  }
-  if (mode === "pipelines") {
-    if (operator.id.startsWith("smk.")) return "Snakemake";
-    return operator.palette.includes("Catalog") ? "nf-core Catalog" : "Curated for Somite";
-  }
+function sectionTitle(operator: Operator) {
+  if (isSource(operator)) return "Data & Inputs";
+  if (isPipeline(operator) || operator.id.startsWith("workflow.")) return "Workflow Catalog";
   const prefix = operator.id.split(".")[0];
   return ({
-    qc: "Quality",
-    align: "Align & Map",
-    quant: "Quantify",
-    asm: "Assemble",
-    diff: "Analyze",
-    var: "Analyze",
-    class: "Analyze",
+    qc: "Quality Control",
+    align: "Align & Assemble",
+    asm: "Align & Assemble",
+    quant: "Measure & Analyze",
+    diff: "Measure & Analyze",
+    var: "Measure & Analyze",
+    class: "Measure & Analyze",
     gap: "Utilities",
   } as Record<string, string>)[prefix] ?? "More Tools";
 }
 
 function buildSections(
   operators: Operator[],
-  mode: LibraryMode,
   query: string,
   favorites: Set<string>,
   recent: string[],
@@ -237,10 +226,7 @@ function buildSections(
         .toLowerCase()
         .includes(normalized);
     }
-    if (continuation) return true;
-    if (mode === "sources") return isSource(operator);
-    if (mode === "pipelines") return isPipeline(operator);
-    return !isSource(operator) && !isPipeline(operator);
+    return true;
   });
   if (continuation) return [{ title: "Compatible Tools", operators: matches, open: true }];
   if (normalized) return [{ title: "Search Results", operators: matches, open: true }];
@@ -251,101 +237,75 @@ function buildSections(
   if (favoriteOperators.length) {
     leading.push({ title: "Favorites", operators: favoriteOperators, open: true });
   }
-  if (mode === "build") {
-    const recentOperators = recent
-      .map((id) => byId.get(id))
-      .filter((operator): operator is Operator => Boolean(operator) && matches.includes(operator as Operator));
-    if (recentOperators.length) {
-      leading.push({ title: "Recent", operators: recentOperators, open: true });
-    }
+  const recentOperators = recent
+    .map((id) => byId.get(id))
+    .filter((operator): operator is Operator => Boolean(operator) && matches.includes(operator as Operator));
+  if (recentOperators.length) {
+    leading.push({ title: "Recent", operators: recentOperators, open: true });
   }
   const grouped = new Map<string, Operator[]>();
   for (const operator of matches) {
-    const title = sectionTitle(operator, mode);
+    const title = sectionTitle(operator);
     grouped.set(title, [...(grouped.get(title) ?? []), operator]);
   }
+  const order = ["Data & Inputs", "Quality Control", "Align & Assemble", "Measure & Analyze", "Workflow Catalog", "Utilities", "More Tools"];
   return [
     ...leading,
-    ...[...grouped.entries()].map(([title, groupedOperators]) => ({
+    ...[...grouped.entries()].sort(([left], [right]) => order.indexOf(left) - order.indexOf(right)).map(([title, groupedOperators]) => ({
       title,
       operators: groupedOperators,
-      open: mode !== "build" || title === "Quality",
+      open: title === "Data & Inputs" || title === "Quality Control",
     })),
   ];
 }
 
 export function LibraryPanel({
   operators,
-  mode,
   query,
   filterQuery,
   favorites,
   recent,
   categoryOpen,
   searchInputRef,
-  toolReadiness,
-  localCount,
-  catalogCount,
-  catalogStatus,
-  snakemakeCount,
-  snakemakeGraphCount,
-  snakemakeStatus,
   continuation,
-  onMode,
   onQuery,
   onClose,
   onAddOperator,
   onAddSource,
-  onImportSnakemake,
   onToggleFavorite,
   onToggleCategory,
 }: {
   operators: Operator[];
-  mode: LibraryMode;
   query: string;
   filterQuery: string;
   favorites: Set<string>;
   recent: string[];
   categoryOpen: Record<string, boolean>;
   searchInputRef: RefObject<HTMLInputElement | null>;
-  toolReadiness?: SystemProfile["tools"];
-  localCount: number;
-  catalogCount: number;
-  catalogStatus: "loading" | "ready" | "offline";
-  snakemakeCount: number;
-  snakemakeGraphCount: number;
-  snakemakeStatus: "loading" | "ready" | "offline";
   continuation?: PendingConnection | null;
-  onMode: (mode: LibraryMode) => void;
   onQuery: (query: string) => void;
   onClose: () => void;
   onAddOperator: (operator: Operator) => void;
   onAddSource: (request: SourceRequest) => void;
-  onImportSnakemake: (path: string, targets: string[]) => Promise<void>;
   onToggleFavorite: (id: string) => void;
   onToggleCategory: (title: string, open: boolean) => void;
 }) {
-  const [accession, setAccession] = useState("");
-  const request = classifySource(accession);
+  const request = classifySource(query);
   const hasDirectSource = request !== null;
   const [sourceResults, setSourceResults] = useState<SourceSearchResult[]>([]);
   const [sourceSearching, setSourceSearching] = useState(false);
   const [sourceSearched, setSourceSearched] = useState(false);
   const [activeSourceResult, setActiveSourceResult] = useState(0);
-  const [localWorkflowPath, setLocalWorkflowPath] = useState("");
-  const [localWorkflowTargets, setLocalWorkflowTargets] = useState("");
-  const [localWorkflowImporting, setLocalWorkflowImporting] = useState(false);
-  const [localWorkflowError, setLocalWorkflowError] = useState("");
   const sections = useMemo(
-    () => buildSections(operators, mode, filterQuery, favorites, recent, continuation),
-    [continuation, favorites, filterQuery, mode, operators, recent],
+    () => buildSections(operators, filterQuery, favorites, recent, continuation),
+    [continuation, favorites, filterQuery, operators, recent],
   );
 
   useEffect(() => {
-    const query = accession.trim();
+    const sourceQuery = filterQuery.trim();
     const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      if (mode !== "sources" || hasDirectSource || query.length < 2) {
+      if (continuation || hasDirectSource || sourceQuery.length < 2) {
         setSourceResults([]);
         setSourceSearching(false);
         setSourceSearched(false);
@@ -358,7 +318,7 @@ export function LibraryPanel({
       setActiveSourceResult(0);
       let pending = 2;
       for (const provider of ["ncbi", "ensembl"] as const) {
-        jsonRequest<SourceSearchResponse>(`/api/sources/search?q=${encodeURIComponent(query)}&provider=${provider}`, {
+        jsonRequest<SourceSearchResponse>(`/api/sources/search?q=${encodeURIComponent(sourceQuery)}&provider=${provider}`, {
           signal: controller.signal,
         })
           .then((response) => {
@@ -383,11 +343,11 @@ export function LibraryPanel({
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [accession, hasDirectSource, mode]);
+  }, [continuation, filterQuery, hasDirectSource]);
 
   const chooseSource = (source: SourceRequest) => {
     onAddSource(source);
-    setAccession("");
+    onQuery("");
     setSourceResults([]);
     setActiveSourceResult(0);
   };
@@ -395,7 +355,7 @@ export function LibraryPanel({
   return (
     <section className="floating-panel library-window" aria-label="Operator Library">
       <header className="floating-panel-head">
-        <div><strong>Library</strong><span>{operators.length} tools</span></div>
+        <div><strong>Add to canvas</strong><span>{operators.length} available</span></div>
         <button type="button" aria-label="Close Library" onClick={onClose}><X size={15} aria-hidden="true" /></button>
       </header>
       <div className="library-toolbar">
@@ -407,88 +367,18 @@ export function LibraryPanel({
             aria-label="Search everything"
             autoComplete="off"
             name="library-search"
-            placeholder="Search everything…  Ctrl K"
+            placeholder="Search tools, data, workflows…  Ctrl K"
             spellCheck={false}
             value={query}
             onChange={(event) => onQuery(event.target.value)}
           />
           {query && <button type="button" aria-label="Clear Search" onClick={() => onQuery("")}><X size={13} aria-hidden="true" /></button>}
         </div>
-        {!continuation && <nav className="library-tabs" aria-label="Library Modes">
-          {(["build", "sources", "pipelines"] as const).map((value) => (
-            <button
-              key={value}
-              type="button"
-              aria-current={mode === value ? "page" : undefined}
-              className={mode === value ? "active" : ""}
-              onClick={() => onMode(value)}
-            >
-              {value[0].toUpperCase() + value.slice(1)}
-            </button>
-          ))}
-        </nav>}
       </div>
 
-      {!continuation && mode === "build" && !query && (
-        <div className="quick-add-grid">
-          <span className="section-kicker">Quick Add</span>
-          <button type="button" onClick={() => {
-            const operator = operators.find((candidate) => candidate.id === "files.import");
-            if (operator) onAddOperator(operator);
-          }}>
-            <FileInput size={16} aria-hidden="true" /><span><strong>Import Reads</strong><small>FASTQ, BAM, VCF or GTF</small></span>
-          </button>
-          <button type="button" onClick={() => onMode("sources")}>
-            <span className="quick-glyph">ID</span><span><strong>Add Accession</strong><small>NCBI or Ensembl stable ID</small></span>
-          </button>
-          <button type="button" onClick={() => onMode("pipelines")}>
-            <span className="quick-glyph">nf</span><span><strong>Find a Pipeline</strong><small>Nextflow & Snakemake</small></span>
-          </button>
-        </div>
-      )}
-
-      {!continuation && mode === "sources" && !query && (
-        <div className="source-builder">
-          <div className="source-readiness">
-            {(["sra", "datasets", "ensembl"] as const).map((tool) => (
-              <span key={tool} className={toolReadiness?.[tool] ? "ready" : "missing"}>
-                <i />{tool === "sra" ? "SRA" : tool[0].toUpperCase() + tool.slice(1)}
-              </span>
-            ))}
-          </div>
-          <label htmlFor="accession-entry">Search Data or Enter an Accession</label>
-          <div className="source-search-input">
-            <Search size={13} aria-hidden="true" />
-            <input
-              id="accession-entry"
-              role="combobox"
-              aria-autocomplete="list"
-              aria-controls="source-search-results"
-              aria-expanded={sourceResults.length > 0}
-              aria-activedescendant={sourceResults[activeSourceResult] ? `source-result-${sourceResults[activeSourceResult].key}` : undefined}
-              autoComplete="off"
-              name="accession"
-              placeholder="human · mouse RNA-seq · BRCA2 · SRR…"
-              spellCheck={false}
-              value={accession}
-              onChange={(event) => setAccession(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "ArrowDown" && sourceResults.length) {
-                  event.preventDefault();
-                  setActiveSourceResult((index) => Math.min(index + 1, sourceResults.length - 1));
-                } else if (event.key === "ArrowUp" && sourceResults.length) {
-                  event.preventDefault();
-                  setActiveSourceResult((index) => Math.max(index - 1, 0));
-                } else if (event.key === "Enter") {
-                  if (request) chooseSource(request);
-                  else if (sourceResults[activeSourceResult]) chooseSource(sourceResults[activeSourceResult].request);
-                } else if (event.key === "Escape") {
-                  setAccession("");
-                }
-              }}
-            />
-            {sourceSearching && <LoaderCircle className="source-search-spinner" size={13} aria-label="Searching NCBI and Ensembl" />}
-          </div>
+      {!continuation && query.trim() && (request || sourceSearching || sourceSearched || sourceResults.length > 0) && (
+        <section className="source-builder unified-source-results" aria-label="Public data results">
+          <header><span><strong>Public data</strong><small>NCBI + Ensembl</small></span>{sourceSearching && <LoaderCircle className="source-search-spinner" size={13} aria-label="Searching NCBI and Ensembl" />}</header>
           {sourceResults.length > 0 && (
             <div className="source-results" id="source-search-results" role="listbox" aria-label="Data source results">
               {sourceResults.map((result, index) => (
@@ -516,43 +406,13 @@ export function LibraryPanel({
             ) : sourceSearching ? (
               <span>Searching live NCBI and Ensembl records…</span>
             ) : sourceSearched && !sourceResults.length ? (
-              <span>No direct matches · try an organism, assay, gene symbol, or accession</span>
+              <span>No public data matches · tools and workflows remain below</span>
             ) : (
-              <span>Reads, reference genomes, assemblies, genes, and stable IDs</span>
+              <span>Searching public data alongside the local catalog…</span>
             )}
           </div>
-          <button type="button" className="source-action" disabled={!request} onClick={() => {
-            if (!request) return;
-            chooseSource(request);
-          }}>
-            {request?.action ?? "Choose a Result"}
-          </button>
-        </div>
-      )}
-
-      {mode === "pipelines" && !query && (
-        <div className="pipeline-banner">
-          <span className="section-kicker">Workflow Engines</span>
-          <div><WayfindingMark label="NF" ready={toolReadiness?.nextflow} /><span><strong>Nextflow / nf-core</strong><small>{catalogStatus === "loading" ? "Loading the official catalog…" : catalogStatus === "offline" ? "Catalog offline · local workflows remain" : `${catalogCount} official workflows ready`}</small></span></div>
-          <div><WayfindingMark label="SM" ready={toolReadiness?.snakemake || toolReadiness?.pixi} /><span><strong>Snakemake Catalog</strong><small>{snakemakeStatus === "loading" ? "Loading released standardized workflows…" : snakemakeStatus === "offline" ? "Catalog offline · local workflows remain" : `${snakemakeCount} released · ${snakemakeGraphCount} graph-ready`}</small></span></div>
-          <form className="local-workflow-import" onSubmit={(event) => {
-            event.preventDefault();
-            const path = localWorkflowPath.trim();
-            if (!path || localWorkflowImporting) return;
-            const targets = localWorkflowTargets.split(/[\s,]+/).filter(Boolean);
-            setLocalWorkflowError("");
-            setLocalWorkflowImporting(true);
-            void onImportSnakemake(path, targets)
-              .catch((error: unknown) => setLocalWorkflowError(error instanceof Error ? error.message : "Could not import workflow"))
-              .finally(() => setLocalWorkflowImporting(false));
-          }}>
-            <div className="local-workflow-title"><FolderOpen size={14} aria-hidden="true" /><span><strong>Open a local Snakemake project</strong><small>Uses its Pixi environment · previews rules only</small></span></div>
-            <label><span>Project or Snakefile</span><input aria-label="Local Snakemake project or Snakefile" autoComplete="off" spellCheck={false} placeholder="/path/to/project" value={localWorkflowPath} onChange={(event) => setLocalWorkflowPath(event.target.value)} /></label>
-            <label><span>Targets <em>optional</em></span><input aria-label="Snakemake targets" autoComplete="off" spellCheck={false} placeholder="intake small_variant" value={localWorkflowTargets} onChange={(event) => setLocalWorkflowTargets(event.target.value)} /></label>
-            {localWorkflowError && <p role="alert">{localWorkflowError}</p>}
-            <button type="submit" disabled={!localWorkflowPath.trim() || localWorkflowImporting}>{localWorkflowImporting ? <><LoaderCircle className="spin" size={13} />Reading workflow…</> : "Visualize workflow"}</button>
-          </form>
-        </div>
+          {request && <button type="button" className="source-action" onClick={() => chooseSource(request)}>{request.action}</button>}
+        </section>
       )}
 
       <div className="operator-sections">
@@ -583,15 +443,45 @@ export function LibraryPanel({
             </section>
           );
         })}
-        {sections.every((section) => section.operators.length === 0) && <p className="panel-empty">No matching tools.</p>}
+        {sections.every((section) => section.operators.length === 0) && <p className="panel-empty">No matching tools or workflows.</p>}
       </div>
-      <footer className="library-footer"><span>★ {favorites.size} favorites</span><span>{localCount} local · {catalogStatus === "loading" || snakemakeStatus === "loading" ? "catalog…" : catalogStatus === "offline" && snakemakeStatus === "offline" ? "catalogs offline" : `${catalogCount + snakemakeCount} catalog`}</span></footer>
+      <footer className="library-footer"><span>★ {favorites.size} favorites</span><span>Click to add · drag to place</span></footer>
     </section>
   );
 }
 
-function WayfindingMark({ label, ready }: { label: string; ready?: boolean }) {
-  return <span className={`wayfinding-mark ${ready ? "ready" : ""}`}>{ready ? <Check size={12} aria-hidden="true" /> : label}</span>;
+export function ProjectPanel({ projectName, graphPath, onImportProject, onClose }: {
+  projectName: string;
+  graphPath: string;
+  onImportProject: (path: string) => Promise<void>;
+  onClose: () => void;
+}) {
+  const [path, setPath] = useState("");
+  const [importing, setImporting] = useState(false);
+  const [error, setError] = useState("");
+  return (
+    <section className="floating-panel project-window" aria-label="Project">
+      <header className="floating-panel-head"><div><strong>Project</strong><span>{projectName}</span></div><button type="button" aria-label="Close Project" onClick={onClose}><X size={15} /></button></header>
+      <div className="project-current"><span>Current graph</span><strong>{graphPath}</strong><small>Changes are saved into this Somite project.</small></div>
+      <form className="project-import" onSubmit={(event) => {
+        event.preventDefault();
+        const projectPath = path.trim();
+        if (!projectPath || importing) return;
+        setError("");
+        setImporting(true);
+        void onImportProject(projectPath)
+          .then(() => setPath(""))
+          .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "Could not open project"))
+          .finally(() => setImporting(false));
+      }}>
+        <div className="project-import-title"><FolderOpen size={18} aria-hidden="true" /><span><strong>Open a local project</strong><small>Detect its workflow structure automatically</small></span></div>
+        <p>Somite adds the project’s visible workflow structure to this canvas. Unsupported formats fail closed.</p>
+        <label><span>Project folder or workflow file</span><input aria-label="Local project folder or workflow file" autoComplete="off" spellCheck={false} placeholder="/path/to/project" value={path} onChange={(event) => setPath(event.target.value)} /></label>
+        {error && <p className="project-import-error" role="alert">{error}</p>}
+        <button type="submit" disabled={!path.trim() || importing}>{importing ? <><LoaderCircle className="spin" size={13} />Opening project…</> : <><FolderOpen size={13} />Open project</>}</button>
+      </form>
+    </section>
+  );
 }
 
 export function MachinePanel({ profile, onClose }: { profile: SystemProfile | null; onClose: () => void }) {

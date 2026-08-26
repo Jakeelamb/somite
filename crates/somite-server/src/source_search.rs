@@ -2,24 +2,34 @@ use std::collections::BTreeMap;
 use std::process::Command;
 use std::time::Duration;
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const EUTILS: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils";
 const ENSEMBL: &str = "https://rest.ensembl.org";
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NcbiSearchPlan {
+    Reads,
+    Assemblies,
+    Both,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SourceRequest {
     pub kind: String,
     pub value: String,
     pub provider: String,
     pub result: String,
     pub action: String,
+    /// Reviewed catalog operators used by Somite's native source recipe, in order.
+    pub operator_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence_type: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SearchResult {
     pub key: String,
     pub title: String,
@@ -31,14 +41,27 @@ pub struct SearchResult {
     pub request: SourceRequest,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SearchResponse {
+    pub query: String,
+    pub provider: String,
+    pub results: Vec<SearchResult>,
+}
+
 pub fn search_ncbi(query: &str) -> Vec<SearchResult> {
-    // Anonymous E-utilities clients are limited to three requests per second.
-    // Each result family needs ESearch + ESummary, so pace the four calls rather
-    // than racing them and silently losing one provider branch to a 429.
-    let mut results = search_sra(query);
-    std::thread::sleep(Duration::from_millis(360));
-    results.extend(search_assemblies(query));
-    results
+    match ncbi_search_plan(query) {
+        NcbiSearchPlan::Reads => search_sra(query),
+        NcbiSearchPlan::Assemblies => search_assemblies(query),
+        NcbiSearchPlan::Both => {
+            // Anonymous E-utilities clients are limited to three requests per
+            // second. Each family needs ESearch + ESummary, so pace the second
+            // family rather than racing it and losing results to a 429.
+            let mut results = search_sra(query);
+            std::thread::sleep(Duration::from_millis(360));
+            results.extend(search_assemblies(query));
+            results
+        }
+    }
 }
 
 pub fn search_ensembl(query: &str) -> Vec<SearchResult> {
@@ -85,9 +108,10 @@ fn search_sra(query: &str) -> Vec<SearchResult> {
 }
 
 fn search_assemblies(query: &str) -> Vec<SearchResult> {
+    let subject = assembly_search_subject(query);
     let term = format!(
         "{} AND \"reference genome\"[RefSeq Category]",
-        ncbi_term(query)
+        ncbi_term(&subject)
     );
     let ids = esearch("assembly", &term, 3);
     let Some(summary) = esummary("assembly", &ids) else {
@@ -96,6 +120,64 @@ fn search_assemblies(query: &str) -> Vec<SearchResult> {
     ordered_records(&summary, &ids)
         .filter_map(assembly_result)
         .collect()
+}
+
+fn ncbi_search_plan(query: &str) -> NcbiSearchPlan {
+    let lower = query.to_ascii_lowercase();
+    let asks_for_assembly = [
+        "assembly",
+        "reference",
+        "genome",
+        "grch",
+        "chm13",
+        "gcf_",
+        "gca_",
+    ]
+    .iter()
+    .any(|term| lower.contains(term));
+    let asks_for_reads = [
+        "reads", "fastq", "sra", "srr", "rna-seq", "wgs", "illumina", "nanopore",
+    ]
+    .iter()
+    .any(|term| lower.contains(term));
+    match (asks_for_reads, asks_for_assembly) {
+        (true, false) => NcbiSearchPlan::Reads,
+        (false, true) => NcbiSearchPlan::Assemblies,
+        _ => NcbiSearchPlan::Both,
+    }
+}
+
+fn assembly_search_subject(query: &str) -> String {
+    let lower = query.to_ascii_lowercase();
+    if lower.contains("homo sapiens") || lower.split_whitespace().any(|word| word == "human") {
+        return "Homo sapiens".to_owned();
+    }
+    let generic = [
+        "latest",
+        "current",
+        "reference",
+        "genome",
+        "assembly",
+        "assemblies",
+        "ncbi",
+        "datasets",
+        "the",
+    ];
+    let subject = query
+        .split_whitespace()
+        .filter(|word| {
+            let normalized = word
+                .trim_matches(|character: char| !character.is_ascii_alphanumeric())
+                .to_ascii_lowercase();
+            !generic.contains(&normalized.as_str())
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if subject.is_empty() {
+        query.trim().to_owned()
+    } else {
+        subject
+    }
 }
 
 fn esearch(database: &str, term: &str, limit: usize) -> Vec<String> {
@@ -163,6 +245,7 @@ fn sra_result(record: &Value) -> Option<SearchResult> {
             provider: "NCBI SRA".to_owned(),
             result: "SRA download → separate R1 / R2 FASTQ streams".to_owned(),
             action: "Add Reads".to_owned(),
+            operator_ids: vec!["sra.prefetch".to_owned(), "sra.fasterq_dump".to_owned()],
             sequence_type: None,
         },
     })
@@ -231,6 +314,7 @@ fn ensembl_feature_result(record: &Value) -> Option<SearchResult> {
             provider: "Ensembl REST".to_owned(),
             result: format!("{data_kind} FASTA sequence"),
             action: "Add Sequence".to_owned(),
+            operator_ids: vec!["ensembl.sequence".to_owned()],
             sequence_type: Some(sequence_type.to_owned()),
         },
     })
@@ -243,6 +327,10 @@ fn assembly_request(accession: String, provider: &str) -> SourceRequest {
         provider: provider.to_owned(),
         result: "Genome, annotations, proteins & metadata package".to_owned(),
         action: "Add Assembly".to_owned(),
+        operator_ids: vec![
+            "ncbi.datasets_assembly".to_owned(),
+            "archive.unzip".to_owned(),
+        ],
         sequence_type: None,
     }
 }
@@ -379,6 +467,10 @@ mod tests {
         }))
         .expect("assembly result");
         assert_eq!(assembly.request.kind, "assembly");
+        assert_eq!(
+            assembly.request.operator_ids,
+            ["ncbi.datasets_assembly", "archive.unzip"]
+        );
         assert_eq!(assembly.data_kind, "Reference");
 
         let gene = ensembl_feature_result(&serde_json::json!({
@@ -390,5 +482,22 @@ mod tests {
         .expect("gene result");
         assert_eq!(gene.request.kind, "ensembl-gene");
         assert_eq!(gene.request.sequence_type.as_deref(), Some("genomic"));
+    }
+
+    #[test]
+    fn routes_reference_queries_directly_to_assemblies() {
+        assert_eq!(
+            ncbi_search_plan("Homo sapiens latest reference genome assembly"),
+            NcbiSearchPlan::Assemblies
+        );
+        assert_eq!(
+            assembly_search_subject("Homo sapiens latest reference genome assembly"),
+            "Homo sapiens"
+        );
+        assert_eq!(
+            ncbi_search_plan("human paired RNA-seq reads"),
+            NcbiSearchPlan::Reads
+        );
+        assert_eq!(ncbi_search_plan("human"), NcbiSearchPlan::Both);
     }
 }

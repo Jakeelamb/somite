@@ -142,12 +142,20 @@ fn compile_cmd(graph_path: &Path, output: &Path) -> Result<()> {
     };
     absolutize_import_paths(&mut runnable_graph, &project_base, &graph_base);
 
-    let workflow_name = graph_path
-        .file_stem()
-        .and_then(|name| name.to_str())
+    let workflow_name = source_graph
+        .name
+        .as_deref()
+        .map(str::trim)
         .filter(|name| !name.is_empty())
-        .unwrap_or("somite-workflow")
-        .to_owned();
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            graph_path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("somite-workflow")
+                .to_owned()
+        });
     let package = create_frozen_package(
         &runnable_graph,
         &catalog,

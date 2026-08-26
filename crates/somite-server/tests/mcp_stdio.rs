@@ -66,6 +66,7 @@ async fn spawned_stdio_server_lists_tools_and_applies_one_atomic_edit() {
     assert!(instructions.contains("state_revision as base_state_revision"));
     assert!(instructions.contains("fresh idempotency_key"));
     assert!(instructions.contains("run.status with wait_ms up to 25000"));
+    assert!(instructions.contains("somite.source.search"));
     assert!(instructions.contains("Never claim a workflow is runnable"));
 
     let tools = client.list_all_tools().await.expect("list MCP tools");
@@ -165,6 +166,7 @@ async fn spawned_stdio_server_lists_tools_and_applies_one_atomic_edit() {
             "somite.run.cancel".to_owned(),
             "somite.run.start".to_owned(),
             "somite.run.status".to_owned(),
+            "somite.source.search".to_owned(),
             "somite.validation.start".to_owned(),
             "somite.workflow.compile".to_owned(),
             "somite.workflow.get".to_owned(),

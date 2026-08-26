@@ -23,6 +23,7 @@ proptest! {
             .collect();
         let g = Graph {
             schema_version: SCHEMA_VERSION,
+            name: None,
             nodes,
             edges: vec![],
         };

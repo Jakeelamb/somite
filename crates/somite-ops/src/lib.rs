@@ -811,6 +811,7 @@ mod tests {
         let operator = catalog.get("qc.fastqc").unwrap();
         let mut graph = Graph {
             schema_version: LEGACY_SCHEMA_VERSION,
+            name: None,
             nodes: vec![Node {
                 id: "fastqc1".into(),
                 operator: operator.id.clone(),

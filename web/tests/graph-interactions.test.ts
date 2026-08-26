@@ -9,6 +9,7 @@ import {
   type PendingConnection,
 } from "../app/graphInteractions.ts";
 import { edgeLifecycleState, semanticGraphKey } from "../app/validationState.ts";
+import { preventBrowserZoomOutsideCanvas } from "../app/canvasGestures.ts";
 import type { SomiteGraphNode, Operator } from "../app/types.ts";
 
 const fastp: Operator = {
@@ -82,6 +83,32 @@ test("imported workflow layout reserves room for node titles, ids, and port labe
   );
 });
 
+test("pinch zoom cannot scale the browser chrome while canvas zoom remains available", () => {
+  let toolbarPrevented = false;
+  preventBrowserZoomOutsideCanvas({
+    ctrlKey: true,
+    target: { closest: () => null },
+    preventDefault: () => { toolbarPrevented = true; },
+  });
+  assert.equal(toolbarPrevented, true);
+
+  let canvasPrevented = false;
+  preventBrowserZoomOutsideCanvas({
+    ctrlKey: true,
+    target: { closest: (selector: string) => selector === ".react-flow" ? {} : null },
+    preventDefault: () => { canvasPrevented = true; },
+  });
+  assert.equal(canvasPrevented, false);
+
+  let regularWheelPrevented = false;
+  preventBrowserZoomOutsideCanvas({
+    ctrlKey: false,
+    target: { closest: () => null },
+    preventDefault: () => { regularWheelPrevented = true; },
+  });
+  assert.equal(regularWheelPrevented, false);
+});
+
 test("validation edges expose progress and terminal evidence without color-only ambiguity", () => {
   const edge = { id: "edge1", from_node: "source1", from_port: "out", to_node: "tool1", to_port: "in" };
   assert.equal(edgeLifecycleState(edge, { source1: "done", tool1: "queued" }), "queued");
@@ -92,8 +119,10 @@ test("validation edges expose progress and terminal evidence without color-only 
 
 test("validation identity ignores layout but invalidates parameter changes", () => {
   const graph = { schema_version: 2, nodes: [{ ...node, params: { threads: 2 } }], edges: [] };
+  const renamed = { ...graph, name: "RNA-seq review" };
   const moved = { ...graph, nodes: [{ ...graph.nodes[0], layout: { x: 900, y: -20 } }] };
   const changed = { ...graph, nodes: [{ ...graph.nodes[0], params: { threads: 4 } }] };
+  assert.equal(semanticGraphKey(graph), semanticGraphKey(renamed));
   assert.equal(semanticGraphKey(graph), semanticGraphKey(moved));
   assert.notEqual(semanticGraphKey(graph), semanticGraphKey(changed));
 });

@@ -8,6 +8,10 @@ exporter. These terms are intentionally small and precise.
 **Graph** — the directed, typed network stored in a `*.somite.json` file. It is
 the source of truth.
 
+**Workflow name** — the user-controlled document title stored in the Graph.
+It names the work in the canvas and exported package without changing what the
+Graph executes. It is distinct from the Project directory and Graph file path.
+
 **Operator** — the stable catalog identity and human metadata for one tool.
 
 **Operator revision** — an immutable Interface-to-Implementation binding for an
@@ -48,8 +52,8 @@ source of truth.
 revisions, ports, parameters, and Edges. Layout and human notes are excluded.
 
 **Graph state revision** — the full editable-document digest used only for
-compare-and-swap writes. It includes layout and notes so concurrent
-presentation edits cannot silently overwrite one another.
+compare-and-swap writes. It includes the Workflow name, layout, and notes so
+concurrent document or presentation edits cannot silently overwrite one another.
 
 **Run closure** — the target-specific identity linking one Graph revision to
 its pinned Operator revisions, exact Pixi lock, platform, compiler, Nextflow,
@@ -138,7 +142,8 @@ gaps.
 - Imported structure and paper inference are labeled honestly.
 - All persisted graph writes are validated by the Rust graph model.
 - Generated engine syntax never introduces an unmapped executable node.
-- Presentation-only layout and notes never alter the semantic Graph revision.
+- Workflow name, presentation-only layout, and notes never alter the semantic
+  Graph revision; all remain part of the editable Graph state revision.
 - Evidence refers to executable identity but is never included in that identity.
 - A passed fixture receipt applies only to its exact Graph and validation
   configuration; semantic edits invalidate it while presentation edits do not.
