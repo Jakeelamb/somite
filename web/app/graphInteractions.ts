@@ -6,6 +6,39 @@ export type PendingConnection = {
   position: { x: number; y: number };
 };
 
+const IMPORTED_COLUMN_PITCH = 360;
+const IMPORTED_ROW_PITCH = 184;
+
+/**
+ * Rebuild engine-authored rank/row coordinates around Somite's complete visual
+ * footprint. Imported nodes have labels and ports outside their card, so the
+ * raw engine pitch is not sufficient when viewers are expanded.
+ */
+export function normalizeImportedNodeLayouts<T extends SomiteGraphNode>(nodes: readonly T[]): T[] {
+  const columns = new Map<number, T[]>();
+  for (const node of nodes) {
+    const column = columns.get(node.layout.x);
+    if (column) column.push(node);
+    else columns.set(node.layout.x, [node]);
+  }
+
+  const normalized = new Map<string, { x: number; y: number }>();
+  [...columns.entries()]
+    .sort(([left], [right]) => left - right)
+    .forEach(([, column], columnIndex) => {
+      column
+        .toSorted((left, right) => left.layout.y - right.layout.y || left.id.localeCompare(right.id))
+        .forEach((node, rowIndex) => {
+          normalized.set(node.id, {
+            x: columnIndex * IMPORTED_COLUMN_PITCH,
+            y: rowIndex * IMPORTED_ROW_PITCH,
+          });
+        });
+    });
+
+  return nodes.map((node) => ({ ...node, layout: normalized.get(node.id) ?? node.layout }));
+}
+
 export function nextContinuationPosition(origin: { x: number; y: number }, direction: SomitePort["dir"], occupied: Array<{ x: number; y: number }>) {
   const x = origin.x + (direction === "out" ? 240 : -240);
   for (const offset of [0, 180, -180, 360, -360]) {

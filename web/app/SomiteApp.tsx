@@ -64,7 +64,12 @@ import {
   type LibraryMode,
 } from "./WorkspacePanels";
 import type { SourceRequest } from "./sourceBuilder";
-import { continuationEdge, nextContinuationPosition, type PendingConnection } from "./graphInteractions";
+import {
+  continuationEdge,
+  nextContinuationPosition,
+  normalizeImportedNodeLayouts,
+  type PendingConnection,
+} from "./graphInteractions";
 import type {
   AgentDiscovery,
   AgentSnapshot,
@@ -193,7 +198,7 @@ function PortHandle({ nodeId, port, index, count }: { nodeId: string; port: Somi
   const continueFrom = useContext(ContinuationContext);
   return (
     <div className={`port-row ${input ? "input" : "output"}`} style={{ top }}>
-      <span>{port.name}</span>
+      <span title={port.name}>{port.name}</span>
       {!input && <button type="button" className="port-continue nodrag nowheel" aria-label={`Continue from ${nodeId}.${port.name}`} title={`Continue from ${port.name}`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); continueFrom?.(nodeId, port); }}>+</button>}
       <Handle
         id={port.name}
@@ -726,18 +731,19 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
 
   const insertImportedGraph = useCallback((imported: WorkflowGraphResponse, target: { x: number; y: number }, title: string, recentId?: string) => {
     remember();
+    const normalizedNodes = normalizeImportedNodeLayouts(imported.graph.nodes);
     const occupied = new Set(nodes.map((node) => node.id));
     const idMap = new Map<string, string>();
-    for (const source of imported.graph.nodes) {
+    for (const source of normalizedNodes) {
       let id = source.id;
       let suffix = 2;
       while (occupied.has(id)) id = `${source.id}-${suffix++}`;
       occupied.add(id);
       idMap.set(source.id, id);
     }
-    const minX = Math.min(...imported.graph.nodes.map((node) => node.layout.x));
-    const minY = Math.min(...imported.graph.nodes.map((node) => node.layout.y));
-    const created = imported.graph.nodes.map((source) => ({
+    const minX = Math.min(...normalizedNodes.map((node) => node.layout.x));
+    const minY = Math.min(...normalizedNodes.map((node) => node.layout.y));
+    const created = normalizedNodes.map((source) => ({
       ...source,
       id: idMap.get(source.id) ?? source.id,
       layout: { x: target.x + source.layout.x - minX, y: target.y + source.layout.y - minY },
@@ -882,9 +888,10 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
 
   const installPaperCandidate = useCallback((candidate: PaperCandidate, index: number) => {
     remember();
-    const nextNodes = candidate.graph.nodes.map((node) => flowNode(node, operatorMap));
+    const graphNodes = normalizeImportedNodeLayouts(candidate.graph.nodes);
+    const nextNodes = graphNodes.map((node) => flowNode(node, operatorMap));
     setNodes(nextNodes.map((node, nodeIndex) => ({ ...node, selected: nodeIndex === 0 })));
-    setEdges(candidate.graph.edges.map((edge) => flowEdge(edge, candidate.graph.nodes)));
+    setEdges(candidate.graph.edges.map((edge) => flowEdge(edge, graphNodes)));
     setSelectedIds(nextNodes[0] ? [nextNodes[0].id] : []);
     setActivePaperCandidate(index);
     setDirty(true);

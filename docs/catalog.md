@@ -64,6 +64,11 @@ its selected revision and expands the process graph into movable
 `workflow.reference` Nodes. This provides transparency without claiming every
 process is independently executable.
 
+Every imported graph is normalized at the canvas boundary around the complete
+node footprint, including its title, ID, and exterior port labels. This applies
+to fresh and cached nf-core and Snakemake graphs; opening a saved Somite project
+still preserves the user's deliberate layout.
+
 Read-consuming boundary processes may expose separate `r1` and optional `r2`
 ports when the engine graph supports that conclusion. Internal nodes keep
 conservative structural ports; arbitrary wires into the middle of a pipeline

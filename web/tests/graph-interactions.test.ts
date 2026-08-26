@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { compatibleOperatorPorts, continuationEdge, nextContinuationPosition, operatorContinues, type PendingConnection } from "../app/graphInteractions.ts";
+import {
+  compatibleOperatorPorts,
+  continuationEdge,
+  nextContinuationPosition,
+  normalizeImportedNodeLayouts,
+  operatorContinues,
+  type PendingConnection,
+} from "../app/graphInteractions.ts";
 import { edgeLifecycleState, semanticGraphKey } from "../app/validationState.ts";
 import type { SomiteGraphNode, Operator } from "../app/types.ts";
 
@@ -56,6 +63,23 @@ test("incompatible types never enter continuation results", () => {
 test("one-click continuation chooses the next clear vertical lane", () => {
   assert.deepEqual(nextContinuationPosition({ x: 100, y: 100 }, "out", [{ x: 340, y: 100 }]), { x: 340, y: 280 });
   assert.deepEqual(nextContinuationPosition({ x: 340, y: 100 }, "in", []), { x: 100, y: 100 });
+});
+
+test("imported workflow layout reserves room for node titles, ids, and port labels", () => {
+  const imported = [
+    { ...node, id: "prepare-a", layout: { x: 0, y: 0 } },
+    { ...node, id: "prepare-b", layout: { x: 0, y: 150 } },
+    { ...node, id: "collect", layout: { x: 280, y: 0 } },
+  ];
+
+  assert.deepEqual(
+    normalizeImportedNodeLayouts(imported).map((item) => item.layout),
+    [
+      { x: 0, y: 0 },
+      { x: 0, y: 184 },
+      { x: 360, y: 0 },
+    ],
+  );
 });
 
 test("validation edges expose progress and terminal evidence without color-only ambiguity", () => {

@@ -198,6 +198,7 @@ button:disabled { cursor: default; opacity: .42; }
 .port-row { position: absolute; display: flex; align-items: center; gap: 5px; color: var(--muted); font: 8px var(--font-readout), monospace; transform: translateY(-50%); pointer-events: none; }
 .port-row.input { left: 0; flex-direction: row-reverse; padding-right: 6px; transform: translate(-100%, -50%); }
 .port-row.output { right: 0; padding-left: 6px; transform: translate(100%, -50%); }
+.port-row > span { max-width: 48px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .port-row .react-flow__handle { position: relative; inset: auto; width: 10px; height: 10px; border: 1px solid #101012; box-shadow: 0 0 0 1px rgb(255 255 255 / 12%); transform: none; pointer-events: auto; transition: box-shadow .12s ease, scale .12s ease; }
 .port-row .react-flow__handle:hover { scale: 1.35; box-shadow: 0 0 0 3px rgb(111 212 137 / 26%); }
 .port-row .react-flow__handle:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
