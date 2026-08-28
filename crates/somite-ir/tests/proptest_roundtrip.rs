@@ -19,6 +19,7 @@ proptest! {
                 params: Default::default(),
                 layout: Layout { x: i as f32, y: 0.0 },
                 note: None,
+                color: None,
             })
             .collect();
         let g = Graph {
@@ -26,6 +27,7 @@ proptest! {
             name: None,
             nodes,
             edges: vec![],
+            annotations: vec![],
         };
         g.validate().unwrap();
         let s = serde_json::to_string(&g).unwrap();

@@ -13,9 +13,9 @@
     "in": [
       { "name": "r1", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
       { "name": "r2", "type": "Fastq", "union": ["Fastq", "FastqGz"], "optional": true },
-      { "name": "ref", "type": "Fasta", "union": ["Fasta", "FastaGz"], "optional": true }
+      { "name": "ref", "type": "Fasta", "union": ["Fasta", "FastaGz"] }
     ],
-    "out": [{ "name": "bam", "type": "Bam" }]
+    "out": [{ "name": "sam", "type": "Sam" }]
   },
   "argv": [
     "bwa", "mem",
@@ -25,6 +25,7 @@
     "{input.r2}"
   ],
   "outputs": {
-    "bam": { "glob": "{work}/out/*", "type": "Bam", "optional": true }
-  }
+    "sam": { "glob": "{work}/out/aligned.sam", "type": "Sam" }
+  },
+  "stdout": "sam"
 }

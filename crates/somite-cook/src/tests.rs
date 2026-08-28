@@ -57,8 +57,10 @@ fn import_then_skip() {
             },
             layout: Layout { x: 0.0, y: 0.0 },
             note: None,
+            color: None,
         }],
         edges: vec![],
+        annotations: vec![],
     };
     g.validate().unwrap();
     let proj = Project::open(dir.path()).unwrap();
@@ -99,8 +101,10 @@ fn paired_import_keeps_mates_as_two_artifacts() {
             ]),
             layout: Layout { x: 0.0, y: 0.0 },
             note: None,
+            color: None,
         }],
         edges: vec![],
+        annotations: vec![],
     };
 
     let project = Project::open(dir.path()).unwrap();
@@ -129,8 +133,10 @@ fn unbound_required_input_is_skipped() {
             params: BTreeMap::new(),
             layout: Layout { x: 0.0, y: 0.0 },
             note: None,
+            color: None,
         }],
         edges: vec![],
+        annotations: vec![],
     };
     g.validate().unwrap();
     let proj = Project::open(dir.path()).unwrap();
@@ -166,6 +172,7 @@ fn import_then_rnaseq_sheet() {
                 },
                 layout: Layout { x: 0.0, y: 0.0 },
                 note: None,
+                color: None,
             },
             Node {
                 id: "sheet1".into(),
@@ -175,6 +182,7 @@ fn import_then_rnaseq_sheet() {
                 params: BTreeMap::new(),
                 layout: Layout { x: 200.0, y: 0.0 },
                 note: None,
+                color: None,
             },
         ],
         edges: vec![somite_ir::Edge {
@@ -184,6 +192,7 @@ fn import_then_rnaseq_sheet() {
             to_node: "sheet1".into(),
             to_port: "r1".into(),
         }],
+        annotations: vec![],
     };
     g.validate().unwrap();
     let proj = Project::open(dir.path()).unwrap();
@@ -237,8 +246,10 @@ fn imports_a_workflow_directory_as_a_typed_artifact() {
             )]),
             layout: Layout { x: 0.0, y: 0.0 },
             note: None,
+            color: None,
         }],
         edges: vec![],
+        annotations: vec![],
     };
 
     let project = Project::open(dir.path()).unwrap();

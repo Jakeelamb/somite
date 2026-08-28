@@ -266,24 +266,36 @@ fn compile_import(
         });
     }
     let values = resolved_params(node, operator)?;
-    let paths: &[(&str, &str)] = match operator.id.as_str() {
-        "files.import" => &[("file", "path")],
-        "files.import_paired" => &[("r1", "r1"), ("r2", "r2")],
-        _ => {
-            return Err(CompileError::UnsupportedInprocess {
-                node: node.id.clone(),
-                operator: operator.id.clone(),
-            })
-        }
+    let declared_imports = operator
+        .ports
+        .out
+        .iter()
+        .filter_map(|port| {
+            port.import_param
+                .as_deref()
+                .map(|parameter| (port.name.as_str(), parameter))
+        })
+        .collect::<Vec<_>>();
+    let paths = if !declared_imports.is_empty() {
+        declared_imports
+    } else if operator.id == "files.import_paired" {
+        vec![("r1", "r1"), ("r2", "r2")]
+    } else if operator.params.contains_key("path") && operator.ports.out.len() == 1 {
+        vec![(operator.ports.out[0].name.as_str(), "path")]
+    } else {
+        return Err(CompileError::UnsupportedInprocess {
+            node: node.id.clone(),
+            operator: operator.id.clone(),
+        });
     };
     let hash = short_hash(&node.id);
     for (port, parameter) in paths {
-        let path = match values.get(*parameter) {
+        let path = match values.get(parameter) {
             Some(ParamValue::String(path)) => path,
             _ => {
                 return Err(CompileError::MissingImportPath {
                     node: node.id.clone(),
-                    parameter: (*parameter).into(),
+                    parameter: parameter.into(),
                 })
             }
         };
@@ -297,7 +309,7 @@ fn compile_import(
         workflow_lines.push(format!(
             "    {channel} = channel.fromPath(params.inputs.{param_key}, checkIfExists: true, glob: false)"
         ));
-        channels.insert((node.id.clone(), (*port).into()), channel);
+        channels.insert((node.id.clone(), port.into()), channel);
     }
     node_map.insert(
         node.id.clone(),
@@ -391,7 +403,16 @@ fn compile_external(
                 source_port: edge.from_port.clone(),
             })?;
         let variable = format!("input_{index}");
-        let staged = staged_name(catalog, source_node, &edge.from_port, index, source_type);
+        let staged = match port.stage_as.as_deref() {
+            Some(value) if safe_staged_basename(value) => value.to_owned(),
+            Some(value) => {
+                return Err(CompileError::InvalidArgv {
+                    operator: operator.id.clone(),
+                    detail: format!("input {} has unsafe stage_as {value:?}", port.name),
+                })
+            }
+            None => staged_name(catalog, source_node, &edge.from_port, index, source_type),
+        };
         input_declarations.push(format!(
             "    path {variable}, name: '{}'",
             bash_single(&staged)
@@ -413,6 +434,7 @@ fn compile_external(
     let argv = render_bash_argv(operator, &values, &input_tokens, &parameter_env)?;
     let output_declarations = render_outputs(operator)?;
     let output_validators = render_output_validators(operator)?;
+    let stdout_path = controlled_stdout_path(operator)?;
     let mut process = String::new();
     process.push_str(&format!("process {process_name} {{\n"));
     process.push_str(&format!("    tag '{process_name}'\n"));
@@ -440,7 +462,14 @@ fn compile_external(
         process.push('\n');
     }
     process.push_str("    )\n");
-    process.push_str("    \"${argv[@]}\"\n");
+    if let Some(path) = stdout_path {
+        process.push_str(&format!(
+            "    \"${{argv[@]}}\" > '{}'\n",
+            bash_single(&path)
+        ));
+    } else {
+        process.push_str("    \"${argv[@]}\"\n");
+    }
     for validator in output_validators {
         process.push_str(&validator);
     }
@@ -465,6 +494,39 @@ fn compile_external(
         invocation,
         outputs,
     })
+}
+
+fn safe_staged_basename(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && !value.contains(['/', '\\'])
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+        })
+}
+
+fn controlled_stdout_path(operator: &Operator) -> Result<Option<String>, CompileError> {
+    let Some(port) = operator.stdout.as_deref() else {
+        return Ok(None);
+    };
+    let spec = operator
+        .outputs
+        .get(port)
+        .ok_or_else(|| CompileError::InvalidOutput {
+            operator: operator.id.clone(),
+            output: port.to_owned(),
+            detail: "stdout names an unknown output port".into(),
+        })?;
+    let path = controlled_output_pattern(operator, port, spec)?;
+    if path.contains(['*', '?', '[', ']']) {
+        return Err(CompileError::InvalidOutput {
+            operator: operator.id.clone(),
+            output: port.to_owned(),
+            detail: "stdout capture requires one exact output path".into(),
+        });
+    }
+    Ok(Some(path))
 }
 
 fn incoming_edges<'a>(
@@ -973,10 +1035,15 @@ fn extension(port_type: PortType) -> &'static str {
         PortType::FastaGz => ".fasta.gz",
         PortType::Gtf => ".gtf",
         PortType::GtfGz => ".gtf.gz",
+        PortType::Gff3 => ".gff3",
+        PortType::Sam => ".sam",
         PortType::Bam => ".bam",
         PortType::Bai => ".bai",
         PortType::Vcf => ".vcf",
         PortType::VcfGz => ".vcf.gz",
+        PortType::Bed => ".bed",
+        PortType::Agp => ".agp",
+        PortType::Chain => ".chain",
         PortType::Table => ".tsv",
         PortType::Json => ".json",
         PortType::Html => ".html",

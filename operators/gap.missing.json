@@ -11,5 +11,11 @@
   "ports": {
     "in": [{ "name": "in", "type": "Directory", "optional": true }],
     "out": [{ "name": "out", "type": "Directory", "optional": true }]
+  },
+  "resolution": {
+    "kind": "adapter",
+    "title": "Add a reviewed tool contract",
+    "detail": "Somite recognized a paper method but does not yet have a reviewed contract for its inputs, command, and outputs.",
+    "action_label": "Ask Agent to add it"
   }
 }

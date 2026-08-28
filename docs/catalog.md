@@ -39,7 +39,7 @@ not a promise that Somite manually maintains every bioinformatics package.
 | `align.bwa` | reads plus reference to BAM |
 | `quant.salmon` | reads plus index to abundance table |
 | `samtools.index` | BAM to BAI |
-| `class.kraken2` | reads plus database to classification table |
+| `class.kraken2` | reads plus a required local Kraken2 database directory to a classification table |
 
 The scalable catalog path is contract generation and audit:
 

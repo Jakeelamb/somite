@@ -470,6 +470,7 @@ fn build_bricks(
         name: None,
         nodes: vec![],
         edges: vec![],
+        annotations: vec![],
     };
 
     let add = |g: &mut Graph, op: &str, params: Vec<(&str, ParamValue)>, note: Option<String>| {
@@ -495,6 +496,7 @@ fn build_bricks(
             params: pmap,
             layout: Layout { x: 0.0, y: 0.0 },
             note,
+            color: None,
         });
         Some(id)
     };
@@ -651,6 +653,21 @@ fn build_bricks(
         }
     }
 
+    let bwa_samtools = if g.nodes.iter().any(|node| node.operator == "align.bwa")
+        && g.nodes.iter().any(|node| {
+            node.operator == "var.haplotypecaller"
+                || node.params.get("tool") == Some(&ParamValue::String("Picard".into()))
+        }) {
+        add(
+            &mut g,
+            "align.samtools_view",
+            vec![("exclude_flags", ParamValue::Int(0))],
+            Some("BWA-MEM emits SAM; convert it to BAM before BAM-based tools".into()),
+        )
+    } else {
+        None
+    };
+
     if prefetch.is_none()
         && g.nodes
             .iter()
@@ -806,13 +823,29 @@ fn build_bricks(
     for aligner in g.nodes.clone() {
         let downstream: &[&str] = match aligner.operator.as_str() {
             "align.star" | "align.hisat2" => &["quant.featurecounts", "quant.stringtie"],
-            "align.bwa" => &["var.haplotypecaller"],
+            "align.bwa" => &[],
             _ => continue,
         };
         for n in g.nodes.clone() {
             if downstream.contains(&n.operator.as_str()) {
                 wire(&mut g, &aligner.id, &n.id);
             }
+        }
+    }
+    if let Some(converter) = &bwa_samtools {
+        if let Some(bwa) = g
+            .nodes
+            .iter()
+            .find(|node| node.operator == "align.bwa")
+            .map(|node| node.id.clone())
+        {
+            wire(&mut g, &bwa, converter);
+        }
+        for downstream in g.nodes.clone().into_iter().filter(|node| {
+            node.operator == "var.haplotypecaller"
+                || node.params.get("tool") == Some(&ParamValue::String("Picard".into()))
+        }) {
+            wire(&mut g, converter, &downstream.id);
         }
     }
     if let Some(gt) = &gtf {
@@ -866,7 +899,9 @@ fn build_bricks(
             .find(|n| n.params.get("tool") == Some(&ParamValue::String("Picard".into())))
             .map(|n| n.id.clone())
         {
-            wire(&mut g, &bw, &pic);
+            if bwa_samtools.is_none() {
+                wire(&mut g, &bw, &pic);
+            }
             if let Some(hc) = g
                 .nodes
                 .iter()
@@ -969,7 +1004,7 @@ fn assay_scores(low: &str) -> [(Assay, u16); 5] {
                     ("iterative assembly pipeline", 5),
                     ("vertebrate genome project", 5),
                 ],
-            ),
+            ) + linkage_scaffolding_score(low),
         ),
         (
             Assay::RnaSeq,
@@ -1063,6 +1098,9 @@ fn build_assembly_candidates(
     low: &str,
     single_role: CandidateRole,
 ) -> Vec<CandidateGraph> {
+    if is_linkage_scaffolding(low) {
+        return vec![build_linkage_scaffolding(catalog, text, low, single_role)];
+    }
     let methods = detected_assembly_methods(low);
     if methods.len() > 1 {
         methods
@@ -1079,6 +1117,263 @@ fn build_assembly_candidates(
             methods.first().copied(),
             single_role,
         )]
+    }
+}
+
+fn is_linkage_scaffolding(low: &str) -> bool {
+    mentioned(low, &["allmaps", "rascaf", "agouti"])
+        && mentioned(low, &["scaffold", "genome assembly"])
+        && mentioned(
+            low,
+            &[
+                "meiotic map",
+                "linkage map",
+                "ordering and orientation",
+                "order and orient",
+            ],
+        )
+}
+
+fn linkage_scaffolding_score(low: &str) -> u16 {
+    if is_linkage_scaffolding(low) {
+        12
+    } else {
+        0
+    }
+}
+
+fn build_linkage_scaffolding(
+    catalog: &Catalog,
+    text: &str,
+    low: &str,
+    role: CandidateRole,
+) -> CandidateGraph {
+    let mut warnings = vec![
+        "FISH validation is wet-lab evidence and remains outside the executable graph.".into(),
+    ];
+    let mut graph = Graph {
+        schema_version: SCHEMA_VERSION,
+        name: None,
+        nodes: vec![],
+        edges: vec![],
+        annotations: vec![],
+    };
+    let add =
+        |graph: &mut Graph, op: &str, params: Vec<(&str, ParamValue)>, note: Option<String>| {
+            let Ok(operator) = catalog.get(op) else {
+                return None;
+            };
+            let existing = graph
+                .nodes
+                .iter()
+                .map(|node| node.id.clone())
+                .collect::<Vec<_>>();
+            let id = next_name(&existing, op, &params);
+            let mut parameter_map = std::collections::BTreeMap::new();
+            for (key, spec) in &operator.params {
+                if let Some(default) = &spec.default {
+                    parameter_map.insert(key.clone(), default.clone());
+                }
+            }
+            for (key, value) in params {
+                parameter_map.insert(key.into(), value);
+            }
+            graph.nodes.push(Node {
+                id: id.clone(),
+                operator: op.into(),
+                operator_revision: operator.revision().ok()?,
+                ports: operator.ir_ports(),
+                params: parameter_map,
+                layout: Layout { x: 0.0, y: 0.0 },
+                note,
+                color: None,
+            });
+            Some(id)
+        };
+    let starting_assembly = add(
+        &mut graph,
+        "files.import_fasta",
+        vec![],
+        snippet(text, "genome assembly (ambMex3)").or_else(|| snippet(text, "genome assembly")),
+    );
+    let dna_reads = add(
+        &mut graph,
+        "files.import_paired",
+        vec![],
+        snippet(text, "paired-end reads")
+            .or_else(|| Some("paired DNA reads for meiotic mapping".into())),
+    );
+    let dna_bwa = add(&mut graph, "align.bwa", vec![], snippet(text, "BWA-MEM"));
+    let samtools = if mentioned(low, &["samtools"]) {
+        add(
+            &mut graph,
+            "align.samtools_view",
+            vec![("exclude_flags", ParamValue::Int(2308))],
+            snippet(text, "samtools"),
+        )
+    } else {
+        None
+    };
+    let gatk = if mentioned(low, &["gatk"]) {
+        add(
+            &mut graph,
+            "method.gatk3_unspecified",
+            vec![],
+            snippet(text, "GATK"),
+        )
+    } else {
+        None
+    };
+    let vcftools = if mentioned(low, &["vcf tools", "vcftools"]) {
+        add(
+            &mut graph,
+            "var.vcftools_filter",
+            vec![("minimum_spacing", ParamValue::Int(75))],
+            snippet(text, "VCF tools").or_else(|| snippet(text, "VCFtools")),
+        )
+    } else {
+        None
+    };
+    let joinmap = add(
+        &mut graph,
+        "manual.joinmap",
+        vec![],
+        snippet(text, "JoinMap"),
+    );
+
+    let rna_reads = add(
+        &mut graph,
+        "files.import_paired",
+        vec![],
+        snippet(text, "Paired-end RNA-Seq")
+            .or_else(|| Some("paired RNA-seq reads for scaffold evidence".into())),
+    );
+    let rna_bwa = add(
+        &mut graph,
+        "align.bwa",
+        vec![],
+        snippet(text, "aligned to genomic scaffolds"),
+    );
+    let rna_view = add(
+        &mut graph,
+        "align.samtools_view",
+        vec![("exclude_flags", ParamValue::Int(4))],
+        Some("BWA-MEM output converted to BAM for RNA-guided scaffolding".into()),
+    );
+    let rna_sort = add(
+        &mut graph,
+        "align.samtools_sort",
+        vec![],
+        Some("Rascaf requires a coordinate-sorted BAM input".into()),
+    );
+    let rascaf = if mentioned(low, &["rascaf"]) {
+        add(
+            &mut graph,
+            "asm.rascaf",
+            vec![("minimum_support", ParamValue::Int(5))],
+            snippet(text, "Rascaf"),
+        )
+    } else {
+        None
+    };
+    let agouti = if mentioned(low, &["agouti"]) {
+        add(
+            &mut graph,
+            "legacy.agouti",
+            vec![
+                ("minimum_support", ParamValue::Int(5)),
+                ("minimum_mapping_quality", ParamValue::Int(20)),
+            ],
+            snippet(text, "AGOUTI"),
+        )
+    } else {
+        None
+    };
+    let allmaps_evidence = add(
+        &mut graph,
+        "manual.allmaps_evidence",
+        vec![],
+        snippet(text, "ALLMAPS"),
+    );
+    let allmaps = add(&mut graph, "asm.allmaps", vec![], snippet(text, "ALLMAPS"));
+
+    if let (Some(source), Some(target)) = (&starting_assembly, &dna_bwa) {
+        wire(&mut graph, source, target);
+    }
+    if let (Some(source), Some(target)) = (&dna_reads, &dna_bwa) {
+        wire_reads(&mut graph, source, target);
+    }
+    let mut dna_tail = dna_bwa.clone();
+    for next in [&samtools, &gatk, &vcftools, &joinmap] {
+        if let (Some(source), Some(target)) = (&dna_tail, next) {
+            wire(&mut graph, source, target);
+            dna_tail = Some(target.clone());
+        }
+    }
+    if let (Some(source), Some(target)) = (&starting_assembly, &gatk) {
+        wire(&mut graph, source, target);
+    }
+    if let (Some(source), Some(target)) = (&starting_assembly, &rna_bwa) {
+        wire(&mut graph, source, target);
+    }
+    if let (Some(source), Some(target)) = (&rna_reads, &rna_bwa) {
+        wire_reads(&mut graph, source, target);
+    }
+    if let (Some(source), Some(target)) = (&rna_bwa, &rna_view) {
+        wire(&mut graph, source, target);
+    }
+    if let (Some(source), Some(target)) = (&rna_view, &rna_sort) {
+        wire(&mut graph, source, target);
+    }
+    for target in [&rascaf, &agouti] {
+        if let (Some(source), Some(target)) = (&rna_sort, target) {
+            wire(&mut graph, source, target);
+        }
+        if let (Some(source), Some(target)) = (&starting_assembly, target) {
+            wire(&mut graph, source, target);
+        }
+    }
+    for source in [&joinmap, &rascaf, &agouti] {
+        if let (Some(source), Some(target)) = (source, &allmaps_evidence) {
+            wire(&mut graph, source, target);
+        }
+    }
+    if let (Some(source), Some(target)) = (&allmaps_evidence, &allmaps) {
+        wire_all(&mut graph, source, target);
+    }
+    if let (Some(source), Some(target)) = (&starting_assembly, &allmaps) {
+        wire(&mut graph, source, target);
+    }
+
+    for (node, column, row) in [
+        (starting_assembly.as_deref(), 0, 0),
+        (dna_reads.as_deref(), 0, 1),
+        (dna_bwa.as_deref(), 1, 1),
+        (samtools.as_deref(), 2, 1),
+        (gatk.as_deref(), 3, 1),
+        (vcftools.as_deref(), 4, 1),
+        (joinmap.as_deref(), 5, 1),
+        (rna_reads.as_deref(), 0, 2),
+        (rna_bwa.as_deref(), 1, 2),
+        (rna_view.as_deref(), 2, 2),
+        (rna_sort.as_deref(), 3, 2),
+        (rascaf.as_deref(), 4, 2),
+        (agouti.as_deref(), 4, 3),
+        (allmaps_evidence.as_deref(), 5, 2),
+        (allmaps.as_deref(), 6, 2),
+    ] {
+        place(&mut graph, node, column, row);
+    }
+    if let Err(error) = graph.validate() {
+        warnings.push(format!("graph did not validate: {error}"));
+    }
+    CandidateGraph {
+        name: "Linkage-guided scaffolding".into(),
+        role,
+        evidence: evidence_ledger(&graph),
+        graph,
+        assay: Assay::Assembly,
+        warnings,
     }
 }
 
@@ -1122,6 +1417,7 @@ fn build_assembly(
         name: None,
         nodes: vec![],
         edges: vec![],
+        annotations: vec![],
     };
     let add = |g: &mut Graph, op: &str, params: Vec<(&str, ParamValue)>, note: Option<String>| {
         let Ok(oper) = catalog.get(op) else {
@@ -1146,6 +1442,7 @@ fn build_assembly(
             params: pmap,
             layout: Layout { x: 0.0, y: 0.0 },
             note,
+            color: None,
         });
         Some(id)
     };
@@ -1766,6 +2063,16 @@ fn wire(g: &mut Graph, from: &str, to: &str) {
     }
 }
 
+fn wire_all(g: &mut Graph, from: &str, to: &str) {
+    loop {
+        let before = g.edges.len();
+        wire(g, from, to);
+        if g.edges.len() == before {
+            break;
+        }
+    }
+}
+
 /// Keep paired reads as two named streams whenever both operators expose the
 /// paired contract. Operators without r1/r2 ports retain the normal typed snap.
 fn wire_reads(g: &mut Graph, from: &str, to: &str) {
@@ -2213,6 +2520,38 @@ were called with GATK Mutect2 following the sarek workflow.
         assert!(ops.contains(&"asm.yahs"), "YaHS is a brick");
         assert!(ops.contains(&"qc.busco"), "BUSCO is a brick");
         assert!(ops.contains(&"align.minimap2"));
+    }
+
+    #[test]
+    fn linkage_scaffolding_paper_is_not_misread_as_rnaseq() {
+        let text = "METHODS\nPaired DNA reads were aligned to a draft genome with BWA-MEM, filtered with samtools, and processed with GATK before VCFtools filtering. A meiotic linkage map was generated with JoinMap 4.1. Paired RNA-seq reads were aligned to the genomic scaffolds with BWA-MEM, then Rascaf and AGOUTI inferred supported linkages. The linkage and orientation evidence was combined with ALLMAPS to order and orient the scaffolds. FISH mapping provided physical validation.\nREFERENCES\nRNA-seq comparison paper.";
+        let reconstruction = reconstruct(&cat(), text);
+
+        assert_eq!(reconstruction.assay, Assay::Assembly);
+        assert_eq!(reconstruction.name, "Linkage-guided scaffolding");
+        let operators = ops(&reconstruction);
+        for expected in [
+            "files.import_fasta",
+            "align.samtools_view",
+            "align.samtools_sort",
+            "method.gatk3_unspecified",
+            "var.vcftools_filter",
+            "manual.joinmap",
+            "asm.rascaf",
+            "legacy.agouti",
+            "manual.allmaps_evidence",
+            "asm.allmaps",
+        ] {
+            assert!(
+                operators.contains(&expected),
+                "missing {expected}: {operators:?}"
+            );
+        }
+        assert!(!operators.contains(&"gap.missing"));
+        assert!(!operators.contains(&"asm.hifiasm"));
+        reconstruction.graph.validate().unwrap();
+        cat().verify_graph(&reconstruction.graph).unwrap();
+        assert_wired(&reconstruction);
     }
 
     #[test]

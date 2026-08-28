@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 use somite_ir::{Direction, Graph, Node, ParamValue, PortType};
@@ -146,8 +146,17 @@ impl Project {
     }
 
     pub fn stage(&self, meta: &ArtifactMeta, dest_dir: &Path) -> io::Result<PathBuf> {
+        self.stage_as(meta, dest_dir, &meta.basename)
+    }
+
+    fn stage_as(
+        &self,
+        meta: &ArtifactMeta,
+        dest_dir: &Path,
+        basename: &str,
+    ) -> io::Result<PathBuf> {
         fs::create_dir_all(dest_dir)?;
-        let dest = dest_dir.join(&meta.basename);
+        let dest = dest_dir.join(basename);
         let src = self.cas_path(&meta.hash);
         let _ = fs::remove_file(&dest);
         let _ = fs::remove_dir_all(&dest);
@@ -541,37 +550,49 @@ fn cook_node(
         return Ok((NodeState::Done, arts));
     }
 
+    let declared_imports = op
+        .ports
+        .out
+        .iter()
+        .filter_map(|port| {
+            port.import_param
+                .as_deref()
+                .map(|parameter| (port, parameter))
+        })
+        .collect::<Vec<_>>();
     if op.kind == OpKind::Inprocess
-        && matches!(op.id.as_str(), "files.import" | "files.import_directory")
+        && (!declared_imports.is_empty()
+            || op.params.contains_key("path") && op.ports.out.len() == 1)
     {
-        let path = match node.params.get("path") {
-            Some(ParamValue::String(s)) => {
-                let p = PathBuf::from(s);
-                if p.is_absolute() {
-                    p
-                } else {
-                    project.root.join(p)
-                }
-            }
-            _ => return Err(CookError::Msg("files.import needs param path".into())),
-        };
-        let (port, ty) = if op.id == "files.import_directory" {
-            ("directory", PortType::Directory)
+        let imports = if declared_imports.is_empty() {
+            vec![(&op.ports.out[0], "path")]
         } else {
-            (
-                "file",
-                node.port("file", Direction::Out)
-                    .map(|p| p.ty)
-                    .unwrap_or(PortType::Fastq),
-            )
-        };
-        let (_h, meta) = if ty == PortType::Directory {
-            project.put_dir(&path, ty)?
-        } else {
-            project.put_file(&path, ty)?
+            declared_imports
         };
         let mut arts = BTreeMap::new();
-        arts.insert(port.into(), meta);
+        for (port, parameter) in imports {
+            let path = match node.params.get(parameter) {
+                Some(ParamValue::String(value)) => {
+                    let path = PathBuf::from(value);
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        project.root.join(path)
+                    }
+                }
+                _ => return Err(CookError::Msg(format!("{} needs param {parameter}", op.id))),
+            };
+            let ty = node
+                .port(&port.name, Direction::Out)
+                .map(|value| value.ty)
+                .unwrap_or(port.ty);
+            let (_hash, meta) = if ty == PortType::Directory {
+                project.put_dir(&path, ty)?
+            } else {
+                project.put_file(&path, ty)?
+            };
+            arts.insert(port.name.clone(), meta);
+        }
         let out = BindingsOut {
             artifacts: arts.clone(),
         };
@@ -601,7 +622,32 @@ fn cook_node(
 
     let mut staged = BTreeMap::new();
     for (port, meta) in &input_meta {
-        let p = project.stage(meta, &inn.join(port))?;
+        let basename = op
+            .ports
+            .r#in
+            .iter()
+            .find(|spec| spec.name == *port)
+            .and_then(|spec| spec.stage_as.as_deref())
+            .unwrap_or(&meta.basename);
+        if basename.is_empty() || matches!(basename, "." | "..") || basename.contains(['/', '\\']) {
+            return Err(CookError::Msg(format!(
+                "{} input {port} has unsafe stage_as {basename:?}",
+                op.id
+            )));
+        }
+        let stage_dir = if op
+            .ports
+            .r#in
+            .iter()
+            .find(|spec| spec.name == *port)
+            .and_then(|spec| spec.stage_as.as_ref())
+            .is_some()
+        {
+            work.clone()
+        } else {
+            inn.join(port)
+        };
+        let p = project.stage_as(meta, &stage_dir, basename)?;
         staged.insert(port.clone(), p);
     }
 
@@ -621,6 +667,23 @@ fn cook_node(
 
     let mut cmd = pixi_command(project, op, &rest)?;
     cmd.current_dir(&work);
+    if let Some(port) = op.stdout.as_deref() {
+        let spec = op.outputs.get(port).ok_or_else(|| {
+            CookError::Msg(format!("{} stdout names unknown output {port}", op.id))
+        })?;
+        let capture = subst_glob(&spec.glob, &b);
+        if capture.contains(['*', '?', '[', ']']) {
+            return Err(CookError::Msg(format!(
+                "{} stdout output {port} must be one exact path",
+                op.id
+            )));
+        }
+        let capture = PathBuf::from(capture);
+        if let Some(parent) = capture.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        cmd.stdout(Stdio::from(fs::File::create(capture)?));
+    }
     let out = cmd.output().map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
             CookError::BinNotFound(op.bin.clone().unwrap_or_default())
@@ -708,6 +771,8 @@ fn subst_glob(g: &str, b: &Bindings<'_>) -> String {
             ports: Default::default(),
             argv: vec![g.to_string()],
             outputs: BTreeMap::new(),
+            stdout: None,
+            resolution: None,
         },
         b,
     )

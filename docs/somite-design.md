@@ -116,6 +116,17 @@ actual runnable Graph and a path-independent configuration digest. Any source
 operator outside the supported family fails closed instead of reaching a
 network.
 
+### `somite-server::readiness`
+
+Interface: `analyze(graph, catalog) -> ReadinessSnapshot`.
+
+This pure Module compares the current graph with pinned operator contracts and
+returns every missing required input, required parameter, and Managed resource
+with typed, catalog-authored Resolutions. It performs no filesystem, process,
+network, or AI work. The web readiness drawer, run and validation admission,
+agent compilation, and `somite.readiness.get` all use this Interface. Evidence
+remains separate because a complete graph is not necessarily a validated graph.
+
 ### `somite-paper`
 
 Interface: extract methods text and return candidate graphs with evidence for
@@ -152,9 +163,10 @@ no native launcher and runs with `pixi run --frozen run`.
 ### `somite-server`
 
 Interface: localhost endpoints for session state, graph validation and saving,
-autosave recovery, uploads, cancellable Nextflow run supervision, paper
-reconstruction, catalog discovery, system detection, export planning, frozen
-ZIP export, agent transactions, evidence lookup, and ACP activity.
+autosave recovery, uploads, cancellable Nextflow run supervision, bioRxiv
+search and paper reconstruction, catalog discovery, system detection, export
+planning, frozen ZIP export, agent transactions, evidence lookup, and ACP
+activity.
 
 The server validates all graph writes. Uploaded files are copied into the
 project, and the browser receives project-relative paths rather than arbitrary
@@ -166,11 +178,32 @@ to graph node IDs.
 
 - The canvas is the primary surface.
 - Add, Project, Paper, Machine, and Export are temporary mutually exclusive
-  panels. Add searches operators, public data, and workflow catalogs through
-  one surface; Project detects supported local workflow projects without
-  exposing an engine selector.
+  panels. Add presents two input choices (local files or live NCBI/Ensembl
+  search), tools, and directly browsable Nextflow/Snakemake workflow catalogs;
+  implementation-level import operators stay hidden. Project detects supported
+  local workflow projects without exposing an engine selector.
+- Rebuild from a Paper owns bioRxiv search. Search and full-text reconstruction
+  never mutate the graph; applying a reviewed candidate is the explicit graph
+  transaction. Papers without Europe PMC full text point back to a local PDF,
+  which can be chosen or dropped anywhere on the Paper panel.
 - A centered canvas toolbar keeps add, file import, fit, and viewer controls
   within pointer reach.
+- The bottom status bar always reports deterministic readiness. Clicking it
+  opens a drawer with required items, rule-based recommendations, validation
+  evidence, direct connection/configuration actions, and contextual Assistant
+  handoff. Missing inputs are also marked on their nodes and ports.
+- Agent is a compact right-side collaborator, separate from the left workspace
+  tools. Its window can be dragged, resized, collapsed without ending the
+  conversation, closed, and reopened from a persistent right-edge launcher.
+  Ordinary conversation shows semantic canvas results while tool and protocol
+  activity stays behind one progressive-disclosure summary. Contextual
+  readiness handoffs still include the exact requirement, graph revision,
+  resolutions, sizes, and scientific effects; the deterministic checker remains
+  authoritative.
+- Sticky notes, stage boxes, pen strokes, and curated node colors are portable
+  presentation state. They participate in save, autosave, history, and graph
+  state revision but never executable identity. Color presets include visible
+  labels and never replace readiness or validation cues.
 - Connections are typed; incompatible ports never connect.
 - Paired reads have separate R1 and R2 ports and snap together when possible.
 - The source launcher resolves exact accessions locally and searches NCBI and
@@ -186,9 +219,12 @@ to graph node IDs.
 - Multi-selection moves, duplicates, deletes, and toggles viewers as a group.
 - Clicking outside a temporary panel closes it.
 - Saves and autosaves are server-validated.
-- The always-available Bot button opens one optional bring-your-own ACP agent.
-- Agent messages, tools, permissions, and transactions remain visible; each
-  transaction is one undoable canvas edit.
+- The always-available right-edge Agent button opens one optional bring-your-own
+  agent. Connection and protocol diagnostics are available on demand rather
+  than occupying the primary conversation.
+- Agent messages, required permissions, semantic results, and errors remain
+  visible; low-level activity is collapsed and each transaction is one
+  undoable canvas edit.
 
 ## Project data
 
@@ -197,6 +233,7 @@ to graph node IDs.
   web.somite.json       editable working graph
   autosave.somite.json  validated recovery graph
   catalog/              cached external catalog data
+  papers/               provenance-checked bioRxiv JATS source cache
   uploads/              browser-imported files
   fixtures/objects/     content-addressed representative data
   evidence/             append-only receipts and index

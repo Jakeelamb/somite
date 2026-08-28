@@ -2,21 +2,31 @@
 
 import {
   ChevronDown,
+  CheckCircle2,
+  CircleAlert,
   CircleStop,
+  CloudUpload,
   Cpu,
+  Database,
   Download,
+  ExternalLink,
   FileSearch,
   FileInput,
   FolderOpen,
   LoaderCircle,
+  MoreHorizontal,
+  MessageSquare,
+  PanelRightClose,
+  PanelRightOpen,
   PlugZap,
   Play,
   Search,
   Send,
+  Settings2,
   Star,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState, type RefObject } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import { classifySource, type SourceRequest, type SourceSearchResponse, type SourceSearchResult } from "./sourceBuilder";
 import { operatorContinues, type PendingConnection } from "./graphInteractions";
 import type {
@@ -25,16 +35,22 @@ import type {
   AgentDiscovery,
   AgentEvent,
   AgentSnapshot,
+  ReadinessItem,
+  ReadinessSnapshot,
   SomiteGraphNode,
   Operator,
   ParamSpec,
   ParamValue,
   PaperReview,
+  PaperSearchResponse,
+  PaperSearchResult,
   ExportPlan,
   SystemProfile,
+  ValidationEvidenceResponse,
 } from "./types";
 import { OperatorGlyph, portColor } from "./visual";
 import { jsonRequest } from "./api";
+import { formatResourceBytes } from "./readinessState";
 
 function groupedAgentEvents(events: AgentEvent[]) {
   return events.reduce<AgentEvent[]>((grouped, event) => {
@@ -55,10 +71,32 @@ function configChoices(option: AgentConfigOption): AgentConfigSelectChoice[] {
   return option.options.flatMap((entry) => "options" in entry ? entry.options : [entry]);
 }
 
-export function AgentPanel({ snapshot, discovery, discoveryLoading, onRefreshDiscovery, onConnect, onConfig, onPrompt, onCancel, onDisconnect, onPermission, onClose }: {
+type AgentFrame = { left: number | null; top: number; width: number; height: number };
+
+function storedAgentFrame(): AgentFrame & { collapsed: boolean } {
+  const fallback = { left: null, top: 16, width: 360, height: 500, collapsed: false };
+  if (typeof window === "undefined") return fallback;
+  try {
+    const raw = window.localStorage.getItem("somite.agent.frame.v1");
+    if (!raw) return fallback;
+    const value = JSON.parse(raw) as Partial<AgentFrame> & { collapsed?: boolean };
+    return {
+      left: typeof value.left === "number" ? value.left : fallback.left,
+      top: typeof value.top === "number" ? value.top : fallback.top,
+      width: typeof value.width === "number" ? Math.min(720, Math.max(300, value.width)) : fallback.width,
+      height: typeof value.height === "number" ? Math.min(760, Math.max(320, value.height)) : fallback.height,
+      collapsed: Boolean(value.collapsed),
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+export function AgentPanel({ snapshot, discovery, discoveryLoading, draft, onRefreshDiscovery, onConnect, onConfig, onPrompt, onCancel, onDisconnect, onPermission, onClose }: {
   snapshot: AgentSnapshot;
   discovery: AgentDiscovery | null;
   discoveryLoading: boolean;
+  draft?: { id: number; message: string } | null;
   onRefreshDiscovery: () => Promise<void>;
   onConnect: (command: string) => Promise<void>;
   onConfig: (configId: string, value: string | boolean) => Promise<void>;
@@ -68,17 +106,43 @@ export function AgentPanel({ snapshot, discovery, discoveryLoading, onRefreshDis
   onPermission: (permissionId: string, optionId?: string) => Promise<void>;
   onClose: () => void;
 }) {
+  const panelRef = useRef<HTMLElement>(null);
+  const dragRef = useRef<{ offsetX: number; offsetY: number; parent: DOMRect; width: number; height: number } | null>(null);
+  const [frame, setFrame] = useState<AgentFrame>(() => storedAgentFrame());
+  const [collapsed, setCollapsed] = useState(() => storedAgentFrame().collapsed);
+  const [showSettings, setShowSettings] = useState(false);
   const [command, setCommand] = useState("");
   const [agentQuery, setAgentQuery] = useState("");
   const [showCatalog, setShowCatalog] = useState(false);
-  const [message, setMessage] = useState("");
+  const [message, setMessage] = useState(draft?.message ?? "");
   const [submitting, setSubmitting] = useState(false);
   const events = useMemo(() => groupedAgentEvents(snapshot.events), [snapshot.events]);
+  const conversation = useMemo(() => events.filter((event) => ["user", "message", "transaction", "permission", "error"].includes(event.kind)), [events]);
+  const activity = useMemo(() => events.filter((event) => event.kind === "tool"), [events]);
   const detectedAgents = useMemo(() => discovery?.agents.filter((agent) => agent.availability === "installed") ?? [], [discovery]);
   const catalogAgents = useMemo(() => {
     const query = agentQuery.trim().toLowerCase();
     return (discovery?.agents ?? []).filter((agent) => agent.availability !== "installed" && (!query || `${agent.name} ${agent.description}`.toLowerCase().includes(query)));
   }, [agentQuery, discovery]);
+
+  useEffect(() => {
+    window.localStorage.setItem("somite.agent.frame.v1", JSON.stringify({ ...frame, collapsed }));
+  }, [collapsed, frame]);
+
+  useEffect(() => {
+    const panel = panelRef.current;
+    if (!panel || collapsed || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (panel.classList.contains("collapsed")) return;
+      const bounds = panel.getBoundingClientRect();
+      const width = Math.round(bounds.width);
+      const height = Math.round(bounds.height);
+      setFrame((current) => current.width === width && current.height === height ? current : { ...current, width, height });
+    });
+    observer.observe(panel);
+    return () => observer.disconnect();
+  }, [collapsed]);
+
   const submitPrompt = async () => {
     const prompt = message.trim();
     if (!prompt || snapshot.busy) return;
@@ -92,93 +156,163 @@ export function AgentPanel({ snapshot, discovery, discoveryLoading, onRefreshDis
       setSubmitting(false);
     }
   };
+  const beginDrag = (event: ReactPointerEvent<HTMLElement>) => {
+    if ((event.target as Element).closest("button, input, select, textarea, summary")) return;
+    const panel = panelRef.current;
+    const parent = panel?.parentElement;
+    if (!panel || !parent) return;
+    const rect = panel.getBoundingClientRect();
+    const parentRect = parent.getBoundingClientRect();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragRef.current = { offsetX: event.clientX - rect.left, offsetY: event.clientY - rect.top, parent: parentRect, width: rect.width, height: rect.height };
+  };
+  const drag = (event: ReactPointerEvent<HTMLElement>) => {
+    const active = dragRef.current;
+    if (!active) return;
+    const left = Math.max(8, Math.min(active.parent.width - active.width - 8, event.clientX - active.parent.left - active.offsetX));
+    const top = Math.max(8, Math.min(active.parent.height - active.height - 8, event.clientY - active.parent.top - active.offsetY));
+    setFrame((current) => ({ ...current, left, top }));
+  };
+  const finishDrag = () => { dragRef.current = null; };
+  const eventTitle = (event: AgentEvent) => ({ user: "You", message: "Agent", transaction: "Canvas updated", permission: "Approval needed", error: "Needs attention" } as Record<string, string>)[event.kind] ?? event.title;
+  const frameStyle = { top: frame.top, width: frame.width, height: collapsed ? 44 : frame.height, ...(frame.left === null ? { right: 16 } : { left: frame.left }) } as CSSProperties;
+
   return (
-    <section className="floating-panel agent-window" aria-label="Workflow Agent">
-      <header className="floating-panel-head">
-        <div><strong>Workflow Agent</strong><span>{snapshot.agent_name ?? (snapshot.connecting ? "connecting via ACP" : "bring your own")}</span></div>
-        <button type="button" aria-label="Close Workflow Agent" onClick={onClose}><X size={15} /></button>
+    <section ref={panelRef} className={`floating-panel agent-window ${collapsed ? "collapsed" : ""}`} style={frameStyle} aria-label="Agent">
+      <header className="floating-panel-head agent-drag-handle" onPointerDown={beginDrag} onPointerMove={drag} onPointerUp={finishDrag} onPointerCancel={finishDrag}>
+        <div><i className={`agent-presence ${snapshot.busy ? "busy" : snapshot.connected ? "ready" : ""}`} /><strong>Agent</strong><span>{snapshot.busy ? "Working…" : snapshot.connected ? "Ready" : snapshot.connecting ? "Connecting…" : "Choose an assistant"}</span></div>
+        <nav aria-label="Agent window controls">
+          {snapshot.connected && <button type="button" aria-label="Agent settings" title="Settings" className={showSettings ? "active" : ""} onClick={() => { setCollapsed(false); setShowSettings((visible) => !visible); }}><Settings2 size={14} /></button>}
+          <button type="button" aria-label={collapsed ? "Expand Agent" : "Collapse Agent"} title={collapsed ? "Expand" : "Collapse"} onClick={() => setCollapsed((value) => !value)}>{collapsed ? <PanelRightOpen size={14} /> : <PanelRightClose size={14} />}</button>
+          <button type="button" aria-label="Close Agent" title="Close" onClick={onClose}><X size={15} /></button>
+        </nav>
       </header>
-      {!snapshot.connected && !snapshot.connecting ? (
-        <div className="agent-launcher">
-          <div className="agent-launcher-intro">
-            <div className="agent-empty-mark"><PlugZap size={19} aria-hidden="true" /></div>
-            <div><strong>Choose an agent</strong><p>Somite found the compatible agents on this computer. Pick one and start building.</p></div>
-            <button type="button" aria-label="Scan for agents again" title="Scan again" disabled={discoveryLoading} onClick={() => void onRefreshDiscovery()}><LoaderCircle size={14} className={discoveryLoading ? "spin" : ""} /></button>
+      {!collapsed && <div className="agent-body">
+        {!snapshot.connected && !snapshot.connecting ? (
+          <div className="agent-launcher">
+            <div className="agent-launcher-intro">
+              <div className="agent-empty-mark"><PlugZap size={17} aria-hidden="true" /></div>
+              <div><strong>Choose your Agent</strong><p>Pick one that is already available on this computer.</p></div>
+              <button type="button" aria-label="Scan for agents again" title="Scan again" disabled={discoveryLoading} onClick={() => void onRefreshDiscovery()}><LoaderCircle size={14} className={discoveryLoading ? "spin" : ""} /></button>
+            </div>
+            <section className="agent-launcher-section">
+              <div className="agent-card-list">
+                {detectedAgents.map((agent) => <button key={agent.id} type="button" className="agent-card" disabled={!agent.command} onClick={() => agent.command && void onConnect(agent.command)}>
+                  <i>{agent.name.slice(0, 1).toUpperCase()}</i>
+                  <span><strong>{agent.name}</strong><small>Ready on this computer</small></span>
+                  <em>Use</em>
+                </button>)}
+                {!detectedAgents.length && !discoveryLoading && <p className="agent-launcher-empty">No local agents found. Try scanning again or open more options.</p>}
+                {discoveryLoading && <div className="agent-launcher-loading"><LoaderCircle size={14} className="spin" />Looking for agents…</div>}
+              </div>
+            </section>
+            <button type="button" className="agent-catalog-toggle" aria-expanded={showCatalog} onClick={() => setShowCatalog((visible) => !visible)}><span>More agents</span><small>Install or connect</small><ChevronDown size={13} /></button>
+            {showCatalog && <section className="agent-catalog">
+              <label><Search size={13} /><input value={agentQuery} onChange={(event) => setAgentQuery(event.target.value)} placeholder="Search agents…" /></label>
+              <div className="agent-card-list compact">
+                {catalogAgents.map((agent) => agent.command ? <button key={agent.id} type="button" className="agent-card" onClick={() => void onConnect(agent.command!)}>
+                  <i>{agent.name.slice(0, 1).toUpperCase()}</i><span><strong>{agent.name}</strong><small>{agent.description}</small></span><em>Use</em>
+                </button> : <a key={agent.id} className="agent-card unavailable" href={agent.website ?? agent.repository} target="_blank" rel="noreferrer">
+                  <i>{agent.name.slice(0, 1).toUpperCase()}</i><span><strong>{agent.name}</strong><small>{agent.description}</small></span><em>Install</em>
+                </a>)}
+              </div>
+              <details className="agent-custom"><summary>Connection details</summary><label htmlFor="agent-command">Custom command</label><input id="agent-command" autoComplete="off" spellCheck={false} value={command} onChange={(event) => setCommand(event.target.value)} placeholder="your-agent --acp" onKeyDown={(event) => { if (event.key === "Enter" && command.trim()) void onConnect(command); }} /><button type="button" className="agent-connect-button" disabled={!command.trim()} onClick={() => void onConnect(command)}><PlugZap size={13} />Connect</button><small className="agent-registry-note">{discovery?.registry_status === "live" ? "Online directory" : "Offline directory"}</small></details>
+            </section>}
           </div>
-          <section className="agent-launcher-section">
-            <header><strong>On this computer</strong><span>{detectedAgents.length || (discoveryLoading ? "…" : "0")}</span></header>
-            <div className="agent-card-list">
-              {detectedAgents.map((agent) => <button key={agent.id} type="button" className="agent-card" disabled={!agent.command} onClick={() => agent.command && void onConnect(agent.command)}>
-                <i>{agent.name.slice(0, 1).toUpperCase()}</i>
-                <span><strong>{agent.name}</strong><small>{agent.availability_detail}</small></span>
-                <em>Connect</em>
-              </button>)}
-              {!detectedAgents.length && !discoveryLoading && <p className="agent-launcher-empty">No installed ACP agents were detected yet.</p>}
-              {discoveryLoading && <div className="agent-launcher-loading"><LoaderCircle size={14} className="spin" />Scanning PATH and the ACP Registry…</div>}
-            </div>
-          </section>
-          <button type="button" className="agent-catalog-toggle" aria-expanded={showCatalog} onClick={() => setShowCatalog((visible) => !visible)}><span>More compatible agents</span><small>Official ACP Registry</small><ChevronDown size={13} /></button>
-          {showCatalog && <section className="agent-catalog">
-            <label><Search size={13} /><input value={agentQuery} onChange={(event) => setAgentQuery(event.target.value)} placeholder="Search agents…" /></label>
-            <div className="agent-card-list compact">
-              {catalogAgents.map((agent) => agent.command ? <button key={agent.id} type="button" className="agent-card" onClick={() => void onConnect(agent.command!)}>
-                <i>{agent.name.slice(0, 1).toUpperCase()}</i>
-                <span><strong>{agent.name}</strong><small>{agent.availability_detail}</small></span>
-                <em>{agent.availability === "ready" ? "Set up" : "Connect"}</em>
-              </button> : <a key={agent.id} className="agent-card unavailable" href={agent.website ?? agent.repository} target="_blank" rel="noreferrer">
-                <i>{agent.name.slice(0, 1).toUpperCase()}</i>
-                <span><strong>{agent.name}</strong><small>{agent.availability_detail}</small></span>
-                <em>Install</em>
-              </a>)}
-            </div>
+        ) : <>
+          {showSettings && <section className="agent-settings" aria-label="Agent settings">
+            <header><strong>Settings</strong><button type="button" aria-label="Close Agent settings" onClick={() => setShowSettings(false)}><X size={13} /></button></header>
+            {snapshot.config_options.length > 0 && <div className="agent-config-options">{snapshot.config_options.map((option) => option.type === "select" ? <label key={option.id} title={option.description}><span>{option.name}</span><select aria-label={option.name} value={option.currentValue} disabled={snapshot.busy} onChange={(event) => void onConfig(option.id, event.target.value)}>{configChoices(option).map((choice) => <option key={choice.value} value={choice.value}>{choice.name}</option>)}</select></label> : <label key={option.id} className="boolean" title={option.description}><span>{option.name}</span><input type="checkbox" checked={option.currentValue} disabled={snapshot.busy} onChange={(event) => void onConfig(option.id, event.target.checked)} /></label>)}</div>}
+            <button type="button" className="agent-disconnect" onClick={() => void onDisconnect()}>Disconnect {snapshot.agent_name ?? "Agent"}</button>
           </section>}
-          <details className="agent-custom">
-            <summary>Connect a custom ACP agent</summary>
-            <label htmlFor="agent-command">Agent command</label>
-            <input id="agent-command" autoComplete="off" spellCheck={false} value={command} onChange={(event) => setCommand(event.target.value)} placeholder="your-agent --acp" onKeyDown={(event) => {
-              if (event.key === "Enter" && command.trim()) void onConnect(command);
-            }} />
-            <button type="button" className="agent-connect-button" disabled={!command.trim()} onClick={() => void onConnect(command)}><PlugZap size={13} />Connect custom agent</button>
-          </details>
-          <small className="agent-registry-note">{discovery?.registry_status === "live" ? "Live ACP Registry" : "Offline registry cache"} · Commands launch directly without a shell.</small>
-        </div>
-      ) : (
-        <>
-          <div className="agent-connection"><span className={snapshot.connected ? "ready" : "connecting"} /><strong>{snapshot.connecting ? "Initializing ACP v1…" : snapshot.agent_name}</strong><button type="button" onClick={() => void onDisconnect()}>Disconnect</button></div>
-          {snapshot.connected && snapshot.config_options.length > 0 && <div className="agent-config-options">
-            {snapshot.config_options.map((option) => option.type === "select" ? <label key={option.id} title={option.description}>
-              <span>{option.name}</span>
-              <select aria-label={option.name} value={option.currentValue} disabled={snapshot.busy} onChange={(event) => void onConfig(option.id, event.target.value)}>
-                {configChoices(option).map((choice) => <option key={choice.value} value={choice.value}>{choice.name}</option>)}
-              </select>
-            </label> : <label key={option.id} className="boolean" title={option.description}>
-              <span>{option.name}</span>
-              <input type="checkbox" checked={option.currentValue} disabled={snapshot.busy} onChange={(event) => void onConfig(option.id, event.target.checked)} />
-            </label>)}
-          </div>}
           <div className="agent-feed" role="log" aria-live="polite">
-            {events.map((event) => <article key={event.cursor} className={`agent-event ${event.kind}`}>
-              <header><i /><strong>{event.title}</strong>{event.status && <span>{event.status.replaceAll("_", " ")}</span>}</header>
-              {event.kind === "tool" && event.detail ? <details><summary>Tool details</summary><pre>{event.detail}</pre></details> : event.detail && <p>{event.detail}</p>}
-              {event.kind === "transaction" && <small>Applied to the canvas as one undoable edit.</small>}
-              {event.kind === "permission" && event.permission_id && Boolean(event.permission_choices?.length) && <div className="agent-permissions">
-                {(event.permission_choices ?? []).map((choice) => <button key={choice.option_id} type="button" className={choice.kind.startsWith("allow") ? "allow" : "reject"} onClick={() => void onPermission(event.permission_id!, choice.option_id)}>{choice.name}</button>)}
-                <button type="button" className="reject" onClick={() => void onPermission(event.permission_id!)}>Cancel</button>
-              </div>}
+            {draft && <div className="agent-context-chip"><MessageSquare size={12} /><span>Workflow requirement attached</span></div>}
+            {!conversation.length && !snapshot.busy && <div className="agent-starters"><strong>What should we do?</strong>{["Build from my files", "Fix what is missing", "Explain this workflow", "Check if this can run"].map((starter) => <button key={starter} type="button" onClick={() => setMessage(starter)}>{starter}</button>)}</div>}
+            {conversation.map((event) => <article key={event.cursor} className={`agent-event ${event.kind}`}>
+              <header><i /><strong>{eventTitle(event)}</strong>{event.status && event.kind !== "transaction" && <span>{event.status.replaceAll("_", " ")}</span>}</header>
+              {event.detail && <p>{event.detail}</p>}
+              {event.kind === "transaction" && <small>Saved as one undoable canvas change.</small>}
+              {event.kind === "permission" && event.permission_id && Boolean(event.permission_choices?.length) && <div className="agent-permissions">{(event.permission_choices ?? []).map((choice) => <button key={choice.option_id} type="button" className={choice.kind.startsWith("allow") ? "allow" : "reject"} onClick={() => void onPermission(event.permission_id!, choice.option_id)}>{choice.name}</button>)}<button type="button" className="reject" onClick={() => void onPermission(event.permission_id!)}>Cancel</button></div>}
             </article>)}
-            {!events.length && <p className="panel-empty">The agent’s messages, tool calls, permissions, and graph transactions will appear here.</p>}
+            {snapshot.busy && <div className="agent-progress"><LoaderCircle size={13} className="spin" /><span><strong>Working on the workflow</strong><small>{activity.at(-1)?.title ?? "Using the canvas and checking requirements"}</small></span></div>}
+            {activity.length > 0 && <details className="agent-activity"><summary><MoreHorizontal size={13} />{snapshot.busy ? `${activity.length} step${activity.length === 1 ? "" : "s"} in progress` : `Completed ${activity.length} step${activity.length === 1 ? "" : "s"}`}</summary><ol>{activity.map((event) => <li key={event.cursor}>{event.title}</li>)}</ol></details>}
           </div>
           <div className="agent-composer">
-            <textarea aria-label="Message Workflow Agent" rows={3} value={message} disabled={!snapshot.connected} placeholder="Describe the pipeline you want to build or change…" onChange={(event) => setMessage(event.target.value)} onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                void submitPrompt();
-              }
-            }} />
-            <div><span>Enter to send · Shift Enter for a line</span>{snapshot.busy ? <button type="button" className="agent-stop" onClick={() => void onCancel()}><CircleStop size={13} />Stop</button> : <button type="button" disabled={!message.trim() || submitting} onClick={() => void submitPrompt()}><Send size={13} />Send</button>}</div>
+            <textarea aria-label="Message Agent" rows={3} value={message} disabled={!snapshot.connected} placeholder="Ask Agent to build, explain, or fix this workflow…" onChange={(event) => setMessage(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submitPrompt(); } }} />
+            <div><span>{snapshot.agent_name ?? "Agent"}</span>{snapshot.busy ? <button type="button" className="agent-stop" onClick={() => void onCancel()}><CircleStop size={13} />Stop</button> : <button type="button" aria-label="Send to Agent" disabled={!message.trim() || submitting} onClick={() => void submitPrompt()}><Send size={13} />Send</button>}</div>
           </div>
-        </>
-      )}
+        </>}
+      </div>}
+    </section>
+  );
+}
+
+export function ReadinessPanel({ snapshot, evidence, onResolve, onFocus, onAskAssistant, onClose }: {
+  snapshot: ReadinessSnapshot;
+  evidence: ValidationEvidenceResponse | null;
+  onResolve: (item: ReadinessItem) => void;
+  onFocus: (item: ReadinessItem) => void;
+  onAskAssistant: (item: ReadinessItem) => void;
+  onClose: () => void;
+}) {
+  const recommended = snapshot.items.flatMap((item) => item.resolutions
+    .filter((resolution) => resolution.recommended && resolution.kind !== "connect" && resolution.kind !== "configure")
+    .map((resolution) => ({ item, resolution })));
+  const receipt = evidence?.receipt;
+  const evidenceLabel = receipt?.result === "passed" ? "Validated" : receipt?.result === "failed" ? "Failed" : receipt ? "Inconclusive" : "Not validated";
+  return (
+    <section className="floating-panel readiness-window" aria-label="Workflow Readiness">
+      <header className="floating-panel-head">
+        <div><strong>Readiness</strong><span>deterministic checks</span></div>
+        <button type="button" aria-label="Close Readiness" onClick={onClose}><X size={15} /></button>
+      </header>
+      <div className={`readiness-hero state-${snapshot.state}`}>
+        {snapshot.state === "ready" ? <CheckCircle2 size={18} /> : <CircleAlert size={18} />}
+        <div><strong>{snapshot.state === "ready" ? "All requirements are connected" : snapshot.state === "empty" ? "Start with a tool or input" : `${snapshot.required_count} required item${snapshot.required_count === 1 ? "" : "s"}`}</strong><span>{snapshot.state === "ready" ? "This graph can enter preparation." : "Resolve these before Somite prepares a run."}</span></div>
+      </div>
+      <div className="readiness-scroll">
+        {snapshot.items.length > 0 && <section className="readiness-section">
+          <header><strong>Required</strong><span>{snapshot.required_count}</span></header>
+          <div className="requirement-list">
+            {snapshot.items.map((item) => <article key={item.id} className={`requirement-card kind-${item.kind}`}>
+              <button type="button" className="requirement-main" onClick={() => onFocus(item)}>
+                <i>{item.kind === "managed_resource" ? <Database size={13} /> : item.kind === "manual_checkpoint" ? <FileInput size={13} /> : <CircleAlert size={13} />}</i>
+                <span><strong>{item.title}</strong><code>{item.node_id}.{item.field}</code><small>{item.detail}</small></span>
+              </button>
+              {item.resolutions.some((resolution) => resolution.source_url) && <div className="resolution-links">
+                {item.resolutions.filter((resolution) => resolution.source_url).map((resolution) => <a key={resolution.id} href={resolution.source_url!} target="_blank" rel="noreferrer"><ExternalLink size={11} />Official guide</a>)}
+              </div>}
+              {item.kind === "managed_resource" && <div className="resolution-list">
+                {item.resolutions.map((resolution) => {
+                  const download = formatResourceBytes(resolution.download_bytes);
+                  const stored = formatResourceBytes(resolution.stored_bytes);
+                  return <div key={resolution.id} className={resolution.recommended ? "recommended" : ""}>
+                    <header><strong>{resolution.label}</strong>{resolution.recommended && <em>Recommended</em>}</header>
+                    <p>{resolution.detail}</p>
+                    {(download || stored) && <small>{download && `${download} download`}{download && stored && " · "}{stored && `${stored} stored`}</small>}
+                    {resolution.scientific_effect && <p className="scientific-effect">{resolution.scientific_effect}</p>}
+                  </div>;
+                })}
+              </div>}
+              <div className="requirement-actions">
+                <button type="button" onClick={() => onResolve(item)}>{item.resolutions[0]?.label ?? (item.kind === "parameter" ? "Configure" : item.kind === "managed_resource" ? "Connect existing" : "Connect input")}</button>
+                <button type="button" className="secondary" onClick={() => onAskAssistant(item)}><MessageSquare size={12} />Ask Assistant</button>
+              </div>
+            </article>)}
+          </div>
+        </section>}
+        {recommended.length > 0 && <section className="readiness-section recommendations">
+          <header><strong>Recommendations</strong><span>rule-based</span></header>
+          {recommended.map(({ item, resolution }) => <div key={`${item.id}:${resolution.id}`}><CheckCircle2 size={13} /><span><strong>{resolution.label}</strong><small>{resolution.scientific_effect ?? resolution.detail}</small></span></div>)}
+        </section>}
+        <section className="readiness-section evidence-readiness">
+          <header><strong>Evidence</strong><span>{evidenceLabel}</span></header>
+          <div className={receipt?.result === "passed" ? "passed" : receipt?.result === "failed" ? "failed" : "pending"}>
+            {receipt?.result === "passed" ? <CheckCircle2 size={14} /> : <CircleAlert size={14} />}
+            <span><strong>{evidenceLabel}</strong><small>{receipt ? `${receipt.scope} · ${receipt.fixture_digests.length} fixture${receipt.fixture_digests.length === 1 ? "" : "s"}` : "Validate with representative fixtures when readiness is clear."}</small></span>
+          </div>
+        </section>
+      </div>
     </section>
   );
 }
@@ -191,13 +325,11 @@ function isSource(operator: Operator) {
   );
 }
 
-function isPipeline(operator: Operator) {
-  return operator.id.startsWith("nf.") || operator.id.startsWith("smk.");
-}
-
 function sectionTitle(operator: Operator) {
   if (isSource(operator)) return "Data & Inputs";
-  if (isPipeline(operator) || operator.id.startsWith("workflow.")) return "Workflow Catalog";
+  if (operator.id.startsWith("nf.")) return "Nextflow Workflows";
+  if (operator.id.startsWith("smk.")) return "Snakemake Workflows";
+  if (operator.id.startsWith("workflow.")) return "Workflow Templates";
   const prefix = operator.id.split(".")[0];
   return ({
     qc: "Quality Control",
@@ -219,7 +351,7 @@ function buildSections(
   continuation?: PendingConnection | null,
 ): LibrarySection[] {
   const normalized = query.trim().toLowerCase();
-  const matches = operators.filter((operator) => {
+  const matches = operators.filter((operator) => !isSource(operator)).filter((operator) => {
     if (continuation && !operatorContinues(operator, continuation)) return false;
     if (normalized) {
       return `${operator.title} ${operator.id} ${operator.palette.join(" ")} ${operator.description ?? ""} ${(operator.topics ?? []).join(" ")}`
@@ -248,7 +380,7 @@ function buildSections(
     const title = sectionTitle(operator);
     grouped.set(title, [...(grouped.get(title) ?? []), operator]);
   }
-  const order = ["Data & Inputs", "Quality Control", "Align & Assemble", "Measure & Analyze", "Workflow Catalog", "Utilities", "More Tools"];
+  const order = ["Data & Inputs", "Nextflow Workflows", "Quality Control", "Align & Assemble", "Measure & Analyze", "Snakemake Workflows", "Workflow Templates", "Utilities", "More Tools"];
   return [
     ...leading,
     ...[...grouped.entries()].sort(([left], [right]) => order.indexOf(left) - order.indexOf(right)).map(([title, groupedOperators]) => ({
@@ -272,6 +404,7 @@ export function LibraryPanel({
   onClose,
   onAddOperator,
   onAddSource,
+  onImportFiles,
   onToggleFavorite,
   onToggleCategory,
 }: {
@@ -287,11 +420,12 @@ export function LibraryPanel({
   onClose: () => void;
   onAddOperator: (operator: Operator) => void;
   onAddSource: (request: SourceRequest) => void;
+  onImportFiles: (files: File[]) => Promise<void>;
   onToggleFavorite: (id: string) => void;
   onToggleCategory: (title: string, open: boolean) => void;
 }) {
   const request = classifySource(query);
-  const hasDirectSource = request !== null;
+  const nextflowCount = operators.filter((operator) => operator.id.startsWith("nf.")).length;
   const [sourceResults, setSourceResults] = useState<SourceSearchResult[]>([]);
   const [sourceSearching, setSourceSearching] = useState(false);
   const [sourceSearched, setSourceSearched] = useState(false);
@@ -305,7 +439,7 @@ export function LibraryPanel({
     const sourceQuery = filterQuery.trim();
     const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      if (continuation || hasDirectSource || sourceQuery.length < 2) {
+      if (continuation || sourceQuery.length < 2) {
         setSourceResults([]);
         setSourceSearching(false);
         setSourceSearched(false);
@@ -343,7 +477,7 @@ export function LibraryPanel({
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [continuation, filterQuery, hasDirectSource]);
+  }, [continuation, filterQuery]);
 
   const chooseSource = (source: SourceRequest) => {
     onAddSource(source);
@@ -375,6 +509,19 @@ export function LibraryPanel({
           {query && <button type="button" aria-label="Clear Search" onClick={() => onQuery("")}><X size={13} aria-hidden="true" /></button>}
         </div>
       </div>
+
+      {!continuation && !query.trim() && <section className="input-choices" aria-label="Add input data">
+        <header><strong>Start with data</strong><span>Choose where it comes from</span></header>
+        <div>
+          <label><CloudUpload size={16} aria-hidden="true" /><span><strong>Local files</strong><small>Choose files from this computer</small></span><input type="file" multiple aria-label="Choose local input files" onChange={(event) => { const files = [...(event.currentTarget.files ?? [])]; event.currentTarget.value = ""; if (files.length) void onImportFiles(files); }} /></label>
+          <button type="button" onClick={() => searchInputRef.current?.focus()}><Database size={16} aria-hidden="true" /><span><strong>NCBI & Ensembl</strong><small>Search by organism, name, or accession</small></span></button>
+        </div>
+      </section>}
+
+      {!continuation && !query.trim() && nextflowCount > 0 && <button type="button" className="nextflow-browse" onClick={() => {
+        onToggleCategory("Nextflow Workflows", true);
+        window.setTimeout(() => document.getElementById("nextflow-workflows")?.scrollIntoView({ behavior: "smooth", block: "start" }), 0);
+      }}><span><strong>Browse Nextflow workflows</strong><small>Explore the nf-core catalog</small></span><em>{nextflowCount}</em><ChevronDown size={13} aria-hidden="true" /></button>}
 
       {!continuation && query.trim() && (request || sourceSearching || sourceSearched || sourceResults.length > 0) && (
         <section className="source-builder unified-source-results" aria-label="Public data results">
@@ -419,7 +566,7 @@ export function LibraryPanel({
         {sections.map((section) => {
           const open = query ? true : (categoryOpen[section.title] ?? section.open);
           return (
-            <section className="operator-section" key={section.title}>
+            <section className="operator-section" id={section.title === "Nextflow Workflows" ? "nextflow-workflows" : undefined} key={section.title}>
               <button type="button" className="operator-section-toggle" aria-expanded={open} onClick={() => onToggleCategory(section.title, !open)}>
                 <ChevronDown className={open ? "" : "closed"} size={13} aria-hidden="true" />
                 <span>{section.title}</span><small>{section.operators.length}</small>
@@ -506,6 +653,9 @@ function toolStateLabel(state: ExportPlan["tools"][number]["state"]) {
     ready: "Ready",
     installable: "Installable",
     system_required: "System tool",
+    manual_checkpoint: "Manual checkpoint",
+    method_details: "Details needed",
+    legacy_source: "Legacy setup",
     adapter_needed: "Needs adapter",
   } as const)[state];
 }
@@ -527,7 +677,7 @@ export function ToolchainPanel({ plan, pixiReady, loading, downloading, onDownlo
       </div>
       {loading && <div className="toolchain-loading"><span className="loader-mark" />Reading operator requirements…</div>}
       {plan && <>
-        <div className="toolchain-summary"><span><strong>{plan.ready_count}</strong>ready</span><span><strong>{plan.installable_count}</strong>installable</span><span className={plan.adapter_count ? "attention" : ""}><strong>{plan.adapter_count}</strong>need adapters</span></div>
+        <div className="toolchain-summary"><span><strong>{plan.ready_count}</strong>ready</span><span><strong>{plan.installable_count}</strong>managed</span><span className={plan.manual_count ? "attention" : ""}><strong>{plan.manual_count}</strong>manual</span><span className={plan.details_count ? "attention" : ""}><strong>{plan.details_count}</strong>need details</span><span className={plan.legacy_count ? "attention" : ""}><strong>{plan.legacy_count}</strong>legacy</span>{plan.adapter_count > 0 && <span className="attention"><strong>{plan.adapter_count}</strong>need adapters</span>}</div>
         <div className="tool-list">
           {plan.tools.map((tool) => <article key={tool.operator_id} className={`tool-row state-${tool.state}`}><header><span><strong>{tool.title}</strong><code>{tool.operator_id}</code></span><em>{toolStateLabel(tool.state)}</em></header><p>{tool.packages.join(" · ") || tool.binary || tool.detail}</p></article>)}
           {!plan.tools.length && <p className="panel-empty">This graph has no tool requirements yet.</p>}
@@ -535,47 +685,182 @@ export function ToolchainPanel({ plan, pixiReady, loading, downloading, onDownlo
         <div className="toolchain-format"><span>Includes</span><code>main.nf</code><code>pixi.lock</code><code>run-closure.json</code><code>operators/</code></div>
       </>}
       <button type="button" className="export-action" disabled={!plan || loading || downloading} onClick={() => void onDownload()}>{downloading ? <><span className="loader-mark" />Building bundle…</> : <><Download size={15} aria-hidden="true" />Download {plan?.filename ?? "run bundle"}</>}</button>
-      <p className="export-honesty">Finding a package does not define a valid node. Paper-only tools remain “Needs adapter” until ports, arguments, and outputs are reviewed.</p>
+      <p className="export-honesty">Somite separates managed tools, manual checkpoints, legacy environments, and missing method details. It will not turn one category into another just because a similarly named package exists.</p>
     </section>
   );
 }
 
-export function PaperPanel({ review, active, loading, onFile, onExample, onActivate, onEvidence, onClose }: {
+export function PaperPanel({ review, active, applied, loading, onFile, onExample, onReconstruct, onSelect, onApply, onEvidence, onClose }: {
   review: PaperReview | null;
   active: number;
+  applied: number | null;
   loading: boolean;
   onFile: (file: File) => Promise<void>;
   onExample: () => Promise<void>;
-  onActivate: (index: number) => void;
+  onReconstruct: (paper: PaperSearchResult) => Promise<void>;
+  onSelect: (index: number) => void;
+  onApply: (index: number) => void;
   onEvidence: (evidence: PaperReview["candidates"][number]["evidence"][number]) => void;
   onClose: () => void;
 }) {
+  const [paperQuery, setPaperQuery] = useState("");
+  const [results, setResults] = useState<PaperSearchResult[]>([]);
+  const [searching, setSearching] = useState(false);
+  const [searched, setSearched] = useState(false);
+  const [searchError, setSearchError] = useState("");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [dropActive, setDropActive] = useState(false);
+  const [dropError, setDropError] = useState("");
+  const dragDepth = useRef(0);
+  const selectedPaper = results.find((paper) => paper.id === selectedId) ?? null;
   const candidate = review?.candidates[active];
   const evidenceCounts = candidate?.evidence.reduce<Record<string, number>>((counts, evidence) => ({ ...counts, [evidence.status]: (counts[evidence.status] ?? 0) + 1 }), {}) ?? {};
+  const resolutionCounts = candidate?.evidence.reduce<Record<string, number>>((counts, evidence) => evidence.resolution_kind ? ({ ...counts, [evidence.resolution_kind]: (counts[evidence.resolution_kind] ?? 0) + 1 }) : counts, {}) ?? {};
+  const supportedCount = (resolutionCounts.managed_tool ?? 0) + (resolutionCounts.built_in ?? 0);
+
+  useEffect(() => {
+    const query = paperQuery.trim();
+    const controller = new AbortController();
+    if (query.length < 2) {
+      return () => controller.abort();
+    }
+    const timer = window.setTimeout(() => {
+      jsonRequest<PaperSearchResponse>(`/api/papers/search?q=${encodeURIComponent(query)}`, { signal: controller.signal })
+        .then((response) => {
+          if (!controller.signal.aborted) setResults(response.results);
+        })
+        .catch((error: unknown) => {
+          if (!controller.signal.aborted) {
+            setResults([]);
+            setSearchError(error instanceof Error ? error.message : "Could not search bioRxiv");
+          }
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) {
+            setSearching(false);
+            setSearched(true);
+          }
+        });
+    }, 420);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
+  }, [paperQuery]);
+
+  const updatePaperQuery = (value: string) => {
+    setPaperQuery(value);
+    setSelectedId(null);
+    setSearchError("");
+    if (value.trim().length < 2) {
+      setResults([]);
+      setSearching(false);
+      setSearched(false);
+    } else {
+      setSearching(true);
+      setSearched(false);
+    }
+  };
+
+  const acceptsPaper = (file: File) => {
+    const name = file.name.toLowerCase();
+    return name.endsWith(".pdf") || name.endsWith(".txt") || name.endsWith(".md") || file.type === "application/pdf" || file.type === "text/plain";
+  };
+
+  const handlePaperDragEnter = (event: ReactDragEvent<HTMLElement>) => {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepth.current += 1;
+    setDropActive(true);
+    setDropError("");
+  };
+
+  const handlePaperDragOver = (event: ReactDragEvent<HTMLElement>) => {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.dataTransfer.dropEffect = "copy";
+  };
+
+  const handlePaperDragLeave = (event: ReactDragEvent<HTMLElement>) => {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDropActive(false);
+  };
+
+  const handlePaperDrop = (event: ReactDragEvent<HTMLElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepth.current = 0;
+    setDropActive(false);
+    const files = [...event.dataTransfer.files];
+    if (files.length !== 1 || !acceptsPaper(files[0])) {
+      setDropError("Drop one PDF or text file.");
+      return;
+    }
+    if (loading) {
+      setDropError("Wait for the current paper to finish, then drop this one again.");
+      return;
+    }
+    setDropError("");
+    void onFile(files[0]);
+  };
+
   return (
-    <section className="floating-panel paper-window" aria-label="Paper Reconstruction">
-      <header className="floating-panel-head"><div><strong>Paper Drop</strong><span>{review ? `${review.candidates.length} workflow${review.candidates.length === 1 ? "" : "s"}` : "methods → graph"}</span></div><button type="button" aria-label="Close Paper Reconstruction" onClick={onClose}><X size={15} /></button></header>
-      <div className="paper-intro"><FileSearch size={20} aria-hidden="true" /><span><strong>Rebuild the methods</strong><small>Somite separates paper evidence, inferred wiring, and tools that still need adapters.</small></span></div>
+    <section className={`floating-panel paper-window ${dropActive ? "drop-ready" : ""}`} aria-label="Paper Reconstruction" onDragEnter={handlePaperDragEnter} onDragOver={handlePaperDragOver} onDragLeave={handlePaperDragLeave} onDrop={handlePaperDrop}>
+      {dropActive && <div className="paper-drop-overlay" aria-live="polite"><FileInput size={24} aria-hidden="true" /><strong>Drop to rebuild this paper</strong><span>PDF, text, or Markdown</span></div>}
+      <header className="floating-panel-head"><div><strong>Rebuild from a Paper</strong><span>{review ? `${review.candidates.length} workflow draft${review.candidates.length === 1 ? "" : "s"}` : "methods → graph"}</span></div><button type="button" aria-label="Close Paper Reconstruction" onClick={onClose}><X size={15} /></button></header>
+      <div className="paper-intro"><FileSearch size={20} aria-hidden="true" /><span><strong>Rebuild the methods</strong><small>Somite separates paper evidence, inferred wiring, managed tools, and exact steps needing your attention.</small></span></div>
+      <div className="paper-discovery">
+        <label className="paper-search"><Search size={14} aria-hidden="true" /><input aria-label="Search bioRxiv" autoComplete="off" spellCheck={false} placeholder="Search bioRxiv by topic, title, author, or DOI…" value={paperQuery} onChange={(event) => updatePaperQuery(event.target.value)} />{searching && <LoaderCircle className="spin" size={13} aria-label="Searching bioRxiv" />}{paperQuery && !searching && <button type="button" aria-label="Clear bioRxiv search" onClick={() => updatePaperQuery("")}><X size={12} /></button>}</label>
+        {results.length > 0 && <div className="paper-search-results" role="listbox" aria-label="bioRxiv papers">
+          {results.map((paper) => <button key={paper.id} type="button" role="option" aria-selected={selectedId === paper.id} className={selectedId === paper.id ? "active" : ""} onClick={() => setSelectedId(paper.id)}>
+            <strong>{paper.title}</strong><span>{paper.authors || "Authors not listed"}</span><small>{paper.date || "Date not listed"} · {paper.doi}</small><em className={paper.full_text_available ? "ready" : "upload"}>{paper.full_text_available ? "Full text ready" : "PDF needed"}</em>
+          </button>)}
+        </div>}
+        {searched && !results.length && !searchError && <p className="paper-search-empty">No bioRxiv papers matched that search.</p>}
+        {searchError && <p className="paper-search-error" role="alert">{searchError}</p>}
+        {selectedPaper && <article className="paper-preview">
+          <header><span><strong>{selectedPaper.title}</strong><small>Preprint · not peer reviewed</small></span><a href={selectedPaper.url} target="_blank" rel="noreferrer" aria-label="Open paper on bioRxiv"><ExternalLink size={13} /></a></header>
+          <p>{selectedPaper.abstract_text || "No abstract is available in the search record."}</p>
+          {selectedPaper.full_text_available ? <button type="button" disabled={loading} onClick={() => void onReconstruct(selectedPaper)}>{loading ? <><LoaderMark />Reading full text…</> : "Rebuild workflow"}</button> : <div className="paper-fulltext-missing"><strong>PDF needed</strong><span>Europe PMC does not have this paper’s full text yet. Upload the PDF below.</span></div>}
+        </article>}
+      </div>
+      <div className="paper-upload-divider"><span>or use a local copy</span></div>
       <label className={`paper-upload ${loading ? "busy" : ""}`}>
         {loading ? <span className="spin"><LoaderMark /></span> : <FileInput size={15} aria-hidden="true" />}
-        <span>{loading ? "Reading methods…" : review ? "Choose another paper" : "Choose PDF or text"}</span>
+        <span>{loading ? "Reading methods…" : review ? "Choose or drop another paper" : "Choose or drop PDF or text"}</span>
         <input type="file" accept=".pdf,.txt,.md,text/plain,application/pdf" disabled={loading} aria-label="Choose methods paper" onChange={(event) => {
           const file = event.target.files?.[0];
           if (file) void onFile(file);
           event.target.value = "";
         }} />
       </label>
+      {dropError && <p className="paper-drop-error" role="alert">{dropError}</p>}
       {!review && <button type="button" className="paper-example" disabled={loading} onClick={() => void onExample()}>Try the RNA-seq methods example</button>}
       {review && <>
         <div className="paper-meta"><span>Extracted via <strong>{review.extracted_via}</strong></span><span>{candidate?.assay}</span></div>
         <nav className="paper-candidates" aria-label="Reconstructed Workflows">
-          {review.candidates.map((item, index) => <button key={`${item.name}-${index}`} type="button" className={active === index ? "active" : ""} onClick={() => onActivate(index)}><strong>{item.name}</strong><span>{item.role} · {item.graph.nodes.length} nodes</span></button>)}
+          {review.candidates.map((item, index) => <button key={`${item.name}-${index}`} type="button" className={active === index ? "active" : ""} onClick={() => onSelect(index)}><strong>{item.name}</strong><span>{item.role} · {item.graph.nodes.length} nodes{applied === index ? " · on canvas" : ""}</span></button>)}
         </nav>
         {candidate && <div className="paper-review">
-          <div className="evidence-summary"><span className="explicit"><i />{evidenceCounts.explicit ?? 0} explicit</span><span className="inferred"><i />{evidenceCounts.inferred ?? 0} inferred</span><span className="needs_adapter"><i />{evidenceCounts.needs_adapter ?? 0} need adapters</span></div>
+          <button type="button" className="paper-apply" disabled={applied === active} onClick={() => onApply(active)}>{applied === active ? "Workflow is on the canvas" : "Use this workflow on the canvas"}</button>
+          {applied !== active && <p className="paper-draft-note">Review this draft first. The canvas will not change until you use it.</p>}
+          <div className="evidence-summary"><span className="explicit"><i />{evidenceCounts.explicit ?? 0} explicit</span><span className="inferred"><i />{evidenceCounts.inferred ?? 0} inferred</span></div>
+          <div className="paper-resolution-summary">
+            {supportedCount > 0 && <span className="supported">{supportedCount} supported</span>}
+            {(resolutionCounts.input_required ?? 0) > 0 && <span>{resolutionCounts.input_required} inputs</span>}
+            {(resolutionCounts.manual_checkpoint ?? 0) > 0 && <span className="attention">{resolutionCounts.manual_checkpoint} manual</span>}
+            {(resolutionCounts.method_details ?? 0) > 0 && <span className="attention">{resolutionCounts.method_details} need details</span>}
+            {(resolutionCounts.legacy_source ?? 0) > 0 && <span className="attention">{resolutionCounts.legacy_source} legacy</span>}
+            {(resolutionCounts.adapter ?? 0) > 0 && <span className="attention">{resolutionCounts.adapter} adapters</span>}
+          </div>
           {candidate.warnings.map((warning) => <p className="paper-warning" key={warning}>{warning}</p>)}
           <div className="evidence-list">
-            {candidate.evidence.map((evidence, index) => <button type="button" key={`${evidence.target_kind}-${evidence.target_id}-${index}`} className={`evidence-item ${evidence.status}`} onClick={() => onEvidence(evidence)} aria-label={`Show ${evidence.target_kind} ${evidence.target_id} on canvas`}><header><i /><strong>{evidence.target_id}</strong><span>{evidence.status}</span></header><p>{evidence.detail}</p></button>)}
+            {candidate.evidence.map((evidence, index) => <button type="button" disabled={applied !== active} key={`${evidence.target_kind}-${evidence.target_id}-${index}`} className={`evidence-item ${evidence.status}`} onClick={() => onEvidence(evidence)} aria-label={applied === active ? `Show ${evidence.target_kind} ${evidence.target_id} on canvas` : `${evidence.target_kind} ${evidence.target_id} evidence`}><header><i /><strong>{evidence.target_id}</strong><span>{evidence.status}</span></header><p>{evidence.detail}</p>{evidence.resolution_label && <small className={`paper-resolution kind-${evidence.resolution_kind}`} title={evidence.resolution_detail}>{evidence.resolution_label}</small>}</button>)}
             {!candidate.evidence.length && <p className="panel-empty">No method evidence was strong enough to place a tool.</p>}
           </div>
         </div>}
@@ -664,7 +949,8 @@ export function InspectorPanel({
 }
 
 function isFileParameter(operator: string, key: string) {
-  return (operator === "files.import" && key === "path") || (operator === "files.import_paired" && (key === "r1" || key === "r2"));
+  return ((operator.startsWith("files.import") || operator.startsWith("manual.")) && (key === "path" || key.endsWith("_path")))
+    || (operator === "files.import_paired" && (key === "r1" || key === "r2"));
 }
 
 function ParameterControl({ node, name, spec, value, update, beginEdit, browse }: {

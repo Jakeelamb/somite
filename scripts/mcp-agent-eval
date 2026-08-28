@@ -32,13 +32,17 @@ if ! [[ "$port" =~ ^[0-9]+$ ]] || ((port < 1024 || port > 65535)); then
   echo "port must be an integer from 1024 through 65535" >&2
   exit 1
 fi
-if [[ "$scenario" != baseline && "$scenario" != natural && "$scenario" != source && "$scenario" != stale ]]; then
-  echo "scenario must be baseline, natural, source, or stale" >&2
+if [[ "$scenario" != baseline && "$scenario" != natural && "$scenario" != source && "$scenario" != metagenomics && "$scenario" != stale ]]; then
+  echo "scenario must be baseline, natural, source, metagenomics, or stale" >&2
   exit 1
 fi
 
 mkdir -p "$output_dir"
-install -m 0644 "$project_root/testdata/mcp_agent_empty.somite.json" "$graph_path"
+graph_fixture="$project_root/testdata/mcp_agent_empty.somite.json"
+if [[ "$scenario" == metagenomics ]]; then
+  graph_fixture="$project_root/testdata/fastq_to_fastqc.somite.json"
+fi
+install -m 0644 "$graph_fixture" "$graph_path"
 
 cargo build --manifest-path "$project_root/Cargo.toml" -p somite-server
 SOMITE_MCP_RUNTIME_CAPABILITY="$capability" \
@@ -89,6 +93,8 @@ if [[ "$scenario" == natural ]]; then
   prompt_fixture="$project_root/testdata/mcp_agent_natural_prompt.txt"
 elif [[ "$scenario" == source ]]; then
   prompt_fixture="$project_root/testdata/mcp_agent_source_prompt.txt"
+elif [[ "$scenario" == metagenomics ]]; then
+  prompt_fixture="$project_root/testdata/mcp_agent_metagenomics_prompt.txt"
 fi
 install -m 0644 "$prompt_fixture" "$output_dir/prompt.txt"
 
@@ -162,9 +168,10 @@ for _ in $(seq 1 900); do
     handled_permissions=$(jq -c --arg id "$permission_id" '. + [$id]' <<<"$handled_permissions")
   done < <(
     jq -r '.events[]
-      | select(.kind == "permission" and .permission_id != null)
+      | select(.kind == "permission" and .permission_id != null and
+          (((.permission_choices // []) | length) > 0))
       | [.permission_id,
-         ((.permission_choices[] | select(.kind == "allow_once") | .option_id) // ""),
+         (((.permission_choices // [])[] | select(.kind == "allow_once") | .option_id) // ""),
          .title]
       | @tsv' "$output_dir/events.json"
   )
@@ -253,7 +260,10 @@ jq -n \
         select((.title // "") | contains("source.search"))] | length),
       status_polls: ([$transcript[0].tool_calls[]? |
         select((.title // "") | contains("run.status"))] | length),
-      permission_prompts: ([$transcript[0].tool_calls[]?.permissions[]?] | length),
+      permission_prompts: ([$transcript[0].tool_calls[]?.permissions[]? |
+        select(((.choices // []) | length) > 0)] | length),
+      automatic_somite_approvals: ([$transcript[0].tool_calls[]?.permissions[]? |
+        select(((.choices // []) | length) == 0)] | length),
       final_nodes: ($workflow[0].graph.nodes | length),
       final_edges: ($workflow[0].graph.edges | length)
     },
@@ -283,6 +293,34 @@ jq -n \
           (.title // "") | startswith("somite.")),
         answer_returned: any($transcript[0].messages[]?;
           .role == "assistant" and ((.text // "") | length) > 0)
+      }
+    elif $scenario == "metagenomics" then
+      .checks = {
+        inspected_before_edit: (
+          [$transcript[0].tool_calls[].title] as $titles |
+          (($titles | index("somite.workflow.get")) // 9999) <
+          (($titles | index("somite.graph.apply_transaction")) // 9999)),
+        kraken2_added: any($workflow[0].graph.nodes[]?;
+          .operator == "class.kraken2"),
+        database_is_required: any($workflow[0].graph.nodes[]?;
+          .operator == "class.kraken2" and
+          any(.ports[]?; .name == "db" and ((.optional // false) | not))),
+        database_is_unbound: (
+          [$edges[]? | select(.to_port == "db")] | length) == 0,
+        validation_not_attempted: all($transcript[0].tool_calls[]?;
+          (.title // "") != "somite.validation.start"),
+        no_irrelevant_source_search: all($transcript[0].tool_calls[]?;
+          (.title // "") != "somite.source.search"),
+        no_interactive_somite_prompts: ([$transcript[0].tool_calls[]?.permissions[]? |
+          select(((.choices // []) | length) > 0)] | length) == 0,
+        asks_for_database_path: any($transcript[0].messages[]?;
+          .role == "assistant" and
+          ((.text // "") | ascii_downcase | contains("database")) and
+          (((.text // "") | ascii_downcase | contains("path")) or
+           ((.text // "") | ascii_downcase | contains("directory")))),
+        somite_native_after_mandatory_instructions: all($transcript[0].tool_calls[]?;
+          ((.title // "") | startswith("somite.")) or
+          ((.title // "") == "Read file '/home/jake/Projects/agent-scripts/AGENTS.MD'"))
       }
     else . end
   | .passed = ([.checks[]] | all)

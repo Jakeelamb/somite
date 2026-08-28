@@ -120,7 +120,11 @@ test("validation edges expose progress and terminal evidence without color-only 
 test("validation identity ignores layout but invalidates parameter changes", () => {
   const graph = { schema_version: 2, nodes: [{ ...node, params: { threads: 2 } }], edges: [] };
   const renamed = { ...graph, name: "RNA-seq review" };
-  const moved = { ...graph, nodes: [{ ...graph.nodes[0], layout: { x: 900, y: -20 } }] };
+  const moved = {
+    ...graph,
+    nodes: [{ ...graph.nodes[0], layout: { x: 900, y: -20 }, color: "violet" as const }],
+    annotations: [{ id: "note-1", kind: "sticky" as const, text: "Review", color: "yellow" as const, layout: { x: 10, y: 20 }, width: 220, height: 140 }],
+  };
   const changed = { ...graph, nodes: [{ ...graph.nodes[0], params: { threads: 4 } }] };
   assert.equal(semanticGraphKey(graph), semanticGraphKey(renamed));
   assert.equal(semanticGraphKey(graph), semanticGraphKey(moved));

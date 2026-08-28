@@ -1,0 +1,32 @@
+{
+  "id": "manual.allmaps_evidence",
+  "title": "ALLMAPS evidence checkpoint",
+  "palette": ["Resolve"],
+  "kind": "inprocess",
+  "cost": "low",
+  "params": {
+    "map_path": { "type": "string", "label": "Combined ALLMAPS BED", "page": "Manual checkpoint", "required": true },
+    "weights_path": { "type": "string", "label": "ALLMAPS weights file", "page": "Manual checkpoint", "required": true }
+  },
+  "ports": {
+    "in": [
+      { "name": "linkage_map", "type": "Table", "optional": true },
+      { "name": "rascaf", "type": "Text", "optional": true },
+      { "name": "agouti", "type": "Fasta", "optional": true }
+    ],
+    "out": [
+      { "name": "map", "type": "Bed", "import_param": "map_path" },
+      { "name": "weights", "type": "Text", "import_param": "weights_path" }
+    ]
+  },
+  "argv": [],
+  "outputs": {},
+  "resolution": {
+    "kind": "method_details",
+    "title": "Attach the combined ALLMAPS evidence",
+    "detail": "The paper says JoinMap, Rascaf, and AGOUTI evidence was appended for ALLMAPS, but does not report the conversion commands. Attach the reviewed BED file instead of guessing that transformation.",
+    "action_label": "Choose evidence BED",
+    "parameters": ["map_path", "weights_path"],
+    "source_url": "https://github.com/tanghaibao/jcvi/wiki/ALLMAPS"
+  }
+}

@@ -81,9 +81,11 @@ tool. The production compiler emits one static Nextflow process for the Node.
 
 ### `inprocess`
 
-A trusted Somite boundary that does not spawn a tool. The first compiler slice
-supports only `files.import` and `files.import_paired`; all other in-process
-operators fail compilation until explicitly lowered.
+A trusted Somite boundary that does not spawn a tool. File sources and manual
+checkpoints lower to input channels. An output port may declare
+`import_param` to name the parameter containing the local file it represents;
+this supports multi-file checkpoints without adding paper-specific compiler
+branches. Other in-process operators fail compilation until explicitly lowered.
 
 ### `reference`
 
@@ -106,9 +108,15 @@ Placeholders are data, never shell source:
 - `?!port:token` includes it only when the input is unbound;
 - `{work}/out` and `{work}/tmp` resolve inside the task directory.
 
+An input port may declare a safe basename-only `stage_as` when a legacy CLI
+derives output names from an input filename. This is reviewed execution
+metadata and is covered by the Operator revision.
+
 Somite renders a Bash array and executes `"${argv[@]}"`. Operator tokens are
 never concatenated into `bash -c`, `eval`, pipes, redirects, or command
-substitutions.
+substitutions. A `stdout` field may name one exact output port for tools such
+as BWA that intentionally emit their artifact to stdout; Somite owns that
+single controlled redirection, and the output still passes normal validation.
 
 ## Outputs
 
@@ -123,6 +131,19 @@ integrity, not a claim that a scientific result is biologically correct.
 
 `OutputSpec.exclude` is not lowered yet and therefore fails compilation. It
 must not be silently ignored.
+
+## Deterministic resolution profiles
+
+`resolution` describes an honest non-package action for a structural or manual
+operator. The supported kinds are `manual_checkpoint`, `method_details`,
+`legacy_source`, and `adapter`. A profile owns the user-facing title, detail,
+action label, optional official source URL, and any parameters whose presence
+clears the requirement.
+
+Readiness, paper review, and export consume the same profile. A package match
+cannot clear one of these states. Manual checkpoints can become ready when the
+declared artifacts are attached; method ambiguity and legacy-source nodes stay
+blocked until the graph is replaced with a reviewed executable contract.
 
 ## Pixi environment
 
@@ -169,6 +190,9 @@ A catalog contribution includes:
 5. output rules that remain under `{work}`;
 6. Pixi package requirements; and
 7. a tiny fixture proving command construction and output collection.
+
+Commands that emit stdout or derive filenames from staged inputs also require
+a compiler fixture for their `stdout` or `stage_as` behavior.
 
 Agents may propose contracts from `--help`, Bioconda recipes, nf-core
 `meta.yml`, or existing workflow tests. Those are evidence sources. Promotion

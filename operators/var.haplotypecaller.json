@@ -9,7 +9,7 @@
   "ports": {
     "in": [
       { "name": "bam", "type": "Bam" },
-      { "name": "ref", "type": "Fasta", "union": ["Fasta", "FastaGz"], "optional": true }
+      { "name": "ref", "type": "Fasta", "union": ["Fasta", "FastaGz"] }
     ],
     "out": [{ "name": "vcf", "type": "Vcf" }]
   },

@@ -33,15 +33,27 @@ cancellation. **Validate** substitutes small content-addressed FASTQ fixtures,
 runs that same production path, and records configuration-scoped evidence.
 Export downloads the same frozen production package.
 
+The bottom status bar continuously reports deterministic **Readiness** for the
+current graph revision. Its drawer lists every missing required connection,
+parameter, or managed scientific resource; known storage and scientific
+tradeoffs; current validation evidence; and direct resolve or **Ask Assistant**
+actions. Nodes mark their own missing inputs. Run, Validate, and agent Compile
+stop before preparation when readiness is blocked.
+
+Agent is a compact right-side collaborator whose ordinary conversation hides
+protocol noise behind one activity disclosure. The window can be dragged,
+resized, collapsed, closed, and reopened without ending its session. Sticky
+notes, stage boxes, pen strokes, and labeled node colors are portable, undoable
+presentation state and do not change workflow execution identity.
+
 ## Build workflows
 
-The Library is one universal add surface. Its search spans typed operators,
-public data, and workflow catalogs without forcing the user to choose a source
-type first. Empty-search sections group entries by their role on the graph:
-data and inputs, quality control, alignment and assembly, measurement and
-analysis, workflow catalog, and utilities. NCBI and Ensembl results appear
-alongside matching tools and workflows; paired reads remain separate R1 and R2
-streams.
+The Library is one universal add surface. Input data has two user-facing paths:
+choose local files, or search the live NCBI and Ensembl catalogs by organism,
+common name, or accession. Somite keeps the lower-level import and download
+operators out of this list and selects them from the chosen result. Tools are
+grouped by their role, while the nf-core Nextflow catalog is an open, directly
+browsable workflow section; paired reads remain separate R1 and R2 streams.
 
 The Project panel is the engine-neutral entry point for local workflow
 projects. Somite detects a supported project and adds its visible structure to
@@ -51,10 +63,14 @@ workflows expand into editable structural nodes and edges; engine-authored
 references remain clearly marked and are not presented as independently
 executable tools until they have reviewed Somite contracts.
 
-Paper Drop reconstructs one or more candidate graphs from methods text or a
-PDF. The evidence view distinguishes text-supported tools, compatibility
-inferences, and missing adapters; it never presents an inferred workflow as a
-verbatim executable method.
+Rebuild from a Paper searches bioRxiv by topic, title, author, or DOI without
+mixing literature into the Add surface. Papers whose JATS full text is available
+through Europe PMC can be previewed and reconstructed in place; a local PDF or
+text file can be chosen or dropped anywhere on the open Paper panel. Search and
+reconstruction produce reviewable drafts only. The canvas changes only when the
+user explicitly accepts a candidate workflow, and the evidence view
+distinguishes text-supported tools, compatibility inferences, and missing
+adapters.
 
 ## Bring your own agent
 
@@ -124,6 +140,15 @@ cargo run -p somite-cli -- cook-oracle testdata/fastq_to_fastqc.somite.json
 cargo run -p somite-cli -- paper testdata/papers/rnaseq_methods.txt
 cargo run -p somite-cli -- import-snakemake path/to/project workflow.somite.json target_a target_b
 ```
+
+Paper reconstruction uses deterministic resolution profiles rather than a
+single “needs adapter” bucket. Managed Pixi tools, local inputs, licensed manual
+checkpoints, legacy source environments, and underspecified methods remain
+distinct in Paper review, Readiness, and export. For example, the linkage-guided
+assembly profile models BWA stdout as SAM, explicit SAMtools conversion/sorting,
+Rascaf and ALLMAPS as managed operators, JoinMap as an attachable manual result,
+AGOUTI as a legacy source tool, and an unnamed GATK 3.5 caller as a method choice
+that Somite will not guess.
 
 ## Architecture
 

@@ -382,7 +382,7 @@ fn digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use somite_ir::{Layout, Node, SCHEMA_VERSION};
+    use somite_ir::{CanvasAnnotation, CanvasColor, Layout, Node, SCHEMA_VERSION};
 
     fn fixture() -> (Graph, Catalog) {
         let operator: Operator = serde_json::from_str(
@@ -403,8 +403,10 @@ mod tests {
                 params: BTreeMap::new(),
                 layout: Layout { x: 0.0, y: 0.0 },
                 note: None,
+                color: None,
             }],
             edges: Vec::new(),
+            annotations: Vec::new(),
         };
         (graph, catalog)
     }
@@ -419,12 +421,21 @@ mod tests {
     }
 
     #[test]
-    fn name_layout_and_notes_do_not_change_the_semantic_graph_revision() {
+    fn presentation_edits_do_not_change_the_semantic_graph_revision() {
         let (graph, _) = fixture();
         let mut moved = graph.clone();
         moved.name = Some("Renamed workflow".into());
         moved.nodes[0].layout = Layout { x: 800.0, y: -40.0 };
         moved.nodes[0].note = Some("presentation only".into());
+        moved.nodes[0].color = Some(CanvasColor::Violet);
+        moved.annotations.push(CanvasAnnotation::Box {
+            id: "box-1".into(),
+            text: "Analysis".into(),
+            color: CanvasColor::Violet,
+            layout: Layout { x: 700.0, y: -80.0 },
+            width: 360.0,
+            height: 220.0,
+        });
         assert_eq!(
             semantic_graph_revision(&graph).unwrap(),
             semantic_graph_revision(&moved).unwrap()

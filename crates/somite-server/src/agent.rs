@@ -33,11 +33,11 @@ const WORKFLOW_AGENT_CONTRACT: &str = r#"You are the Workflow Agent embedded in 
 
 Work through the Somite MCP tools immediately. Do not inspect or modify the Somite repository, run shell commands, read project files directly, or create workflow JSON by hand. Do not use developer tools to discover capabilities that Somite already exposes.
 
-Begin by inspecting the current workflow. Search exact catalog contracts instead of inventing operator ids, ports, parameters, or revisions. When current NCBI or Ensembl data is relevant, use Somite source search before leaving the application. If a source result includes ordered operator_ids, treat them as Somite's native source recipe and search those exact ids. Independent workflow, catalog, and source lookups should be issued without unnecessary narration and in parallel when the agent supports it.
+Begin by inspecting the current workflow. Search exact catalog contracts instead of inventing operator ids, ports, parameters, or revisions. Use short single-concept catalog queries; issue independent queries in one parallel batch. When current NCBI or Ensembl data is relevant, use Somite source search before leaving the application. If a source result includes ordered operator_ids, treat them as Somite's native source recipe and search those exact ids. A local file or Directory input is a user/project resource, not an NCBI or Ensembl research query.
 
 Generic web research is allowed only when the request genuinely requires current external evidence that no Somite tool can provide. Prefer authoritative primary sources, state what was learned, and return immediately to the Somite tools. Never use generic web research to inspect Somite's repository or operator contracts.
 
-Apply a small coherent canvas transaction as soon as the available information supports one. Do not ask for confirmation before ordinary reversible canvas edits. Ask one concise question only when a missing scientific choice would materially change the valid graph and Somite cannot represent a safe useful subset first. If a required reviewed contract is missing, report the exact MCP-visible blocker; do not work around it by editing the repository. A representative-validation rejection for an unsupported source family is a blocker, not a reason to replace a scientifically correct source operator. Never claim a workflow is runnable unless validation completed successfully.
+Before editing, identify every required non-optional input in the selected contracts. Apply a small coherent canvas transaction as soon as the available information supports one. Do not ask for confirmation before ordinary reversible canvas edits. After editing, call Somite readiness and use its typed requirements and resolutions instead of rediscovering missing inputs yourself. If a required local resource such as a database Directory has no user-supplied path, build only a scientifically useful partial graph, report the exact readiness item, and do not compile or start validation. Ask one concise question only when a missing scientific choice would materially change the valid graph and Somite cannot represent a safe useful subset first. If a required reviewed contract is missing, report the exact MCP-visible blocker; do not work around it by editing the repository. A representative-validation rejection for an unsupported source family is a blocker, not a reason to replace a scientifically correct source operator. Start validation only when readiness is clear. Never claim a workflow is runnable unless validation completed successfully.
 
 Do not narrate a plan before the first relevant Somite tool call. Keep the final response short and centered on canvas changes, exact blockers, revisions, and validation evidence.
 
@@ -270,6 +270,7 @@ fn apply_operation(
                 params: bound,
                 layout: Layout { x, y },
                 note,
+                color: None,
             });
         }
         GraphOperation::RemoveNode { node_id } => {
@@ -1022,6 +1023,24 @@ async fn run_agent(
                     request.tool_call.fields.raw_input.as_ref().or(fallback.1.as_ref()),
                     fallback.0.as_deref(),
                 );
+                if let Some(option_id) = automatic_somite_permission(&title, &choices) {
+                    push_event_with_tool_call(
+                        &permission_state,
+                        AgentEventKind::Permission,
+                        title,
+                        format!("{detail} · Automatically allowed for this Somite session"),
+                        Some("approved".to_owned()),
+                        None,
+                        Some(permission_id),
+                        Vec::new(),
+                        Some(tool_call_id),
+                    );
+                    return responder.respond(RequestPermissionResponse::new(
+                        RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                            option_id.to_owned(),
+                        )),
+                    ));
+                }
                 let (sender, receiver) = oneshot::channel();
                 let option_ids = choices
                     .iter()
@@ -1271,6 +1290,28 @@ fn permission_kind(kind: PermissionOptionKind) -> &'static str {
         PermissionOptionKind::RejectAlways => "reject_always",
         _ => "other",
     }
+}
+
+fn automatic_somite_permission<'a>(
+    title: &str,
+    choices: &'a [PermissionChoice],
+) -> Option<&'a str> {
+    let action = title.strip_prefix("Approve ")?;
+    if !action.starts_with("somite.")
+        || action.len() == "somite.".len()
+        || !action
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '_'))
+    {
+        return None;
+    }
+    choices
+        .iter()
+        .find(|choice| {
+            choice.kind == "allow_always" && choice.name.to_ascii_lowercase().contains("session")
+        })
+        .or_else(|| choices.iter().find(|choice| choice.kind == "allow_once"))
+        .map(|choice| choice.option_id.as_str())
 }
 
 fn permission_event_fields(
@@ -1717,6 +1758,7 @@ mod tests {
             name: None,
             nodes: Vec::new(),
             edges: Vec::new(),
+            annotations: Vec::new(),
         }
     }
 
@@ -1906,6 +1948,40 @@ mod tests {
 
         assert_eq!(title, "Approve somite.validation.start");
         assert_eq!(detail, "Tool call `exec-456`");
+    }
+
+    #[test]
+    fn somite_permissions_are_automatically_allowed_for_the_session_only() {
+        let choices = vec![
+            PermissionChoice {
+                option_id: "allow_once".to_owned(),
+                name: "Allow".to_owned(),
+                kind: "allow_once".to_owned(),
+            },
+            PermissionChoice {
+                option_id: "allow_session".to_owned(),
+                name: "Allow for This Session".to_owned(),
+                kind: "allow_always".to_owned(),
+            },
+            PermissionChoice {
+                option_id: "allow_always".to_owned(),
+                name: "Allow and Don't Ask Again".to_owned(),
+                kind: "allow_always".to_owned(),
+            },
+        ];
+
+        assert_eq!(
+            automatic_somite_permission("Approve somite.graph.apply_transaction", &choices),
+            Some("allow_session")
+        );
+        assert_eq!(
+            automatic_somite_permission("Approve shell command", &choices),
+            None
+        );
+        assert_eq!(
+            automatic_somite_permission("Approve agent action", &choices),
+            None
+        );
     }
 
     #[test]
@@ -2157,6 +2233,9 @@ done
         assert!(delivered.contains("Work through the Somite MCP tools immediately"));
         assert!(delivered.contains("Do not inspect or modify the Somite repository"));
         assert!(delivered.contains("Generic web research is allowed only"));
+        assert!(delivered.contains("Use short single-concept catalog queries"));
+        assert!(delivered.contains("After editing, call Somite readiness"));
+        assert!(delivered.contains("Start validation only when readiness is clear"));
         assert!(delivered.ends_with("Build a tiny workflow"));
 
         bridge.disconnect().await.expect("disconnect ACP fixture");

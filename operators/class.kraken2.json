@@ -13,7 +13,49 @@
     "in": [
       { "name": "r1", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
       { "name": "r2", "type": "Fastq", "union": ["Fastq", "FastqGz"], "optional": true },
-      { "name": "db", "type": "Directory", "optional": true }
+      {
+        "name": "db",
+        "type": "Directory",
+        "resource": {
+          "profile": "kraken2-database",
+          "title": "Kraken2 database",
+          "detail": "Kraken2 needs a versioned taxonomic index in addition to its executable. Somite keeps this scientific resource outside the disposable Pixi environment.",
+          "resolutions": [
+            {
+              "id": "existing",
+              "label": "Use an existing database",
+              "detail": "Connect a Kraken2 database directory already present on this computer or mounted storage.",
+              "kind": "use_existing"
+            },
+            {
+              "id": "standard-8",
+              "label": "Download Standard-8",
+              "detail": "A compact prebuilt database for machines with limited disk and memory.",
+              "kind": "download",
+              "recommended": true,
+              "download_bytes": 5500000000,
+              "stored_bytes": 7500000000,
+              "scientific_effect": "Smaller reference coverage than Standard, with much lower storage and memory requirements."
+            },
+            {
+              "id": "standard",
+              "label": "Download Standard",
+              "detail": "The broader prebuilt Standard database.",
+              "kind": "download",
+              "download_bytes": 79600000000,
+              "stored_bytes": 103100000000,
+              "scientific_effect": "Broader reference coverage than Standard-8, with substantially higher disk and memory requirements."
+            },
+            {
+              "id": "custom",
+              "label": "Build a custom database",
+              "detail": "Choose the taxonomic libraries and build a project-specific Kraken2 index.",
+              "kind": "build",
+              "scientific_effect": "Reference coverage follows the selected libraries and build provenance."
+            }
+          ]
+        }
+      }
     ],
     "out": [{ "name": "report", "type": "Table" }]
   },

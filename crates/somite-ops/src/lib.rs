@@ -36,6 +36,8 @@ pub enum OpsError {
         actual: String,
         expected: String,
     },
+    #[error("node {node} ports do not match operator {operator}")]
+    PortContractMismatch { node: String, operator: String },
     #[error("graph schema {0} cannot be migrated")]
     GraphSchema(u32),
     #[error("invalid graph after pinning: {0}")]
@@ -65,6 +67,42 @@ pub struct ParamSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceResolutionSpec {
+    pub id: String,
+    pub label: String,
+    pub detail: String,
+    pub kind: ResourceResolutionKind,
+    #[serde(default)]
+    pub recommended: bool,
+    #[serde(default)]
+    pub download_bytes: Option<u64>,
+    #[serde(default)]
+    pub stored_bytes: Option<u64>,
+    #[serde(default)]
+    pub scientific_effect: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceResolutionKind {
+    UseExisting,
+    Download,
+    Build,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceSpec {
+    pub profile: String,
+    pub title: String,
+    pub detail: String,
+    #[serde(default)]
+    pub resolutions: Vec<ResourceResolutionSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PortSpec {
     pub name: String,
     #[serde(rename = "type")]
@@ -73,6 +111,16 @@ pub struct PortSpec {
     pub union: Vec<PortType>,
     #[serde(default)]
     pub optional: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<ResourceSpec>,
+    /// Stable basename used when a legacy command derives outputs from its
+    /// input filename. Paths are intentionally forbidden.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_as: Option<String>,
+    /// For in-process source/checkpoint operators, the parameter containing
+    /// the local file represented by this output port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_param: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -109,6 +157,30 @@ pub enum Cost {
     High,
 }
 
+/// A deterministic, user-facing resolution for an operator that cannot be
+/// prepared as an ordinary managed command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorResolutionKind {
+    ManualCheckpoint,
+    MethodDetails,
+    LegacySource,
+    Adapter,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorResolutionSpec {
+    pub kind: OperatorResolutionKind,
+    pub title: String,
+    pub detail: String,
+    pub action_label: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Operator {
@@ -131,6 +203,12 @@ pub struct Operator {
     pub argv: Vec<String>,
     #[serde(default)]
     pub outputs: BTreeMap<String, OutputSpec>,
+    /// Output port whose exact output path receives the command's stdout.
+    /// This keeps stdout-producing tools data-safe without shell fragments in argv.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution: Option<OperatorResolutionSpec>,
 }
 
 fn high() -> Cost {
@@ -230,6 +308,10 @@ impl Operator {
             ports: &'a PortsSpec,
             argv: &'a [String],
             outputs: &'a BTreeMap<String, OutputSpec>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            stdout: &'a Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            resolution: &'a Option<OperatorResolutionSpec>,
         }
 
         let material = RevisionMaterial {
@@ -256,6 +338,8 @@ impl Operator {
             ports: &self.ports,
             argv: &self.argv,
             outputs: &self.outputs,
+            stdout: &self.stdout,
+            resolution: &self.resolution,
         };
         let encoded = serde_json::to_vec(&material)?;
         Ok(format!("blake3:{}", blake3::hash(&encoded).to_hex()))
@@ -358,6 +442,17 @@ impl Catalog {
                     operator: node.operator.clone(),
                     actual: node.operator_revision.clone(),
                     expected,
+                });
+            }
+            let operator = self.get(&node.operator)?;
+            let structural_adapter = operator
+                .resolution
+                .as_ref()
+                .is_some_and(|resolution| resolution.kind == OperatorResolutionKind::Adapter);
+            if node.ports != operator.ir_ports() && !structural_adapter {
+                return Err(OpsError::PortContractMismatch {
+                    node: node.id.clone(),
+                    operator: node.operator.clone(),
                 });
             }
         }
@@ -516,6 +611,8 @@ mod tests {
             ports: PortsSpec::default(),
             argv: vec!["-O".into(), "{work}/out/{param.accession}".into()],
             outputs: BTreeMap::new(),
+            stdout: None,
+            resolution: None,
         };
         let a = render_argv(&op, &b).unwrap();
         assert_eq!(a, vec!["-O", "/w/out/SRR1"]);
@@ -550,6 +647,9 @@ mod tests {
                     ty: PortType::Table,
                     union: vec![],
                     optional: true,
+                    resource: None,
+                    stage_as: None,
+                    import_param: None,
                 }],
                 out: vec![],
             },
@@ -561,6 +661,8 @@ mod tests {
                 "{work}/out".into(),
             ],
             outputs: BTreeMap::new(),
+            stdout: None,
+            resolution: None,
         };
         let a = render_argv(&op, &b).unwrap();
         assert_eq!(a, vec!["nextflow", "--outdir", "/w/out"]);
@@ -656,6 +758,41 @@ mod tests {
                 .iter()
                 .any(|port| port.name == "r2" && port.optional));
         }
+    }
+
+    #[test]
+    fn kraken2_database_is_a_required_execution_input() {
+        let catalog =
+            Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
+                .unwrap();
+        let database = catalog
+            .get("class.kraken2")
+            .unwrap()
+            .ports
+            .r#in
+            .iter()
+            .find(|port| port.name == "db")
+            .expect("Kraken2 database port");
+
+        assert!(!database.optional);
+        let resource = database
+            .resource
+            .as_ref()
+            .expect("managed resource metadata");
+        assert_eq!(resource.profile, "kraken2-database");
+        assert!(resource
+            .resolutions
+            .iter()
+            .any(|resolution| resolution.kind == ResourceResolutionKind::UseExisting));
+        assert!(resource.resolutions.iter().any(|resolution| {
+            resolution.kind == ResourceResolutionKind::Download
+                && resolution.download_bytes.is_some()
+                && resolution.stored_bytes.is_some()
+        }));
+        assert!(resource
+            .resolutions
+            .iter()
+            .any(|resolution| resolution.kind == ResourceResolutionKind::Build));
     }
 
     #[test]
@@ -820,8 +957,10 @@ mod tests {
                 params: BTreeMap::new(),
                 layout: Layout { x: 0.0, y: 0.0 },
                 note: None,
+                color: None,
             }],
             edges: Vec::new(),
+            annotations: Vec::new(),
         };
 
         catalog.pin_graph(&mut graph).unwrap();

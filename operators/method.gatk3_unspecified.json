@@ -1,0 +1,26 @@
+{
+  "id": "method.gatk3_unspecified",
+  "title": "GATK 3.5 variant calling",
+  "palette": ["Resolve"],
+  "kind": "reference",
+  "cost": "low",
+  "params": {
+    "version": { "type": "string", "label": "Reported version", "page": "Paper", "default": "3.5", "required": true }
+  },
+  "ports": {
+    "in": [
+      { "name": "bam", "type": "Bam" },
+      { "name": "ref", "type": "Fasta", "union": ["Fasta", "FastaGz"] }
+    ],
+    "out": [{ "name": "vcf", "type": "Vcf" }]
+  },
+  "argv": [],
+  "outputs": {},
+  "resolution": {
+    "kind": "method_details",
+    "title": "Choose the GATK 3.5 calling method",
+    "detail": "The paper names GATK 3.5 but does not identify the caller or command. Somite will not substitute a modern HaplotypeCaller workflow because that can change the scientific method.",
+    "action_label": "Review method details",
+    "source_url": "https://gatk.broadinstitute.org/hc/en-us/articles/360035890811"
+  }
+}

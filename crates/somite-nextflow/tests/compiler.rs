@@ -1,8 +1,33 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use somite_ir::{Graph, ParamValue};
+use somite_ir::{Edge, Graph, Layout, Node, ParamValue, SCHEMA_VERSION};
 use somite_nextflow::{compile, CompileError, CompileOptions};
 use somite_ops::{Catalog, OpKind, Operator};
+
+fn catalog_node(
+    catalog: &Catalog,
+    id: &str,
+    operator_id: &str,
+    params: BTreeMap<String, ParamValue>,
+) -> Node {
+    let operator = catalog.get(operator_id).expect("catalog operator");
+    let mut resolved = operator
+        .params
+        .iter()
+        .filter_map(|(name, spec)| spec.default.clone().map(|value| (name.clone(), value)))
+        .collect::<BTreeMap<_, _>>();
+    resolved.extend(params);
+    Node {
+        id: id.into(),
+        operator: operator_id.into(),
+        operator_revision: operator.revision().expect("operator revision"),
+        ports: operator.ir_ports(),
+        params: resolved,
+        layout: Layout { x: 0.0, y: 0.0 },
+        note: None,
+        color: None,
+    }
+}
 
 fn options() -> CompileOptions {
     CompileOptions {
@@ -123,14 +148,17 @@ fn rejects_unsupported_execution_honestly() {
         bin: None,
         pixi: vec![],
         params: BTreeMap::new(),
-        ports: Default::default(),
+        ports: catalog.ops["qc.fastp"].ports.clone(),
         argv: vec![],
         outputs: BTreeMap::new(),
+        stdout: None,
+        resolution: None,
     };
     catalog.ops.insert(reference.id.clone(), reference.clone());
     let mut rejected = graph.clone();
     rejected.nodes[1].operator = "reference".into();
     rejected.nodes[1].operator_revision = reference.revision().unwrap();
+    rejected.nodes[1].ports = reference.ir_ports();
     assert!(matches!(
         compile(&rejected, &catalog, &options()),
         Err(CompileError::ReferenceNode { .. })
@@ -206,5 +234,170 @@ fn rejects_unsupported_execution_honestly() {
     assert!(matches!(
         compile(&indirect_graph, &indirect_catalog, &options()),
         Err(CompileError::NestedEngine { .. })
+    ));
+}
+
+#[test]
+fn stdout_and_stable_input_names_compile_legacy_cli_contracts_without_shell_argv() {
+    let catalog = Catalog::load_dir(
+        &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"),
+    )
+    .expect("catalog");
+    let graph = Graph {
+        schema_version: SCHEMA_VERSION,
+        name: Some("ALLMAPS compile contract".into()),
+        nodes: vec![
+            catalog_node(
+                &catalog,
+                "assembly-input",
+                "files.import_fasta",
+                BTreeMap::from([("path".into(), ParamValue::String("assembly.fa".into()))]),
+            ),
+            catalog_node(
+                &catalog,
+                "evidence-input",
+                "manual.allmaps_evidence",
+                BTreeMap::from([
+                    ("map_path".into(), ParamValue::String("evidence.bed".into())),
+                    (
+                        "weights_path".into(),
+                        ParamValue::String("weights.txt".into()),
+                    ),
+                ]),
+            ),
+            catalog_node(&catalog, "allmaps", "asm.allmaps", BTreeMap::new()),
+        ],
+        edges: vec![
+            Edge {
+                id: "map".into(),
+                from_node: "evidence-input".into(),
+                from_port: "map".into(),
+                to_node: "allmaps".into(),
+                to_port: "map".into(),
+            },
+            Edge {
+                id: "weights".into(),
+                from_node: "evidence-input".into(),
+                from_port: "weights".into(),
+                to_node: "allmaps".into(),
+                to_port: "weights".into(),
+            },
+            Edge {
+                id: "assembly".into(),
+                from_node: "assembly-input".into(),
+                from_port: "assembly".into(),
+                to_node: "allmaps".into(),
+                to_port: "assembly".into(),
+            },
+        ],
+        annotations: vec![],
+    };
+    let compiled = compile(&graph, &catalog, &options()).expect("compile ALLMAPS graph");
+    assert!(compiled.main_nf.contains("name: 'evidence.bed'"));
+    assert!(compiled.main_nf.contains("name: 'weights.txt'"));
+    assert!(compiled.main_nf.contains("name: 'assembly.fasta'"));
+    assert!(compiled
+        .main_nf
+        .contains("evidence.fasta', emit: out_assembly"));
+
+    let bwa_graph = Graph {
+        schema_version: SCHEMA_VERSION,
+        name: Some("BWA stdout contract".into()),
+        nodes: vec![
+            catalog_node(
+                &catalog,
+                "reads",
+                "files.import_paired",
+                BTreeMap::from([
+                    ("r1".into(), ParamValue::String("r1.fastq".into())),
+                    ("r2".into(), ParamValue::String("r2.fastq".into())),
+                ]),
+            ),
+            catalog_node(
+                &catalog,
+                "reference",
+                "files.import_fasta",
+                BTreeMap::from([("path".into(), ParamValue::String("reference.fa".into()))]),
+            ),
+            catalog_node(&catalog, "bwa", "align.bwa", BTreeMap::new()),
+        ],
+        edges: vec![
+            Edge {
+                id: "r1".into(),
+                from_node: "reads".into(),
+                from_port: "r1".into(),
+                to_node: "bwa".into(),
+                to_port: "r1".into(),
+            },
+            Edge {
+                id: "r2".into(),
+                from_node: "reads".into(),
+                from_port: "r2".into(),
+                to_node: "bwa".into(),
+                to_port: "r2".into(),
+            },
+            Edge {
+                id: "ref".into(),
+                from_node: "reference".into(),
+                from_port: "assembly".into(),
+                to_node: "bwa".into(),
+                to_port: "ref".into(),
+            },
+        ],
+        annotations: vec![],
+    };
+    let bwa = compile(&bwa_graph, &catalog, &options()).expect("compile BWA graph");
+    assert!(bwa
+        .main_nf
+        .contains("\"${argv[@]}\" > 'somite_out/aligned.sam'"));
+}
+
+#[test]
+fn kraken2_without_a_database_fails_as_a_missing_required_input() {
+    let operators = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators");
+    let catalog = Catalog::load_dir(&operators).expect("operator catalog");
+    let mut graph: Graph = serde_json::from_value(serde_json::json!({
+        "schema_version": 1,
+        "nodes": [
+            {
+                "id": "reads",
+                "operator": "files.import",
+                "operator_revision": "",
+                "ports": [],
+                "params": {"path": "reads.fastq"},
+                "layout": {"x": 0.0, "y": 0.0}
+            },
+            {
+                "id": "classify",
+                "operator": "class.kraken2",
+                "operator_revision": "",
+                "ports": [],
+                "params": {"threads": 2},
+                "layout": {"x": 240.0, "y": 0.0}
+            }
+        ],
+        "edges": [
+            {
+                "id": "reads-to-kraken",
+                "from_node": "reads",
+                "from_port": "file",
+                "to_node": "classify",
+                "to_port": "r1"
+            }
+        ]
+    }))
+    .expect("Kraken2 graph");
+    for node in &mut graph.nodes {
+        node.ports = catalog
+            .get(&node.operator)
+            .expect("graph operator")
+            .ir_ports();
+    }
+    catalog.pin_graph(&mut graph).expect("pin graph");
+
+    assert!(matches!(
+        compile(&graph, &catalog, &options()),
+        Err(CompileError::MissingInput { node, port })
+            if node == "classify" && port == "db"
     ));
 }

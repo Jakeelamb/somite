@@ -6,9 +6,12 @@ Somite's MCP surface passed the fixed paired-end workflow task with four model
 configurations and a forced concurrent-edit scenario. It now also passes two
 natural-language routing cases that contain no instructions about MCP, shell,
 filesystem, or tool choice: one complete paired-read QC build and one current
-NCBI human-reference request. The current evidence is strong for these bounded
-paths, not for every possible workflow, operator, model provider, or MCP
-transport.
+NCBI human-reference request. A third natural request now reproduces the
+metagenomics case that originally failed: the agent builds the useful Kraken2
+branch, identifies its required local database input, and stops before
+validation because no database path is available. The current evidence is
+strong for these bounded paths, not for every possible workflow, operator,
+model provider, or MCP transport.
 
 The final baseline needs five to seven MCP calls: exact catalog discovery,
 state inspection, one atomic edit, one idempotent validation start, and one
@@ -24,11 +27,16 @@ receipt for both nodes and both edges.
 | GPT-5.6 Luna, low | forced stale state | 8 | 2 | 1 | 50.583 s | 13/13 checks passed |
 | GPT-5.6 Luna, low | natural QC request | 6 | 2 | 1 | 38.102 s | 12/12 checks passed |
 | GPT-5.6 Luna, low | natural NCBI reference request | 14 | 11 | 0 | 36.311 s | 6/6 routing checks passed |
+| GPT-5.6 Luna, low | natural metagenomics request | 7 | 5 | 0 | 26.565 s | 9/9 checks passed |
 
 Wall time includes agent generation, any ACP permission decisions, and, for the
 validated QC cases, Pixi preparation, Nextflow execution, and evidence
 persistence. It is not a model-only latency benchmark. The NCBI case issued its
 catalog discovery in three parallel batches and needed one canvas permission.
+The metagenomics run needed no interactive permission: its single Somite edit
+was automatically allowed for the session. Its wall time does not include
+validation because stopping for the missing required Kraken2 database is the
+correct result.
 
 ## Tasks and deterministic checks
 
@@ -58,6 +66,11 @@ reference record, catalog discovery, MCP-only tool use, and an honest response.
 The resulting partial canvas contains the native
 `ncbi.datasets_assembly -> archive.unzip` recipe and stops for an SRA accession
 or paired FASTQ paths; it is not scored or presented as a runnable assembly.
+The `metagenomics` scenario starts from an imported FASTQ and existing FastQC
+branch. It checks that the agent adds Kraken2, preserves the database as a
+required unbound input, avoids irrelevant source research, does not attempt
+validation, and asks for the local database directory without requiring an
+interactive Somite permission.
 
 Run it from the repository root:
 
@@ -66,6 +79,7 @@ scripts/mcp-agent-eval gpt-5.6-luna low 7391 baseline
 scripts/mcp-agent-eval gpt-5.6-luna low 7393 natural
 scripts/mcp-agent-eval gpt-5.6-luna low 7394 source
 scripts/mcp-agent-eval gpt-5.6-luna low 7395 stale
+scripts/mcp-agent-eval gpt-5.6-luna low 7396 metagenomics
 ```
 
 Each run writes its prompt, configuration snapshots, raw events, redacted
@@ -88,6 +102,8 @@ runs:
 | Luna used `graph_revision` as the transaction base and received a stale error. | The workflow tool description contradicted the transaction contract. | Tools and server instructions now distinguish full `state_revision` from semantic `graph_revision`; the stale error includes exact recovery fields. |
 | A natural paired-read query needed seven searches. | Search indexed too little metadata and returned weak partial matches beside complete matches. | Search now indexes ports, artifact types, aliases, labels, Pixi packages, and outputs; complete multi-term matches suppress partial matches. The Inspector query now returns one exact match. |
 | Validation approval briefly appeared as generic `agent action`. | ACP delivered the permission request before the matching tool update. | Permission handling waits up to 200 ms for the update keyed by `tool_call_id`, then emits the exact tool name and edit summary. |
+| A metagenomics pipeline reached validation with `class.kraken2 argv: unbound input db`. | The Kraken2 contract incorrectly marked `db` optional even though its command always expands `--db {input.db}`. The agent also attempted validation before resolving all required local resources. | The database port is required, the agent contract checks all required inputs before editing and validating, and the regression scenario stops once it needs the user's local database path. |
+| Repeated Somite permission clicks interrupted native tool use. | Every canvas mutation and validation start surfaced the ACP permission prompt even though these tools are constrained to Somite's local session. | Exact `somite.*` permissions are automatically allowed for the current session. Shell and other external actions remain interactive. |
 | A successful Luna run used nine repeated status calls. | Status had no bounded wait contract. | `somite.run.status.wait_ms` long-polls for up to 25 seconds. Final agents used one status call. |
 | Terra observed `phase: completed` with no receipt, then found the receipt through evidence lookup. | The runner exposed its process terminal state before evidence finalization. | Validation remains `finalizing` until its receipt is persisted; terminal completion and evidence now become visible atomically. |
 | A compile blocker marked every unexecuted node failed. | Preparation failure was projected onto units that never ran. | Running units fail; queued units become skipped and evidence-inconclusive. |
@@ -127,6 +143,10 @@ real external-client requirement.
 - The fixed task covers a small, valid paired-end graph. More cases should test
   invalid ports, unsupported fixture families, large imported workflows,
   pagination, cancellation during execution, and recovery after process loss.
+- Full Kraken2 execution still requires a real local Kraken2 database directory.
+  The current representative-validation fixture set does not contain a reviewed
+  miniature Kraken2 database, so the metagenomics scenario proves honest
+  blocking behavior rather than classifier execution.
 - The NCBI case proves native current-reference discovery and a safe partial
   source recipe. It does not prove a complete human reference-guided assembly;
   that still requires actual reads and reviewed archive-to-FASTA and downstream

@@ -1,0 +1,25 @@
+{
+  "id": "asm.rascaf",
+  "title": "Rascaf connections",
+  "palette": ["Align & Assemble"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "rascaf",
+  "pixi": ["bioconda::rascaf"],
+  "params": {
+    "minimum_support": { "type": "int", "label": "Minimum supporting alignments", "page": "Rascaf", "default": 5, "min": 2 }
+  },
+  "ports": {
+    "in": [
+      { "name": "alignments", "type": "Bam" },
+      { "name": "assembly", "type": "Fasta", "union": ["Fasta", "FastaGz"] }
+    ],
+    "out": [{ "name": "connections", "type": "Text" }]
+  },
+  "argv": [
+    "rascaf", "-b", "{input.alignments}", "-f", "{input.assembly}", "-ms", "{param.minimum_support}", "-o", "{work}/out/rascaf"
+  ],
+  "outputs": {
+    "connections": { "glob": "{work}/out/rascaf.out", "type": "Text" }
+  }
+}

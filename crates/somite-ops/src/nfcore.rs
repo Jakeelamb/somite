@@ -43,12 +43,18 @@ impl Pipeline {
                 ty: PortType::Table,
                 union: Vec::new(),
                 optional: true,
+                resource: None,
+                stage_as: None,
+                import_param: None,
             }],
             out: vec![PortSpec {
                 name: "results".into(),
                 ty: PortType::Directory,
                 union: Vec::new(),
                 optional: true,
+                resource: None,
+                stage_as: None,
+                import_param: None,
             }],
         };
         let mut outputs = BTreeMap::new();
@@ -83,6 +89,8 @@ impl Pipeline {
                 "{work}/out".into(),
             ],
             outputs,
+            stdout: None,
+            resolution: None,
         }
     }
 }

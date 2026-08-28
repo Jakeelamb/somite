@@ -1,0 +1,33 @@
+{
+  "id": "asm.allmaps",
+  "title": "ALLMAPS chromosome build",
+  "palette": ["Align & Assemble"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "python",
+  "pixi": ["bioconda::jcvi"],
+  "params": {
+    "threads": { "type": "int", "label": "Threads", "page": "ALLMAPS", "default": 8, "min": 1, "max": 64 },
+    "gap_size": { "type": "int", "label": "Inter-scaffold gap size", "page": "ALLMAPS", "default": 100, "min": 0 }
+  },
+  "ports": {
+    "in": [
+      { "name": "map", "type": "Bed", "stage_as": "evidence.bed" },
+      { "name": "weights", "type": "Text", "stage_as": "weights.txt" },
+      { "name": "assembly", "type": "Fasta", "union": ["Fasta", "FastaGz"], "stage_as": "assembly.fasta" }
+    ],
+    "out": [
+      { "name": "assembly", "type": "Fasta" },
+      { "name": "agp", "type": "Agp" },
+      { "name": "chain", "type": "Chain" }
+    ]
+  },
+  "argv": [
+    "python", "-m", "jcvi.assembly.allmaps", "path", "{input.map}", "{input.assembly}", "--cpus", "{param.threads}", "--gapsize", "{param.gap_size}", "--noplot"
+  ],
+  "outputs": {
+    "assembly": { "glob": "{work}/evidence.fasta", "type": "Fasta" },
+    "agp": { "glob": "{work}/evidence.agp", "type": "Agp" },
+    "chain": { "glob": "{work}/evidence.chain", "type": "Chain" }
+  }
+}

@@ -8,6 +8,8 @@ use thiserror::Error;
 pub const SCHEMA_VERSION: u32 = 2;
 pub const LEGACY_SCHEMA_VERSION: u32 = 1;
 pub const MAX_GRAPH_NAME_CHARS: usize = 100;
+pub const MAX_ANNOTATION_TEXT_CHARS: usize = 5_000;
+pub const MAX_STROKE_POINTS: usize = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -19,10 +21,15 @@ pub enum PortType {
     FastaGz,
     Gtf,
     GtfGz,
+    Gff3,
+    Sam,
     Bam,
     Bai,
     Vcf,
     VcfGz,
+    Bed,
+    Agp,
+    Chain,
     Table,
     Json,
     Html,
@@ -65,6 +72,91 @@ pub struct Layout {
     pub y: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CanvasColor {
+    Yellow,
+    Orange,
+    Rose,
+    Violet,
+    Blue,
+    Teal,
+    Green,
+    Gray,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CanvasAnnotation {
+    Sticky {
+        id: String,
+        text: String,
+        color: CanvasColor,
+        layout: Layout,
+        width: f32,
+        height: f32,
+    },
+    Box {
+        id: String,
+        text: String,
+        color: CanvasColor,
+        layout: Layout,
+        width: f32,
+        height: f32,
+    },
+    Stroke {
+        id: String,
+        color: CanvasColor,
+        points: Vec<Layout>,
+    },
+}
+
+impl CanvasAnnotation {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Sticky { id, .. } | Self::Box { id, .. } | Self::Stroke { id, .. } => id,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        let text_is_valid = |text: &str| {
+            text.chars().count() <= MAX_ANNOTATION_TEXT_CHARS
+                && !text.chars().any(|character| {
+                    character.is_control() && character != '\n' && character != '\t'
+                })
+        };
+        let point_is_valid = |point: &Layout| point.x.is_finite() && point.y.is_finite();
+        match self {
+            Self::Sticky {
+                text,
+                layout,
+                width,
+                height,
+                ..
+            }
+            | Self::Box {
+                text,
+                layout,
+                width,
+                height,
+                ..
+            } => {
+                text_is_valid(text)
+                    && point_is_valid(layout)
+                    && width.is_finite()
+                    && height.is_finite()
+                    && *width >= 80.0
+                    && *height >= 60.0
+                    && *width <= 4_000.0
+                    && *height <= 4_000.0
+            }
+            Self::Stroke { points, .. } => {
+                (2..=MAX_STROKE_POINTS).contains(&points.len()) && points.iter().all(point_is_valid)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ParamValue {
@@ -91,6 +183,9 @@ pub struct Node {
     /// Paper quote, wrap hint, or other human note. Not in the cook key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Optional user-authored presentation color. Not in executable identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<CanvasColor>,
 }
 
 impl Node {
@@ -118,6 +213,9 @@ pub struct Graph {
     pub nodes: Vec<Node>,
     #[serde(default)]
     pub edges: Vec<Edge>,
+    /// Human-authored canvas notes and marks. Not in executable identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub annotations: Vec<CanvasAnnotation>,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -144,6 +242,8 @@ pub enum IrError {
     SelfEdge(String),
     #[error("multiple edges target scalar input {node}.{port}")]
     MultipleInputs { node: String, port: String },
+    #[error("invalid canvas annotation {0}")]
+    InvalidAnnotation(String),
 }
 
 impl Graph {
@@ -214,6 +314,14 @@ impl Graph {
                     node: e.to_node.clone(),
                     port: e.to_port.clone(),
                 });
+            }
+        }
+        for annotation in &self.annotations {
+            if !ids.insert(annotation.id().to_owned()) {
+                return Err(IrError::DuplicateId(annotation.id().to_owned()));
+            }
+            if !annotation.is_valid() {
+                return Err(IrError::InvalidAnnotation(annotation.id().to_owned()));
             }
         }
         if has_cycle(self) {
@@ -307,6 +415,7 @@ mod tests {
             params: BTreeMap::new(),
             layout: Layout { x, y: 0.0 },
             note: None,
+            color: None,
         }
     }
 
@@ -377,6 +486,7 @@ mod tests {
                 ),
             ],
             edges: vec![e("e1", "n_src", "fastq", "n_qc", "fastq")],
+            annotations: vec![],
         };
         g.validate().expect("should snap");
     }
@@ -391,6 +501,7 @@ mod tests {
                 n("b", "qc.fastqc", vec![inn("fastq", PortType::FastqGz)], 1.0),
             ],
             edges: vec![e("e1", "a", "bam", "b", "fastq")],
+            annotations: vec![],
         };
         assert!(matches!(g.validate(), Err(IrError::Type { .. })));
     }
@@ -419,6 +530,7 @@ mod tests {
                 e("e1", "r1", "fastq", "qc", "fastq"),
                 e("e2", "r2", "fastq", "qc", "fastq"),
             ],
+            annotations: vec![],
         };
 
         assert_eq!(
@@ -450,6 +562,7 @@ mod tests {
                 ),
             ],
             edges: vec![e("e1", "a", "o", "b", "i"), e("e2", "b", "o", "a", "i")],
+            annotations: vec![],
         };
         assert_eq!(g.validate(), Err(IrError::Cycle));
     }
@@ -466,6 +579,14 @@ mod tests {
                 0.0,
             )],
             edges: vec![],
+            annotations: vec![CanvasAnnotation::Sticky {
+                id: "note-1".into(),
+                text: "Check adapters".into(),
+                color: CanvasColor::Yellow,
+                layout: Layout { x: 40.0, y: 80.0 },
+                width: 220.0,
+                height: 140.0,
+            }],
         };
         let s = serde_json::to_string(&g).unwrap();
         let h: Graph = serde_json::from_str(&s).unwrap();
@@ -490,12 +611,34 @@ mod tests {
     }
 
     #[test]
+    fn canvas_annotations_are_validated_without_becoming_execution_nodes() {
+        let mut graph: Graph = serde_json::from_str(
+            r#"{"schema_version":2,"nodes":[],"edges":[],"annotations":[{"id":"stroke-1","kind":"stroke","color":"teal","points":[{"x":0.0,"y":0.0},{"x":12.0,"y":8.0}]}]}"#,
+        )
+        .unwrap();
+        graph.validate().unwrap();
+        graph.annotations.push(CanvasAnnotation::Sticky {
+            id: "stroke-1".into(),
+            text: String::new(),
+            color: CanvasColor::Yellow,
+            layout: Layout { x: 0.0, y: 0.0 },
+            width: 220.0,
+            height: 140.0,
+        });
+        assert_eq!(
+            graph.validate(),
+            Err(IrError::DuplicateId("stroke-1".into()))
+        );
+    }
+
+    #[test]
     fn empty_ok() {
         Graph {
             schema_version: SCHEMA_VERSION,
             name: None,
             nodes: vec![],
             edges: vec![],
+            annotations: vec![],
         }
         .validate()
         .unwrap();
@@ -508,6 +651,7 @@ mod tests {
             name: None,
             nodes: vec![n("n_a", "x", vec![out("o", PortType::Text)], 0.0)],
             edges: vec![e("e1", "n_a", "o", "missing", "i")],
+            annotations: vec![],
         };
         assert!(matches!(g.validate(), Err(IrError::UnknownNode(_))));
     }

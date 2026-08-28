@@ -10,7 +10,7 @@ use serde::Serialize;
 use somite_ir::{Graph, ParamValue};
 use somite_linker::{freeze, link, EvidenceIndex, LinkOptions, RunClosure};
 use somite_nextflow::{compile, CompileOptions, PINNED_NEXTFLOW_VERSION, PINNED_OPENJDK_VERSION};
-use somite_ops::{Catalog, OpKind, Operator};
+use somite_ops::{Catalog, OpKind, Operator, OperatorResolutionKind};
 use thiserror::Error;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -61,6 +61,9 @@ pub enum ToolState {
     Ready,
     Installable,
     SystemRequired,
+    ManualCheckpoint,
+    MethodDetails,
+    LegacySource,
     AdapterNeeded,
 }
 
@@ -83,6 +86,9 @@ pub struct BundlePlan {
     pub tools: Vec<ToolRequirement>,
     pub ready_count: usize,
     pub installable_count: usize,
+    pub manual_count: usize,
+    pub details_count: usize,
+    pub legacy_count: usize,
     pub adapter_count: usize,
 }
 
@@ -257,6 +263,8 @@ pub fn absolutize_import_paths(graph: &mut Graph, project_base: &Path, graph_bas
     for node in &mut graph.nodes {
         let parameters: &[&str] = match node.operator.as_str() {
             "files.import" => &["path"],
+            "files.import_fasta" | "manual.joinmap" => &["path"],
+            "manual.allmaps_evidence" => &["map_path", "weights_path"],
             "files.import_paired" => &["r1", "r2"],
             _ => continue,
         };
@@ -400,6 +408,18 @@ fn build_plan(
         .iter()
         .filter(|tool| tool.state == ToolState::AdapterNeeded)
         .count();
+    let manual_count = tools
+        .iter()
+        .filter(|tool| tool.state == ToolState::ManualCheckpoint)
+        .count();
+    let details_count = tools
+        .iter()
+        .filter(|tool| tool.state == ToolState::MethodDetails)
+        .count();
+    let legacy_count = tools
+        .iter()
+        .filter(|tool| tool.state == ToolState::LegacySource)
+        .count();
     BundlePlan {
         filename: format!("{}.somite-run.zip", safe_name(&target.archive_name)),
         platform: target.platform.clone(),
@@ -408,6 +428,9 @@ fn build_plan(
         tools,
         ready_count,
         installable_count,
+        manual_count,
+        details_count,
+        legacy_count,
         adapter_count,
     }
 }
@@ -444,6 +467,22 @@ fn tool_requirement(
             detail: "Needs a reviewed Somite adapter: package discovery cannot infer typed ports, argv, or outputs.".to_owned(),
         };
     }
+    if let Some(resolution) = &operator.resolution {
+        let state = match resolution.kind {
+            OperatorResolutionKind::ManualCheckpoint => ToolState::ManualCheckpoint,
+            OperatorResolutionKind::MethodDetails => ToolState::MethodDetails,
+            OperatorResolutionKind::LegacySource => ToolState::LegacySource,
+            OperatorResolutionKind::Adapter => ToolState::AdapterNeeded,
+        };
+        return ToolRequirement {
+            operator_id: operator.id.clone(),
+            title: operator.title.clone(),
+            binary: operator.bin.clone(),
+            packages: operator.pixi.clone(),
+            state,
+            detail: resolution.detail.clone(),
+        };
+    }
     if operator.kind == OpKind::Reference {
         return ToolRequirement {
             operator_id: operator.id.clone(),
@@ -467,13 +506,13 @@ fn tool_requirement(
     let binary = operator.bin.clone();
     let available = binary.as_deref().is_some_and(binary_available);
     let package_specs = operator.pixi.clone();
-    let (state, detail) = if available {
-        (ToolState::Ready, "Available on this machine.".to_owned())
-    } else if !package_specs.is_empty() {
+    let (state, detail) = if !package_specs.is_empty() {
         (
             ToolState::Installable,
             "Declared package will be resolved and locked by Pixi.".to_owned(),
         )
+    } else if available {
+        (ToolState::Ready, "Available on this machine.".to_owned())
     } else {
         (
             ToolState::SystemRequired,
@@ -544,6 +583,7 @@ mod tests {
             params: BTreeMap::new(),
             layout: Layout { x: 0.0, y: 0.0 },
             note: None,
+            color: None,
         }
     }
 
@@ -559,6 +599,7 @@ mod tests {
             name: None,
             nodes: vec![node("echo1", &echo)],
             edges: Vec::new(),
+            annotations: Vec::new(),
         };
         let temporary = tempfile::tempdir().expect("temporary directory");
         let destination = temporary.path().join("frozen");
@@ -644,6 +685,7 @@ mod tests {
             name: None,
             nodes: vec![gap_node],
             edges: Vec::new(),
+            annotations: Vec::new(),
         };
         let plan = plan_frozen_package(
             &graph,

@@ -67,6 +67,7 @@ async fn spawned_stdio_server_lists_tools_and_applies_one_atomic_edit() {
     assert!(instructions.contains("fresh idempotency_key"));
     assert!(instructions.contains("run.status with wait_ms up to 25000"));
     assert!(instructions.contains("somite.source.search"));
+    assert!(instructions.contains("somite.readiness.get"));
     assert!(instructions.contains("Never claim a workflow is runnable"));
 
     let tools = client.list_all_tools().await.expect("list MCP tools");
@@ -164,6 +165,7 @@ async fn spawned_stdio_server_lists_tools_and_applies_one_atomic_edit() {
             "somite.evidence.lookup".to_owned(),
             "somite.graph.apply_transaction".to_owned(),
             "somite.run.cancel".to_owned(),
+            "somite.readiness.get".to_owned(),
             "somite.run.start".to_owned(),
             "somite.run.status".to_owned(),
             "somite.source.search".to_owned(),
@@ -183,6 +185,13 @@ async fn spawned_stdio_server_lists_tools_and_applies_one_atomic_edit() {
         .as_str()
         .expect("state revision");
     assert!(base_revision.starts_with("blake3:"));
+    let empty_readiness = client
+        .call_tool(CallToolRequestParams::new("somite.readiness.get"))
+        .await
+        .expect("inspect readiness")
+        .structured_content
+        .expect("structured readiness response");
+    assert_eq!(empty_readiness["state"], "empty");
 
     let transaction_arguments = arguments(json!({
         "base_state_revision": base_revision,
@@ -258,6 +267,14 @@ async fn spawned_stdio_server_lists_tools_and_applies_one_atomic_edit() {
         .structured_content
         .expect("structured edited graph");
     assert_eq!(current["graph"]["nodes"][0]["id"], "reads");
+    let ready = client
+        .call_tool(CallToolRequestParams::new("somite.readiness.get"))
+        .await
+        .expect("inspect edited readiness")
+        .structured_content
+        .expect("structured edited readiness");
+    assert_eq!(ready["state"], "ready");
+    assert_eq!(ready["required_count"], 0);
 
     client.cancel().await.expect("stop MCP client");
     web_task.abort();

@@ -1,0 +1,22 @@
+{
+  "id": "align.samtools_view",
+  "title": "SAMtools view",
+  "palette": ["Align & Assemble"],
+  "kind": "external",
+  "cost": "low",
+  "bin": "samtools",
+  "pixi": ["bioconda::samtools"],
+  "params": {
+    "exclude_flags": { "type": "int", "label": "Exclude SAM flags", "page": "Filter", "default": 2308, "min": 0 }
+  },
+  "ports": {
+    "in": [{ "name": "sam", "type": "Sam" }],
+    "out": [{ "name": "bam", "type": "Bam" }]
+  },
+  "argv": [
+    "samtools", "view", "-F", "{param.exclude_flags}", "-b", "-o", "{work}/out/filtered.bam", "{input.sam}"
+  ],
+  "outputs": {
+    "bam": { "glob": "{work}/out/filtered.bam", "type": "Bam" }
+  }
+}

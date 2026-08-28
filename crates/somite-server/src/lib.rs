@@ -23,7 +23,7 @@ use somite_linker::{
     evidence_receipt, graph_state_revision, semantic_graph_revision, EvidenceDraft, EvidenceIndex,
     EvidenceReceipt, EvidenceResult,
 };
-use somite_ops::{current_pixi_platform, Catalog, Operator};
+use somite_ops::{current_pixi_platform, Catalog, OpKind, Operator, OperatorResolutionKind};
 use somite_ops::{nfcore, snakemake, snakemake_local, workflow};
 use somite_paper::{
     extract_from_path, reconstruct, Assay, CandidateRole, EvidenceStatus, EvidenceTarget,
@@ -37,7 +37,9 @@ use tower_http::trace::TraceLayer;
 
 mod agent;
 mod agent_discovery;
+mod literature;
 mod mcp;
+pub mod readiness;
 mod source_search;
 
 pub use agent::{
@@ -71,6 +73,8 @@ pub enum ServerError {
     Validation(String),
     #[error("paper: {0}")]
     Paper(String),
+    #[error("{0}")]
+    Literature(#[from] literature::LiteratureError),
     #[error("project path is not a readable file: {0}")]
     InvalidProjectPath(String),
     #[error("nf-core catalog: {0}")]
@@ -85,6 +89,10 @@ pub enum ServerError {
     Export(#[from] somite_bundle::BundleError),
     #[error("link: {0}")]
     Link(#[from] somite_linker::LinkError),
+    #[error("readiness: {0}")]
+    Readiness(#[from] readiness::ReadinessError),
+    #[error("workflow is not ready: {0}")]
+    NotReady(String),
 }
 
 impl IntoResponse for ServerError {
@@ -98,18 +106,31 @@ impl IntoResponse for ServerError {
                 | somite_ops::OpsError::InvalidGraph(_)
                 | somite_ops::OpsError::Argv(_),
             ) => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::MissingUpload | Self::InvalidFilename | Self::InvalidProjectPath(_) => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::MissingUpload
+            | Self::InvalidFilename
+            | Self::InvalidProjectPath(_)
+            | Self::Literature(
+                literature::LiteratureError::InvalidQuery
+                | literature::LiteratureError::InvalidPaperId,
+            ) => StatusCode::BAD_REQUEST,
             Self::RunNotFound(_) => StatusCode::NOT_FOUND,
             Self::Io(_)
             | Self::Json(_)
             | Self::Catalog(_)
             | Self::Upload(_)
             | Self::Run(_)
-            | Self::Export(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            | Self::Export(_)
+            | Self::Literature(literature::LiteratureError::Cache(_)) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             Self::Link(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Readiness(_) | Self::NotReady(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Paper(_) | Self::WorkflowImport(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Literature(
+                literature::LiteratureError::FullTextUnavailable
+                | literature::LiteratureError::NotBiorxiv,
+            ) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Literature(literature::LiteratureError::Upstream(_)) => StatusCode::BAD_GATEWAY,
             Self::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Agent(
                 agent::AgentError::StaleTransaction { .. }
@@ -279,6 +300,11 @@ pub struct PaperRequest {
     pub path: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BiorxivPaperRequest {
+    pub id: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PaperResponse {
     pub extracted_via: String,
@@ -301,6 +327,12 @@ pub struct PaperEvidence {
     pub target_id: String,
     pub status: String,
     pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_detail: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -380,6 +412,7 @@ pub struct WebProject {
     replay_sequence: AtomicU64,
     sequence: AtomicU64,
     source_search_cache: Mutex<BTreeMap<String, (Instant, Vec<source_search::SearchResult>)>>,
+    paper_search_cache: Mutex<BTreeMap<String, (Instant, Vec<literature::PaperSearchResult>)>>,
 }
 
 #[derive(Clone)]
@@ -509,6 +542,7 @@ impl WebProject {
             replay_sequence: AtomicU64::new(0),
             sequence: AtomicU64::new(0),
             source_search_cache: Mutex::new(BTreeMap::new()),
+            paper_search_cache: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -691,9 +725,11 @@ pub fn app(project: WebProject) -> Router {
             post(import_local_snakemake),
         )
         .route("/api/sources/search", get(search_sources))
+        .route("/api/papers/search", get(search_papers))
         .route("/api/graph", put(save_graph))
         .route("/api/graph/autosave", put(autosave_graph))
         .route("/api/graph/validate", post(validate_graph))
+        .route("/api/readiness", post(readiness_snapshot))
         .route("/api/runs", post(start_run))
         .route("/api/runs/{run_id}", get(run_status))
         .route("/api/runs/{run_id}/cancel", post(cancel_run))
@@ -719,6 +755,10 @@ pub fn app(project: WebProject) -> Router {
         .route("/api/export/plan", post(export_plan))
         .route("/api/export", post(export_bundle))
         .route("/api/paper", post(rebuild_paper))
+        .route(
+            "/api/papers/biorxiv/reconstruct",
+            post(rebuild_biorxiv_paper),
+        )
         .route("/api/files", post(upload_file))
         .layer(DefaultBodyLimit::disable())
         .layer(cors)
@@ -863,6 +903,47 @@ async fn search_sources(
     Ok(Json(source_search::SearchResponse {
         query: owned_query,
         provider,
+        results,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct PaperSearchQuery {
+    q: String,
+}
+
+async fn search_papers(
+    State(project): State<Arc<WebProject>>,
+    Query(request): Query<PaperSearchQuery>,
+) -> Result<Json<literature::PaperSearchResponse>, ServerError> {
+    let query = request.q.trim();
+    let key = query.to_ascii_lowercase();
+    if let Some((_, results)) = project
+        .paper_search_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&key)
+        .filter(|(created, _)| created.elapsed() < Duration::from_secs(600))
+        .cloned()
+    {
+        return Ok(Json(literature::PaperSearchResponse {
+            query: query.to_owned(),
+            results,
+        }));
+    }
+
+    let owned_query = query.to_owned();
+    let worker_query = owned_query.clone();
+    let results = tokio::task::spawn_blocking(move || literature::search_biorxiv(&worker_query))
+        .await
+        .map_err(|error| ServerError::Paper(error.to_string()))??;
+    project
+        .paper_search_cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(key, (Instant::now(), results.clone()));
+    Ok(Json(literature::PaperSearchResponse {
+        query: owned_query,
         results,
     }))
 }
@@ -1154,6 +1235,16 @@ async fn validate_graph(
     Ok(Json(ValidationResponse { valid: true }))
 }
 
+async fn readiness_snapshot(
+    State(project): State<Arc<WebProject>>,
+    Json(mut graph): Json<Graph>,
+) -> Result<Json<readiness::ReadinessSnapshot>, ServerError> {
+    let mut catalog = project.catalog.clone();
+    install_cached_nfcore(&project.root, &mut catalog);
+    catalog.pin_graph(&mut graph)?;
+    Ok(Json(readiness::analyze(&graph, &catalog)?))
+}
+
 async fn save_graph(
     State(project): State<Arc<WebProject>>,
     Json(mut graph): Json<Graph>,
@@ -1241,6 +1332,18 @@ fn operator_catalog_terms(operator: &Operator) -> BTreeSet<String> {
         add_catalog_terms(&mut terms, &format!("{:?}", port.ty));
         for ty in &port.union {
             add_catalog_terms(&mut terms, &format!("{ty:?}"));
+        }
+        if let Some(resource) = &port.resource {
+            add_catalog_terms(&mut terms, &resource.profile);
+            add_catalog_terms(&mut terms, &resource.title);
+            add_catalog_terms(&mut terms, &resource.detail);
+            for resolution in &resource.resolutions {
+                add_catalog_terms(&mut terms, &resolution.label);
+                add_catalog_terms(&mut terms, &resolution.detail);
+                if let Some(effect) = &resolution.scientific_effect {
+                    add_catalog_terms(&mut terms, effect);
+                }
+            }
         }
     }
     for (name, output) in &operator.outputs {
@@ -1503,6 +1606,7 @@ async fn agent_compile(
     let source_graph = current_agent_graph(&project)?;
     let source_graph_revision = semantic_graph_revision(&source_graph)?;
     let (graph, catalog, target) = production_inputs(&project, &source_graph)?;
+    require_ready(&graph, &catalog)?;
     let pixi = project
         .pixi
         .clone()
@@ -1725,6 +1829,7 @@ async fn start_run(
 ) -> Result<(StatusCode, Json<RunStartResponse>), ServerError> {
     let request_digest = content_digest(&serde_json::to_vec(&("run", &graph))?);
     let (graph, catalog, target) = production_inputs(&project, &graph)?;
+    require_ready(&graph, &catalog)?;
     queue_run(
         &project,
         graph,
@@ -1742,6 +1847,11 @@ async fn start_validation(
     Json(graph): Json<Graph>,
 ) -> Result<(StatusCode, Json<RunStartResponse>), ServerError> {
     let request_digest = content_digest(&serde_json::to_vec(&("validation", &graph))?);
+    let mut readiness_catalog = project.catalog.clone();
+    install_cached_nfcore(&project.root, &mut readiness_catalog);
+    let mut readiness_graph = graph.clone();
+    readiness_catalog.pin_graph(&mut readiness_graph)?;
+    require_ready(&readiness_graph, &readiness_catalog)?;
     let (graph, catalog, target, validation) = validation_inputs(&project, &graph)?;
     queue_run(
         &project,
@@ -1752,6 +1862,26 @@ async fn start_validation(
         query.idempotency_key.as_deref(),
         request_digest,
     )
+}
+
+fn require_ready(graph: &Graph, catalog: &Catalog) -> Result<(), ServerError> {
+    let snapshot = readiness::analyze(graph, catalog)?;
+    if snapshot.is_ready() {
+        return Ok(());
+    }
+    let detail = match snapshot.state {
+        readiness::ReadinessState::Empty => "add at least one operator".to_owned(),
+        _ => format!(
+            "resolve {} required item{}; inspect /api/readiness or somite.readiness.get",
+            snapshot.required_count,
+            if snapshot.required_count == 1 {
+                ""
+            } else {
+                "s"
+            }
+        ),
+    };
+    Err(ServerError::NotReady(detail))
 }
 
 fn queue_run(
@@ -2561,41 +2691,116 @@ async fn rebuild_paper(
     let response = tokio::task::spawn_blocking(move || {
         let extracted =
             extract_from_path(&path).map_err(|error| ServerError::Paper(error.to_string()))?;
-        let reconstruction = reconstruct(&catalog, &extracted.text);
-        Ok::<_, ServerError>(PaperResponse {
-            extracted_via: extract_via_label(extracted.via).to_owned(),
-            candidates: reconstruction
-                .candidates
-                .into_iter()
-                .map(|candidate| PaperCandidate {
+        Ok::<_, ServerError>(paper_response(
+            &catalog,
+            extract_via_label(extracted.via),
+            &extracted.text,
+        ))
+    })
+    .await
+    .map_err(|error| ServerError::Paper(error.to_string()))??;
+    Ok(Json(response))
+}
+
+async fn rebuild_biorxiv_paper(
+    State(project): State<Arc<WebProject>>,
+    Json(request): Json<BiorxivPaperRequest>,
+) -> Result<Json<PaperResponse>, ServerError> {
+    let cache_directory = project.root.join(".somite/papers");
+    let catalog = project.catalog.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        let text = literature::fetch_biorxiv_text(&cache_directory, &request.id)?;
+        Ok::<_, ServerError>(paper_response(&catalog, "jats", &text))
+    })
+    .await
+    .map_err(|error| ServerError::Paper(error.to_string()))??;
+    Ok(Json(response))
+}
+
+fn paper_response(catalog: &Catalog, extracted_via: &str, text: &str) -> PaperResponse {
+    let reconstruction = reconstruct(catalog, text);
+    PaperResponse {
+        extracted_via: extracted_via.to_owned(),
+        candidates: reconstruction
+            .candidates
+            .into_iter()
+            .map(|candidate| {
+                let evidence = candidate
+                    .evidence
+                    .into_iter()
+                    .map(|evidence| {
+                        let (target_kind, target_id) = match evidence.target {
+                            EvidenceTarget::Node(id) => ("node", id),
+                            EvidenceTarget::Edge(id) => ("edge", id),
+                        };
+                        let resolution = (target_kind == "node")
+                            .then(|| candidate.graph.node(&target_id))
+                            .flatten()
+                            .and_then(|node| catalog.get(&node.operator).ok())
+                            .map(paper_operator_resolution);
+                        PaperEvidence {
+                            target_kind: target_kind.to_owned(),
+                            target_id,
+                            status: evidence_status_label(evidence.status).to_owned(),
+                            detail: evidence.detail,
+                            resolution_kind: resolution.as_ref().map(|value| value.0.to_owned()),
+                            resolution_label: resolution.as_ref().map(|value| value.1.clone()),
+                            resolution_detail: resolution.map(|value| value.2),
+                        }
+                    })
+                    .collect();
+                PaperCandidate {
                     name: candidate.name,
                     role: candidate_role_label(candidate.role).to_owned(),
                     assay: assay_label(candidate.assay).to_owned(),
                     graph: candidate.graph,
                     warnings: candidate.warnings,
-                    evidence: candidate
-                        .evidence
-                        .into_iter()
-                        .map(|evidence| {
-                            let (target_kind, target_id) = match evidence.target {
-                                EvidenceTarget::Node(id) => ("node", id),
-                                EvidenceTarget::Edge(id) => ("edge", id),
-                            };
-                            PaperEvidence {
-                                target_kind: target_kind.to_owned(),
-                                target_id,
-                                status: evidence_status_label(evidence.status).to_owned(),
-                                detail: evidence.detail,
-                            }
-                        })
-                        .collect(),
-                })
-                .collect(),
-        })
-    })
-    .await
-    .map_err(|error| ServerError::Paper(error.to_string()))??;
-    Ok(Json(response))
+                    evidence,
+                }
+            })
+            .collect(),
+    }
+}
+
+fn paper_operator_resolution(operator: &Operator) -> (&'static str, String, String) {
+    if let Some(resolution) = &operator.resolution {
+        let kind = match resolution.kind {
+            OperatorResolutionKind::ManualCheckpoint => "manual_checkpoint",
+            OperatorResolutionKind::MethodDetails => "method_details",
+            OperatorResolutionKind::LegacySource => "legacy_source",
+            OperatorResolutionKind::Adapter => "adapter",
+        };
+        return (kind, resolution.title.clone(), resolution.detail.clone());
+    }
+    if operator.id.starts_with("files.import") {
+        return (
+            "input_required",
+            "Choose input".to_owned(),
+            "Connect a local file or replace this node with a searchable online source.".to_owned(),
+        );
+    }
+    match operator.kind {
+        OpKind::External if !operator.pixi.is_empty() => (
+            "managed_tool",
+            "Managed automatically".to_owned(),
+            format!("Somite can resolve {} with Pixi.", operator.pixi.join(", ")),
+        ),
+        OpKind::External => (
+            "system_tool",
+            "System tool required".to_owned(),
+            "This command must already be available on the machine.".to_owned(),
+        ),
+        OpKind::Inprocess => (
+            "built_in",
+            "Built into Somite".to_owned(),
+            "No separate tool installation is needed.".to_owned(),
+        ),
+        OpKind::Reference => (
+            "adapter",
+            "Reviewed adapter required".to_owned(),
+            "This structural reference is not executable yet.".to_owned(),
+        ),
+    }
 }
 
 fn extract_via_label(via: ExtractVia) -> &'static str {
@@ -2835,6 +3040,8 @@ mod tests {
     use tower::ServiceExt;
     use zip::ZipArchive;
 
+    const READY_RUN_GRAPH: &str = r#"{"schema_version":1,"nodes":[{"id":"noop","operator":"test.noop","ports":[],"layout":{"x":0.0,"y":0.0}}],"edges":[]}"#;
+
     fn fixture_project() -> (TempDir, WebProject) {
         fixture_project_with_run("exit 0")
     }
@@ -2842,6 +3049,11 @@ mod tests {
     fn fixture_project_with_run(run_body: &str) -> (TempDir, WebProject) {
         let temp = TempDir::new().expect("temporary project");
         std::fs::create_dir(temp.path().join("operators")).expect("operator directory");
+        std::fs::write(
+            temp.path().join("operators/test.noop.json"),
+            r#"{"id":"test.noop","title":"No-op","palette":[],"kind":"external","bin":"true","argv":["true"]}"#,
+        )
+        .expect("no-op operator");
         let graph_path = temp.path().join("graph.somite.json");
         std::fs::write(&graph_path, r#"{"schema_version":1,"nodes":[],"edges":[]}"#)
             .expect("fixture graph");
@@ -3072,6 +3284,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readiness_route_reports_an_empty_workflow_without_ai() {
+        let (_temp, project) = fixture_project();
+        let response = app(project)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/readiness")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"schema_version":1,"nodes":[],"edges":[]}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let readiness: serde_json::Value = serde_json::from_slice(&body).expect("readiness json");
+        assert_eq!(readiness["state"], "empty");
+        assert_eq!(readiness["required_count"], 0);
+        assert!(readiness["graph_revision"]
+            .as_str()
+            .is_some_and(|revision| revision.starts_with("blake3:")));
+    }
+
+    #[tokio::test]
+    async fn run_admission_rejects_an_empty_workflow_before_preparation() {
+        let (_temp, project) = fixture_project();
+        let response = app(project)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/runs")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"schema_version":1,"nodes":[],"edges":[]}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let error: serde_json::Value = serde_json::from_slice(&body).expect("error json");
+        assert!(error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("add at least one operator")));
+    }
+
+    #[tokio::test]
     async fn agent_transaction_route_is_atomic_visible_and_stale_safe() {
         let (temp, project) = agent_fixture_project();
         let authorization = format!("Bearer {}", project.mcp_runtime_capability());
@@ -3139,33 +3408,7 @@ mod tests {
             )
             .await
             .expect("compile response");
-        assert_eq!(compile_response.status(), StatusCode::OK);
-        let compile_body = compile_response
-            .into_body()
-            .collect()
-            .await
-            .expect("compile body")
-            .to_bytes();
-        let compiled: serde_json::Value =
-            serde_json::from_slice(&compile_body).expect("compile json");
-        let closure_digest = compiled["closure_digest"].as_str().expect("closure digest");
-        assert_eq!(compiled["source_graph_revision"], graph_revision);
-        assert_eq!(compiled["compiled_graph_revision"], graph_revision);
-        assert_eq!(compiled["reused"], false);
-        assert_eq!(
-            compiled["output_path"],
-            format!(
-                ".somite/compiled/{}",
-                closure_digest
-                    .strip_prefix("blake3:")
-                    .unwrap_or(closure_digest)
-            )
-        );
-        assert!(temp
-            .path()
-            .join(compiled["output_path"].as_str().expect("compile path"))
-            .join("run-closure.json")
-            .is_file());
+        assert_eq!(compile_response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
         let transaction = serde_json::json!({
             "base_state_revision": base_revision,
@@ -3204,6 +3447,50 @@ mod tests {
         assert_eq!(edit["graph"]["nodes"][0]["id"], "reads");
         assert_eq!(edit["replayed"], false);
         assert_ne!(edit["state_revision"], base_revision);
+
+        let compile_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/agent/compile")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, &authorization)
+                    .body(Body::from("{}"))
+                    .expect("compile request"),
+            )
+            .await
+            .expect("compile response");
+        assert_eq!(compile_response.status(), StatusCode::OK);
+        let compile_body = compile_response
+            .into_body()
+            .collect()
+            .await
+            .expect("compile body")
+            .to_bytes();
+        let compiled: serde_json::Value =
+            serde_json::from_slice(&compile_body).expect("compile json");
+        let closure_digest = compiled["closure_digest"].as_str().expect("closure digest");
+        assert_eq!(compiled["source_graph_revision"], edit["graph_revision"]);
+        assert!(compiled["compiled_graph_revision"]
+            .as_str()
+            .is_some_and(|revision| revision.starts_with("blake3:")));
+        assert_ne!(compiled["compiled_graph_revision"], edit["graph_revision"]);
+        assert_eq!(compiled["reused"], false);
+        assert_eq!(
+            compiled["output_path"],
+            format!(
+                ".somite/compiled/{}",
+                closure_digest
+                    .strip_prefix("blake3:")
+                    .unwrap_or(closure_digest)
+            )
+        );
+        assert!(temp
+            .path()
+            .join(compiled["output_path"].as_str().expect("compile path"))
+            .join("run-closure.json")
+            .is_file());
 
         let replay_response = router
             .clone()
@@ -3507,7 +3794,7 @@ mod tests {
                     .method(Method::POST)
                     .uri("/api/runs")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"schema_version":1,"nodes":[],"edges":[]}"#))
+                    .body(Body::from(READY_RUN_GRAPH))
                     .expect("request"),
             )
             .await
@@ -3537,7 +3824,7 @@ mod tests {
     async fn run_start_idempotency_replays_lost_responses_without_duplicate_work() {
         let (temp, project) = fixture_project();
         let router = app(project);
-        let graph = r#"{"schema_version":1,"nodes":[],"edges":[]}"#;
+        let graph = READY_RUN_GRAPH;
         let start = || {
             Request::builder()
                 .method(Method::POST)
@@ -3617,7 +3904,7 @@ mod tests {
                     .method(Method::POST)
                     .uri("/api/runs")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"schema_version":1,"nodes":[],"edges":[]}"#))
+                    .body(Body::from(READY_RUN_GRAPH))
                     .expect("start request"),
             )
             .await
@@ -3666,7 +3953,7 @@ mod tests {
                     .method(Method::POST)
                     .uri("/api/runs")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"schema_version":1,"nodes":[],"edges":[]}"#))
+                    .body(Body::from(READY_RUN_GRAPH))
                     .expect("request"),
             )
             .await
@@ -3701,7 +3988,7 @@ mod tests {
                     .method(Method::POST)
                     .uri("/api/runs")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"schema_version":1,"nodes":[],"edges":[]}"#))
+                    .body(Body::from(READY_RUN_GRAPH))
                     .expect("request"),
             )
             .await
@@ -3962,6 +4249,36 @@ mod tests {
         assert!(review["candidates"][0]["evidence"]
             .as_array()
             .is_some_and(|items| !items.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn paper_discovery_rejects_invalid_queries_and_ids_before_network_access() {
+        let (_temp, project) = fixture_project();
+        let router = app(project);
+        let search = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/papers/search?q=%21%21")
+                    .body(Body::empty())
+                    .expect("search request"),
+            )
+            .await
+            .expect("search response");
+        assert_eq!(search.status(), StatusCode::BAD_REQUEST);
+
+        let reconstruction = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/papers/biorxiv/reconstruct")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"id":"PMC123"}"#))
+                    .expect("reconstruction request"),
+            )
+            .await
+            .expect("reconstruction response");
+        assert_eq!(reconstruction.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

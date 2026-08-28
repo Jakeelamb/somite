@@ -1,0 +1,22 @@
+{
+  "id": "align.samtools_sort",
+  "title": "SAMtools coordinate sort",
+  "palette": ["Align & Assemble"],
+  "kind": "external",
+  "cost": "low",
+  "bin": "samtools",
+  "pixi": ["bioconda::samtools"],
+  "params": {
+    "threads": { "type": "int", "label": "Threads", "page": "Sort", "default": 4, "min": 1, "max": 64 }
+  },
+  "ports": {
+    "in": [{ "name": "bam", "type": "Bam" }],
+    "out": [{ "name": "bam", "type": "Bam" }]
+  },
+  "argv": [
+    "samtools", "sort", "-@", "{param.threads}", "-o", "{work}/out/sorted.bam", "{input.bam}"
+  ],
+  "outputs": {
+    "bam": { "glob": "{work}/out/sorted.bam", "type": "Bam" }
+  }
+}

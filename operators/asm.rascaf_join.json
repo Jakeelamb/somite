@@ -1,0 +1,22 @@
+{
+  "id": "asm.rascaf_join",
+  "title": "Rascaf scaffold join",
+  "palette": ["Align & Assemble"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "rascaf-join",
+  "pixi": ["bioconda::rascaf"],
+  "params": {
+    "minimum_support": { "type": "int", "label": "Minimum supporting alignments", "page": "Rascaf", "default": 5, "min": 2 }
+  },
+  "ports": {
+    "in": [{ "name": "connections", "type": "Text" }],
+    "out": [{ "name": "assembly", "type": "Fasta" }]
+  },
+  "argv": [
+    "rascaf-join", "-r", "{input.connections}", "-ms", "{param.minimum_support}", "-o", "{work}/out/rascaf-scaffold"
+  ],
+  "outputs": {
+    "assembly": { "glob": "{work}/out/rascaf-scaffold.fa", "type": "Fasta" }
+  }
+}

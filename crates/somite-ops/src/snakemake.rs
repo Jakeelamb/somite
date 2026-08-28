@@ -48,6 +48,8 @@ impl Workflow {
             ports: PortsSpec::default(),
             argv: Vec::new(),
             outputs: BTreeMap::new(),
+            stdout: None,
+            resolution: None,
         }
     }
 }

@@ -21,6 +21,14 @@ export type PortType =
 
 export type ParamValue = string | number | boolean;
 
+export type CanvasColor = "yellow" | "orange" | "rose" | "violet" | "blue" | "teal" | "green" | "gray";
+
+export type CanvasPoint = { x: number; y: number };
+
+export type CanvasAnnotation =
+  | { id: string; kind: "sticky" | "box"; text: string; color: CanvasColor; layout: CanvasPoint; width: number; height: number }
+  | { id: string; kind: "stroke"; color: CanvasColor; points: CanvasPoint[] };
+
 export type SomitePort = {
   name: string;
   dir: "in" | "out";
@@ -37,6 +45,7 @@ export type SomiteGraphNode = {
   params?: Record<string, ParamValue>;
   layout: { x: number; y: number };
   note?: string;
+  color?: CanvasColor;
 };
 
 export type SomiteEdge = {
@@ -52,6 +61,7 @@ export type SomiteGraph = {
   name?: string;
   nodes: SomiteGraphNode[];
   edges: SomiteEdge[];
+  annotations?: CanvasAnnotation[];
 };
 
 export type ParamSpec = {
@@ -69,6 +79,62 @@ export type PortSpec = {
   type: PortType;
   union?: PortType[];
   optional?: boolean;
+  resource?: ResourceSpec;
+};
+
+export type ResourceResolutionKind = "use_existing" | "download" | "build";
+
+export type ResourceResolutionSpec = {
+  id: string;
+  label: string;
+  detail: string;
+  kind: ResourceResolutionKind;
+  recommended?: boolean;
+  download_bytes?: number | null;
+  stored_bytes?: number | null;
+  scientific_effect?: string;
+};
+
+export type ResourceSpec = {
+  profile: string;
+  title: string;
+  detail: string;
+  resolutions: ResourceResolutionSpec[];
+};
+
+export type ReadinessState = "empty" | "building" | "needs_action" | "ready";
+export type RequirementKind = "input" | "parameter" | "managed_resource" | "manual_checkpoint" | "method_details" | "legacy_tool" | "adapter";
+export type ResolutionKind = "connect" | "configure" | "use_existing" | "download" | "build" | "attach" | "review" | "setup" | "add_adapter";
+
+export type ReadinessResolution = {
+  id: string;
+  label: string;
+  detail: string;
+  kind: ResolutionKind;
+  recommended: boolean;
+  download_bytes?: number | null;
+  stored_bytes?: number | null;
+  scientific_effect?: string;
+  source_url?: string;
+};
+
+export type ReadinessItem = {
+  id: string;
+  node_id: string;
+  operator_id: string;
+  field: string;
+  title: string;
+  detail: string;
+  kind: RequirementKind;
+  resource_profile?: string;
+  resolutions: ReadinessResolution[];
+};
+
+export type ReadinessSnapshot = {
+  graph_revision: string;
+  state: ReadinessState;
+  required_count: number;
+  items: ReadinessItem[];
 };
 
 export type Operator = {
@@ -245,6 +311,9 @@ export type PaperEvidence = {
   target_id: string;
   status: "explicit" | "inferred" | "needs_adapter";
   detail: string;
+  resolution_kind?: "input_required" | "managed_tool" | "built_in" | "system_tool" | "manual_checkpoint" | "method_details" | "legacy_source" | "adapter";
+  resolution_label?: string;
+  resolution_detail?: string;
 };
 
 export type ExportTool = {
@@ -252,7 +321,7 @@ export type ExportTool = {
   title: string;
   binary?: string;
   packages: string[];
-  state: "built_in" | "ready" | "installable" | "system_required" | "adapter_needed";
+  state: "built_in" | "ready" | "installable" | "system_required" | "manual_checkpoint" | "method_details" | "legacy_source" | "adapter_needed";
   detail: string;
 };
 
@@ -264,6 +333,9 @@ export type ExportPlan = {
   tools: ExportTool[];
   ready_count: number;
   installable_count: number;
+  manual_count: number;
+  details_count: number;
+  legacy_count: number;
   adapter_count: number;
 };
 
@@ -277,8 +349,24 @@ export type PaperCandidate = {
 };
 
 export type PaperReview = {
-  extracted_via: "text" | "poppler" | "ocr";
+  extracted_via: "text" | "poppler" | "ocr" | "jats";
   candidates: PaperCandidate[];
+};
+
+export type PaperSearchResult = {
+  id: string;
+  doi: string;
+  title: string;
+  authors: string;
+  date: string;
+  abstract_text: string;
+  url: string;
+  full_text_available: boolean;
+};
+
+export type PaperSearchResponse = {
+  query: string;
+  results: PaperSearchResult[];
 };
 
 export type UploadResult = {

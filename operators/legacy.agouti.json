@@ -1,0 +1,31 @@
+{
+  "id": "legacy.agouti",
+  "title": "AGOUTI (2016)",
+  "palette": ["Resolve"],
+  "kind": "reference",
+  "cost": "low",
+  "params": {
+    "minimum_support": { "type": "int", "label": "Minimum read-pair support", "page": "Paper", "default": 5, "min": 1 },
+    "minimum_mapping_quality": { "type": "int", "label": "Minimum mapping quality", "page": "Paper", "default": 20, "min": 0 }
+  },
+  "ports": {
+    "in": [
+      { "name": "alignments", "type": "Bam" },
+      { "name": "assembly", "type": "Fasta", "union": ["Fasta", "FastaGz"] },
+      { "name": "annotation", "type": "Gff3", "optional": true }
+    ],
+    "out": [
+      { "name": "assembly", "type": "Fasta" },
+      { "name": "annotation", "type": "Gff3", "optional": true }
+    ]
+  },
+  "argv": [],
+  "outputs": {},
+  "resolution": {
+    "kind": "legacy_source",
+    "title": "Prepare the original AGOUTI environment",
+    "detail": "The 2016 AGOUTI workflow is source-backed and Python 2-era. The current Bioconda package named agouti is a different program, so Somite will not install it by name.",
+    "action_label": "Open legacy setup guide",
+    "source_url": "https://github.com/svm-zhang/AGOUTI"
+  }
+}

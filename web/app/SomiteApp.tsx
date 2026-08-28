@@ -9,6 +9,7 @@ import {
   Position,
   ReactFlow,
   ReactFlowProvider,
+  ViewportPortal,
   addEdge,
   getBezierPath,
   useEdgesState,
@@ -23,7 +24,9 @@ import {
 } from "@xyflow/react";
 import {
   Check,
+  CheckCircle2,
   Bot,
+  CircleAlert,
   CloudUpload,
   Cpu,
   Eye,
@@ -32,17 +35,22 @@ import {
   FolderOpen,
   LoaderCircle,
   Maximize2,
+  MousePointer2,
   Minus,
   Moon,
   PackageOpen,
+  Palette,
+  PenTool,
   Plus,
   Play,
   Redo2,
   Save,
   ShieldCheck,
   Square,
+  StickyNote,
   Sun,
   Undo2,
+  X,
 } from "lucide-react";
 import React, {
   createContext,
@@ -62,8 +70,10 @@ import {
   MachinePanel,
   PaperPanel,
   ProjectPanel,
+  ReadinessPanel,
   ToolchainPanel,
 } from "./WorkspacePanels";
+import { CanvasAnnotations } from "./CanvasAnnotations";
 import type { SourceRequest } from "./sourceBuilder";
 import { preventBrowserZoomOutsideCanvas } from "./canvasGestures";
 import {
@@ -75,6 +85,8 @@ import {
 import type {
   AgentDiscovery,
   AgentSnapshot,
+  CanvasAnnotation,
+  CanvasColor,
   SomiteEdge,
   SomiteGraph,
   SomiteGraphNode,
@@ -86,8 +98,11 @@ import type {
   PaperCandidate,
   PaperEvidence,
   PaperReview,
+  PaperSearchResult,
   ExportPlan,
   ProjectSession,
+  ReadinessItem,
+  ReadinessSnapshot,
   RunNodeState,
   RunStartResponse,
   RunStatusResponse,
@@ -100,6 +115,8 @@ import { portColor } from "./visual";
 import { edgeLifecycleState, evidenceNodeState, semanticGraphKey } from "./validationState";
 import { SOMITE_SERVER, jsonRequest } from "./api";
 import { mergeAgentSnapshots, unseenAgentTransactions } from "./agentState";
+import { readinessAgentPrompt, readinessSummary } from "./readinessState";
+import { appendStrokePoint, canvasColor as getCanvasColor, canvasPalette, createCanvasAnnotation, nextAnnotationId } from "./canvasPresentation";
 
 const SNAP: [number, number] = [20, 20];
 const HISTORY_LIMIT = 80;
@@ -113,22 +130,25 @@ type SomiteNodeData = Record<string, unknown> & {
   cost: "low" | "high";
   viewerHidden: boolean;
   runState: "idle" | RunNodeState;
+  readinessItems: ReadinessItem[];
 };
 type SomiteFlowNode = Node<SomiteNodeData, "somite">;
 type SomiteFlowEdge = Edge<{ somite: SomiteEdge; portType: string; validationState: "idle" | RunNodeState }, "typed">;
 type History = { past: SomiteGraph[]; future: SomiteGraph[] };
 type Theme = "dark" | "light";
+type CanvasTool = "select" | "pen" | "sticky" | "box";
 type ContinueFromPort = (nodeId: string, port: SomitePort) => void;
 
 const ContinuationContext = createContext<ContinueFromPort | null>(null);
 
 function SomiteNodeCardBase({ data, selected }: NodeProps<SomiteFlowNode>) {
-  const { graphNode, title, viewerHidden, runState } = data;
+  const { graphNode, title, viewerHidden, runState, readinessItems } = data;
+  const nodeColor = graphNode.color ? getCanvasColor(graphNode.color) : null;
   const inputs = graphNode.ports.filter((port) => port.dir === "in");
   const outputs = graphNode.ports.filter((port) => port.dir === "out");
   return (
-    <article className={`somite-node state-${runState} ${selected ? "is-selected" : ""} ${viewerHidden ? "viewer-hidden" : ""}`}>
-      <div className="node-floating-title"><i /><span>{title}</span>{runState !== "idle" && <em>{runState}</em>}</div>
+    <article className={`somite-node state-${runState} ${selected ? "is-selected" : ""} ${viewerHidden ? "viewer-hidden" : ""} ${readinessItems.length ? "needs-readiness" : ""} ${nodeColor ? "has-user-color" : ""}`} style={nodeColor ? { "--node-user-color": nodeColor.hex } as React.CSSProperties : undefined}>
+      <div className="node-floating-title"><i /><span>{title}</span>{nodeColor && <b className="node-stage-label">{nodeColor.label}</b>}{readinessItems.length > 0 ? <em className="node-requirement-badge">{readinessItems.length} needed</em> : runState !== "idle" && <em>{runState}</em>}</div>
       {viewerHidden ? (
         <div className="node-collapsed-body">
           <strong>{graphNode.operator.startsWith("nf.") || graphNode.operator.startsWith("smk.") ? "Required Inputs" : title}</strong>
@@ -143,7 +163,7 @@ function SomiteNodeCardBase({ data, selected }: NodeProps<SomiteFlowNode>) {
       <span className={`viewer-flag ${viewerHidden ? "off" : ""}`} title={viewerHidden ? "Viewer hidden" : "Viewer visible"} />
       {!viewerHidden && <span className="node-name">{graphNode.id}</span>}
       <div className="port-column port-inputs">
-        {inputs.map((port, index) => <PortHandle key={port.name} nodeId={graphNode.id} port={port} index={index} count={inputs.length} />)}
+        {inputs.map((port, index) => <PortHandle key={port.name} nodeId={graphNode.id} port={port} index={index} count={inputs.length} required={readinessItems.some((item) => item.field === port.name && item.kind !== "parameter")} />)}
       </div>
       <div className="port-column port-outputs">
         {outputs.map((port, index) => <PortHandle key={port.name} nodeId={graphNode.id} port={port} index={index} count={outputs.length} />)}
@@ -194,13 +214,14 @@ function NodeViewer({ node, title }: { node: SomiteGraphNode; title: string }) {
 
 const SomiteNodeCard = memo(SomiteNodeCardBase);
 
-function PortHandle({ nodeId, port, index, count }: { nodeId: string; port: SomitePort; index: number; count: number }) {
+function PortHandle({ nodeId, port, index, count, required = false }: { nodeId: string; port: SomitePort; index: number; count: number; required?: boolean }) {
   const top = `${((index + 1) * 100) / (count + 1)}%`;
   const input = port.dir === "in";
   const continueFrom = useContext(ContinuationContext);
   return (
-    <div className={`port-row ${input ? "input" : "output"}`} style={{ top }}>
+    <div className={`port-row ${input ? "input" : "output"} ${required ? "required" : ""}`} style={{ top }}>
       <span title={port.name}>{port.name}</span>
+      {required && <CircleAlert className="port-requirement" size={11} aria-label={`${nodeId}.${port.name} is required`} />}
       {!input && <button type="button" className="port-continue nodrag nowheel" aria-label={`Continue from ${nodeId}.${port.name}`} title={`Continue from ${port.name}`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); continueFrom?.(nodeId, port); }}>+</button>}
       <Handle
         id={port.name}
@@ -236,7 +257,7 @@ function TypedEdgeBase({
 const TypedEdge = memo(TypedEdgeBase);
 const edgeTypes = { typed: TypedEdge };
 
-function flowNode(node: SomiteGraphNode, operators: Map<string, Operator>, viewerHidden = false, runState: SomiteNodeData["runState"] = "idle"): SomiteFlowNode {
+function flowNode(node: SomiteGraphNode, operators: Map<string, Operator>, viewerHidden = false, runState: SomiteNodeData["runState"] = "idle", readinessItems: ReadinessItem[] = []): SomiteFlowNode {
   const operator = operators.get(node.operator);
   const importedTitle = node.operator === "workflow.reference" && typeof node.params?.component === "string"
     ? node.params.component.split(":").at(-1)?.replaceAll("_", " ")
@@ -245,7 +266,7 @@ function flowNode(node: SomiteGraphNode, operators: Map<string, Operator>, viewe
     id: node.id,
     type: "somite",
     position: node.layout,
-    data: { graphNode: node, title: importedTitle ?? operator?.title ?? node.operator, cost: operator?.cost ?? "high", viewerHidden, runState },
+    data: { graphNode: node, title: importedTitle ?? operator?.title ?? node.operator, cost: operator?.cost ?? "high", viewerHidden, runState, readinessItems },
   };
 }
 
@@ -285,12 +306,13 @@ function pairedCompanion(edge: SomiteEdge, graphNodes: SomiteGraphNode[]): Somit
   };
 }
 
-function somiteGraph(name: string, nodes: SomiteFlowNode[], edges: SomiteFlowEdge[]): SomiteGraph {
+function somiteGraph(name: string, nodes: SomiteFlowNode[], edges: SomiteFlowEdge[], annotations: CanvasAnnotation[] = []): SomiteGraph {
   return {
     schema_version: 2,
     name,
     nodes: nodes.map((node) => ({ ...node.data.graphNode, layout: { x: node.position.x, y: node.position.y } })),
     edges: edges.map((edge) => edge.data?.somite).filter((edge): edge is SomiteEdge => Boolean(edge)),
+    annotations,
   };
 }
 
@@ -394,11 +416,20 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const [exportDownloading, setExportDownloading] = useState(false);
   const [paperVisible, setPaperVisible] = useState(false);
   const [agentVisible, setAgentVisible] = useState(false);
+  const [canvasTool, setCanvasTool] = useState<CanvasTool>("select");
+  const [activeCanvasColor, setActiveCanvasColor] = useState<CanvasColor>("yellow");
+  const [annotations, setAnnotations] = useState<CanvasAnnotation[]>([]);
+  const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
+  const [readinessVisible, setReadinessVisible] = useState(false);
+  const [readiness, setReadiness] = useState<ReadinessSnapshot | null>(null);
+  const [validationEvidence, setValidationEvidence] = useState<ValidationEvidenceResponse | null>(null);
+  const [agentDraft, setAgentDraft] = useState<{ id: number; message: string } | null>(null);
   const [agentSnapshot, setAgentSnapshot] = useState<AgentSnapshot>({ connected: false, connecting: false, busy: false, config_options: [], cursor: 0, events: [] });
   const [agentDiscovery, setAgentDiscovery] = useState<AgentDiscovery | null>(null);
   const [agentDiscoveryLoading, setAgentDiscoveryLoading] = useState(false);
   const [paperReview, setPaperReview] = useState<PaperReview | null>(null);
   const [activePaperCandidate, setActivePaperCandidate] = useState(0);
+  const [appliedPaperCandidate, setAppliedPaperCandidate] = useState<number | null>(null);
   const [paperLoading, setPaperLoading] = useState(false);
   const [nfcoreCatalog, setNfcoreCatalog] = useState<NfcoreCatalog | null>(null);
   const [snakemakeCatalog, setSnakemakeCatalog] = useState<SnakemakeCatalog | null>(null);
@@ -423,11 +454,12 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const dragSnapshotRef = useRef<SomiteGraph | null>(null);
   const paramHistoryKeyRef = useRef<string | null>(null);
   const connectionStartRef = useRef<Pick<PendingConnection, "nodeId" | "port"> | null>(null);
+  const drawingRef = useRef<Extract<CanvasAnnotation, { kind: "stroke" }> | null>(null);
   const semanticKeyRef = useRef("");
   const agentCursorRef = useRef(0);
   const appliedAgentTransactionsRef = useRef(new Set<string>());
   const previousSemanticKeyRef = useRef("");
-  const graphSnapshotRef = useRef<SomiteGraph>({ schema_version: 2, name: "Untitled workflow", nodes: [], edges: [] });
+  const graphSnapshotRef = useRef<SomiteGraph>({ schema_version: 2, name: "Untitled workflow", nodes: [], edges: [], annotations: [] });
   const titleEditStartRef = useRef<{ graph: SomiteGraph; dirty: boolean; title: string } | null>(null);
   const titleEditCancelledRef = useRef(false);
   const running = activeIntent !== null;
@@ -440,16 +472,18 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     return [...operators.values()];
   }, [nfcoreCatalog, session, snakemakeCatalog]);
   const operatorMap = useMemo(() => new Map(availableOperators.map((operator) => [operator.id, operator])), [availableOperators]);
-  const snapshot = useCallback(() => somiteGraph(workflowTitle, nodes, edges), [edges, nodes, workflowTitle]);
-  const semanticKey = useMemo(() => semanticGraphKey(somiteGraph(workflowTitle, nodes, edges)), [edges, nodes, workflowTitle]);
+  const snapshot = useCallback(() => somiteGraph(workflowTitle, nodes, edges, annotations), [annotations, edges, nodes, workflowTitle]);
+  const semanticKey = useMemo(() => semanticGraphKey(somiteGraph(workflowTitle, nodes, edges, annotations)), [annotations, edges, nodes, workflowTitle]);
   semanticKeyRef.current = semanticKey;
-  graphSnapshotRef.current = somiteGraph(workflowTitle, nodes, edges);
+  graphSnapshotRef.current = somiteGraph(workflowTitle, nodes, edges, annotations);
 
   useEffect(() => {
     const previous = previousSemanticKeyRef.current;
     previousSemanticKeyRef.current = semanticKey;
     if (!previous || previous === semanticKey) return;
-    setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, runState: "idle" } })));
+    setReadiness(null);
+    setValidationEvidence(null);
+    setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, runState: "idle", readinessItems: [] } })));
     setEdges((current) => current.map((edge) => ({ ...edge, animated: false, data: edge.data ? { ...edge.data, validationState: "idle" } : edge.data })));
   }, [semanticKey, setEdges, setNodes]);
 
@@ -460,7 +494,9 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     const timeout = window.setTimeout(() => {
       void jsonRequest<ValidationEvidenceResponse>("/api/validations/status", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(graph) })
         .then((evidence) => {
-          if (semanticKeyRef.current !== requestedKey || !evidence.receipt) return;
+          if (semanticKeyRef.current !== requestedKey) return;
+          setValidationEvidence(evidence);
+          if (!evidence.receipt) return;
           const nodeStates = Object.fromEntries(Object.entries(evidence.receipt.node_results).map(([node, result]) => [node, evidenceNodeState(result)])) as Record<string, RunNodeState>;
           setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, runState: nodeStates[node.id] ?? "idle" } })));
           setEdges((current) => current.map((edge) => {
@@ -474,6 +510,24 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     return () => window.clearTimeout(timeout);
   }, [activeIntent, semanticKey, session, setEdges, setNodes]);
 
+  useEffect(() => {
+    if (!session || activeIntent) return;
+    const requestedKey = semanticKey;
+    const graph = graphSnapshotRef.current;
+    const timeout = window.setTimeout(() => {
+      void jsonRequest<ReadinessSnapshot>("/api/readiness", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(graph) })
+        .then((snapshot) => {
+          if (semanticKeyRef.current !== requestedKey) return;
+          setReadiness(snapshot);
+          const itemsByNode = new Map<string, ReadinessItem[]>();
+          for (const item of snapshot.items) itemsByNode.set(item.node_id, [...(itemsByNode.get(item.node_id) ?? []), item]);
+          setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, readinessItems: itemsByNode.get(node.id) ?? [] } })));
+        })
+        .catch(() => undefined);
+    }, 120);
+    return () => window.clearTimeout(timeout);
+  }, [activeIntent, semanticKey, session, setNodes]);
+
   const remember = useCallback((graph = snapshot()) => {
     setHistory((current) => ({ past: [...current.past.slice(-(HISTORY_LIMIT - 1)), graph], future: [] }));
   }, [snapshot]);
@@ -481,10 +535,13 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const restoreGraph = useCallback((graph: SomiteGraph) => {
     const hidden = new Map(nodes.map((node) => [node.id, node.data.viewerHidden]));
     const states = new Map(nodes.map((node) => [node.id, node.data.runState]));
+    const requirements = new Map(nodes.map((node) => [node.id, node.data.readinessItems]));
     setWorkflowTitle(graph.name ?? "Untitled workflow");
-    setNodes(graph.nodes.map((node) => flowNode(node, operatorMap, hidden.get(node.id) ?? false, states.get(node.id) ?? "idle")));
+    setNodes(graph.nodes.map((node) => flowNode(node, operatorMap, hidden.get(node.id) ?? false, states.get(node.id) ?? "idle", requirements.get(node.id) ?? [])));
     setEdges(graph.edges.map((edge) => flowEdge(edge, graph.nodes)));
+    setAnnotations(graph.annotations ?? []);
     setSelectedIds([]);
+    setSelectedAnnotationId(null);
     setDirty(true);
   }, [nodes, operatorMap, setEdges, setNodes]);
 
@@ -549,6 +606,9 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       try {
         const incoming = await jsonRequest<AgentSnapshot>(`/api/agent/events?after=${agentCursorRef.current}`);
         if (stopped) return;
+        if (incoming.events.some((event) => event.kind === "status" && event.status === "ready")) {
+          setStatus(`${incoming.agent_name ?? "Agent"} is ready`);
+        }
         const transactions = unseenAgentTransactions(incoming.events, appliedAgentTransactionsRef.current);
         if (transactions.length) {
           const precedingGraphs: SomiteGraph[] = [];
@@ -632,6 +692,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
         setAgentSnapshot((current) => ({ ...current, cursor: loaded.agent_cursor }));
         setNodes(loaded.graph.nodes.map((node) => flowNode(node, operators)));
         setEdges((loaded.graph.edges ?? []).map((edge) => flowEdge(edge, loaded.graph.nodes)));
+        setAnnotations(loaded.graph.annotations ?? []);
         setStatus(loaded.recovered_autosave ? "Recovered the last autosave" : "Tab add · drag ports to wire · space-drag pan · F fit");
       })
       .catch((error) => setStatus(`Project engine is not running — ${errorMessage(error)}`));
@@ -656,7 +717,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
         body: JSON.stringify({ command }),
       });
       mergeAgentSnapshot(connected);
-      setStatus("Connecting your ACP agent…");
+      setStatus("Agent is connecting…");
     } catch (error) {
       setStatus(`Agent connection failed — ${errorMessage(error)}`);
     }
@@ -670,7 +731,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
         body: JSON.stringify({ message, graph: graphSnapshotRef.current }),
       });
       setAgentSnapshot((current) => ({ ...current, busy: true }));
-      setStatus("Agent is working with the Somite tools…");
+      setStatus("Agent is working on the workflow…");
     } catch (error) {
       setStatus(`Agent prompt failed — ${errorMessage(error)}`);
       throw error;
@@ -703,7 +764,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const disconnectAgent = useCallback(async () => {
     try {
       await jsonRequest<void>("/api/agent/disconnect", { method: "POST" });
-      setStatus("Disconnecting the ACP agent…");
+      setStatus("Disconnecting Agent…");
     } catch (error) {
       setStatus(`Could not disconnect agent — ${errorMessage(error)}`);
     }
@@ -798,6 +859,35 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     setStatus(`Choose a tool for ${nodeId}.${port.name} · ${port.ty}`);
     window.setTimeout(() => searchInputRef.current?.focus(), 0);
   }, [edges, nodes]);
+
+  const focusRequirement = useCallback((item: ReadinessItem) => {
+    const node = nodes.find((candidate) => candidate.id === item.node_id);
+    if (!node) return;
+    setSelectedIds([node.id]);
+    setNodes((current) => current.map((candidate) => ({ ...candidate, selected: candidate.id === node.id })));
+    void flow?.setCenter(node.position.x + 97, node.position.y + 62, { zoom: Math.max(zoom, .72), duration: 220 });
+    setStatus(`${item.title} · ${item.node_id}.${item.field}`);
+  }, [flow, nodes, setNodes, zoom]);
+
+  const resolveRequirement = useCallback((item: ReadinessItem) => {
+    focusRequirement(item);
+    if (!["input", "managed_resource"].includes(item.kind)) {
+      setReadinessVisible(false);
+      return;
+    }
+    const node = nodes.find((candidate) => candidate.id === item.node_id);
+    const port = node?.data.graphNode.ports.find((candidate) => candidate.dir === "in" && candidate.name === item.field);
+    if (!port) return;
+    setReadinessVisible(false);
+    openContinuation(item.node_id, port);
+  }, [focusRequirement, nodes, openContinuation]);
+
+  const askAssistantAboutRequirement = useCallback((item: ReadinessItem) => {
+    focusRequirement(item);
+    setAgentDraft({ id: Date.now(), message: readinessAgentPrompt(item, readiness?.graph_revision ?? "not yet computed") });
+    setAgentVisible(true);
+    if (!agentSnapshot.connected && !agentDiscovery && !agentDiscoveryLoading) void refreshAgentDiscovery();
+  }, [agentDiscovery, agentDiscoveryLoading, agentSnapshot.connected, focusRequirement, readiness, refreshAgentDiscovery]);
 
   const insertImportedGraph = useCallback((imported: WorkflowGraphResponse, target: { x: number; y: number }, title: string, recentId?: string) => {
     remember();
@@ -965,6 +1055,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     setEdges(candidate.graph.edges.map((edge) => flowEdge(edge, graphNodes)));
     setSelectedIds(nextNodes[0] ? [nextNodes[0].id] : []);
     setActivePaperCandidate(index);
+    setAppliedPaperCandidate(index);
     setDirty(true);
     setStatus(`Rebuilt ${candidate.name} · ${candidate.graph.nodes.length} nodes · review evidence before running`);
     window.setTimeout(() => void flow?.fitView({ padding: .24, duration: 280, maxZoom: 1 }), 0);
@@ -980,14 +1071,15 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       const uploaded = await upload(file);
       const review = await jsonRequest<PaperReview>("/api/paper", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: uploaded.path }) });
       setPaperReview(review);
-      if (review.candidates[0]) installPaperCandidate(review.candidates[0], 0);
-      else setStatus(`No workflow candidates were found in ${file.name}`);
+      setActivePaperCandidate(0);
+      setAppliedPaperCandidate(null);
+      setStatus(review.candidates.length ? `Found ${review.candidates.length} workflow draft${review.candidates.length === 1 ? "" : "s"} in ${file.name} · review before using` : `No workflow candidates were found in ${file.name}`);
     } catch (error) {
       setStatus(`Could not rebuild paper — ${errorMessage(error)}`);
     } finally {
       setPaperLoading(false);
     }
-  }, [installPaperCandidate, upload]);
+  }, [upload]);
 
   const openExamplePaper = useCallback(async () => {
     setPaperVisible(true);
@@ -998,13 +1090,31 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     try {
       const review = await jsonRequest<PaperReview>("/api/paper", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: "testdata/papers/rnaseq_methods.txt" }) });
       setPaperReview(review);
-      if (review.candidates[0]) installPaperCandidate(review.candidates[0], 0);
+      setActivePaperCandidate(0);
+      setAppliedPaperCandidate(null);
+      setStatus(`Found ${review.candidates.length} example workflow draft${review.candidates.length === 1 ? "" : "s"} · review before using`);
     } catch (error) {
       setStatus(`Could not rebuild example — ${errorMessage(error)}`);
     } finally {
       setPaperLoading(false);
     }
-  }, [installPaperCandidate]);
+  }, []);
+
+  const rebuildBiorxivPaper = useCallback(async (paper: PaperSearchResult) => {
+    setPaperLoading(true);
+    setStatus(`Reading ${paper.title}…`);
+    try {
+      const review = await jsonRequest<PaperReview>("/api/papers/biorxiv/reconstruct", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: paper.id }) });
+      setPaperReview(review);
+      setActivePaperCandidate(0);
+      setAppliedPaperCandidate(null);
+      setStatus(review.candidates.length ? `Found ${review.candidates.length} workflow draft${review.candidates.length === 1 ? "" : "s"} in ${paper.title} · review before using` : `No workflow candidates were found in ${paper.title}`);
+    } catch (error) {
+      setStatus(`Could not rebuild bioRxiv paper — ${errorMessage(error)}`);
+    } finally {
+      setPaperLoading(false);
+    }
+  }, []);
 
   const addDroppedFiles = useCallback(async (files: File[], position: { x: number; y: number }) => {
     if (!files.length) return;
@@ -1053,7 +1163,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     const additions = [somite, ...(companion ? [companion] : [])].filter((edge) => !edges.some((current) => current.id === edge.id)).map((edge) => flowEdge(edge, graphNodes));
     const connected = additions.reduce((current, edge) => addEdge(edge, current), edges);
     try {
-      await jsonRequest<{ valid: boolean }>("/api/graph/validate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(somiteGraph(workflowTitle, nodes, connected)) });
+      await jsonRequest<{ valid: boolean }>("/api/graph/validate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(somiteGraph(workflowTitle, nodes, connected, annotations)) });
       remember();
       setEdges(connected);
       setDirty(true);
@@ -1061,7 +1171,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     } catch (error) {
       setStatus(`These ports cannot connect — ${errorMessage(error)}`);
     }
-  }, [edges, nodes, remember, setEdges, workflowTitle]);
+  }, [annotations, edges, nodes, remember, setEdges, workflowTitle]);
 
   const onConnectStart = useCallback((_: MouseEvent | TouchEvent, params: OnConnectStartParams) => {
     const node = nodes.find((candidate) => candidate.id === params.nodeId);
@@ -1139,7 +1249,8 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     try {
       const plan = await jsonRequest<ExportPlan>("/api/export/plan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(snapshot()) });
       setExportPlan(plan);
-      setStatus(`${plan.ready_count} ready · ${plan.installable_count} installable · ${plan.adapter_count} need adapters`);
+      const attention = plan.manual_count + plan.details_count + plan.legacy_count + plan.adapter_count;
+      setStatus(`${plan.ready_count} ready · ${plan.installable_count} managed${attention ? ` · ${attention} need your attention` : ""}`);
     } catch (error) {
       setStatus(`Could not resolve export — ${errorMessage(error)}`);
     } finally {
@@ -1175,6 +1286,24 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     if (running) return;
     const requestedKey = semanticKey;
     const graph = snapshot();
+    try {
+      const latest = await jsonRequest<ReadinessSnapshot>("/api/readiness", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(graph) });
+      if (semanticKeyRef.current !== requestedKey) return;
+      setReadiness(latest);
+      const itemsByNode = new Map<string, ReadinessItem[]>();
+      for (const item of latest.items) itemsByNode.set(item.node_id, [...(itemsByNode.get(item.node_id) ?? []), item]);
+      setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, readinessItems: itemsByNode.get(node.id) ?? [] } })));
+      if (latest.state !== "ready") {
+        setReadinessVisible(true);
+        const first = latest.items[0];
+        if (first) focusRequirement(first);
+        setStatus(latest.state === "empty" ? "Add at least one tool before running" : `Resolve ${latest.required_count} required item${latest.required_count === 1 ? "" : "s"} before ${intent === "validation" ? "validation" : "running"}`);
+        return;
+      }
+    } catch (error) {
+      setStatus(`Could not inspect readiness — ${errorMessage(error)}`);
+      return;
+    }
     setActiveIntent(intent);
     setStatus(intent === "validation" ? "Binding representative FASTQ fixtures…" : "Freezing the exact Pixi environment…");
     setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, runState: "queued" } })));
@@ -1217,7 +1346,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       setActiveRunId(null);
       setActiveIntent(null);
     }
-  }, [running, semanticKey, setEdges, setNodes, snapshot]);
+  }, [focusRequirement, running, semanticKey, setEdges, setNodes, snapshot]);
 
   const runGraph = useCallback(() => executeGraph("run"), [executeGraph]);
   const validateGraphWithFixtures = useCallback(() => executeGraph("validation"), [executeGraph]);
@@ -1331,6 +1460,100 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     setStatus(shouldShow ? `Showing all ${nodes.length} node viewers` : `Hid all ${nodes.length} node viewers`);
   }, [nodes, setNodes]);
 
+  const beginAnnotationChange = useCallback(() => remember(), [remember]);
+
+  const updateAnnotation = useCallback((annotation: CanvasAnnotation) => {
+    setAnnotations((current) => current.map((item) => item.id === annotation.id ? annotation : item));
+    setDirty(true);
+  }, []);
+
+  const removeAnnotation = useCallback((id: string) => {
+    remember();
+    setAnnotations((current) => current.filter((annotation) => annotation.id !== id));
+    setSelectedAnnotationId((current) => current === id ? null : current);
+    setDirty(true);
+    setStatus("Removed canvas annotation");
+  }, [remember]);
+
+  const applyCanvasColor = useCallback((color: CanvasColor) => {
+    setActiveCanvasColor(color);
+    if (selectedIds.length) {
+      remember();
+      const selected = new Set(selectedIds);
+      setNodes((current) => current.map((node) => selected.has(node.id) ? { ...node, data: { ...node.data, graphNode: { ...node.data.graphNode, color } } } : node));
+      setDirty(true);
+      setStatus(`Marked ${selectedIds.length} node${selectedIds.length === 1 ? "" : "s"} as ${getCanvasColor(color).label}`);
+      return;
+    }
+    if (selectedAnnotationId) {
+      remember();
+      setAnnotations((current) => current.map((annotation) => annotation.id === selectedAnnotationId ? { ...annotation, color } : annotation));
+      setDirty(true);
+    }
+  }, [remember, selectedAnnotationId, selectedIds, setNodes]);
+
+  const clearNodeColor = useCallback(() => {
+    if (!selectedIds.length) return;
+    remember();
+    const selected = new Set(selectedIds);
+    setNodes((current) => current.map((node) => selected.has(node.id) ? { ...node, data: { ...node.data, graphNode: { ...node.data.graphNode, color: undefined } } } : node));
+    setDirty(true);
+    setStatus("Cleared node stage color");
+  }, [remember, selectedIds, setNodes]);
+
+  const placeCanvasAnnotation = useCallback((event: React.MouseEvent) => {
+    if (!flow || (canvasTool !== "sticky" && canvasTool !== "box")) {
+      setSelectedAnnotationId(null);
+      return;
+    }
+    const position = flow.screenToFlowPosition({ x: event.clientX, y: event.clientY }, { snapToGrid: true });
+    remember();
+    const annotation = createCanvasAnnotation(canvasTool, activeCanvasColor, position, annotations);
+    setAnnotations((current) => [...current, annotation]);
+    setSelectedAnnotationId(annotation.id);
+    setCanvasTool("select");
+    setDirty(true);
+    setStatus(canvasTool === "sticky" ? "Added a note — start typing" : "Added a stage box");
+  }, [activeCanvasColor, annotations, canvasTool, flow, remember]);
+
+  const beginStroke = useCallback((event: React.PointerEvent<HTMLElement>) => {
+    if (canvasTool !== "pen" || !flow || !(event.target instanceof Element) || !event.target.closest(".react-flow__pane")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    const point = flow.screenToFlowPosition({ x: event.clientX, y: event.clientY });
+    const stroke: Extract<CanvasAnnotation, { kind: "stroke" }> = { id: nextAnnotationId("stroke", annotations), kind: "stroke", color: activeCanvasColor, points: [point] };
+    remember();
+    drawingRef.current = stroke;
+    setAnnotations((current) => [...current, stroke]);
+    setSelectedAnnotationId(stroke.id);
+    setDirty(true);
+  }, [activeCanvasColor, annotations, canvasTool, flow, remember]);
+
+  const continueStroke = useCallback((event: React.PointerEvent<HTMLElement>) => {
+    const stroke = drawingRef.current;
+    if (!stroke || !flow) return;
+    const point = flow.screenToFlowPosition({ x: event.clientX, y: event.clientY });
+    const points = appendStrokePoint(stroke.points, point);
+    if (points === stroke.points) return;
+    const next = { ...stroke, points };
+    drawingRef.current = next;
+    setAnnotations((current) => current.map((annotation) => annotation.id === next.id ? next : annotation));
+  }, [flow]);
+
+  const finishStroke = useCallback((event: React.PointerEvent<HTMLElement>) => {
+    const stroke = drawingRef.current;
+    if (!stroke) return;
+    event.currentTarget.releasePointerCapture(event.pointerId);
+    if (stroke.points.length === 1) {
+      const point = stroke.points[0];
+      const next = { ...stroke, points: [point, { x: point.x + .1, y: point.y + .1 }] };
+      setAnnotations((current) => current.map((annotation) => annotation.id === next.id ? next : annotation));
+    }
+    drawingRef.current = null;
+    setStatus("Added a drawing · press Esc to return to Select");
+  }, []);
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const command = event.metaKey || event.ctrlKey;
@@ -1353,6 +1576,11 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
         return;
       }
       if (isTypingTarget(event.target)) return;
+      if ((event.key === "Backspace" || event.key === "Delete") && selectedAnnotationId) {
+        event.preventDefault();
+        removeAnnotation(selectedAnnotationId);
+        return;
+      }
       if (command && event.key.toLowerCase() === "d") {
         event.preventDefault();
         duplicateSelected();
@@ -1371,7 +1599,18 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
         setPaperVisible(false);
         setLibraryVisible(true);
         window.setTimeout(() => searchInputRef.current?.focus(), 0);
+      } else if (!command && event.key.toLowerCase() === "m") {
+        setCanvasTool("pen");
+        setSelectedAnnotationId(null);
+      } else if (!command && event.key.toLowerCase() === "s") {
+        setCanvasTool("sticky");
+        setSelectedAnnotationId(null);
+      } else if (!command && event.key.toLowerCase() === "b") {
+        setCanvasTool("box");
+        setSelectedAnnotationId(null);
       } else if (event.key === "Escape") {
+        setCanvasTool("select");
+        setSelectedAnnotationId(null);
         setLibraryVisible(false);
         setProjectVisible(false);
         setMachineVisible(false);
@@ -1380,13 +1619,15 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [duplicateSelected, flow, redo, runGraph, save, undo]);
+  }, [duplicateSelected, flow, redo, removeAnnotation, runGraph, save, selectedAnnotationId, undo]);
 
   const selectedNode = nodes.find((node) => node.id === selectedIds.at(-1)) ?? null;
   const selectedOperator = selectedNode ? operatorMap.get(selectedNode.data.graphNode.operator) : undefined;
   const selectedHiddenCount = nodes.filter((node) => selectedIds.includes(node.id) && node.data.viewerHidden).length;
   const allViewersHidden = nodes.length > 0 && nodes.every((node) => node.data.viewerHidden);
+  const showCanvasPalette = canvasTool !== "select" || selectedIds.length > 0 || selectedAnnotationId !== null;
   const statusError = /not running|could not|cannot|failed|invalid/i.test(status);
+  const readinessStatus = readinessSummary(readiness, running, validationEvidence);
 
   if (!session) {
     return <main className="boot-screen"><div className="brand-mark"><span /><span /><span /><span /></div><span className="spin"><LoaderCircle size={22} aria-hidden="true" /></span><p>{status}</p><small>Run scripts/somite-web from the project to open this graph.</small></main>;
@@ -1441,14 +1682,13 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
           </div>
         </header>
 
-        <section id="workflow-canvas" aria-label="Workflow Canvas" className="canvas-wrap studio-canvas" onDrop={onDrop} onDragOver={(event) => event.preventDefault()} onDoubleClick={(event) => {
-          if (!flow || !(event.target instanceof Element) || !event.target.closest(".react-flow__pane")) return;
+        <section id="workflow-canvas" aria-label="Workflow Canvas" className={`canvas-wrap studio-canvas tool-${canvasTool}`} onDrop={onDrop} onDragOver={(event) => event.preventDefault()} onPointerDownCapture={beginStroke} onPointerMove={continueStroke} onPointerUp={finishStroke} onPointerCancel={finishStroke} onDoubleClick={(event) => {
+          if (canvasTool !== "select" || !flow || !(event.target instanceof Element) || !event.target.closest(".react-flow__pane")) return;
           setPendingConnection(null);
           setPendingAddPosition(flow.screenToFlowPosition({ x: event.clientX, y: event.clientY }, { snapToGrid: true }));
           setProjectVisible(false);
           setPaperVisible(false);
           setToolchainVisible(false);
-          setAgentVisible(false);
           setLibraryVisible(true);
           window.setTimeout(() => searchInputRef.current?.focus(), 0);
         }} onPointerDown={() => {
@@ -1457,7 +1697,6 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
           if (machineVisible) setMachineVisible(false);
           if (paperVisible) setPaperVisible(false);
           if (toolchainVisible) setToolchainVisible(false);
-          if (agentVisible) setAgentVisible(false);
         }}>
           {snapGuides.x !== undefined && <div className="snap-guide vertical" style={{ left: snapGuides.x }} />}
           {snapGuides.y !== undefined && <div className="snap-guide horizontal" style={{ top: snapGuides.y }} />}
@@ -1502,9 +1741,11 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
             onConnect={(connection) => void onConnect(connection)}
             onConnectStart={onConnectStart}
             onConnectEnd={onConnectEnd}
+            onPaneClick={placeCanvasAnnotation}
             onSelectionChange={({ nodes: selected }) => {
               const next = selected.map((node) => node.id);
               setSelectedIds((current) => current.length === next.length && current.every((id, index) => id === next[index]) ? current : next);
+              if (next.length) setSelectedAnnotationId(null);
               paramHistoryKeyRef.current = null;
             }}
             onMove={(_, viewport) => setZoom((current) => Math.abs(current - viewport.zoom) < .001 ? current : viewport.zoom)}
@@ -1522,34 +1763,45 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
             zoomOnDoubleClick={false}
             zoomOnPinch
             zoomActivationKeyCode={["Meta", "Control"]}
-            panOnDrag={[1, 2]}
+            panOnDrag={canvasTool === "select" ? [1, 2] : false}
+            nodesDraggable={canvasTool === "select"}
             panActivationKeyCode="Space"
             connectionRadius={28}
             proOptions={{ hideAttribution: true }}
           >
             <Background variant={BackgroundVariant.Lines} gap={20} size={1} color="var(--grid)" />
+            <ViewportPortal>
+              <CanvasAnnotations annotations={annotations} zoom={zoom} selectedId={selectedAnnotationId} onSelect={(id) => { setSelectedAnnotationId(id); if (id) { setSelectedIds([]); setNodes((current) => current.map((node) => ({ ...node, selected: false }))); } }} onBeginChange={beginAnnotationChange} onChange={updateAnnotation} onRemove={removeAnnotation} />
+            </ViewportPortal>
           </ReactFlow>
           </ContinuationContext.Provider>
           <div className="drop-hint"><CloudUpload size={14} aria-hidden="true" />Drop FASTQ pairs, local files, or workflow directories</div>
         </section>
 
         <aside className="tool-rail" aria-label="Workspace Tools">
-          <button type="button" className={libraryVisible ? "primary active" : "primary"} aria-label="Add to Canvas" title="Add to Canvas" onClick={(event) => { event.stopPropagation(); const opening = !libraryVisible; setProjectVisible(false); setPaperVisible(false); setAgentVisible(false); setToolchainVisible(false); setPendingConnection(null); setLibraryVisible(opening); if (opening) window.setTimeout(() => searchInputRef.current?.focus(), 0); }}><Plus size={19} aria-hidden="true" /></button>
-          <button type="button" className={projectVisible ? "active" : ""} aria-label="Project" title="Project" onClick={(event) => { event.stopPropagation(); const opening = !projectVisible; setLibraryVisible(false); setPaperVisible(false); setAgentVisible(false); setToolchainVisible(false); setPendingConnection(null); setProjectVisible(opening); }}><FolderOpen size={16} aria-hidden="true" /></button>
+          <button type="button" className={libraryVisible ? "primary active" : "primary"} aria-label="Add to Canvas" title="Add to Canvas" onClick={(event) => { event.stopPropagation(); const opening = !libraryVisible; setProjectVisible(false); setPaperVisible(false); setToolchainVisible(false); setPendingConnection(null); setLibraryVisible(opening); if (opening) window.setTimeout(() => searchInputRef.current?.focus(), 0); }}><Plus size={19} aria-hidden="true" /></button>
+          <button type="button" className={projectVisible ? "active" : ""} aria-label="Project" title="Project" onClick={(event) => { event.stopPropagation(); const opening = !projectVisible; setLibraryVisible(false); setPaperVisible(false); setToolchainVisible(false); setPendingConnection(null); setProjectVisible(opening); }}><FolderOpen size={16} aria-hidden="true" /></button>
           <div className="tool-rail-divider" />
-          <button type="button" className={paperVisible ? "active" : ""} aria-label="Rebuild from a Paper" title="Paper Reconstruction" onClick={(event) => { event.stopPropagation(); const opening = !paperVisible; setPendingConnection(null); setLibraryVisible(false); setProjectVisible(false); setAgentVisible(false); setToolchainVisible(false); setPaperVisible(opening); }}><FileSearch size={16} aria-hidden="true" /></button>
-          <button type="button" className={agentVisible ? "active agent-toggle" : "agent-toggle"} aria-label="Open Workflow Agent" title="Workflow Agent" onClick={(event) => { event.stopPropagation(); setToolchainVisible(false); setMachineVisible(false); setLibraryVisible(false); setProjectVisible(false); setPaperVisible(false); const opening = !agentVisible; setAgentVisible(opening); if (opening && !agentSnapshot.connected && !agentDiscovery && !agentDiscoveryLoading) void refreshAgentDiscovery(); }}><Bot size={17} aria-hidden="true" />{(agentSnapshot.connected || agentSnapshot.connecting) && <i className={agentSnapshot.busy ? "busy" : "ready"} />}</button>
+          <button type="button" className={paperVisible ? "active" : ""} aria-label="Rebuild from a Paper" title="Paper Reconstruction" onClick={(event) => { event.stopPropagation(); const opening = !paperVisible; setPendingConnection(null); setLibraryVisible(false); setProjectVisible(false); setToolchainVisible(false); setPaperVisible(opening); }}><FileSearch size={16} aria-hidden="true" /></button>
         </aside>
 
+        {!agentVisible && <button type="button" className="agent-edge-launcher" aria-label="Open Agent" title="Open Agent" onClick={(event) => { event.stopPropagation(); setAgentDraft(null); setAgentVisible(true); if (!agentSnapshot.connected && !agentDiscovery && !agentDiscoveryLoading) void refreshAgentDiscovery(); }}><Bot size={16} aria-hidden="true" /><span>Agent</span>{(agentSnapshot.connected || agentSnapshot.connecting) && <i className={agentSnapshot.busy ? "busy" : "ready"} />}</button>}
+
         <div className="canvas-toolbar" aria-label="Canvas Tools" onPointerDown={(event) => event.stopPropagation()}>
-          <button type="button" className={libraryVisible ? "primary active" : "primary"} aria-label="Add Anything" title="Add anything (Ctrl K)" onClick={() => { setProjectVisible(false); setPaperVisible(false); setAgentVisible(false); setToolchainVisible(false); setPendingConnection(null); setLibraryVisible(true); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}><Plus size={17} aria-hidden="true" /><span>Add</span></button>
+          <button type="button" className={libraryVisible ? "primary active" : "primary"} aria-label="Add Anything" title="Add anything (Ctrl K)" onClick={() => { setProjectVisible(false); setPaperVisible(false); setToolchainVisible(false); setPendingConnection(null); setLibraryVisible(true); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}><Plus size={17} aria-hidden="true" /><span>Add</span></button>
           <label className="canvas-tool" title="Import local files"><CloudUpload size={16} aria-hidden="true" /><span>Import files</span><input type="file" multiple aria-label="Import local files" onChange={(event) => { const files = [...(event.currentTarget.files ?? [])]; event.currentTarget.value = ""; void addDroppedFiles(files, canvasCenter()); }} /></label>
+          <i className="canvas-toolbar-divider" />
+          <button type="button" className={canvasTool === "select" ? "active" : ""} aria-label="Select Tool" title="Select (Esc)" onClick={() => setCanvasTool("select")}><MousePointer2 size={15} aria-hidden="true" /></button>
+          <button type="button" className={canvasTool === "pen" ? "active" : ""} aria-label="Pen Tool" title="Pen (M)" onClick={() => { setCanvasTool("pen"); setSelectedAnnotationId(null); }}><PenTool size={15} aria-hidden="true" /></button>
+          <button type="button" className={canvasTool === "sticky" ? "active" : ""} aria-label="Sticky Note Tool" title="Sticky note (S)" onClick={() => { setCanvasTool("sticky"); setSelectedAnnotationId(null); }}><StickyNote size={15} aria-hidden="true" /></button>
+          <button type="button" className={canvasTool === "box" ? "active" : ""} aria-label="Box Tool" title="Stage box (B)" onClick={() => { setCanvasTool("box"); setSelectedAnnotationId(null); }}><Square size={15} aria-hidden="true" /></button>
+          {showCanvasPalette && <div className="canvas-color-palette" aria-label="Canvas colors"><Palette size={13} aria-hidden="true" />{canvasPalette.map((entry) => <button key={entry.color} type="button" className={activeCanvasColor === entry.color ? "active" : ""} style={{ "--swatch": entry.hex } as React.CSSProperties} aria-label={`Use ${entry.label} color`} title={entry.label} onClick={() => applyCanvasColor(entry.color)} />)}{selectedIds.length > 0 && <button type="button" className="clear" aria-label="Clear node color" title="Clear node color" onClick={clearNodeColor}><X size={10} /></button>}</div>}
           <i className="canvas-toolbar-divider" />
           <button type="button" aria-label="Fit Workflow" title="Fit workflow (F)" onClick={() => void flow?.fitView({ padding: .22, duration: 260, maxZoom: 1 })}><Maximize2 size={16} aria-hidden="true" /></button>
           <button type="button" aria-label={allViewersHidden ? "Show All Viewers" : "Hide All Viewers"} title={allViewersHidden ? "Show all viewers" : "Hide all viewers"} disabled={!nodes.length} onClick={toggleAllViewers}>{allViewersHidden ? <Eye size={16} aria-hidden="true" /> : <EyeOff size={16} aria-hidden="true" />}</button>
         </div>
 
-        {libraryVisible && <div className="panel-layer" onPointerDown={(event) => event.stopPropagation()}><LibraryPanel operators={availableOperators} query={query} filterQuery={deferredQuery} favorites={favorites} recent={recent} categoryOpen={categoryOpen} searchInputRef={searchInputRef} continuation={pendingConnection} onQuery={setQuery} onClose={() => { setLibraryVisible(false); setPendingConnection(null); }} onAddOperator={addOperator} onAddSource={addSource} onToggleFavorite={(id) => setFavorites((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; })} onToggleCategory={(title, open) => setCategoryOpen((current) => ({ ...current, [title]: open }))} /></div>}
+        {libraryVisible && <div className="panel-layer" onPointerDown={(event) => event.stopPropagation()}><LibraryPanel operators={availableOperators} query={query} filterQuery={deferredQuery} favorites={favorites} recent={recent} categoryOpen={categoryOpen} searchInputRef={searchInputRef} continuation={pendingConnection} onQuery={setQuery} onClose={() => { setLibraryVisible(false); setPendingConnection(null); }} onAddOperator={addOperator} onAddSource={addSource} onImportFiles={(files) => addDroppedFiles(files, canvasCenter())} onToggleFavorite={(id) => setFavorites((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; })} onToggleCategory={(title, open) => setCategoryOpen((current) => ({ ...current, [title]: open }))} /></div>}
 
         {projectVisible && <div className="project-layer" onPointerDown={(event) => event.stopPropagation()}><ProjectPanel projectName={session.project_name} graphPath={session.graph_path} onImportProject={importLocalProject} onClose={() => setProjectVisible(false)} /></div>}
 
@@ -1559,16 +1811,21 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
 
         {toolchainVisible && <div className="toolchain-layer" onPointerDown={(event) => event.stopPropagation()}><ToolchainPanel plan={exportPlan} pixiReady={system?.tools.pixi} loading={exportLoading} downloading={exportDownloading} onDownload={downloadBundle} onClose={() => setToolchainVisible(false)} /></div>}
 
-        {paperVisible && <div className="paper-layer" onPointerDown={(event) => event.stopPropagation()}><PaperPanel review={paperReview} active={activePaperCandidate} loading={paperLoading} onFile={rebuildPaper} onExample={openExamplePaper} onActivate={(index) => { const candidate = paperReview?.candidates[index]; if (candidate) installPaperCandidate(candidate, index); }} onEvidence={focusPaperEvidence} onClose={() => setPaperVisible(false)} /></div>}
+        {paperVisible && <div className="paper-layer" onPointerDown={(event) => event.stopPropagation()}><PaperPanel review={paperReview} active={activePaperCandidate} applied={appliedPaperCandidate} loading={paperLoading} onFile={rebuildPaper} onExample={openExamplePaper} onReconstruct={rebuildBiorxivPaper} onSelect={setActivePaperCandidate} onApply={(index) => { const candidate = paperReview?.candidates[index]; if (candidate) installPaperCandidate(candidate, index); }} onEvidence={focusPaperEvidence} onClose={() => setPaperVisible(false)} /></div>}
 
-        {agentVisible && <div className="agent-layer" onPointerDown={(event) => event.stopPropagation()}><AgentPanel snapshot={agentSnapshot} discovery={agentDiscovery} discoveryLoading={agentDiscoveryLoading} onRefreshDiscovery={refreshAgentDiscovery} onConnect={connectAgent} onConfig={configureAgent} onPrompt={promptAgent} onCancel={cancelAgent} onDisconnect={disconnectAgent} onPermission={answerAgentPermission} onClose={() => setAgentVisible(false)} /></div>}
+        {readinessVisible && readiness && <div className={`readiness-layer ${agentVisible ? "with-agent" : ""}`} onPointerDown={(event) => event.stopPropagation()}><ReadinessPanel snapshot={readiness} evidence={validationEvidence} onResolve={resolveRequirement} onFocus={focusRequirement} onAskAssistant={askAssistantAboutRequirement} onClose={() => setReadinessVisible(false)} /></div>}
+
+        {agentVisible && <div className="agent-layer" onPointerDown={(event) => event.stopPropagation()}><AgentPanel key={agentDraft?.id ?? "agent"} snapshot={agentSnapshot} discovery={agentDiscovery} discoveryLoading={agentDiscoveryLoading} draft={agentDraft} onRefreshDiscovery={refreshAgentDiscovery} onConnect={connectAgent} onConfig={configureAgent} onPrompt={promptAgent} onCancel={cancelAgent} onDisconnect={disconnectAgent} onPermission={answerAgentPermission} onClose={() => { setAgentVisible(false); setAgentDraft(null); }} /></div>}
 
         <footer className="statusbar studio-statusbar" aria-live="polite">
           <span className={`engine-light ${statusError ? "error" : ""}`} />
           <span className="status-copy">{status}</span>
           <span className="status-spacer" />
+          <button type="button" className={`readiness-status tone-${readinessStatus.tone} ${readinessVisible ? "active" : ""}`} title={readinessStatus.detail} aria-expanded={readinessVisible} onClick={(event) => { event.stopPropagation(); setReadinessVisible((visible) => !visible); }}>
+            {readinessStatus.tone === "ready" || readinessStatus.tone === "validated" ? <CheckCircle2 size={12} aria-hidden="true" /> : <CircleAlert size={12} aria-hidden="true" />}{readinessStatus.label}
+          </button>
           <span>{countFormatter.format(nodes.length)} nodes</span><span>{countFormatter.format(edges.length)} wires</span>
-          <button type="button" className={machineVisible ? "active" : ""} onClick={(event) => { event.stopPropagation(); setToolchainVisible(false); setAgentVisible(false); setProjectVisible(false); setMachineVisible((visible) => !visible); }}><Cpu size={12} aria-hidden="true" />Machine</button>
+          <button type="button" className={machineVisible ? "active" : ""} onClick={(event) => { event.stopPropagation(); setToolchainVisible(false); setProjectVisible(false); setMachineVisible((visible) => !visible); }}><Cpu size={12} aria-hidden="true" />Machine</button>
           <div className="zoom-cluster">
             <button type="button" aria-label="Zoom Out" onClick={() => void flow?.zoomOut({ duration: 120 })}><Minus size={13} /></button>
             <button type="button" aria-label="Reset Zoom to 100%" onClick={() => void flow?.zoomTo(1, { duration: 160 })}>{Math.round(zoom * 100)}%</button>

@@ -39,6 +39,21 @@ a scalar, enum, path, or flag.
 **Artifact** — a content-addressed file or directory produced or consumed by a
 node. The graph type-checks the declared artifact kind, not a filename suffix.
 
+**Managed resource** — persistent, versioned scientific data required by a
+tool but neither installed executable software nor a user's sample: for
+example a Kraken2 database, BUSCO lineage, reference bundle, or aligner index.
+A Managed resource has a Resource profile, provenance, and content identity;
+it is not an anonymous path or part of a Pixi environment.
+
+**Resource profile** — the machine-checkable scientific format of a Managed
+resource, such as `kraken2-database`. It refines the physical artifact kind so
+an arbitrary Directory cannot satisfy a specialized database or index input.
+
+**Resource materialization** — importing, downloading, or building a Managed
+resource into a user-owned persistent store and recording its identity. It is
+separate from Staging, which places an already materialized artifact into one
+isolated run.
+
 **Project** — a directory containing graphs and local `.somite/` state.
 
 **Run** — one request to realize a graph or a node cone, with timestamps and
@@ -85,6 +100,42 @@ contract, parameters, and input hashes.
 **Staging** — materializing cached inputs in an isolated work directory under
 tool-friendly names.
 
+**Canvas annotation** — a human-authored Sticky, Box, or Stroke stored with the
+Graph. Canvas annotations organize and explain the workflow but have no ports,
+parameters, execution behavior, or role in executable identity.
+
+**Node color** — an optional curated presentation label on a Node. It may help
+the user group stages such as Input, QC, Analysis, Review, and Output, but it
+never substitutes for typed ports, Readiness, validation evidence, or text.
+
+## Readiness and assistance
+
+**Requirement** — one deterministic fact that prevents the current Graph from
+entering Preparation: a missing required input, parameter, Managed resource,
+manual checkpoint, method detail, legacy environment, or reviewed Adapter. It
+is computed from the pinned operator contracts and current Edges, not from an
+agent response.
+
+**Resolution** — a known action that can satisfy a Requirement, such as
+connecting an existing artifact, setting a parameter, downloading a reviewed
+resource, attaching a manual export, reviewing an ambiguous method, or building
+a resource. A Resolution may include storage estimates, official guidance, and
+scientific effects without claiming that the action has already occurred.
+
+**Recommendation** — non-blocking, rule-based guidance derived from known
+contracts or machine facts. It is distinct from a Requirement.
+
+**Agent suggestion** — optional contextual help proposed through the Agent
+bridge. It never changes deterministic Readiness or substitutes for evidence.
+
+**Preparation** — the observable install, download, build, transfer, freeze, or
+verification work needed after requirements are satisfied and before execution.
+
+**Readiness** — the computed summary for one exact Graph revision. It is
+`empty`, `building`, `needs_action`, or `ready` and carries every unresolved
+Requirement and known Resolution. Validation evidence is displayed beside
+Readiness but remains a separate claim.
+
 ## Discovery and composition
 
 **Catalog** — the operators and workflows available for insertion. A catalog
@@ -124,13 +175,17 @@ transaction is one undoable browser history entry.
 
 **Reconstruction** — an evidence-bound interpretation of a paper package. It is
 a draft for review, not a claim that the paper supplied an executable graph.
+Literature discovery is not a graph source: selecting or reconstructing a
+bioRxiv record cannot mutate the Graph. Only explicit acceptance of a Candidate
+graph creates a Graph transaction.
 
 **Candidate graph** — one named interpretation of a distinct method track.
 Parallel analyses and mutually exclusive alternatives remain separate.
 
 **Evidence** — retained source text or explicit inference attached to a
-reconstructed node or edge. Missing operator contracts remain visible adapter
-gaps.
+reconstructed node or edge. Operator support is shown separately as built-in,
+managed, manual, method-details, legacy-source, or Adapter-needed; scientific
+evidence strength is never used as a proxy for executability.
 
 ## Invariants
 
@@ -138,14 +193,26 @@ gaps.
 - Every Node pins the exact execution-semantic revision of its Operator.
 - Every edge passes port-type validation and the graph remains acyclic.
 - Scientific bytes live in artifacts, never inside graph JSON.
+- Pixi environments contain executable dependencies, not Managed resource
+  bytes; environment recreation must not delete scientific databases or
+  indexes.
+- A specialized resource input accepts only a compatible Resource profile;
+  physical `Directory` shape alone is insufficient.
 - Package metadata alone never substitutes for an operator contract.
 - Imported structure and paper inference are labeled honestly.
 - All persisted graph writes are validated by the Rust graph model.
 - Generated engine syntax never introduces an unmapped executable node.
-- Workflow name, presentation-only layout, and notes never alter the semantic
-  Graph revision; all remain part of the editable Graph state revision.
+- Workflow name, presentation-only layout, notes, Canvas annotations, and Node
+  colors never alter the semantic Graph revision; all remain part of the
+  editable Graph state revision.
+- Canvas annotation IDs are unique across the Graph and annotation coordinates,
+  dimensions, text, and stroke size are validated before persistence.
 - Evidence refers to executable identity but is never included in that identity.
 - A passed fixture receipt applies only to its exact Graph and validation
   configuration; semantic edits invalidate it while presentation edits do not.
 - Agent edits never bypass Graph or Catalog validation and never overwrite a
   newer server Graph revision.
+- Readiness is deterministic and shared by UI and agents; an Agent suggestion
+  cannot clear a Requirement.
+- Run, validation, and agent compilation fail before Preparation unless the
+  current Graph revision is ready.

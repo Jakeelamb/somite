@@ -1,0 +1,22 @@
+{
+  "id": "var.vcftools_filter",
+  "title": "VCFtools SNP spacing filter",
+  "palette": ["Measure & Analyze"],
+  "kind": "external",
+  "cost": "low",
+  "bin": "vcftools",
+  "pixi": ["bioconda::vcftools"],
+  "params": {
+    "minimum_spacing": { "type": "int", "label": "Minimum SNP spacing (bp)", "page": "Filter", "default": 75, "min": 1 }
+  },
+  "ports": {
+    "in": [{ "name": "vcf", "type": "Vcf", "union": ["Vcf", "VcfGz"] }],
+    "out": [{ "name": "vcf", "type": "Vcf" }]
+  },
+  "argv": [
+    "vcftools", "--vcf", "{input.vcf}", "--thin", "{param.minimum_spacing}", "--recode", "--recode-INFO-all", "--out", "{work}/out/filtered"
+  ],
+  "outputs": {
+    "vcf": { "glob": "{work}/out/filtered.recode.vcf", "type": "Vcf" }
+  }
+}

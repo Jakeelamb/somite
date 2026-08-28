@@ -102,9 +102,12 @@ fn search_sra(query: &str) -> Vec<SearchResult> {
     let Some(summary) = esummary("sra", &ids) else {
         return Vec::new();
     };
-    ordered_records(&summary, &ids)
-        .filter_map(sra_result)
-        .collect()
+    let mut results = ordered_records(&summary, &ids)
+        .flat_map(sra_results)
+        .collect::<Vec<_>>();
+    results.sort_by_key(|result| !result.accession.eq_ignore_ascii_case(query));
+    results.truncate(8);
+    results
 }
 
 fn search_assemblies(query: &str) -> Vec<SearchResult> {
@@ -217,9 +220,18 @@ fn ordered_records<'a>(
     ids.iter().filter_map(|id| summary.get(id))
 }
 
-fn sra_result(record: &Value) -> Option<SearchResult> {
-    let run_xml = record.get("runs")?.as_str()?;
-    let accession = attribute(run_xml, "acc")?;
+fn sra_results(record: &Value) -> Vec<SearchResult> {
+    record
+        .get("runs")
+        .and_then(Value::as_str)
+        .map(run_accessions)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|accession| sra_result_for_accession(record, accession))
+        .collect()
+}
+
+fn sra_result_for_accession(record: &Value, accession: String) -> Option<SearchResult> {
     let experiment = record.get("expxml")?.as_str()?;
     let title = between(experiment, "<Title>", "</Title>")
         .unwrap_or_else(|| "Sequence Read Archive run".to_owned());
@@ -249,6 +261,18 @@ fn sra_result(record: &Value) -> Option<SearchResult> {
             sequence_type: None,
         },
     })
+}
+
+fn run_accessions(run_xml: &str) -> Vec<String> {
+    let mut accessions = Vec::new();
+    let mut rest = run_xml;
+    while let Some((_, tail)) = rest.split_once("<Run ") {
+        if let Some(accession) = attribute(tail, "acc") {
+            accessions.push(accession);
+        }
+        rest = tail;
+    }
+    accessions
 }
 
 fn assembly_result(record: &Value) -> Option<SearchResult> {
@@ -447,13 +471,21 @@ mod tests {
     #[test]
     fn parses_sra_summary_into_a_paired_read_source() {
         let record = serde_json::json!({
-            "runs": "<Run acc=\"SRR123456\"/>",
+            "runs": "<Run acc=\"SRR123456\"/><Run acc=\"SRR123457\"/>",
             "expxml": "<Summary><Title>RNA sequencing</Title></Summary><Organism ScientificName=\"Homo sapiens\"/><LIBRARY_STRATEGY>RNA-Seq</LIBRARY_STRATEGY><LIBRARY_LAYOUT><PAIRED/></LIBRARY_LAYOUT>"
         });
-        let result = sra_result(&record).expect("SRA result");
+        let results = sra_results(&record);
+        let result = results.first().expect("SRA result");
         assert_eq!(result.accession, "SRR123456");
         assert_eq!(result.data_kind, "Reads");
         assert!(result.tags.contains(&"Paired".to_owned()));
+        assert_eq!(
+            results
+                .into_iter()
+                .map(|item| item.accession)
+                .collect::<Vec<_>>(),
+            ["SRR123456", "SRR123457"]
+        );
     }
 
     #[test]

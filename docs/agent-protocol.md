@@ -65,11 +65,18 @@ external evidence that Somite cannot supply. The visible activity feed and
 persisted transcript retain only the user's original message, not this internal
 routing context.
 
+The contract also requires short single-concept catalog queries in parallel and
+a deterministic readiness check after editing. Missing local resources such as
+a Kraken2 database remain explicit typed requirements with known resolutions;
+the agent does not waste a web or NCBI search trying to fabricate them and does
+not compile or launch a validation while readiness is blocked.
+
 ## Tool surface
 
 | Tool | Effect |
 | --- | --- |
 | `somite.workflow.get` | Read the current typed graph, full state revision, and semantic revision. |
+| `somite.readiness.get` | Read deterministic missing inputs, parameters, and Managed resources plus known resolutions for the current graph revision. |
 | `somite.catalog.search` | Search exact operator contracts, ports, parameters, Pixi packages, and revisions with deterministic ranking and opaque pagination. |
 | `somite.source.search` | Search current NCBI or Ensembl reads, reference assemblies, organisms, accessions, and genes with structured provenance and ordered native source-recipe operators. |
 | `somite.graph.apply_transaction` | Apply up to 64 graph operations atomically against a compare-and-swap base revision. |
@@ -137,6 +144,9 @@ Run and validation starts use the same rule. The start tool requires a fresh
 key for one intended launch. Retrying an identical launch with that key returns
 the original `run_id` with `replayed: true`; using it for a different launch is
 rejected. This prevents a lost response from creating duplicate compute jobs.
+Before a launch is queued, the server applies the same readiness analysis used
+by the web drawer. A blocked graph returns `workflow_not_ready` before Pixi,
+Nextflow, downloads, or fixture binding begin.
 
 Somite clones the current graph, applies every operation, validates graph and
 catalog invariants, and writes the result only if all operations pass. A stale
@@ -158,10 +168,13 @@ one history entry for each, so normal Undo reverses them individually.
 - The agent command is not saved in the project.
 - Agent messages, status, tool input/output, transactions, and permission
   prompts appear in one chronological feed.
-- Permission prompts identify the exact ACP tool-call id and summarize the
-  requested Somite operation before the user chooses an advertised option.
-- A permission request blocks until the user chooses an advertised ACP option,
-  cancels it, or the five-minute timeout expires.
+- Somite-owned `somite.*` calls are automatically allowed for the active agent
+  session and remain visible and correlated by ACP tool-call id in the activity
+  feed and transcript. This covers only Somite's typed, server-enforced
+  capability surface; it does not approve shell commands or other tools.
+- Non-Somite permission requests identify the exact tool-call id and block until
+  the user chooses an advertised ACP option, cancels it, or the five-minute
+  timeout expires.
 - Disconnect and Stop remain available while the agent works. Canvas, run,
   validation, and export remain available without an agent.
 - Graph writes pass through the same Rust validation and autosave boundary as
@@ -201,6 +214,7 @@ permissions, and writes a deterministic score plus redacted evidence:
 scripts/mcp-agent-eval gpt-5.6-luna low 7391 baseline
 scripts/mcp-agent-eval gpt-5.6-luna low 7393 natural
 scripts/mcp-agent-eval gpt-5.6-luna low 7394 source
+scripts/mcp-agent-eval gpt-5.6-luna low 7396 metagenomics
 scripts/mcp-agent-eval gpt-5.6-luna low 7395 stale
 ```
 

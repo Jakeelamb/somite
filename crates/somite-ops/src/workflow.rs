@@ -268,6 +268,7 @@ fn build_graph(
                 y: *row as f32 * 150.0,
             },
             note: Some(format!("Imported from {workflow}@{revision} · {label}")),
+            color: None,
         });
         *row += 1;
     }
@@ -298,6 +299,7 @@ fn build_graph(
         name: None,
         nodes,
         edges,
+        annotations: vec![],
     };
     graph.validate().map_err(|error| error.to_string())?;
     Ok(graph)

@@ -1,0 +1,25 @@
+{
+  "id": "manual.joinmap",
+  "title": "JoinMap 4.1 checkpoint",
+  "palette": ["Resolve"],
+  "kind": "inprocess",
+  "cost": "low",
+  "params": {
+    "path": { "type": "string", "label": "Exported linkage map", "page": "Manual checkpoint", "required": true },
+    "version": { "type": "string", "label": "Reported version", "page": "Paper", "default": "4.1", "required": true }
+  },
+  "ports": {
+    "in": [{ "name": "variants", "type": "Vcf", "union": ["Vcf", "VcfGz"], "optional": true }],
+    "out": [{ "name": "map", "type": "Table" }]
+  },
+  "argv": [],
+  "outputs": {},
+  "resolution": {
+    "kind": "manual_checkpoint",
+    "title": "Attach the curated JoinMap result",
+    "detail": "JoinMap 4.1 is licensed Windows software and the paper includes manual curation. Run that step externally, then attach the exported linkage map here.",
+    "action_label": "Choose exported map",
+    "parameters": ["path"],
+    "source_url": "https://www.kyazma.nl/index.php/JoinMap/"
+  }
+}

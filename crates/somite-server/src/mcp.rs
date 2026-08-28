@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{source_search, GraphTransaction};
+use crate::{readiness::ReadinessSnapshot, source_search, GraphTransaction};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -150,6 +150,29 @@ pub struct PortSpecOutput {
     pub union: Vec<PortTypeOutput>,
     #[serde(default)]
     pub optional: bool,
+    pub resource: Option<ResourceSpecOutput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ResourceSpecOutput {
+    pub profile: String,
+    pub title: String,
+    pub detail: String,
+    #[serde(default)]
+    pub resolutions: Vec<ResourceResolutionSpecOutput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ResourceResolutionSpecOutput {
+    pub id: String,
+    pub label: String,
+    pub detail: String,
+    pub kind: String,
+    #[serde(default)]
+    pub recommended: bool,
+    pub download_bytes: Option<u64>,
+    pub stored_bytes: Option<u64>,
+    pub scientific_effect: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -442,6 +465,30 @@ impl SomiteMcp {
             "GET",
             "/api/agent/graph".to_owned(),
             None,
+        )
+        .await
+    }
+
+    /// Inspect deterministic workflow readiness before compiling, running, or
+    /// validating. The result names every missing input, parameter, or managed
+    /// scientific resource and lists known resolutions without requiring AI.
+    #[tool(
+        name = "somite.readiness.get",
+        annotations(
+            title = "Inspect Somite readiness",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn get_readiness(&self) -> Result<Json<ReadinessSnapshot>, CallToolResult> {
+        let workflow = self.current_graph().await?;
+        self.request(
+            Some("somite.readiness.get"),
+            "POST",
+            "/api/readiness".to_owned(),
+            Some(Self::graph_body(&workflow.graph).map_err(graph_serialization_error)?),
         )
         .await
     }
@@ -765,7 +812,7 @@ impl ServerHandler for SomiteMcp {
                 Implementation::new("somite", env!("CARGO_PKG_VERSION")).with_title("Somite"),
             )
             .with_instructions(
-                "Somite is a typed visual bioinformatics workflow compiler. Before each edit, call somite.workflow.get and pass its state_revision as base_state_revision. Search exact operator contracts; never invent operator ids, ports, or parameters. Use somite.source.search for current NCBI or Ensembl reads, assemblies, genes, and references before generic web research. Give each intended edit, run, or validation a fresh idempotency_key; reuse it only to retry the identical call after a lost response. Apply one small coherent atomic transaction. If it is stale, inspect again, re-check intent, and retry once with a new key. After validation.start, call run.status with wait_ms up to 25000 until it reaches a terminal phase. Never claim a workflow is runnable unless validation completed successfully.".to_owned(),
+                "Somite is a typed visual bioinformatics workflow compiler. Before each edit, call somite.workflow.get and pass its state_revision as base_state_revision. Search exact operator contracts; never invent operator ids, ports, or parameters. Use somite.source.search for current NCBI or Ensembl reads, assemblies, genes, and references before generic web research. Give each intended edit, run, or validation a fresh idempotency_key; reuse it only to retry the identical call after a lost response. Apply one small coherent atomic transaction. If it is stale, inspect again, re-check intent, and retry once with a new key. Call somite.readiness.get after editing and resolve or report every required item before compile, run, or validation. After validation.start, call run.status with wait_ms up to 25000 until it reaches a terminal phase. Never claim a workflow is runnable unless validation completed successfully.".to_owned(),
             )
     }
 }
@@ -852,6 +899,16 @@ fn stale_revisions(message: &str) -> (Option<String>, Option<String>) {
 }
 
 fn http_tool_error(tool: Option<&str>, message: String) -> CallToolResult {
+    if message.contains("workflow is not ready") {
+        return tool_error(
+            "workflow_not_ready",
+            message,
+            false,
+            Some("Call somite.readiness.get and resolve or report each required item before retrying.".to_owned()),
+            None,
+            None,
+        );
+    }
     if message.contains("idempotency key was already used") {
         return tool_error(
             "idempotency_conflict",
