@@ -76,6 +76,7 @@ import {
 import { CanvasAnnotations } from "./CanvasAnnotations";
 import type { SourceRequest } from "./sourceBuilder";
 import { preventBrowserZoomOutsideCanvas } from "./canvasGestures";
+import { paperResolutionAgentPrompt } from "./paperResolution";
 import {
   continuationEdge,
   nextContinuationPosition,
@@ -431,6 +432,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const [activePaperCandidate, setActivePaperCandidate] = useState(0);
   const [appliedPaperCandidate, setAppliedPaperCandidate] = useState<number | null>(null);
   const [paperLoading, setPaperLoading] = useState(false);
+  const [paperPreparingField, setPaperPreparingField] = useState<string | null>(null);
   const [nfcoreCatalog, setNfcoreCatalog] = useState<NfcoreCatalog | null>(null);
   const [snakemakeCatalog, setSnakemakeCatalog] = useState<SnakemakeCatalog | null>(null);
   const [categoryOpen, setCategoryOpen] = useState<Record<string, boolean>>({});
@@ -1046,6 +1048,81 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     body.append("file", file);
     return jsonRequest<UploadResult>("/api/files", { method: "POST", body });
   }, []);
+
+  const attachRequirementFile = useCallback(async (item: ReadinessItem, field: string, file: File) => {
+    setStatus(`Importing ${file.name} for ${item.title}…`);
+    try {
+      const result = await upload(file);
+      remember();
+      setNodes((current) => current.map((node) => node.id === item.node_id ? {
+        ...node,
+        data: {
+          ...node.data,
+          graphNode: {
+            ...node.data.graphNode,
+            params: { ...(node.data.graphNode.params ?? {}), [field]: result.path },
+          },
+        },
+      } : node));
+      setDirty(true);
+      setStatus(`${item.title} · attached ${result.filename}`);
+    } catch (error) {
+      setStatus(`Could not attach ${file.name} — ${errorMessage(error)}`);
+    }
+  }, [remember, setNodes, upload]);
+
+  const updatePaperCandidateParameter = useCallback(async (index: number, item: ReadinessItem, field: string, value: ParamValue) => {
+    const candidate = paperReview?.candidates[index];
+    if (!candidate) return;
+    const graph: SomiteGraph = {
+      ...candidate.graph,
+      nodes: candidate.graph.nodes.map((node) => node.id === item.node_id ? {
+        ...node,
+        params: { ...(node.params ?? {}), [field]: value },
+      } : node),
+    };
+    const assessment = await jsonRequest<ReadinessSnapshot>("/api/readiness", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(graph),
+    });
+    setPaperReview((current) => current ? {
+      ...current,
+      candidates: current.candidates.map((entry, candidateIndex) => candidateIndex === index ? { ...entry, graph, assessment } : entry),
+    } : current);
+    if (appliedPaperCandidate === index) setAppliedPaperCandidate(null);
+  }, [appliedPaperCandidate, paperReview]);
+
+  const attachPaperInput = useCallback(async (index: number, item: ReadinessItem, field: string, file: File) => {
+    const key = `${item.id}:${field}`;
+    setPaperPreparingField(key);
+    setStatus(`Importing ${file.name} for ${item.title}…`);
+    try {
+      const result = await upload(file);
+      await updatePaperCandidateParameter(index, item, field, result.path);
+      setStatus(`${item.title} · attached ${result.filename}`);
+    } catch (error) {
+      setStatus(`Could not prepare ${item.title} — ${errorMessage(error)}`);
+    } finally {
+      setPaperPreparingField(null);
+    }
+  }, [updatePaperCandidateParameter, upload]);
+
+  const setPaperInput = useCallback(async (index: number, item: ReadinessItem, field: string, value: string) => {
+    if (!value.trim()) return;
+    try {
+      await updatePaperCandidateParameter(index, item, field, value.trim());
+      setStatus(`${item.title} updated`);
+    } catch (error) {
+      setStatus(`Could not update ${item.title} — ${errorMessage(error)}`);
+    }
+  }, [updatePaperCandidateParameter]);
+
+  const askAgentAboutPaperItem = useCallback((candidate: PaperCandidate, item: ReadinessItem) => {
+    setAgentDraft({ id: Date.now(), message: paperResolutionAgentPrompt(candidate, item) });
+    setAgentVisible(true);
+    if (!agentSnapshot.connected && !agentDiscovery && !agentDiscoveryLoading) void refreshAgentDiscovery();
+  }, [agentDiscovery, agentDiscoveryLoading, agentSnapshot.connected, refreshAgentDiscovery]);
 
   const installPaperCandidate = useCallback((candidate: PaperCandidate, index: number) => {
     remember();
@@ -1811,9 +1888,9 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
 
         {toolchainVisible && <div className="toolchain-layer" onPointerDown={(event) => event.stopPropagation()}><ToolchainPanel plan={exportPlan} pixiReady={system?.tools.pixi} loading={exportLoading} downloading={exportDownloading} onDownload={downloadBundle} onClose={() => setToolchainVisible(false)} /></div>}
 
-        {paperVisible && <div className="paper-layer" onPointerDown={(event) => event.stopPropagation()}><PaperPanel review={paperReview} active={activePaperCandidate} applied={appliedPaperCandidate} loading={paperLoading} onFile={rebuildPaper} onExample={openExamplePaper} onReconstruct={rebuildBiorxivPaper} onSelect={setActivePaperCandidate} onApply={(index) => { const candidate = paperReview?.candidates[index]; if (candidate) installPaperCandidate(candidate, index); }} onEvidence={focusPaperEvidence} onClose={() => setPaperVisible(false)} /></div>}
+        {paperVisible && <div className="paper-layer" onPointerDown={(event) => event.stopPropagation()}><PaperPanel review={paperReview} active={activePaperCandidate} applied={appliedPaperCandidate} loading={paperLoading} preparingField={paperPreparingField} onFile={rebuildPaper} onExample={openExamplePaper} onReconstruct={rebuildBiorxivPaper} onSelect={setActivePaperCandidate} onApply={(index) => { const candidate = paperReview?.candidates[index]; if (candidate) installPaperCandidate(candidate, index); }} onAttachInput={attachPaperInput} onSetInput={setPaperInput} onEscalate={askAgentAboutPaperItem} onEvidence={focusPaperEvidence} onClose={() => setPaperVisible(false)} /></div>}
 
-        {readinessVisible && readiness && <div className={`readiness-layer ${agentVisible ? "with-agent" : ""}`} onPointerDown={(event) => event.stopPropagation()}><ReadinessPanel snapshot={readiness} evidence={validationEvidence} onResolve={resolveRequirement} onFocus={focusRequirement} onAskAssistant={askAssistantAboutRequirement} onClose={() => setReadinessVisible(false)} /></div>}
+        {readinessVisible && readiness && <div className={`readiness-layer ${agentVisible ? "with-agent" : ""}`} onPointerDown={(event) => event.stopPropagation()}><ReadinessPanel snapshot={readiness} evidence={validationEvidence} onResolve={resolveRequirement} onFocus={focusRequirement} onAttachFile={attachRequirementFile} onAskAssistant={askAssistantAboutRequirement} onClose={() => setReadinessVisible(false)} /></div>}
 
         {agentVisible && <div className="agent-layer" onPointerDown={(event) => event.stopPropagation()}><AgentPanel key={agentDraft?.id ?? "agent"} snapshot={agentSnapshot} discovery={agentDiscovery} discoveryLoading={agentDiscoveryLoading} draft={agentDraft} onRefreshDiscovery={refreshAgentDiscovery} onConnect={connectAgent} onConfig={configureAgent} onPrompt={promptAgent} onCancel={cancelAgent} onDisconnect={disconnectAgent} onPermission={answerAgentPermission} onClose={() => { setAgentVisible(false); setAgentDraft(null); }} /></div>}
 

@@ -56,7 +56,8 @@ test("starter preview is removed and the real canvas is wired", async () => {
   assert.match(panels, /onDrop=\{handlePaperDrop\}/);
   assert.match(panels, /Drop one PDF or text file/);
   assert.match(panels, /Preprint · not peer reviewed/);
-  assert.match(panels, /Use this workflow on the canvas/);
+  assert.match(panels, /Use ready workflow on the canvas/);
+  assert.match(panels, /Add draft to canvas/);
   assert.match(panels, /Browse Nextflow workflows/);
   assert.match(panels, /Search by organism, name, or accession/);
   assert.match(panels, /filter\(\(operator\) => !isSource\(operator\)\)/);
@@ -70,10 +71,10 @@ test("starter preview is removed and the real canvas is wired", async () => {
   assert.match(app, /aria-label="Workflow name"/);
   assert.match(app, /ReadinessPanel/);
   assert.match(panels, /deterministic checks/);
-  assert.match(panels, /Ask Assistant/);
+  assert.match(panels, /Ask Agent/);
   assert.match(app, /maxLength=\{100\}/);
   assert.match(app, /Renamed workflow to/);
-  assert.match(panels, /Show .* on canvas/);
+  assert.match(panels, /Show on canvas/);
   assert.match(app, /beforeunload/);
   assert.match(app, /aria-live="polite"/);
   assert.match(css, /\.app-shell/);

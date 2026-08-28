@@ -27,6 +27,20 @@
     "detail": "The paper says JoinMap, Rascaf, and AGOUTI evidence was appended for ALLMAPS, but does not report the conversion commands. Attach the reviewed BED file instead of guessing that transformation.",
     "action_label": "Choose evidence BED",
     "parameters": ["map_path", "weights_path"],
-    "source_url": "https://github.com/tanghaibao/jcvi/wiki/ALLMAPS"
+    "source_url": "https://github.com/tanghaibao/jcvi/wiki/ALLMAPS",
+    "recipes": [{
+      "id": "allmaps-evidence-v1",
+      "title": "Prepare reviewed ALLMAPS evidence",
+      "summary": "Attach the combined evidence BED and weights file without inventing an undocumented conversion.",
+      "version": "1",
+      "kind": "artifact_preparation",
+      "steps": [
+        "Review the paper and supplements for the JoinMap, Rascaf, and AGOUTI evidence conversion.",
+        "Create or obtain the combined ALLMAPS BED using that documented transformation.",
+        "Attach the matching weights file and record any assumptions in the node note."
+      ],
+      "parameters": ["map_path", "weights_path"],
+      "source_url": "https://github.com/tanghaibao/jcvi/wiki/ALLMAPS"
+    }]
   }
 }

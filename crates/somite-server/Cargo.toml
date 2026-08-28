@@ -9,6 +9,7 @@ description = "Local web interface for Somite projects"
 anyhow = "1"
 getrandom = "0.3"
 agent-client-protocol = { git = "https://github.com/agentclientprotocol/rust-sdk.git", rev = "754d5aa1ce2cfa54ba2c2a6d3edc7e7b6bce28eb" }
+somite-assessment = { path = "../somite-assessment" }
 somite-ir = { path = "../somite-ir" }
 somite-bundle = { path = "../somite-bundle" }
 somite-fixtures = { path = "../somite-fixtures" }

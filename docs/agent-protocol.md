@@ -66,17 +66,21 @@ persisted transcript retain only the user's original message, not this internal
 routing context.
 
 The contract also requires short single-concept catalog queries in parallel and
-a deterministic readiness check after editing. Missing local resources such as
-a Kraken2 database remain explicit typed requirements with known resolutions;
+a deterministic Workflow assessment after editing. Missing local resources such
+as a Kraken2 database remain explicit typed requirements with known resolutions;
 the agent does not waste a web or NCBI search trying to fabricate them and does
-not compile or launch a validation while readiness is blocked.
+not compile or launch a validation while readiness is blocked. Deterministic
+file, parameter, and connection work never needs agent interpretation. An
+escalated requirement carries its exact evidence, source location, choices, and
+versioned recipes; generic web research is a last resort when those sources are
+insufficient.
 
 ## Tool surface
 
 | Tool | Effect |
 | --- | --- |
 | `somite.workflow.get` | Read the current typed graph, full state revision, and semantic revision. |
-| `somite.readiness.get` | Read deterministic missing inputs, parameters, and Managed resources plus known resolutions for the current graph revision. |
+| `somite.readiness.get` | Read the shared Workflow assessment: ordered requirements, Node support, input controls, known resolutions, recipes, and escalation eligibility for the current graph revision. |
 | `somite.catalog.search` | Search exact operator contracts, ports, parameters, Pixi packages, and revisions with deterministic ranking and opaque pagination. |
 | `somite.source.search` | Search current NCBI or Ensembl reads, reference assemblies, organisms, accessions, and genes with structured provenance and ordered native source-recipe operators. |
 | `somite.graph.apply_transaction` | Apply up to 64 graph operations atomically against a compare-and-swap base revision. |

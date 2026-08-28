@@ -16,6 +16,18 @@
     "kind": "adapter",
     "title": "Add a reviewed tool contract",
     "detail": "Somite recognized a paper method but does not yet have a reviewed contract for its inputs, command, and outputs.",
-    "action_label": "Ask Agent to add it"
+    "action_label": "Ask Agent to add it",
+    "recipes": [{
+      "id": "reviewed-adapter-v1",
+      "title": "Draft a reviewed operator contract",
+      "summary": "Turn retained method evidence into a typed, tested operator instead of guessing from a package name.",
+      "version": "1",
+      "kind": "adapter_contract",
+      "steps": [
+        "Locate the authoritative tool source and version named by the paper.",
+        "Record typed inputs, arguments, outputs, and installation requirements.",
+        "Add a representative fixture and replace this gap only after validation."
+      ]
+    }]
   }
 }

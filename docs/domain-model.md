@@ -122,11 +122,26 @@ resource, attaching a manual export, reviewing an ambiguous method, or building
 a resource. A Resolution may include storage estimates, official guidance, and
 scientific effects without claiming that the action has already occurred.
 
+**Resolution recipe** — a portable, versioned procedure attached to a manual,
+legacy, ambiguous, or missing-contract Resolution. It records reviewed steps,
+required parameters, and an optional official source. A recipe is guidance and
+provenance, never an implicitly executable shell command.
+
+**Workflow assessment** — the one deterministic projection of a pinned Graph
+and Catalog into ordered Requirements, Resolutions, Node support states, input
+controls, recipes, and escalation eligibility. Paper review, Readiness, Export,
+and Agent handoff consume this same value.
+
 **Recommendation** — non-blocking, rule-based guidance derived from known
 contracts or machine facts. It is distinct from a Requirement.
 
 **Agent suggestion** — optional contextual help proposed through the Agent
 bridge. It never changes deterministic Readiness or substitutes for evidence.
+
+**Escalation** — an explicit Workflow-assessment property reserved for a
+scientific choice, legacy environment, Managed-resource tradeoff, or missing
+reviewed contract. Ordinary file attachment, parameter entry, and typed
+connection work is deterministic and does not invoke the Agent.
 
 **Preparation** — the observable install, download, build, transfer, freeze, or
 verification work needed after requirements are satisfied and before execution.
@@ -187,6 +202,9 @@ reconstructed node or edge. Operator support is shown separately as built-in,
 managed, manual, method-details, legacy-source, or Adapter-needed; scientific
 evidence strength is never used as a proxy for executability.
 
+**Source location** — the exact PDF page when the extraction preserves page
+separators. It is optional for plain text and JATS sources and never fabricated.
+
 ## Invariants
 
 - Node IDs are unique and edges reference existing nodes and ports.
@@ -214,5 +232,11 @@ evidence strength is never used as a proxy for executability.
   newer server Graph revision.
 - Readiness is deterministic and shared by UI and agents; an Agent suggestion
   cannot clear a Requirement.
+- Paper, Readiness, Export, and Agent handoff consume one Workflow assessment;
+  they cannot independently reclassify the same Node.
+- Resolution recipes are portable guidance and cannot introduce execution
+  outside the reviewed Operator contract.
+- Agent escalation is absent for deterministic file, parameter, and connection
+  work; escalation carries the exact Requirement, evidence, choices, and recipes.
 - Run, validation, and agent compilation fail before Preparation unless the
   current Graph revision is ready.

@@ -6,6 +6,7 @@ license.workspace = true
 description = "Portable Somite workflow and toolchain bundles"
 
 [dependencies]
+somite-assessment = { path = "../somite-assessment" }
 somite-ir = { path = "../somite-ir" }
 somite-ops = { path = "../somite-ops" }
 somite-nextflow = { path = "../somite-nextflow" }

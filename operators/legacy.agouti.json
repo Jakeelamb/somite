@@ -26,6 +26,20 @@
     "title": "Prepare the original AGOUTI environment",
     "detail": "The 2016 AGOUTI workflow is source-backed and Python 2-era. The current Bioconda package named agouti is a different program, so Somite will not install it by name.",
     "action_label": "Open legacy setup guide",
-    "source_url": "https://github.com/svm-zhang/AGOUTI"
+    "source_url": "https://github.com/svm-zhang/AGOUTI",
+    "recipes": [{
+      "id": "agouti-original-source-v1",
+      "title": "Isolate the original AGOUTI source",
+      "summary": "Prepare the paper-era implementation without substituting the unrelated modern package of the same name.",
+      "version": "1",
+      "kind": "environment",
+      "steps": [
+        "Use the original AGOUTI repository linked by this recipe.",
+        "Create an isolated legacy environment that satisfies the upstream Python 2 requirements.",
+        "Run the upstream example before using study data.",
+        "Record the source revision and replace this reference with a reviewed Somite operator before execution."
+      ],
+      "source_url": "https://github.com/svm-zhang/AGOUTI"
+    }]
   }
 }

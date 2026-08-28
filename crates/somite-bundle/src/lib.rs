@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::Serialize;
+use somite_assessment::{assess, SupportKind, WorkflowAssessment};
 use somite_ir::{Graph, ParamValue};
 use somite_linker::{freeze, link, EvidenceIndex, LinkOptions, RunClosure};
 use somite_nextflow::{compile, CompileOptions, PINNED_NEXTFLOW_VERSION, PINNED_OPENJDK_VERSION};
-use somite_ops::{Catalog, OpKind, Operator, OperatorResolutionKind};
+use somite_ops::{Catalog, Operator};
 use thiserror::Error;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -29,6 +30,8 @@ pub enum BundleError {
     Io(#[from] std::io::Error),
     #[error("compile: {0}")]
     Compile(#[from] somite_nextflow::CompileError),
+    #[error("assessment: {0}")]
+    Assessment(#[from] somite_assessment::AssessmentError),
     #[error("link: {0}")]
     Link(#[from] somite_linker::LinkError),
     #[error("output path already exists: {0}")]
@@ -90,6 +93,7 @@ pub struct BundlePlan {
     pub details_count: usize,
     pub legacy_count: usize,
     pub adapter_count: usize,
+    pub assessment: WorkflowAssessment,
 }
 
 #[derive(Debug, Clone)]
@@ -154,8 +158,9 @@ fn create_frozen_package_with_lock(
             destination.display().to_string(),
         ));
     }
+    let assessment = assess(graph, catalog)?;
     let operators = used_operators(graph, catalog)?;
-    let plan = build_plan(graph, &operators, target, binary_available);
+    let plan = build_plan(&operators, target, binary_available, assessment);
     let options = CompileOptions {
         // This is stable execution metadata. The user-controlled Graph name is
         // deliberately restricted to the archive filename below.
@@ -203,6 +208,7 @@ fn create_frozen_package_with_lock(
         write_text(&staging, "pixi.toml", &compiled.pixi_toml)?;
         write_json(&staging, "workflow.somite.json", graph)?;
         write_json(&staging, "toolchain/tools.json", &plan)?;
+        write_json(&staging, "assessment.json", &plan.assessment)?;
         write_json(&staging, "evidence/index.json", &EvidenceIndex::default())?;
         write_text(&staging, "README.md", &frozen_readme())?;
         for manifest in &linked.operator_manifests {
@@ -365,8 +371,9 @@ pub fn plan_frozen_package(
 ) -> Result<BundlePlan, BundleError> {
     graph.validate()?;
     catalog.verify_graph(graph)?;
+    let assessment = assess(graph, catalog)?;
     let operators = used_operators(graph, catalog)?;
-    Ok(build_plan(graph, &operators, target, binary_available))
+    Ok(build_plan(&operators, target, binary_available, assessment))
 }
 
 fn used_operators<'a>(
@@ -384,15 +391,15 @@ fn used_operators<'a>(
 }
 
 fn build_plan(
-    graph: &Graph,
     operators: &[&Operator],
     target: &ExportTarget,
     binary_available: impl Fn(&str) -> bool,
+    assessment: WorkflowAssessment,
 ) -> BundlePlan {
     let mut packages = BTreeSet::new();
     let mut tools = Vec::new();
     for operator in operators {
-        let requirement = tool_requirement(graph, operator, &binary_available);
+        let requirement = tool_requirement(operator, &assessment, &binary_available);
         packages.extend(requirement.packages.iter().cloned());
         tools.push(requirement);
     }
@@ -432,76 +439,71 @@ fn build_plan(
         details_count,
         legacy_count,
         adapter_count,
+        assessment,
     }
 }
 
 fn tool_requirement(
-    graph: &Graph,
     operator: &Operator,
+    assessment: &WorkflowAssessment,
     binary_available: &impl Fn(&str) -> bool,
 ) -> ToolRequirement {
-    if operator.id == "gap.missing" {
-        let names = graph
-            .nodes
-            .iter()
-            .filter(|node| node.operator == operator.id)
-            .filter_map(|node| match node.params.get("tool") {
-                Some(ParamValue::String(name)) if !name.trim().is_empty() => {
-                    Some(name.trim().to_owned())
-                }
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        return ToolRequirement {
-            operator_id: operator.id.clone(),
-            title: if names.is_empty() {
-                "Unresolved paper tool".to_owned()
-            } else {
-                names.join(", ")
-            },
-            binary: None,
-            packages: Vec::new(),
-            state: ToolState::AdapterNeeded,
-            detail: "Needs a reviewed Somite adapter: package discovery cannot infer typed ports, argv, or outputs.".to_owned(),
+    let supports = assessment
+        .nodes
+        .iter()
+        .filter(|node| node.operator_id == operator.id)
+        .collect::<Vec<_>>();
+    let title = supports
+        .iter()
+        .map(|support| support.title.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let support = supports.first().copied();
+    let requires_action = supports.iter().any(|support| support.requires_action);
+    if let Some(support) = support {
+        let blocked = match support.kind {
+            SupportKind::ManualCheckpoint => Some(ToolState::ManualCheckpoint),
+            SupportKind::MethodDetails => Some(ToolState::MethodDetails),
+            SupportKind::LegacySource => Some(ToolState::LegacySource),
+            SupportKind::Adapter => Some(ToolState::AdapterNeeded),
+            _ => None,
         };
-    }
-    if let Some(resolution) = &operator.resolution {
-        let state = match resolution.kind {
-            OperatorResolutionKind::ManualCheckpoint => ToolState::ManualCheckpoint,
-            OperatorResolutionKind::MethodDetails => ToolState::MethodDetails,
-            OperatorResolutionKind::LegacySource => ToolState::LegacySource,
-            OperatorResolutionKind::Adapter => ToolState::AdapterNeeded,
-        };
-        return ToolRequirement {
-            operator_id: operator.id.clone(),
-            title: operator.title.clone(),
-            binary: operator.bin.clone(),
-            packages: operator.pixi.clone(),
-            state,
-            detail: resolution.detail.clone(),
-        };
-    }
-    if operator.kind == OpKind::Reference {
-        return ToolRequirement {
-            operator_id: operator.id.clone(),
-            title: operator.title.clone(),
-            binary: None,
-            packages: Vec::new(),
-            state: ToolState::AdapterNeeded,
-            detail: "Imported workflow structure; convert this component to a reviewed Somite operator before standalone execution.".to_owned(),
-        };
-    }
-    if operator.kind == OpKind::Inprocess {
-        return ToolRequirement {
-            operator_id: operator.id.clone(),
-            title: operator.title.clone(),
-            binary: None,
-            packages: Vec::new(),
-            state: ToolState::BuiltIn,
-            detail: "Included in the Somite runtime.".to_owned(),
-        };
+        if let Some(state) = blocked.filter(|_| requires_action) {
+            return ToolRequirement {
+                operator_id: operator.id.clone(),
+                title: if title.is_empty() {
+                    operator.title.clone()
+                } else {
+                    title
+                },
+                binary: operator.bin.clone(),
+                packages: operator.pixi.clone(),
+                state,
+                detail: support.detail.clone(),
+            };
+        }
+        if matches!(
+            support.kind,
+            SupportKind::InputRequired
+                | SupportKind::BuiltIn
+                | SupportKind::ManualCheckpoint
+                | SupportKind::MethodDetails
+        ) {
+            return ToolRequirement {
+                operator_id: operator.id.clone(),
+                title: if title.is_empty() {
+                    operator.title.clone()
+                } else {
+                    title
+                },
+                binary: None,
+                packages: Vec::new(),
+                state: ToolState::BuiltIn,
+                detail: support.label.clone(),
+            };
+        }
     }
     let binary = operator.bin.clone();
     let available = binary.as_deref().is_some_and(binary_available);
@@ -521,7 +523,11 @@ fn tool_requirement(
     };
     ToolRequirement {
         operator_id: operator.id.clone(),
-        title: operator.title.clone(),
+        title: if title.is_empty() {
+            operator.title.clone()
+        } else {
+            title
+        },
         binary,
         packages: package_specs,
         state,
@@ -614,6 +620,7 @@ mod tests {
         .expect("frozen package");
         assert_eq!(package.plan.filename, "RNA-seq.somite-run.zip");
         assert_eq!(package.plan.installable_count, 1);
+        assert!(package.plan.assessment.is_ready());
         assert!(package.closure.closure_digest.starts_with("blake3:"));
         let mut renamed_graph = graph.clone();
         renamed_graph.name = Some("Renamed workflow".into());
@@ -636,6 +643,7 @@ mod tests {
             "pixi.toml",
             "pixi.lock",
             "workflow.somite.json",
+            "assessment.json",
             "run-closure.json",
             "evidence/index.json",
             "operators/test.echo.json",
@@ -650,6 +658,7 @@ mod tests {
             "pixi.lock",
             "run-closure.json",
             "workflow.somite.json",
+            "assessment.json",
             "operators/test.echo.json",
             "toolchain/tools.json",
         ] {

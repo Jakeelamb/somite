@@ -8,10 +8,14 @@ const resource: ReadinessItem = {
   node_id: "kraken",
   operator_id: "class.kraken2",
   field: "db",
+  fields: [{ name: "db", label: "Kraken2 database", input_mode: "choice" }],
   title: "Kraken2 database",
   detail: "Connect a database.",
   kind: "managed_resource",
+  priority: 30,
+  escalatable: true,
   resource_profile: "kraken2-database",
+  recipes: [],
   resolutions: [{
     id: "standard-8",
     label: "Download Standard-8",
@@ -30,6 +34,7 @@ function snapshot(items: ReadinessItem[] = []): ReadinessSnapshot {
     state: items.length ? "needs_action" : "ready",
     required_count: items.length,
     items,
+    nodes: [],
   };
 }
 

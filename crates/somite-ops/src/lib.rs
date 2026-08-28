@@ -168,6 +168,35 @@ pub enum OperatorResolutionKind {
     Adapter,
 }
 
+/// A portable, versioned procedure attached to an exceptional operator.
+/// Recipes describe reviewed human or agent work; they are never executed as
+/// hidden shell commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorResolutionRecipeKind {
+    ExternalCheckpoint,
+    Environment,
+    MethodSelection,
+    ArtifactPreparation,
+    AdapterContract,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorResolutionRecipeSpec {
+    pub id: String,
+    pub title: String,
+    pub summary: String,
+    pub version: String,
+    pub kind: OperatorResolutionRecipeKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub parameters: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorResolutionSpec {
@@ -179,6 +208,8 @@ pub struct OperatorResolutionSpec {
     pub parameters: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recipes: Vec<OperatorResolutionRecipeSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -36,8 +36,9 @@ Export downloads the same frozen production package.
 The bottom status bar continuously reports deterministic **Readiness** for the
 current graph revision. Its drawer lists every missing required connection,
 parameter, or managed scientific resource; known storage and scientific
-tradeoffs; current validation evidence; and direct resolve or **Ask Assistant**
-actions. Nodes mark their own missing inputs. Run, Validate, and agent Compile
+tradeoffs; current validation evidence; and one direct next action. File and
+connection work stays deterministic; **Ask Agent** appears only for requirements
+that explicitly need scientific interpretation or a reviewed contract. Nodes mark their own missing inputs. Run, Validate, and agent Compile
 stop before preparation when readiness is blocked.
 
 Agent is a compact right-side collaborator whose ordinary conversation hides
@@ -68,9 +69,11 @@ mixing literature into the Add surface. Papers whose JATS full text is available
 through Europe PMC can be previewed and reconstructed in place; a local PDF or
 text file can be chosen or dropped anywhere on the open Paper panel. Search and
 reconstruction produce reviewable drafts only. The canvas changes only when the
-user explicitly accepts a candidate workflow, and the evidence view
-distinguishes text-supported tools, compatibility inferences, and missing
-adapters.
+user explicitly accepts a candidate workflow. A pre-canvas intake guides the
+user through one unresolved input, checkpoint, or method decision at a time;
+attached files clear the shared assessment immediately. Evidence excerpts,
+PDF page locations, compatibility inferences, supported tools, and study notes
+remain available under progressive provenance disclosure.
 
 ## Bring your own agent
 
@@ -150,6 +153,11 @@ Rascaf and ALLMAPS as managed operators, JoinMap as an attachable manual result,
 AGOUTI as a legacy source tool, and an unnamed GATK 3.5 caller as a method choice
 that Somite will not guess.
 
+All four surfaces consume one `WorkflowAssessment`. Exceptional methods may
+publish versioned resolution recipes containing reviewed steps, parameters,
+and an official source. Those recipes travel in `assessment.json` inside the
+frozen bundle; they guide human or agent work but never execute hidden commands.
+
 ## Architecture
 
 ```text
@@ -159,6 +167,7 @@ web/ React canvas
 somite-server
       +-- somite-ir       typed graph and validation
       +-- somite-ops      operator and workflow catalogs
+      +-- somite-assessment shared requirements, recipes, and support
       +-- somite-nextflow pure Graph-to-DSL2 compiler
       +-- somite-linker   run-closure and evidence identities
       +-- somite-fixtures content-addressed representative test data

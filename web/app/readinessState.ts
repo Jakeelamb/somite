@@ -46,6 +46,10 @@ export function readinessAgentPrompt(item: ReadinessItem, graphRevision: string)
       return `- ${resolution.label}${sizes ? ` (${sizes})` : ""}: ${resolution.detail}${resolution.scientific_effect ? ` Scientific effect: ${resolution.scientific_effect}` : ""}`;
     })
     .join("\n");
+  const recipes = item.recipes.map((recipe) => [
+    `- ${recipe.title} (recipe ${recipe.version}): ${recipe.summary}`,
+    ...recipe.steps.map((step, index) => `  ${index + 1}. ${step}`),
+  ].join("\n")).join("\n");
   return [
     "Help me resolve this deterministic Somite readiness requirement.",
     `Graph revision: ${graphRevision}`,
@@ -55,6 +59,7 @@ export function readinessAgentPrompt(item: ReadinessItem, graphRevision: string)
     `Kind: ${item.kind}`,
     `Detail: ${item.detail}`,
     options ? `Known resolutions:\n${options}` : "",
-    "Use Somite tools immediately. Treat Somite readiness as the final authority, and ask before making a scientific choice that changes reference coverage.",
+    recipes ? `Reviewed recipes:\n${recipes}` : "",
+    "Use Somite tools immediately. Treat Somite assessment as the final authority, preserve the reported method, and never silently make a scientific choice. Use web research only when the retained evidence and official recipe source are insufficient.",
   ].filter(Boolean).join("\n");
 }

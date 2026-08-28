@@ -1650,11 +1650,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "somite-assessment"
+version = "0.1.0"
+dependencies = [
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "somite-ir",
+ "somite-linker",
+ "somite-ops",
+ "thiserror",
+]
+
+[[package]]
 name = "somite-bundle"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "somite-assessment",
  "somite-ir",
  "somite-linker",
  "somite-nextflow",
@@ -1770,6 +1784,7 @@ dependencies = [
  "schemars 1.2.2",
  "serde",
  "serde_json",
+ "somite-assessment",
  "somite-bundle",
  "somite-fixtures",
  "somite-ir",

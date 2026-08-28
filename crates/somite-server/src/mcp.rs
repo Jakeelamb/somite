@@ -10,8 +10,9 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use somite_assessment::WorkflowAssessment;
 
-use crate::{readiness::ReadinessSnapshot, source_search, GraphTransaction};
+use crate::{source_search, GraphTransaction};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -482,7 +483,7 @@ impl SomiteMcp {
             open_world_hint = false
         )
     )]
-    pub async fn get_readiness(&self) -> Result<Json<ReadinessSnapshot>, CallToolResult> {
+    pub async fn get_readiness(&self) -> Result<Json<WorkflowAssessment>, CallToolResult> {
         let workflow = self.current_graph().await?;
         self.request(
             Some("somite.readiness.get"),

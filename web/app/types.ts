@@ -105,6 +105,26 @@ export type ResourceSpec = {
 export type ReadinessState = "empty" | "building" | "needs_action" | "ready";
 export type RequirementKind = "input" | "parameter" | "managed_resource" | "manual_checkpoint" | "method_details" | "legacy_tool" | "adapter";
 export type ResolutionKind = "connect" | "configure" | "use_existing" | "download" | "build" | "attach" | "review" | "setup" | "add_adapter";
+export type RequirementInputMode = "connection" | "file" | "text" | "choice" | "guide" | "agent";
+export type SupportKind = "input_required" | "managed_tool" | "built_in" | "system_tool" | "manual_checkpoint" | "method_details" | "legacy_source" | "adapter";
+export type ResolutionRecipeKind = "external_checkpoint" | "environment" | "method_selection" | "artifact_preparation" | "adapter_contract";
+
+export type ResolutionRecipe = {
+  id: string;
+  title: string;
+  summary: string;
+  version: string;
+  kind: ResolutionRecipeKind;
+  steps: string[];
+  parameters: string[];
+  source_url?: string;
+};
+
+export type RequirementField = {
+  name: string;
+  label: string;
+  input_mode: RequirementInputMode;
+};
 
 export type ReadinessResolution = {
   id: string;
@@ -123,19 +143,37 @@ export type ReadinessItem = {
   node_id: string;
   operator_id: string;
   field: string;
+  fields: RequirementField[];
   title: string;
   detail: string;
   kind: RequirementKind;
+  priority: number;
+  escalatable: boolean;
   resource_profile?: string;
   resolutions: ReadinessResolution[];
+  recipes: ResolutionRecipe[];
 };
 
-export type ReadinessSnapshot = {
+export type NodeAssessment = {
+  node_id: string;
+  operator_id: string;
+  title: string;
+  kind: SupportKind;
+  label: string;
+  detail: string;
+  requires_action: boolean;
+  recipes: ResolutionRecipe[];
+};
+
+export type WorkflowAssessment = {
   graph_revision: string;
   state: ReadinessState;
   required_count: number;
   items: ReadinessItem[];
+  nodes: NodeAssessment[];
 };
+
+export type ReadinessSnapshot = WorkflowAssessment;
 
 export type Operator = {
   id: string;
@@ -314,6 +352,8 @@ export type PaperEvidence = {
   resolution_kind?: "input_required" | "managed_tool" | "built_in" | "system_tool" | "manual_checkpoint" | "method_details" | "legacy_source" | "adapter";
   resolution_label?: string;
   resolution_detail?: string;
+  resolution_required?: boolean;
+  source_location?: string;
 };
 
 export type ExportTool = {
@@ -337,6 +377,7 @@ export type ExportPlan = {
   details_count: number;
   legacy_count: number;
   adapter_count: number;
+  assessment: WorkflowAssessment;
 };
 
 export type PaperCandidate = {
@@ -346,6 +387,7 @@ export type PaperCandidate = {
   graph: SomiteGraph;
   warnings: string[];
   evidence: PaperEvidence[];
+  assessment: WorkflowAssessment;
 };
 
 export type PaperReview = {

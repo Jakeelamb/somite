@@ -384,7 +384,7 @@ fn pdf_ocr(path: &Path) -> Result<String, PaperError> {
         match out {
             Ok(o) if o.status.success() => {
                 text.push_str(&String::from_utf8_lossy(&o.stdout));
-                text.push('\n');
+                text.push('\u{000c}');
             }
             Ok(o) => {
                 let _ = fs::remove_dir_all(&dir);

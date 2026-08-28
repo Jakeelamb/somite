@@ -13,6 +13,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use somite_assessment::{assess, AssessmentState, SupportKind, WorkflowAssessment};
 use somite_bundle::{
     absolutize_import_paths, archive_frozen_package, create_frozen_package_with_pixi,
     pixi_executable, plan_frozen_package, BundlePlan, ExportTarget,
@@ -23,7 +24,7 @@ use somite_linker::{
     evidence_receipt, graph_state_revision, semantic_graph_revision, EvidenceDraft, EvidenceIndex,
     EvidenceReceipt, EvidenceResult,
 };
-use somite_ops::{current_pixi_platform, Catalog, OpKind, Operator, OperatorResolutionKind};
+use somite_ops::{current_pixi_platform, Catalog, Operator};
 use somite_ops::{nfcore, snakemake, snakemake_local, workflow};
 use somite_paper::{
     extract_from_path, reconstruct, Assay, CandidateRole, EvidenceStatus, EvidenceTarget,
@@ -39,7 +40,6 @@ mod agent;
 mod agent_discovery;
 mod literature;
 mod mcp;
-pub mod readiness;
 mod source_search;
 
 pub use agent::{
@@ -89,8 +89,8 @@ pub enum ServerError {
     Export(#[from] somite_bundle::BundleError),
     #[error("link: {0}")]
     Link(#[from] somite_linker::LinkError),
-    #[error("readiness: {0}")]
-    Readiness(#[from] readiness::ReadinessError),
+    #[error("assessment: {0}")]
+    Assessment(#[from] somite_assessment::AssessmentError),
     #[error("workflow is not ready: {0}")]
     NotReady(String),
 }
@@ -124,7 +124,7 @@ impl IntoResponse for ServerError {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             Self::Link(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::Readiness(_) | Self::NotReady(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Assessment(_) | Self::NotReady(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Paper(_) | Self::WorkflowImport(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Literature(
                 literature::LiteratureError::FullTextUnavailable
@@ -319,6 +319,7 @@ pub struct PaperCandidate {
     pub graph: Graph,
     pub warnings: Vec<String>,
     pub evidence: Vec<PaperEvidence>,
+    pub assessment: WorkflowAssessment,
 }
 
 #[derive(Debug, Serialize)]
@@ -333,6 +334,10 @@ pub struct PaperEvidence {
     pub resolution_label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolution_detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_required: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_location: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1238,11 +1243,11 @@ async fn validate_graph(
 async fn readiness_snapshot(
     State(project): State<Arc<WebProject>>,
     Json(mut graph): Json<Graph>,
-) -> Result<Json<readiness::ReadinessSnapshot>, ServerError> {
+) -> Result<Json<WorkflowAssessment>, ServerError> {
     let mut catalog = project.catalog.clone();
     install_cached_nfcore(&project.root, &mut catalog);
     catalog.pin_graph(&mut graph)?;
-    Ok(Json(readiness::analyze(&graph, &catalog)?))
+    Ok(Json(assess(&graph, &catalog)?))
 }
 
 async fn save_graph(
@@ -1865,12 +1870,12 @@ async fn start_validation(
 }
 
 fn require_ready(graph: &Graph, catalog: &Catalog) -> Result<(), ServerError> {
-    let snapshot = readiness::analyze(graph, catalog)?;
+    let snapshot = assess(graph, catalog)?;
     if snapshot.is_ready() {
         return Ok(());
     }
     let detail = match snapshot.state {
-        readiness::ReadinessState::Empty => "add at least one operator".to_owned(),
+        AssessmentState::Empty => "add at least one operator".to_owned(),
         _ => format!(
             "resolve {} required item{}; inspect /api/readiness or somite.readiness.get",
             snapshot.required_count,
@@ -2691,11 +2696,7 @@ async fn rebuild_paper(
     let response = tokio::task::spawn_blocking(move || {
         let extracted =
             extract_from_path(&path).map_err(|error| ServerError::Paper(error.to_string()))?;
-        Ok::<_, ServerError>(paper_response(
-            &catalog,
-            extract_via_label(extracted.via),
-            &extracted.text,
-        ))
+        paper_response(&catalog, extract_via_label(extracted.via), &extracted.text)
     })
     .await
     .map_err(|error| ServerError::Paper(error.to_string()))??;
@@ -2710,21 +2711,26 @@ async fn rebuild_biorxiv_paper(
     let catalog = project.catalog.clone();
     let response = tokio::task::spawn_blocking(move || {
         let text = literature::fetch_biorxiv_text(&cache_directory, &request.id)?;
-        Ok::<_, ServerError>(paper_response(&catalog, "jats", &text))
+        paper_response(&catalog, "jats", &text)
     })
     .await
     .map_err(|error| ServerError::Paper(error.to_string()))??;
     Ok(Json(response))
 }
 
-fn paper_response(catalog: &Catalog, extracted_via: &str, text: &str) -> PaperResponse {
+fn paper_response(
+    catalog: &Catalog,
+    extracted_via: &str,
+    text: &str,
+) -> Result<PaperResponse, ServerError> {
     let reconstruction = reconstruct(catalog, text);
-    PaperResponse {
+    Ok(PaperResponse {
         extracted_via: extracted_via.to_owned(),
         candidates: reconstruction
             .candidates
             .into_iter()
-            .map(|candidate| {
+            .map(|candidate| -> Result<PaperCandidate, ServerError> {
+                let assessment = assess(&candidate.graph, catalog)?;
                 let evidence = candidate
                     .evidence
                     .into_iter()
@@ -2734,73 +2740,79 @@ fn paper_response(catalog: &Catalog, extracted_via: &str, text: &str) -> PaperRe
                             EvidenceTarget::Edge(id) => ("edge", id),
                         };
                         let resolution = (target_kind == "node")
-                            .then(|| candidate.graph.node(&target_id))
-                            .flatten()
-                            .and_then(|node| catalog.get(&node.operator).ok())
-                            .map(paper_operator_resolution);
+                            .then(|| assessment.node(&target_id))
+                            .flatten();
+                        let source_location = evidence_source_location(
+                            extracted_via,
+                            text,
+                            evidence.status,
+                            &evidence.detail,
+                        );
                         PaperEvidence {
                             target_kind: target_kind.to_owned(),
                             target_id,
                             status: evidence_status_label(evidence.status).to_owned(),
                             detail: evidence.detail,
-                            resolution_kind: resolution.as_ref().map(|value| value.0.to_owned()),
-                            resolution_label: resolution.as_ref().map(|value| value.1.clone()),
-                            resolution_detail: resolution.map(|value| value.2),
+                            resolution_kind: resolution
+                                .map(|value| support_kind_label(value.kind).to_owned()),
+                            resolution_label: resolution.map(|value| value.label.clone()),
+                            resolution_detail: resolution.map(|value| value.detail.clone()),
+                            resolution_required: resolution.map(|value| value.requires_action),
+                            source_location,
                         }
                     })
                     .collect();
-                PaperCandidate {
+                Ok(PaperCandidate {
                     name: candidate.name,
                     role: candidate_role_label(candidate.role).to_owned(),
                     assay: assay_label(candidate.assay).to_owned(),
                     graph: candidate.graph,
                     warnings: candidate.warnings,
                     evidence,
-                }
+                    assessment,
+                })
             })
-            .collect(),
+            .collect::<Result<Vec<_>, _>>()?,
+    })
+}
+
+fn support_kind_label(kind: SupportKind) -> &'static str {
+    match kind {
+        SupportKind::InputRequired => "input_required",
+        SupportKind::ManagedTool => "managed_tool",
+        SupportKind::BuiltIn => "built_in",
+        SupportKind::SystemTool => "system_tool",
+        SupportKind::ManualCheckpoint => "manual_checkpoint",
+        SupportKind::MethodDetails => "method_details",
+        SupportKind::LegacySource => "legacy_source",
+        SupportKind::Adapter => "adapter",
     }
 }
 
-fn paper_operator_resolution(operator: &Operator) -> (&'static str, String, String) {
-    if let Some(resolution) = &operator.resolution {
-        let kind = match resolution.kind {
-            OperatorResolutionKind::ManualCheckpoint => "manual_checkpoint",
-            OperatorResolutionKind::MethodDetails => "method_details",
-            OperatorResolutionKind::LegacySource => "legacy_source",
-            OperatorResolutionKind::Adapter => "adapter",
-        };
-        return (kind, resolution.title.clone(), resolution.detail.clone());
+fn evidence_source_location(
+    extracted_via: &str,
+    text: &str,
+    status: EvidenceStatus,
+    detail: &str,
+) -> Option<String> {
+    if status != EvidenceStatus::Explicit || !matches!(extracted_via, "poppler" | "ocr") {
+        return None;
     }
-    if operator.id.starts_with("files.import") {
-        return (
-            "input_required",
-            "Choose input".to_owned(),
-            "Connect a local file or replace this node with a searchable online source.".to_owned(),
-        );
+    let needle = normalized_evidence_text(detail);
+    if needle.is_empty() {
+        return None;
     }
-    match operator.kind {
-        OpKind::External if !operator.pixi.is_empty() => (
-            "managed_tool",
-            "Managed automatically".to_owned(),
-            format!("Somite can resolve {} with Pixi.", operator.pixi.join(", ")),
-        ),
-        OpKind::External => (
-            "system_tool",
-            "System tool required".to_owned(),
-            "This command must already be available on the machine.".to_owned(),
-        ),
-        OpKind::Inprocess => (
-            "built_in",
-            "Built into Somite".to_owned(),
-            "No separate tool installation is needed.".to_owned(),
-        ),
-        OpKind::Reference => (
-            "adapter",
-            "Reviewed adapter required".to_owned(),
-            "This structural reference is not executable yet.".to_owned(),
-        ),
-    }
+    text.split('\u{000c}')
+        .enumerate()
+        .find(|(_, page)| normalized_evidence_text(page).contains(&needle))
+        .map(|(index, _)| format!("PDF page {}", index + 1))
+}
+
+fn normalized_evidence_text(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn extract_via_label(via: ExtractVia) -> &'static str {
@@ -4186,6 +4198,7 @@ mod tests {
             "pixi.lock",
             "run-closure.json",
             "workflow.somite.json",
+            "assessment.json",
         ] {
             assert!(zip.by_name(name).is_ok(), "missing {name}");
         }
@@ -4249,6 +4262,34 @@ mod tests {
         assert!(review["candidates"][0]["evidence"]
             .as_array()
             .is_some_and(|items| !items.is_empty()));
+        assert!(review["candidates"][0]["assessment"]["nodes"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()));
+        assert!(review["candidates"][0]["assessment"]["graph_revision"]
+            .as_str()
+            .is_some_and(|revision| revision.starts_with("blake3:")));
+    }
+
+    #[test]
+    fn paper_evidence_reports_the_exact_pdf_page_when_available() {
+        let text = "first page\u{000c}Methods used BWA-MEM and samtools.\u{000c}references";
+        assert_eq!(
+            evidence_source_location(
+                "poppler",
+                text,
+                EvidenceStatus::Explicit,
+                "Methods used BWA-MEM and samtools."
+            )
+            .as_deref(),
+            Some("PDF page 2")
+        );
+        assert!(evidence_source_location(
+            "poppler",
+            text,
+            EvidenceStatus::Inferred,
+            "Methods used BWA-MEM and samtools."
+        )
+        .is_none());
     }
 
     #[tokio::test]

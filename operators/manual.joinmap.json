@@ -20,6 +20,20 @@
     "detail": "JoinMap 4.1 is licensed Windows software and the paper includes manual curation. Run that step externally, then attach the exported linkage map here.",
     "action_label": "Choose exported map",
     "parameters": ["path"],
-    "source_url": "https://www.kyazma.nl/index.php/JoinMap/"
+    "source_url": "https://www.kyazma.nl/index.php/JoinMap/",
+    "recipes": [{
+      "id": "joinmap-export-v1",
+      "title": "Attach a curated JoinMap export",
+      "summary": "Keep the licensed, manually curated linkage-map step external and attach its reviewed output.",
+      "version": "1",
+      "kind": "external_checkpoint",
+      "steps": [
+        "Run the reported JoinMap workflow in the licensed desktop application.",
+        "Review and curate the linkage groups using the study protocol.",
+        "Export the final linkage map and attach it to this checkpoint."
+      ],
+      "parameters": ["path"],
+      "source_url": "https://www.kyazma.nl/index.php/JoinMap/"
+    }]
   }
 }

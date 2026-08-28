@@ -18,6 +18,7 @@ web/ React canvas
 somite-server
       ├── somite-ir       graph types and invariants
       ├── somite-ops      operator contracts and Pixi manifest rendering
+      ├── somite-assessment one shared requirements and support projection
       ├── somite-nextflow pure Graph-to-DSL2 compilation
       ├── somite-linker   immutable revisions, run closures, evidence receipts
       ├── somite-fixtures content-addressed representative biological data
@@ -116,16 +117,17 @@ actual runnable Graph and a path-independent configuration digest. Any source
 operator outside the supported family fails closed instead of reaching a
 network.
 
-### `somite-server::readiness`
+### `somite-assessment`
 
-Interface: `analyze(graph, catalog) -> ReadinessSnapshot`.
+Interface: `assess(graph, catalog) -> WorkflowAssessment`.
 
-This pure Module compares the current graph with pinned operator contracts and
-returns every missing required input, required parameter, and Managed resource
-with typed, catalog-authored Resolutions. It performs no filesystem, process,
-network, or AI work. The web readiness drawer, run and validation admission,
-agent compilation, and `somite.readiness.get` all use this Interface. Evidence
-remains separate because a complete graph is not necessarily a validated graph.
+This pure deep Module compares the current graph with pinned operator contracts
+and returns every ordered Requirement, typed Resolution, Node support state,
+input control, portable recipe, and escalation flag. It performs no filesystem,
+process, network, or AI work. Paper review, the web readiness drawer, export,
+run and validation admission, agent handoff, and `somite.readiness.get` all use
+this Interface. Evidence remains separate because a complete graph is not
+necessarily a validated graph.
 
 ### `somite-paper`
 
@@ -151,6 +153,7 @@ node-map.json
 pixi.toml
 pixi.lock
 workflow.somite.json
+assessment.json
 operators/<used-id>.json
 run-closure.json
 evidence/index.json
@@ -185,7 +188,10 @@ to graph node IDs.
 - Rebuild from a Paper owns bioRxiv search. Search and full-text reconstruction
   never mutate the graph; applying a reviewed candidate is the explicit graph
   transaction. Papers without Europe PMC full text point back to a local PDF,
-  which can be chosen or dropped anywhere on the Paper panel.
+  which can be chosen or dropped anywhere on the Paper panel. Candidate review
+  is attention-first: one intake or decision step is visible at a time, direct
+  file attachments immediately refresh the Workflow assessment, and supported
+  steps plus page-located evidence stay collapsed under provenance.
 - A centered canvas toolbar keeps add, file import, fit, and viewer controls
   within pointer reach.
 - The bottom status bar always reports deterministic readiness. Clicking it
@@ -197,9 +203,9 @@ to graph node IDs.
   conversation, closed, and reopened from a persistent right-edge launcher.
   Ordinary conversation shows semantic canvas results while tool and protocol
   activity stays behind one progressive-disclosure summary. Contextual
-  readiness handoffs still include the exact requirement, graph revision,
-  resolutions, sizes, and scientific effects; the deterministic checker remains
-  authoritative.
+  readiness handoffs exist only for escalatable items and include the exact
+  requirement, graph revision, paper excerpt and page, resolutions, recipes,
+  sizes, and scientific effects; the deterministic assessment remains authoritative.
 - Sticky notes, stage boxes, pen strokes, and curated node colors are portable
   presentation state. They participate in save, autosave, history, and graph
   state revision but never executable identity. Color presets include visible

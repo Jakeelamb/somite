@@ -1,6 +1,8 @@
 "use client";
 
 import {
+  ChevronLeft,
+  ChevronRight,
   ChevronDown,
   CheckCircle2,
   CircleAlert,
@@ -51,6 +53,7 @@ import type {
 import { OperatorGlyph, portColor } from "./visual";
 import { jsonRequest } from "./api";
 import { formatResourceBytes } from "./readinessState";
+import { paperAttentionItems, paperParameterValue, paperSupportedCount } from "./paperResolution";
 
 function groupedAgentEvents(events: AgentEvent[]) {
   return events.reduce<AgentEvent[]>((grouped, event) => {
@@ -247,14 +250,18 @@ export function AgentPanel({ snapshot, discovery, discoveryLoading, draft, onRef
   );
 }
 
-export function ReadinessPanel({ snapshot, evidence, onResolve, onFocus, onAskAssistant, onClose }: {
+export function ReadinessPanel({ snapshot, evidence, onResolve, onFocus, onAttachFile, onAskAssistant, onClose }: {
   snapshot: ReadinessSnapshot;
   evidence: ValidationEvidenceResponse | null;
   onResolve: (item: ReadinessItem) => void;
   onFocus: (item: ReadinessItem) => void;
+  onAttachFile: (item: ReadinessItem, field: string, file: File) => Promise<void>;
   onAskAssistant: (item: ReadinessItem) => void;
   onClose: () => void;
 }) {
+  const [step, setStep] = useState(0);
+  const currentStep = Math.min(step, Math.max(0, snapshot.items.length - 1));
+  const current = snapshot.items[currentStep] ?? null;
   const recommended = snapshot.items.flatMap((item) => item.resolutions
     .filter((resolution) => resolution.recommended && resolution.kind !== "connect" && resolution.kind !== "configure")
     .map((resolution) => ({ item, resolution })));
@@ -268,38 +275,51 @@ export function ReadinessPanel({ snapshot, evidence, onResolve, onFocus, onAskAs
       </header>
       <div className={`readiness-hero state-${snapshot.state}`}>
         {snapshot.state === "ready" ? <CheckCircle2 size={18} /> : <CircleAlert size={18} />}
-        <div><strong>{snapshot.state === "ready" ? "All requirements are connected" : snapshot.state === "empty" ? "Start with a tool or input" : `${snapshot.required_count} required item${snapshot.required_count === 1 ? "" : "s"}`}</strong><span>{snapshot.state === "ready" ? "This graph can enter preparation." : "Resolve these before Somite prepares a run."}</span></div>
+        <div><strong>{snapshot.state === "ready" ? "All requirements are connected" : snapshot.state === "empty" ? "Start with a tool or input" : `${snapshot.required_count} step${snapshot.required_count === 1 ? "" : "s"} to ready`}</strong><span>{snapshot.state === "ready" ? "This graph can enter preparation." : "Somite will guide you through one exact action at a time."}</span></div>
       </div>
       <div className="readiness-scroll">
-        {snapshot.items.length > 0 && <section className="readiness-section">
-          <header><strong>Required</strong><span>{snapshot.required_count}</span></header>
-          <div className="requirement-list">
-            {snapshot.items.map((item) => <article key={item.id} className={`requirement-card kind-${item.kind}`}>
-              <button type="button" className="requirement-main" onClick={() => onFocus(item)}>
-                <i>{item.kind === "managed_resource" ? <Database size={13} /> : item.kind === "manual_checkpoint" ? <FileInput size={13} /> : <CircleAlert size={13} />}</i>
-                <span><strong>{item.title}</strong><code>{item.node_id}.{item.field}</code><small>{item.detail}</small></span>
-              </button>
-              {item.resolutions.some((resolution) => resolution.source_url) && <div className="resolution-links">
-                {item.resolutions.filter((resolution) => resolution.source_url).map((resolution) => <a key={resolution.id} href={resolution.source_url!} target="_blank" rel="noreferrer"><ExternalLink size={11} />Official guide</a>)}
-              </div>}
-              {item.kind === "managed_resource" && <div className="resolution-list">
-                {item.resolutions.map((resolution) => {
-                  const download = formatResourceBytes(resolution.download_bytes);
-                  const stored = formatResourceBytes(resolution.stored_bytes);
-                  return <div key={resolution.id} className={resolution.recommended ? "recommended" : ""}>
-                    <header><strong>{resolution.label}</strong>{resolution.recommended && <em>Recommended</em>}</header>
-                    <p>{resolution.detail}</p>
-                    {(download || stored) && <small>{download && `${download} download`}{download && stored && " · "}{stored && `${stored} stored`}</small>}
-                    {resolution.scientific_effect && <p className="scientific-effect">{resolution.scientific_effect}</p>}
-                  </div>;
-                })}
-              </div>}
-              <div className="requirement-actions">
-                <button type="button" onClick={() => onResolve(item)}>{item.resolutions[0]?.label ?? (item.kind === "parameter" ? "Configure" : item.kind === "managed_resource" ? "Connect existing" : "Connect input")}</button>
-                <button type="button" className="secondary" onClick={() => onAskAssistant(item)}><MessageSquare size={12} />Ask Assistant</button>
-              </div>
-            </article>)}
-          </div>
+        {current && <section className="readiness-section readiness-guide">
+          <header><strong>Resolve next</strong><span>{currentStep + 1} of {snapshot.required_count}</span></header>
+          <article className={`requirement-card kind-${current.kind}`}>
+            <button type="button" className="requirement-main" onClick={() => onFocus(current)}>
+              <i>{current.kind === "managed_resource" ? <Database size={13} /> : current.kind === "manual_checkpoint" ? <FileInput size={13} /> : <CircleAlert size={13} />}</i>
+              <span><strong>{current.title}</strong><code>{current.node_id}.{current.field}</code><small>{current.detail}</small></span>
+            </button>
+            {current.fields.filter((field) => field.input_mode === "file").map((field) => <label className="requirement-file" key={field.name}>
+              <FileInput size={12} /><span><strong>{field.label}</strong><small>Choose from this computer</small></span>
+              <input type="file" aria-label={`Choose ${field.label}`} onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; if (file) void onAttachFile(current, field.name, file); }} />
+            </label>)}
+            {current.resolutions.some((resolution) => resolution.source_url) && <div className="resolution-links">
+              {current.resolutions.filter((resolution) => resolution.source_url).map((resolution) => <a key={resolution.id} href={resolution.source_url!} target="_blank" rel="noreferrer"><ExternalLink size={11} />Official guide</a>)}
+            </div>}
+            {current.kind === "managed_resource" && <div className="resolution-list">
+              {current.resolutions.map((resolution) => {
+                const download = formatResourceBytes(resolution.download_bytes);
+                const stored = formatResourceBytes(resolution.stored_bytes);
+                return <div key={resolution.id} className={resolution.recommended ? "recommended" : ""}>
+                  <header><strong>{resolution.label}</strong>{resolution.recommended && <em>Recommended</em>}</header>
+                  <p>{resolution.detail}</p>
+                  {(download || stored) && <small>{download && `${download} download`}{download && stored && " · "}{stored && `${stored} stored`}</small>}
+                  {resolution.scientific_effect && <p className="scientific-effect">{resolution.scientific_effect}</p>}
+                </div>;
+              })}
+            </div>}
+            {current.recipes.map((recipe) => <details className="resolution-recipe" key={recipe.id}>
+              <summary><span><strong>{recipe.title}</strong><small>Reusable recipe · v{recipe.version}</small></span><ChevronDown size={12} /></summary>
+              <p>{recipe.summary}</p>
+              <ol>{recipe.steps.map((entry) => <li key={entry}>{entry}</li>)}</ol>
+              {recipe.source_url && <a href={recipe.source_url} target="_blank" rel="noreferrer"><ExternalLink size={11} />Open recipe source</a>}
+            </details>)}
+            <div className="requirement-actions">
+              {!current.fields.some((field) => field.input_mode === "file") && <button type="button" onClick={() => onResolve(current)}>{current.resolutions[0]?.label ?? (current.kind === "parameter" ? "Configure" : current.kind === "managed_resource" ? "Connect existing" : "Connect input")}</button>}
+              {current.escalatable && <button type="button" className="secondary" onClick={() => onAskAssistant(current)}><MessageSquare size={12} />Ask Agent</button>}
+            </div>
+          </article>
+          {snapshot.required_count > 1 && <nav className="readiness-steps" aria-label="Readiness steps">
+            <button type="button" disabled={currentStep === 0} onClick={() => setStep(Math.max(0, currentStep - 1))}><ChevronLeft size={12} />Previous</button>
+            <span>{snapshot.items.map((item, index) => <button key={item.id} type="button" className={index === currentStep ? "active" : ""} aria-label={`Go to readiness step ${index + 1}`} onClick={() => setStep(index)} />)}</span>
+            <button type="button" disabled={currentStep === snapshot.items.length - 1} onClick={() => setStep(Math.min(snapshot.items.length - 1, currentStep + 1))}>Next<ChevronRight size={12} /></button>
+          </nav>}
         </section>}
         {recommended.length > 0 && <section className="readiness-section recommendations">
           <header><strong>Recommendations</strong><span>rule-based</span></header>
@@ -677,6 +697,7 @@ export function ToolchainPanel({ plan, pixiReady, loading, downloading, onDownlo
       </div>
       {loading && <div className="toolchain-loading"><span className="loader-mark" />Reading operator requirements…</div>}
       {plan && <>
+        <div className={`export-assessment state-${plan.assessment.state}`}>{plan.assessment.required_count > 0 ? <CircleAlert size={14} /> : <CheckCircle2 size={14} />}<span><strong>{plan.assessment.required_count > 0 ? `${plan.assessment.required_count} setup step${plan.assessment.required_count === 1 ? "" : "s"} remain` : "Workflow setup is complete"}</strong><small>{plan.assessment.items[0]?.title ?? "The same assessment has cleared Paper, Readiness, and Export."}</small></span></div>
         <div className="toolchain-summary"><span><strong>{plan.ready_count}</strong>ready</span><span><strong>{plan.installable_count}</strong>managed</span><span className={plan.manual_count ? "attention" : ""}><strong>{plan.manual_count}</strong>manual</span><span className={plan.details_count ? "attention" : ""}><strong>{plan.details_count}</strong>need details</span><span className={plan.legacy_count ? "attention" : ""}><strong>{plan.legacy_count}</strong>legacy</span>{plan.adapter_count > 0 && <span className="attention"><strong>{plan.adapter_count}</strong>need adapters</span>}</div>
         <div className="tool-list">
           {plan.tools.map((tool) => <article key={tool.operator_id} className={`tool-row state-${tool.state}`}><header><span><strong>{tool.title}</strong><code>{tool.operator_id}</code></span><em>{toolStateLabel(tool.state)}</em></header><p>{tool.packages.join(" · ") || tool.binary || tool.detail}</p></article>)}
@@ -684,22 +705,26 @@ export function ToolchainPanel({ plan, pixiReady, loading, downloading, onDownlo
         </div>
         <div className="toolchain-format"><span>Includes</span><code>main.nf</code><code>pixi.lock</code><code>run-closure.json</code><code>operators/</code></div>
       </>}
-      <button type="button" className="export-action" disabled={!plan || loading || downloading} onClick={() => void onDownload()}>{downloading ? <><span className="loader-mark" />Building bundle…</> : <><Download size={15} aria-hidden="true" />Download {plan?.filename ?? "run bundle"}</>}</button>
+      <button type="button" className="export-action" disabled={!plan || loading || downloading || plan.assessment.required_count > 0} onClick={() => void onDownload()}>{downloading ? <><span className="loader-mark" />Building bundle…</> : plan && plan.assessment.required_count > 0 ? <><CircleAlert size={15} aria-hidden="true" />Resolve setup before export</> : <><Download size={15} aria-hidden="true" />Download {plan?.filename ?? "run bundle"}</>}</button>
       <p className="export-honesty">Somite separates managed tools, manual checkpoints, legacy environments, and missing method details. It will not turn one category into another just because a similarly named package exists.</p>
     </section>
   );
 }
 
-export function PaperPanel({ review, active, applied, loading, onFile, onExample, onReconstruct, onSelect, onApply, onEvidence, onClose }: {
+export function PaperPanel({ review, active, applied, loading, preparingField, onFile, onExample, onReconstruct, onSelect, onApply, onAttachInput, onSetInput, onEscalate, onEvidence, onClose }: {
   review: PaperReview | null;
   active: number;
   applied: number | null;
   loading: boolean;
+  preparingField: string | null;
   onFile: (file: File) => Promise<void>;
   onExample: () => Promise<void>;
   onReconstruct: (paper: PaperSearchResult) => Promise<void>;
   onSelect: (index: number) => void;
   onApply: (index: number) => void;
+  onAttachInput: (index: number, item: ReadinessItem, field: string, file: File) => Promise<void>;
+  onSetInput: (index: number, item: ReadinessItem, field: string, value: string) => Promise<void>;
+  onEscalate: (candidate: PaperReview["candidates"][number], item: ReadinessItem) => void;
   onEvidence: (evidence: PaperReview["candidates"][number]["evidence"][number]) => void;
   onClose: () => void;
 }) {
@@ -711,12 +736,16 @@ export function PaperPanel({ review, active, applied, loading, onFile, onExample
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [dropActive, setDropActive] = useState(false);
   const [dropError, setDropError] = useState("");
+  const [attentionStep, setAttentionStep] = useState(0);
   const dragDepth = useRef(0);
   const selectedPaper = results.find((paper) => paper.id === selectedId) ?? null;
   const candidate = review?.candidates[active];
   const evidenceCounts = candidate?.evidence.reduce<Record<string, number>>((counts, evidence) => ({ ...counts, [evidence.status]: (counts[evidence.status] ?? 0) + 1 }), {}) ?? {};
-  const resolutionCounts = candidate?.evidence.reduce<Record<string, number>>((counts, evidence) => evidence.resolution_kind ? ({ ...counts, [evidence.resolution_kind]: (counts[evidence.resolution_kind] ?? 0) + 1 }) : counts, {}) ?? {};
-  const supportedCount = (resolutionCounts.managed_tool ?? 0) + (resolutionCounts.built_in ?? 0);
+  const attentionItems = paperAttentionItems(candidate);
+  const currentAttentionStep = Math.min(attentionStep, Math.max(0, attentionItems.length - 1));
+  const currentAttention = attentionItems[currentAttentionStep] ?? null;
+  const supportedCount = paperSupportedCount(candidate);
+  const resolutionCounts = candidate?.assessment.nodes.reduce<Record<string, number>>((counts, node) => node.requires_action ? ({ ...counts, [node.kind]: (counts[node.kind] ?? 0) + 1 }) : counts, {}) ?? {};
 
   useEffect(() => {
     const query = paperQuery.trim();
@@ -844,25 +873,54 @@ export function PaperPanel({ review, active, applied, loading, onFile, onExample
       {review && <>
         <div className="paper-meta"><span>Extracted via <strong>{review.extracted_via}</strong></span><span>{candidate?.assay}</span></div>
         <nav className="paper-candidates" aria-label="Reconstructed Workflows">
-          {review.candidates.map((item, index) => <button key={`${item.name}-${index}`} type="button" className={active === index ? "active" : ""} onClick={() => onSelect(index)}><strong>{item.name}</strong><span>{item.role} · {item.graph.nodes.length} nodes{applied === index ? " · on canvas" : ""}</span></button>)}
+          {review.candidates.map((item, index) => <button key={`${item.name}-${index}`} type="button" className={active === index ? "active" : ""} onClick={() => { setAttentionStep(0); onSelect(index); }}><strong>{item.name}</strong><span>{item.role} · {item.graph.nodes.length} nodes{applied === index ? " · on canvas" : ""}</span></button>)}
         </nav>
         {candidate && <div className="paper-review">
-          <button type="button" className="paper-apply" disabled={applied === active} onClick={() => onApply(active)}>{applied === active ? "Workflow is on the canvas" : "Use this workflow on the canvas"}</button>
-          {applied !== active && <p className="paper-draft-note">Review this draft first. The canvas will not change until you use it.</p>}
-          <div className="evidence-summary"><span className="explicit"><i />{evidenceCounts.explicit ?? 0} explicit</span><span className="inferred"><i />{evidenceCounts.inferred ?? 0} inferred</span></div>
-          <div className="paper-resolution-summary">
-            {supportedCount > 0 && <span className="supported">{supportedCount} supported</span>}
-            {(resolutionCounts.input_required ?? 0) > 0 && <span>{resolutionCounts.input_required} inputs</span>}
-            {(resolutionCounts.manual_checkpoint ?? 0) > 0 && <span className="attention">{resolutionCounts.manual_checkpoint} manual</span>}
-            {(resolutionCounts.method_details ?? 0) > 0 && <span className="attention">{resolutionCounts.method_details} need details</span>}
-            {(resolutionCounts.legacy_source ?? 0) > 0 && <span className="attention">{resolutionCounts.legacy_source} legacy</span>}
-            {(resolutionCounts.adapter ?? 0) > 0 && <span className="attention">{resolutionCounts.adapter} adapters</span>}
-          </div>
-          {candidate.warnings.map((warning) => <p className="paper-warning" key={warning}>{warning}</p>)}
-          <div className="evidence-list">
-            {candidate.evidence.map((evidence, index) => <button type="button" disabled={applied !== active} key={`${evidence.target_kind}-${evidence.target_id}-${index}`} className={`evidence-item ${evidence.status}`} onClick={() => onEvidence(evidence)} aria-label={applied === active ? `Show ${evidence.target_kind} ${evidence.target_id} on canvas` : `${evidence.target_kind} ${evidence.target_id} evidence`}><header><i /><strong>{evidence.target_id}</strong><span>{evidence.status}</span></header><p>{evidence.detail}</p>{evidence.resolution_label && <small className={`paper-resolution kind-${evidence.resolution_kind}`} title={evidence.resolution_detail}>{evidence.resolution_label}</small>}</button>)}
-            {!candidate.evidence.length && <p className="panel-empty">No method evidence was strong enough to place a tool.</p>}
-          </div>
+          <button type="button" className="paper-apply" disabled={applied === active} onClick={() => onApply(active)}>{applied === active ? "Workflow is on the canvas" : attentionItems.length ? "Add draft to canvas" : "Use ready workflow on the canvas"}</button>
+          {applied !== active && <p className="paper-draft-note">Prepare the known inputs here, then add the reviewed draft when you are ready.</p>}
+
+          <section className={`paper-guided-setup ${attentionItems.length ? "needs-attention" : "ready"}`}>
+            {!currentAttention ? <div className="paper-guided-ready"><CheckCircle2 size={18} /><span><strong>Setup complete</strong><small>Every deterministic requirement is satisfied. Preparation can begin after you add the workflow.</small></span></div> : <>
+              <header><span><strong>Resolve next</strong><small>Step {currentAttentionStep + 1} of {attentionItems.length}</small></span><em>{currentAttention.kind.replaceAll("_", " ")}</em></header>
+              <div className="paper-attention-copy"><strong>{currentAttention.title}</strong><code>{currentAttention.node_id}.{currentAttention.field}</code><p>{currentAttention.detail}</p></div>
+              {currentAttention.fields.map((field) => {
+                const value = paperParameterValue(candidate, currentAttention.node_id, field.name);
+                const key = `${currentAttention.id}:${field.name}`;
+                if (field.input_mode === "file") return <label className={`paper-intake-field ${preparingField === key ? "busy" : ""}`} key={field.name}>
+                  <FileInput size={13} /><span><strong>{field.label}</strong><small>{value ? value.split("/").at(-1) : "Choose from this computer"}</small></span><em>{preparingField === key ? "Importing…" : value ? "Replace" : "Choose"}</em>
+                  <input type="file" disabled={preparingField !== null} aria-label={`Choose ${field.label}`} onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; if (file) void onAttachInput(active, currentAttention, field.name, file); }} />
+                </label>;
+                if (field.input_mode === "text") return <label className="paper-intake-text" key={field.name}><span>{field.label}</span><input defaultValue={value} onBlur={(event) => void onSetInput(active, currentAttention, field.name, event.currentTarget.value)} /></label>;
+                return null;
+              })}
+              {currentAttention.fields.some((field) => field.input_mode === "connection" || field.input_mode === "choice") && <button type="button" className="paper-canvas-resolution" onClick={() => onApply(active)}>{applied === active ? "Reconnect this input on the canvas" : "Add draft to connect this input"}</button>}
+              {currentAttention.resolutions.some((resolution) => resolution.source_url) && <div className="paper-resolution-links">{currentAttention.resolutions.filter((resolution) => resolution.source_url).map((resolution) => <a key={resolution.id} href={resolution.source_url} target="_blank" rel="noreferrer"><ExternalLink size={11} />Official guide</a>)}</div>}
+              {currentAttention.recipes.map((recipe) => <details className="paper-recipe" key={recipe.id}>
+                <summary><span><strong>{recipe.title}</strong><small>Reusable recipe · v{recipe.version}</small></span><ChevronDown size={12} /></summary>
+                <p>{recipe.summary}</p><ol>{recipe.steps.map((step) => <li key={step}>{step}</li>)}</ol>
+                {recipe.source_url && <a href={recipe.source_url} target="_blank" rel="noreferrer"><ExternalLink size={11} />Open recipe source</a>}
+              </details>)}
+              {currentAttention.escalatable && <button type="button" className="paper-agent-escalation" onClick={() => onEscalate(candidate, currentAttention)}><MessageSquare size={12} />Ask Agent with this evidence</button>}
+              {attentionItems.length > 1 && <nav className="paper-attention-nav" aria-label="Paper setup steps"><button type="button" disabled={currentAttentionStep === 0} onClick={() => setAttentionStep(Math.max(0, currentAttentionStep - 1))}><ChevronLeft size={12} />Back</button><span>{attentionItems.map((item, index) => <button key={item.id} type="button" className={index === currentAttentionStep ? "active" : ""} aria-label={`Go to paper setup step ${index + 1}`} onClick={() => setAttentionStep(index)} />)}</span><button type="button" disabled={currentAttentionStep === attentionItems.length - 1} onClick={() => setAttentionStep(Math.min(attentionItems.length - 1, currentAttentionStep + 1))}>Next<ChevronRight size={12} /></button></nav>}
+            </>}
+          </section>
+
+          <details className="paper-provenance">
+            <summary><span><strong>Evidence & provenance</strong><small>{evidenceCounts.explicit ?? 0} explicit · {evidenceCounts.inferred ?? 0} inferred · {supportedCount} supported</small></span><ChevronDown size={13} /></summary>
+            <div className="paper-resolution-summary">
+              {supportedCount > 0 && <span className="supported">{supportedCount} supported</span>}
+              {(resolutionCounts.input_required ?? 0) > 0 && <span>{resolutionCounts.input_required} inputs</span>}
+              {(resolutionCounts.manual_checkpoint ?? 0) > 0 && <span className="attention">{resolutionCounts.manual_checkpoint} manual</span>}
+              {(resolutionCounts.method_details ?? 0) > 0 && <span className="attention">{resolutionCounts.method_details} need details</span>}
+              {(resolutionCounts.legacy_source ?? 0) > 0 && <span className="attention">{resolutionCounts.legacy_source} legacy</span>}
+              {(resolutionCounts.adapter ?? 0) > 0 && <span className="attention">{resolutionCounts.adapter} adapters</span>}
+            </div>
+            {candidate.warnings.length > 0 && <details className="paper-study-notes"><summary>{candidate.warnings.length} study note{candidate.warnings.length === 1 ? "" : "s"}</summary>{candidate.warnings.map((warning) => <p className="paper-warning" key={warning}>{warning}</p>)}</details>}
+            <div className="evidence-list">
+              {candidate.evidence.map((evidence, index) => <details key={`${evidence.target_kind}-${evidence.target_id}-${index}`} className={`evidence-item ${evidence.status}`}><summary><i /><strong>{evidence.target_id}</strong><span>{evidence.source_location ?? evidence.status}</span></summary><p>{evidence.detail}</p>{evidence.resolution_label && <small className={`paper-resolution kind-${evidence.resolution_kind}`} title={evidence.resolution_detail}>{evidence.resolution_label}</small>}{applied === active && <button type="button" onClick={() => onEvidence(evidence)}>Show on canvas</button>}</details>)}
+              {!candidate.evidence.length && <p className="panel-empty">No method evidence was strong enough to place a tool.</p>}
+            </div>
+          </details>
         </div>}
       </>}
     </section>

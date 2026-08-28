@@ -1,0 +1,17 @@
+[package]
+name = "somite-assessment"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "One deterministic workflow assessment shared by Somite surfaces"
+
+[dependencies]
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+somite-ir = { path = "../somite-ir" }
+somite-linker = { path = "../somite-linker" }
+somite-ops = { path = "../somite-ops" }
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"

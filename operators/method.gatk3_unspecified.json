@@ -21,6 +21,19 @@
     "title": "Choose the GATK 3.5 calling method",
     "detail": "The paper names GATK 3.5 but does not identify the caller or command. Somite will not substitute a modern HaplotypeCaller workflow because that can change the scientific method.",
     "action_label": "Review method details",
-    "source_url": "https://gatk.broadinstitute.org/hc/en-us/articles/360035890811"
+    "source_url": "https://gatk.broadinstitute.org/hc/en-us/articles/360035890811",
+    "recipes": [{
+      "id": "gatk3-method-selection-v1",
+      "title": "Recover the reported GATK 3.5 method",
+      "summary": "Identify the exact caller and arguments before selecting an executable replacement.",
+      "version": "1",
+      "kind": "method_selection",
+      "steps": [
+        "Search the methods, supplements, repository, and cited protocol for the caller name.",
+        "Record the GATK version, caller, arguments, filters, and reference preparation.",
+        "Choose or add a reviewed operator only when those details are supported."
+      ],
+      "source_url": "https://gatk.broadinstitute.org/hc/en-us/articles/360035890811"
+    }]
   }
 }

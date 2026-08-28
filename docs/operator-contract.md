@@ -145,6 +145,13 @@ cannot clear one of these states. Manual checkpoints can become ready when the
 declared artifacts are attached; method ambiguity and legacy-source nodes stay
 blocked until the graph is replaced with a reviewed executable contract.
 
+A profile may publish `recipes`. Each recipe has a stable id, version, kind,
+summary, ordered steps, covered parameters, and optional source URL. Supported
+kinds are `external_checkpoint`, `environment`, `method_selection`,
+`artifact_preparation`, and `adapter_contract`. Recipes are included in the
+Workflow assessment and frozen `assessment.json`; they are not appended to
+`argv`, invoked by the runtime, or allowed to clear a Requirement by themselves.
+
 ## Pixi environment
 
 `pixi` lists the package requirements needed by the tool. Channel-qualified
