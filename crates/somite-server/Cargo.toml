@@ -11,7 +11,7 @@ description = "Local web interface for Somite projects"
 [dependencies]
 anyhow = "1"
 blake3 = "1"
-getrandom = "0.3"
+getrandom = "0.4"
 agent-client-protocol = { git = "https://github.com/agentclientprotocol/rust-sdk.git", rev = "754d5aa1ce2cfa54ba2c2a6d3edc7e7b6bce28eb" }
 somite-assessment = { path = "../somite-assessment" }
 somite-ir = { path = "../somite-ir" }
@@ -26,11 +26,11 @@ rmcp = { version = "3.1.4", features = ["client", "server", "transport-child-pro
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha1 = "0.10"
+sha1 = "0.11"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
-tower-http = { version = "0.6", features = ["cors", "limit", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "limit", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 unicode-casefold = "0.2"
