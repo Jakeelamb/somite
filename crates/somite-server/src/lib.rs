@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
@@ -3346,9 +3347,20 @@ struct PortableSourcePathRegistry {
     // such as `A/file.nf` plus `a/other.nf`, whose distinct directory
     // spellings collapse on a case-insensitive filesystem and make exact
     // manifest enumeration ambiguous.
-    prefixes: BTreeMap<Vec<String>, String>,
-    directories: BTreeMap<Vec<String>, String>,
-    files: BTreeMap<Vec<String>, String>,
+    roots: BTreeMap<String, usize>,
+    nodes: Vec<PortableSourcePathNode>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PortableSourcePathKind {
+    Directory,
+    File,
+}
+
+struct PortableSourcePathNode {
+    source_prefix: String,
+    kind: PortableSourcePathKind,
+    children: BTreeMap<String, usize>,
 }
 
 impl PortableSourcePathRegistry {
@@ -3370,56 +3382,82 @@ impl PortableSourcePathRegistry {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut portable_prefix = Vec::new();
-        let mut source_prefix = Vec::new();
+        let mut source_prefix = String::with_capacity(path.len());
+        let mut parent: Option<usize> = None;
         for (index, &component) in components.iter().enumerate() {
             let portable_component = portable_source_component_key(path, component)?;
-            portable_prefix.push(portable_component);
-            source_prefix.push(component);
-            let source_prefix = source_prefix.join("/");
-            if let Some(first) = self.prefixes.get(&portable_prefix) {
-                if first != &source_prefix {
-                    return Err(PortableSourcePathError::Collision {
-                        first: first.clone(),
-                        second: source_prefix,
-                    });
-                }
-            } else {
-                let _ = self
-                    .prefixes
-                    .insert(portable_prefix.clone(), source_prefix.clone());
+            if !source_prefix.is_empty() {
+                source_prefix.push('/');
             }
-
+            source_prefix.push_str(component);
             let final_component = index + 1 == components.len();
-            if final_component {
-                if let Some(first) = self.directories.get(&portable_prefix) {
-                    return Err(PortableSourcePathError::Collision {
-                        first: first.clone(),
-                        second: source_prefix,
-                    });
-                }
-                let _ = self.files.insert(portable_prefix.clone(), source_prefix);
+            let kind = if final_component {
+                PortableSourcePathKind::File
             } else {
-                if let Some(first) = self.files.get(&portable_prefix) {
-                    return Err(PortableSourcePathError::Collision {
-                        first: first.clone(),
-                        second: source_prefix,
-                    });
+                PortableSourcePathKind::Directory
+            };
+            let existing = match parent {
+                Some(parent) => self.nodes[parent]
+                    .children
+                    .get(portable_component.as_ref())
+                    .copied(),
+                None => self.roots.get(portable_component.as_ref()).copied(),
+            };
+            let node_index = if let Some(existing) = existing {
+                existing
+            } else {
+                let node_index = self.nodes.len();
+                self.nodes.push(PortableSourcePathNode {
+                    source_prefix: source_prefix.clone(),
+                    kind,
+                    children: BTreeMap::new(),
+                });
+                match parent {
+                    Some(parent) => {
+                        let _ = self.nodes[parent]
+                            .children
+                            .insert(portable_component.into_owned(), node_index);
+                    }
+                    None => {
+                        let _ = self
+                            .roots
+                            .insert(portable_component.into_owned(), node_index);
+                    }
                 }
-                let _ = self
-                    .directories
-                    .insert(portable_prefix.clone(), source_prefix);
+                node_index
+            };
+            let node = &self.nodes[node_index];
+            if node.source_prefix.as_str() != source_prefix.as_str() {
+                return Err(PortableSourcePathError::Collision {
+                    first: node.source_prefix.clone(),
+                    second: source_prefix.clone(),
+                });
             }
+            if node.kind != kind {
+                return Err(PortableSourcePathError::Collision {
+                    first: node.source_prefix.clone(),
+                    second: source_prefix.clone(),
+                });
+            }
+            parent = Some(node_index);
         }
         Ok(())
     }
 }
 
-fn portable_source_component_key(
+fn portable_source_component_key<'a>(
     path: &str,
-    component: &str,
-) -> Result<String, PortableSourcePathError> {
-    let portable_component = component.nfkc().case_fold().nfkc().collect::<String>();
+    component: &'a str,
+) -> Result<Cow<'a, str>, PortableSourcePathError> {
+    let portable_component = if component.is_ascii() {
+        if component.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            Cow::Owned(component.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(component)
+        }
+    } else {
+        Cow::Owned(component.nfkc().case_fold().nfkc().collect::<String>())
+    };
     let invalid_character = portable_component.chars().any(|character| {
         character.is_control()
             || matches!(
@@ -9920,6 +9958,25 @@ workflow { DEMO() }
             .expect_err("Windows-invalid source must fail before CAS creation");
         assert!(error.to_string().contains("not portable"), "{error}");
         assert!(!source_workflow_store(target.path()).exists());
+    }
+
+    #[test]
+    fn portable_source_component_keys_borrow_normalized_ascii() {
+        assert!(matches!(
+            portable_source_component_key("modules/main.nf", "main.nf")
+                .expect("portable lowercase ASCII component"),
+            Cow::Borrowed("main.nf")
+        ));
+        assert_eq!(
+            portable_source_component_key("Modules/Main.NF", "Main.NF")
+                .expect("portable mixed-case ASCII component"),
+            "main.nf"
+        );
+        assert_eq!(
+            portable_source_component_key("caf\u{e9}.nf", "caf\u{e9}.nf")
+                .expect("portable Unicode component"),
+            "caf\u{e9}.nf"
+        );
     }
 
     #[test]

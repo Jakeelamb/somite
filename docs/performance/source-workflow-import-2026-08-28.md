@@ -355,6 +355,54 @@ Final server artifacts:
 | `heaptrack-server-final-v6-bounded.txt` | `5df0f083359ff24eac21d081ac5796eede1d9f581f4d19d4690fec7b990525a1` |
 | `heaptrack-server-registry-final-v6-bounded.txt` | `17a02b1c011b0b31b72d18e4f9c8643088b0807f2ff7e5d2823b6aae8a4fd8c5` |
 
+## Portable-path registry follow-up — 2026-08-29
+
+The v6 server trace identified `PortableSourcePathRegistry` as Somite's
+largest owned allocation source. A fresh trace of pushed commit `1c2cdd9`
+reproduced the whole-test baseline before this follow-up. The implementation
+then replaced three flat maps of repeatedly cloned prefix vectors with an
+iterative arena trie. Lowercase ASCII component keys remain borrowed during
+lookup, mixed-case ASCII uses direct ASCII folding, and non-ASCII components
+retain the full NFKC + case-fold + NFKC path. The collision, reserved-device,
+Unicode-alias, file-versus-directory, exact-source, and deep-tree tests all use
+the same production validation path.
+
+The before and after Heaptrack recordings cover the same real test: pinned
+`nf-core/pangenome` 1.1.3 cold import, 100 warm verification/readiness rounds,
+100 alternating set/reset edits, and the test harness.
+
+| Whole-test Heaptrack measure | Pushed v6 baseline | Arena + ASCII path | Change |
+|---|---:|---:|---:|
+| Allocation calls | 4,348,229 | 2,220,040 | -2,128,189 (-48.94%) |
+| Temporary allocations (`heaptrack_print`) | 860,904 | 661,841 | -199,063 (-23.12%) |
+| Registry-attributed allocation calls | 1,179,115 | 166,852 | -1,012,263 (-85.85%) |
+| Peak live heap | 12.70 MB | 12.70 MB | unchanged |
+| Peak RSS including Heaptrack | 27.87 MB | 27.73 MB | -0.14 MB |
+
+Five direct release-binary observations after the change reported warm-100
+times of 104, 107, 108, 115, and 109 ms (median 108 ms), and alternating-100
+times of 148, 162, 136, 145, and 144 ms (median 145 ms). The comparable v6
+medians were 205 and 227 ms, respectively, so the observed medians fell 47.3%
+and 36.1%. Cold import remains excluded from the comparison because external
+Git, network, and cache state dominate it. A concurrent host research workload
+materially disturbed intermediate runs; only the tight final five-run sample
+is reported, and these observations are not an SLA.
+
+The pre-ASCII CPU recording attributed 14.45% self share to character-based
+`String` construction, plus visible Unicode normalization helpers. In the
+final 5,921-sample recording, no Unicode-normalization symbol reached the 0.5%
+reporting threshold. The registry itself was 2.62%; the remaining leading
+named work was optimized BLAKE3 and JSON serialization. There is no remaining
+owned arithmetic kernel that justifies assembly work.
+
+Local ignored artifacts:
+
+| Artifact | SHA-256 |
+|---|---|
+| `heaptrack-server-portable-registry-baseline.zst` | `fdbdd4da6c8616185994cc0d3c7b44e4562a73e595b0277aa641e6533763c5e6` |
+| `heaptrack-server-portable-registry-ascii.zst` | `c78087467a47fe6a75aa7b4186c44bd77345ca522db45164c80b48ec6d89fcc2` |
+| `perf-server-portable-registry-ascii.data` | `672b0a6d0eaecddf7ab68d69b862b92dc0cd03dc573e10b0ddb199b1d13ed4e0` |
+
 ## Stop boundary
 
 The final v6 source-example CPU evidence does not justify another indexer/source
