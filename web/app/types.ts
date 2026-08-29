@@ -390,8 +390,43 @@ export type PaperCandidate = {
   assessment: WorkflowAssessment;
 };
 
+export type PaperResourceCitation = {
+  accession: string;
+  kind: "sra_study" | "sra_sample" | "sra_experiment" | "sra_run" | "bioproject" | "biosample" | "assembly" | "ensembl";
+  role: "reads" | "reference" | "annotation" | "sample_metadata" | "unknown";
+  context: string;
+  source_location?: string;
+};
+
+export type PaperResourceGroup = {
+  citation: PaperResourceCitation;
+  provider: "ncbi" | "ensembl";
+  status: "available" | "unavailable";
+  results: import("./sourceBuilder").SourceSearchResult[];
+};
+
+export type PaperResourceResolution = {
+  groups: PaperResourceGroup[];
+};
+
+export type PaperReconstructionOutcome = "drafts_ready" | "recognized_unsupported" | "no_reconstructable_methods";
+
+export type PaperMethodMention = {
+  display_name: string;
+  normalized_name: string;
+  operation_class?: string;
+  evidence: string;
+  support: "operator" | "unsupported";
+  operator_id?: string;
+  source_location?: string;
+};
+
 export type PaperReview = {
   extracted_via: "text" | "poppler" | "ocr" | "jats";
+  outcome: PaperReconstructionOutcome;
+  warnings: string[];
+  mentions: PaperMethodMention[];
+  resources: PaperResourceCitation[];
   candidates: PaperCandidate[];
 };
 
@@ -416,6 +451,22 @@ export type UploadResult = {
   filename: string;
 };
 
+export type PaperToolSource = "managed_pixi" | "project_pixi" | "system_path";
+
+export type PaperExtractionToolReadiness = {
+  name: string;
+  available: boolean;
+  path?: string;
+  source?: PaperToolSource;
+  detail: string;
+};
+
+export type PaperExtractionPreflight = {
+  native_pdf_text: boolean;
+  scanned_pdf_ocr: boolean;
+  tools: PaperExtractionToolReadiness[];
+};
+
 export type SystemProfile = {
   cpu: string;
   physical_cores: number;
@@ -431,4 +482,5 @@ export type SystemProfile = {
     nextflow: boolean;
     snakemake: boolean;
   };
+  paper_extraction: PaperExtractionPreflight;
 };

@@ -2,6 +2,11 @@
   "id": "diff.deseq2",
   "title": "DESeq2",
   "palette": ["RNA"],
+  "paper": {
+    "aliases": ["DESeq2"],
+    "operation_class": "differential_expression",
+    "assays": ["rna-seq"]
+  },
   "kind": "external",
   "cost": "high",
   "bin": "Rscript",

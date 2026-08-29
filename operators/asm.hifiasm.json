@@ -2,6 +2,11 @@
   "id": "asm.hifiasm",
   "title": "hifiasm",
   "palette": ["Assembly"],
+  "paper": {
+    "aliases": ["hifiasm"],
+    "operation_class": "genome_assembly",
+    "assays": ["assembly"]
+  },
   "kind": "external",
   "cost": "high",
   "bin": "hifiasm",

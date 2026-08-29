@@ -7,6 +7,7 @@ export type SourceRequest = {
   result: string;
   action: string;
   sequenceType?: "genomic" | "cdna" | "protein";
+  sequence_type?: "genomic" | "cdna" | "protein";
 };
 
 export type SourceSearchResult = {

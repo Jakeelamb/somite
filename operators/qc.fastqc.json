@@ -2,6 +2,11 @@
   "id": "qc.fastqc",
   "title": "FastQC",
   "palette": ["QC"],
+  "paper": {
+    "aliases": ["FastQC", "Fast QC"],
+    "operation_class": "quality_control",
+    "assays": ["qc", "rna-seq", "metagenome", "variants"]
+  },
   "kind": "external",
   "cost": "high",
   "bin": "fastqc",

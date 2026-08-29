@@ -2,6 +2,11 @@
   "id": "quant.stringtie",
   "title": "StringTie",
   "palette": ["RNA"],
+  "paper": {
+    "aliases": ["StringTie"],
+    "operation_class": "transcript_assembly",
+    "assays": ["rna-seq"]
+  },
   "kind": "external",
   "cost": "high",
   "bin": "stringtie",

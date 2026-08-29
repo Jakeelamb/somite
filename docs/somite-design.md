@@ -131,12 +131,17 @@ necessarily a validated graph.
 
 ### `somite-paper`
 
-Interface: extract methods text and return candidate graphs with evidence for
-every reconstructed node and inferred edge.
+Interface: `reconstruct(catalog, text) -> Reconstruction`, where the result has
+an explicit outcome, retained method mentions, warnings, and zero or more
+validated non-empty candidate graphs.
 
 The module preserves uncertainty. It distinguishes text-supported tools,
 compatibility inferences, and tools that need adapters. Parallel analyses and
-compared methods remain separate candidate graphs.
+mutually exclusive methods the paper actually ran remain separate candidate
+graphs; comparison-only mentions remain evidence. Reviewed aliases live with
+Operator presentation metadata and do not change execution revisions. A small
+unsupported-method registry can retain identity and evidence, but cannot create
+an executable edge without a reviewed port contract.
 
 ### `somite-bundle`
 
@@ -177,6 +182,23 @@ server filesystem access. `POST /api/runs` creates a background run; status and
 cancellation use the run-scoped endpoints while Nextflow trace data maps back
 to graph node IDs.
 
+Paper intake has its own bounded upload boundary rather than narrowing generic
+scientific-file upload. It streams each accepted PDF/text artifact into an
+immutable BLAKE3-addressed object, deduplicates identical content, and starts an
+observable intake job from that digest. Native text extraction remains the fast
+path. OCR is page-bounded, reports progress, observes cancellation between
+pages and while an extraction child is active, enforces per-command timeouts,
+and cleans temporary raster output. At most two paper jobs execute by default;
+additional retained jobs remain queued rather than spawning unbounded OCR
+children. `SOMITE_PAPER_MAX_ACTIVE_JOBS`, `SOMITE_PAPER_MAX_UPLOAD_BYTES`,
+`SOMITE_PAPER_MAX_TEXT_BYTES`, `SOMITE_PAPER_MAX_OCR_PAGES`, and
+`SOMITE_PAPER_COMMAND_TIMEOUT_SECONDS` provide bounded deployment overrides.
+`/api/system` reports the exact managed-Pixi, project-Pixi, or system binaries
+the extractor will launch and gives package guidance for missing tools.
+Extracted text and deterministic
+reconstruction use separate cache keys, allowing a Catalog change to rerun only
+recognition and assessment.
+
 ## Web interaction contract
 
 - The canvas is the primary surface.
@@ -191,7 +213,19 @@ to graph node IDs.
   which can be chosen or dropped anywhere on the Paper panel. Candidate review
   is attention-first: one intake or decision step is visible at a time, direct
   file attachments immediately refresh the Workflow assessment, and supported
-  steps plus page-located evidence stay collapsed under provenance.
+  steps plus page-located evidence stay collapsed under provenance. Cited SRA,
+  BioProject, BioSample, assembly, and Ensembl accessions retain nearby paper
+  context and page location. One cached batch route resolves them through the
+  existing source adapters while the workflow draft remains immediately usable.
+  Collection citations expose exact runs for explicit selection; choosing a run
+  replaces one unresolved local-read source in the draft and refreshes the same
+  Workflow assessment. If the candidate is already on the canvas, that explicit
+  choice applies only the candidate delta to the canvas immediately; unrelated
+  nodes, edges, annotations, colors, and moved layouts remain intact.
+  Every local-paper attempt has an in-panel activity record with honest upload
+  and reconstruction stages. Its success, no-recognized-workflow result, or
+  exact failure remains visible. Retry is offered only for retryable failures;
+  a failed replacement never hides or mutates the prior draft or canvas.
 - A centered canvas toolbar keeps add, file import, fit, and viewer controls
   within pointer reach.
 - The bottom status bar always reports deterministic readiness. Clicking it
@@ -213,7 +247,8 @@ to graph node IDs.
 - Connections are typed; incompatible ports never connect.
 - Paired reads have separate R1 and R2 ports and snap together when possible.
 - The source launcher resolves exact accessions locally and searches NCBI and
-  Ensembl into provider- and artifact-tagged suggestions.
+  Ensembl into provider- and artifact-tagged suggestions. Paper-resource intake
+  reuses this boundary rather than introducing a paper-specific downloader.
 - Node dragging uses a magnetic grid and neighbor alignment.
 - Pan and zoom work with mouse, trackpad, keyboard, and canvas controls; the
   overview range reaches 2% for very large imported workflows. Pinch gestures
@@ -239,7 +274,12 @@ to graph node IDs.
   web.somite.json       editable working graph
   autosave.somite.json  validated recovery graph
   catalog/              cached external catalog data
-  papers/               provenance-checked bioRxiv JATS source cache
+  papers/
+    objects/<digest>/   verified content-addressed local paper artifacts
+    display-names/      original filenames as presentation metadata
+    cache/extracted/    extractor-versioned normalized text cache
+    cache/reconstructed/ text-and-Catalog-versioned reconstruction cache
+    <bioRxiv-id>/        provenance-checked bioRxiv JATS source cache
   uploads/              browser-imported files
   fixtures/objects/     content-addressed representative data
   evidence/             append-only receipts and index

@@ -28,7 +28,8 @@ import {
   Star,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
+import { clampAgentFrame, type AgentFrame } from "./agentFrame";
 import { classifySource, type SourceRequest, type SourceSearchResponse, type SourceSearchResult } from "./sourceBuilder";
 import { operatorContinues, type PendingConnection } from "./graphInteractions";
 import type {
@@ -44,6 +45,7 @@ import type {
   ParamSpec,
   ParamValue,
   PaperReview,
+  PaperResourceResolution,
   PaperSearchResponse,
   PaperSearchResult,
   ExportPlan,
@@ -53,7 +55,10 @@ import type {
 import { OperatorGlyph, portColor } from "./visual";
 import { jsonRequest } from "./api";
 import { formatResourceBytes } from "./readinessState";
-import { paperAttentionItems, paperParameterValue, paperSupportedCount } from "./paperResolution";
+import { nextPaperReadSlot, paperAttentionItems, paperParameterValue, paperResourceApplied, paperSupportedCount } from "./paperResolution";
+import { formatPaperElapsed, paperCandidateCanApply, paperIntakeIsBusy, paperIntakePresentation, paperUnsupportedMentions, type PaperIntakeState } from "./paperIntake";
+import { paperReadingPresentation } from "./paperReading";
+import { catalogExpansionPresentation, type CatalogExpansionActivity } from "./catalogExpansion";
 
 function groupedAgentEvents(events: AgentEvent[]) {
   return events.reduce<AgentEvent[]>((grouped, event) => {
@@ -73,8 +78,6 @@ function configChoices(option: AgentConfigOption): AgentConfigSelectChoice[] {
   if (option.type !== "select") return [];
   return option.options.flatMap((entry) => "options" in entry ? entry.options : [entry]);
 }
-
-type AgentFrame = { left: number | null; top: number; width: number; height: number };
 
 function storedAgentFrame(): AgentFrame & { collapsed: boolean } {
   const fallback = { left: null, top: 16, width: 360, height: 500, collapsed: false };
@@ -132,6 +135,30 @@ export function AgentPanel({ snapshot, discovery, discoveryLoading, draft, onRef
     window.localStorage.setItem("somite.agent.frame.v1", JSON.stringify({ ...frame, collapsed }));
   }, [collapsed, frame]);
 
+  useLayoutEffect(() => {
+    const panel = panelRef.current;
+    const parent = panel?.parentElement;
+    if (!panel || !parent) return;
+    const clampToParent = () => {
+      const bounds = parent.getBoundingClientRect();
+      setFrame((current) => {
+        const next = clampAgentFrame(current, { width: bounds.width, height: bounds.height }, collapsed);
+        return current.left === next.left && current.top === next.top && current.width === next.width && current.height === next.height
+          ? current
+          : next;
+      });
+    };
+
+    clampToParent();
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(clampToParent);
+    observer?.observe(parent);
+    window.addEventListener("resize", clampToParent);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener("resize", clampToParent);
+    };
+  }, [collapsed]);
+
   useEffect(() => {
     const panel = panelRef.current;
     if (!panel || collapsed || typeof ResizeObserver === "undefined") return;
@@ -140,7 +167,16 @@ export function AgentPanel({ snapshot, discovery, discoveryLoading, draft, onRef
       const bounds = panel.getBoundingClientRect();
       const width = Math.round(bounds.width);
       const height = Math.round(bounds.height);
-      setFrame((current) => current.width === width && current.height === height ? current : { ...current, width, height });
+      const parentBounds = panel.parentElement?.getBoundingClientRect();
+      setFrame((current) => {
+        const measured = { ...current, width, height };
+        const next = parentBounds
+          ? clampAgentFrame(measured, { width: parentBounds.width, height: parentBounds.height }, false)
+          : measured;
+        return current.left === next.left && current.top === next.top && current.width === next.width && current.height === next.height
+          ? current
+          : next;
+      });
     });
     observer.observe(panel);
     return () => observer.disconnect();
@@ -420,6 +456,7 @@ export function LibraryPanel({
   categoryOpen,
   searchInputRef,
   continuation,
+  catalogExpansion,
   onQuery,
   onClose,
   onAddOperator,
@@ -427,6 +464,7 @@ export function LibraryPanel({
   onImportFiles,
   onToggleFavorite,
   onToggleCategory,
+  onDismissCatalogExpansion,
 }: {
   operators: Operator[];
   query: string;
@@ -436,6 +474,7 @@ export function LibraryPanel({
   categoryOpen: Record<string, boolean>;
   searchInputRef: RefObject<HTMLInputElement | null>;
   continuation?: PendingConnection | null;
+  catalogExpansion: CatalogExpansionActivity | null;
   onQuery: (query: string) => void;
   onClose: () => void;
   onAddOperator: (operator: Operator) => void;
@@ -443,6 +482,7 @@ export function LibraryPanel({
   onImportFiles: (files: File[]) => Promise<void>;
   onToggleFavorite: (id: string) => void;
   onToggleCategory: (title: string, open: boolean) => void;
+  onDismissCatalogExpansion: () => void;
 }) {
   const request = classifySource(query);
   const nextflowCount = operators.filter((operator) => operator.id.startsWith("nf.")).length;
@@ -592,20 +632,30 @@ export function LibraryPanel({
                 <span>{section.title}</span><small>{section.operators.length}</small>
               </button>
               {open && <div className="studio-operator-list">
-                {section.operators.map((operator) => (
-                  <div className="studio-operator-row" key={operator.id} draggable onDragStart={(event) => {
-                    event.dataTransfer.setData("application/somite-operator", operator.id);
-                    event.dataTransfer.effectAllowed = "copy";
-                  }}>
-                    <button type="button" className="operator-add" onClick={() => onAddOperator(operator)}>
-                      <span className="operator-icon"><OperatorGlyph operator={operator.id} /></span>
-                      <span><strong>{operator.title}</strong><small>{operator.description || operator.id}</small></span>
-                    </button>
-                    <button type="button" className={`favorite-button ${favorites.has(operator.id) ? "active" : ""}`} aria-label={`${favorites.has(operator.id) ? "Remove" : "Add"} ${operator.title} ${favorites.has(operator.id) ? "from" : "to"} Favorites`} onClick={() => onToggleFavorite(operator.id)}>
-                      <Star size={13} fill={favorites.has(operator.id) ? "currentColor" : "none"} aria-hidden="true" />
-                    </button>
-                  </div>
-                ))}
+                {section.operators.map((operator) => {
+                  const activity = catalogExpansion?.operatorId === operator.id ? catalogExpansion : null;
+                  const presentation = activity ? catalogExpansionPresentation(activity) : null;
+                  return (
+                    <div className={`studio-operator-row ${activity ? `catalog-${activity.phase}` : ""}`} key={operator.id} draggable={!activity} onDragStart={(event) => {
+                      event.dataTransfer.setData("application/somite-operator", operator.id);
+                      event.dataTransfer.effectAllowed = "copy";
+                    }}>
+                      <button type="button" className="operator-add" aria-busy={activity?.phase === "resolving"} disabled={activity?.phase === "resolving"} onClick={() => onAddOperator(operator)}>
+                        <span className="operator-icon">{activity?.phase === "resolving" ? <LoaderCircle className="spin" size={14} aria-hidden="true" /> : <OperatorGlyph operator={operator.id} />}</span>
+                        <span><strong>{operator.title}</strong><small>{operator.description || operator.id}</small></span>
+                      </button>
+                      <button type="button" className={`favorite-button ${favorites.has(operator.id) ? "active" : ""}`} aria-label={`${favorites.has(operator.id) ? "Remove" : "Add"} ${operator.title} ${favorites.has(operator.id) ? "from" : "to"} Favorites`} onClick={() => onToggleFavorite(operator.id)}>
+                        <Star size={13} fill={favorites.has(operator.id) ? "currentColor" : "none"} aria-hidden="true" />
+                      </button>
+                      {activity && presentation && <div className={`catalog-expansion-feedback ${presentation.tone}`} role={activity.phase === "failed" ? "alert" : "status"} aria-live={activity.phase === "failed" ? "assertive" : "polite"}>
+                        {activity.phase === "resolving" ? <LoaderCircle className="spin" size={15} aria-hidden="true" /> : <CircleAlert size={15} aria-hidden="true" />}
+                        <span><strong>{presentation.headline}</strong><small>{presentation.summary}</small></span>
+                        {presentation.detail && <details><summary>Technical details</summary><code>{presentation.detail}</code></details>}
+                        {activity.phase === "failed" && <div className="catalog-expansion-actions"><button type="button" onClick={() => onAddOperator(operator)}>Try again</button><button type="button" onClick={onDismissCatalogExpansion}>Dismiss</button></div>}
+                      </div>}
+                    </div>
+                  );
+                })}
               </div>}
             </section>
           );
@@ -653,6 +703,7 @@ export function ProjectPanel({ projectName, graphPath, onImportProject, onClose 
 
 export function MachinePanel({ profile, onClose }: { profile: SystemProfile | null; onClose: () => void }) {
   const memory = profile ? `${(profile.memory_bytes / 1024 ** 3).toFixed(1)} GiB` : "Detecting…";
+  const paperReading = profile ? paperReadingPresentation(profile.paper_extraction) : null;
   return (
     <section className="floating-panel machine-window" aria-label="This Machine">
       <header className="floating-panel-head"><div><strong>This Machine</strong><span>Detected locally</span></div><button type="button" aria-label="Close Machine Profile" onClick={onClose}><X size={15} /></button></header>
@@ -663,6 +714,34 @@ export function MachinePanel({ profile, onClose }: { profile: SystemProfile | nu
         <div><dt>Memory</dt><dd>{memory}</dd></div>
         <div><dt>GPU</dt><dd>{profile?.gpus.join(", ") || "None detected"}</dd></div>
       </dl>
+      <section className="paper-reading" aria-label="Paper reading readiness">
+        <header className="paper-reading-head">
+          <span><strong>Paper reading</strong><small>Checked locally · no agent required</small></span>
+          {paperReading && <em>{paperReading.readyToolCount}/{paperReading.tools.length} tools</em>}
+        </header>
+        <div className="paper-reading-capabilities">
+          {(paperReading?.capabilities ?? [
+            { key: "native_pdf_text", label: "Native PDF text", ready: false, status: "Checking…" },
+            { key: "scanned_pdf_ocr", label: "Scanned PDF OCR", ready: false, status: "Checking…" },
+          ]).map((capability) => (
+            <div key={capability.key} className={paperReading ? capability.ready ? "ready" : "missing" : "checking"}>
+              <span>{capability.label}</span>
+              <strong>{paperReading && (capability.ready ? <CheckCircle2 size={12} aria-hidden="true" /> : <CircleAlert size={12} aria-hidden="true" />)}{capability.status}</strong>
+            </div>
+          ))}
+        </div>
+        {paperReading?.guidance && <p className="paper-reading-guidance"><CircleAlert size={14} aria-hidden="true" /><span>{paperReading.guidance}</span></p>}
+        {paperReading && <details className="paper-reading-tools">
+          <summary><span>Tool details</span><small>{paperReading.missingToolNames.length ? `${paperReading.missingToolNames.length} missing` : "All available"}</small><ChevronDown size={13} aria-hidden="true" /></summary>
+          <div>
+            {paperReading.tools.map((tool) => <article key={tool.name} className={tool.available ? "ready" : "missing"}>
+              <header><code>{tool.name}</code><span>{tool.status} · {tool.source}</span></header>
+              <p>{tool.detail}</p>
+              {tool.path && <small title={tool.path}>{tool.path}</small>}
+            </article>)}
+          </div>
+        </details>}
+      </section>
     </section>
   );
 }
@@ -711,17 +790,31 @@ export function ToolchainPanel({ plan, pixiReady, loading, downloading, onDownlo
   );
 }
 
-export function PaperPanel({ review, active, applied, loading, preparingField, onFile, onExample, onReconstruct, onSelect, onApply, onAttachInput, onSetInput, onEscalate, onEvidence, onClose }: {
-  review: PaperReview | null;
+function PaperElapsed({ startedAtMs }: { startedAtMs: number }) {
+  const [nowMs, setNowMs] = useState(startedAtMs);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [startedAtMs]);
+
+  if (nowMs - startedAtMs < 1_000) return null;
+  return <small className="paper-job-elapsed">Elapsed {formatPaperElapsed(startedAtMs, nowMs)}</small>;
+}
+
+export function PaperPanel({ intake, active, applied, preparingField, onFile, onRetry, onCancel, onExample, onReconstruct, onSelect, onApply, onUseResource, onAttachInput, onSetInput, onEscalate, onEvidence, onClose }: {
+  intake: PaperIntakeState;
   active: number;
   applied: number | null;
-  loading: boolean;
   preparingField: string | null;
   onFile: (file: File) => Promise<void>;
+  onRetry: () => Promise<void>;
+  onCancel: () => void;
   onExample: () => Promise<void>;
   onReconstruct: (paper: PaperSearchResult) => Promise<void>;
   onSelect: (index: number) => void;
   onApply: (index: number) => void;
+  onUseResource: (index: number, result: SourceSearchResult) => Promise<void>;
   onAttachInput: (index: number, item: ReadinessItem, field: string, file: File) => Promise<void>;
   onSetInput: (index: number, item: ReadinessItem, field: string, value: string) => Promise<void>;
   onEscalate: (candidate: PaperReview["candidates"][number], item: ReadinessItem) => void;
@@ -736,16 +829,59 @@ export function PaperPanel({ review, active, applied, loading, preparingField, o
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [dropActive, setDropActive] = useState(false);
   const [dropError, setDropError] = useState("");
+  const [sourceChooserRequest, setSourceChooserRequest] = useState<number | null>(null);
   const [attentionStep, setAttentionStep] = useState(0);
+  const [resourceLookup, setResourceLookup] = useState<{ key: string; resolution: PaperResourceResolution | null; error: string }>({ key: "", resolution: null, error: "" });
+  const [addingResource, setAddingResource] = useState<string | null>(null);
   const dragDepth = useRef(0);
+  const review = intake.current?.review ?? null;
+  const runningActivity = intake.activity.status === "running" ? intake.activity : null;
+  const running = Boolean(runningActivity);
+  const intakeBusy = paperIntakeIsBusy(intake.activity);
+  const presentation = paperIntakePresentation(intake);
+  const activitySource = intake.activity.status === "idle" ? null : intake.activity.source;
   const selectedPaper = results.find((paper) => paper.id === selectedId) ?? null;
   const candidate = review?.candidates[active];
+  const paperResultLabel = review?.outcome === "drafts_ready"
+    ? candidate?.assay
+    : review?.outcome === "recognized_unsupported"
+      ? "Methods retained"
+      : review ? "No workflow identified" : "";
+  const resourceKey = (review?.resources ?? []).map((resource) => `${resource.accession}:${resource.role}`).join("|");
+  const resourceResolution = resourceLookup.key === resourceKey ? resourceLookup.resolution : null;
+  const resourceError = resourceLookup.key === resourceKey ? resourceLookup.error : "";
+  const resourcesLoading = Boolean(resourceKey) && resourceLookup.key !== resourceKey;
   const evidenceCounts = candidate?.evidence.reduce<Record<string, number>>((counts, evidence) => ({ ...counts, [evidence.status]: (counts[evidence.status] ?? 0) + 1 }), {}) ?? {};
   const attentionItems = paperAttentionItems(candidate);
   const currentAttentionStep = Math.min(attentionStep, Math.max(0, attentionItems.length - 1));
   const currentAttention = attentionItems[currentAttentionStep] ?? null;
   const supportedCount = paperSupportedCount(candidate);
+  const unsupportedMentions = paperUnsupportedMentions(review);
+  const canApplyCandidate = paperCandidateCanApply(review, candidate, intakeBusy);
   const resolutionCounts = candidate?.assessment.nodes.reduce<Record<string, number>>((counts, node) => node.requires_action ? ({ ...counts, [node.kind]: (counts[node.kind] ?? 0) + 1 }) : counts, {}) ?? {};
+  const activityRequestId = intake.activity.status === "idle" ? 0 : intake.activity.requestId;
+  const choosingSource = intake.activity.status === "idle" || sourceChooserRequest === activityRequestId;
+  const activityArtifact = intake.activity.status === "idle" ? undefined : intake.activity.artifact;
+  const currentReceipt = intake.current?.requestId === activityRequestId ? intake.current : null;
+
+  useEffect(() => {
+    const resources = review?.resources ?? [];
+    const controller = new AbortController();
+    if (!resources.length) {
+      return () => controller.abort();
+    }
+    jsonRequest<PaperResourceResolution>("/api/paper/resources/resolve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ resources }),
+      signal: controller.signal,
+    }).then((response) => {
+      if (!controller.signal.aborted) setResourceLookup({ key: resourceKey, resolution: response, error: "" });
+    }).catch((error: unknown) => {
+      if (!controller.signal.aborted) setResourceLookup({ key: resourceKey, resolution: null, error: error instanceof Error ? error.message : "Could not check cited data" });
+    });
+    return () => controller.abort();
+  }, [resourceKey, review?.resources]);
 
   useEffect(() => {
     const query = paperQuery.trim();
@@ -830,54 +966,117 @@ export function PaperPanel({ review, active, applied, loading, preparingField, o
       setDropError("Drop one PDF or text file.");
       return;
     }
-    if (loading) {
-      setDropError("Wait for the current paper to finish, then drop this one again.");
-      return;
-    }
     setDropError("");
+    setSourceChooserRequest(null);
     void onFile(files[0]);
   };
 
   return (
     <section className={`floating-panel paper-window ${dropActive ? "drop-ready" : ""}`} aria-label="Paper Reconstruction" onDragEnter={handlePaperDragEnter} onDragOver={handlePaperDragOver} onDragLeave={handlePaperDragLeave} onDrop={handlePaperDrop}>
       {dropActive && <div className="paper-drop-overlay" aria-live="polite"><FileInput size={24} aria-hidden="true" /><strong>Drop to rebuild this paper</strong><span>PDF, text, or Markdown</span></div>}
-      <header className="floating-panel-head"><div><strong>Rebuild from a Paper</strong><span>{review ? `${review.candidates.length} workflow draft${review.candidates.length === 1 ? "" : "s"}` : "methods → graph"}</span></div><button type="button" aria-label="Close Paper Reconstruction" onClick={onClose}><X size={15} /></button></header>
-      <div className="paper-intro"><FileSearch size={20} aria-hidden="true" /><span><strong>Rebuild the methods</strong><small>Somite separates paper evidence, inferred wiring, managed tools, and exact steps needing your attention.</small></span></div>
-      <div className="paper-discovery">
-        <label className="paper-search"><Search size={14} aria-hidden="true" /><input aria-label="Search bioRxiv" autoComplete="off" spellCheck={false} placeholder="Search bioRxiv by topic, title, author, or DOI…" value={paperQuery} onChange={(event) => updatePaperQuery(event.target.value)} />{searching && <LoaderCircle className="spin" size={13} aria-label="Searching bioRxiv" />}{paperQuery && !searching && <button type="button" aria-label="Clear bioRxiv search" onClick={() => updatePaperQuery("")}><X size={12} /></button>}</label>
-        {results.length > 0 && <div className="paper-search-results" role="listbox" aria-label="bioRxiv papers">
-          {results.map((paper) => <button key={paper.id} type="button" role="option" aria-selected={selectedId === paper.id} className={selectedId === paper.id ? "active" : ""} onClick={() => setSelectedId(paper.id)}>
-            <strong>{paper.title}</strong><span>{paper.authors || "Authors not listed"}</span><small>{paper.date || "Date not listed"} · {paper.doi}</small><em className={paper.full_text_available ? "ready" : "upload"}>{paper.full_text_available ? "Full text ready" : "PDF needed"}</em>
-          </button>)}
-        </div>}
-        {searched && !results.length && !searchError && <p className="paper-search-empty">No bioRxiv papers matched that search.</p>}
-        {searchError && <p className="paper-search-error" role="alert">{searchError}</p>}
-        {selectedPaper && <article className="paper-preview">
-          <header><span><strong>{selectedPaper.title}</strong><small>Preprint · not peer reviewed</small></span><a href={selectedPaper.url} target="_blank" rel="noreferrer" aria-label="Open paper on bioRxiv"><ExternalLink size={13} /></a></header>
-          <p>{selectedPaper.abstract_text || "No abstract is available in the search record."}</p>
-          {selectedPaper.full_text_available ? <button type="button" disabled={loading} onClick={() => void onReconstruct(selectedPaper)}>{loading ? <><LoaderMark />Reading full text…</> : "Rebuild workflow"}</button> : <div className="paper-fulltext-missing"><strong>PDF needed</strong><span>Europe PMC does not have this paper’s full text yet. Upload the PDF below.</span></div>}
-        </article>}
-      </div>
-      <div className="paper-upload-divider"><span>or use a local copy</span></div>
-      <label className={`paper-upload ${loading ? "busy" : ""}`}>
-        {loading ? <span className="spin"><LoaderMark /></span> : <FileInput size={15} aria-hidden="true" />}
-        <span>{loading ? "Reading methods…" : review ? "Choose or drop another paper" : "Choose or drop PDF or text"}</span>
-        <input type="file" accept=".pdf,.txt,.md,text/plain,application/pdf" disabled={loading} aria-label="Choose methods paper" onChange={(event) => {
-          const file = event.target.files?.[0];
-          if (file) void onFile(file);
-          event.target.value = "";
-        }} />
-      </label>
+      <header className="floating-panel-head"><div><strong>Rebuild from a Paper</strong><span>{intake.activity.status === "idle" ? "methods → graph" : presentation.badge}</span></div><button type="button" aria-label="Close Paper Reconstruction" onClick={onClose}><X size={15} /></button></header>
+      {!choosingSource && <button type="button" className="paper-source-switch" onClick={() => setSourceChooserRequest(activityRequestId)}><FileSearch size={13} />Process another paper</button>}
+      {choosingSource && <>
+        <div className="paper-intro"><FileSearch size={20} aria-hidden="true" /><span><strong>Rebuild the methods</strong><small>Somite separates paper evidence, inferred wiring, managed tools, and exact steps needing your attention.</small></span></div>
+        <div className="paper-discovery">
+          <label className="paper-search"><Search size={14} aria-hidden="true" /><input aria-label="Search bioRxiv" autoComplete="off" spellCheck={false} placeholder="Search bioRxiv by topic, title, author, or DOI…" value={paperQuery} onChange={(event) => updatePaperQuery(event.target.value)} />{searching && <LoaderCircle className="spin" size={13} aria-label="Searching bioRxiv" />}{paperQuery && !searching && <button type="button" aria-label="Clear bioRxiv search" onClick={() => updatePaperQuery("")}><X size={12} /></button>}</label>
+          {results.length > 0 && <div className="paper-search-results" role="listbox" aria-label="bioRxiv papers">
+            {results.map((paper) => <button key={paper.id} type="button" role="option" aria-selected={selectedId === paper.id} className={selectedId === paper.id ? "active" : ""} onClick={() => setSelectedId(paper.id)}>
+              <strong>{paper.title}</strong><span>{paper.authors || "Authors not listed"}</span><small>{paper.date || "Date not listed"} · {paper.doi}</small><em className={paper.full_text_available ? "ready" : "upload"}>{paper.full_text_available ? "Full text ready" : "PDF needed"}</em>
+            </button>)}
+          </div>}
+          {searched && !results.length && !searchError && <p className="paper-search-empty">No bioRxiv papers matched that search.</p>}
+          {searchError && <p className="paper-search-error" role="alert">{searchError}</p>}
+          {selectedPaper && <article className="paper-preview">
+            <header><span><strong>{selectedPaper.title}</strong><small>Preprint · not peer reviewed</small></span><a href={selectedPaper.url} target="_blank" rel="noreferrer" aria-label="Open paper on bioRxiv"><ExternalLink size={13} /></a></header>
+            <p>{selectedPaper.abstract_text || "No abstract is available in the search record."}</p>
+            {selectedPaper.full_text_available ? <button type="button" onClick={() => { setSourceChooserRequest(null); void onReconstruct(selectedPaper); }}>{intakeBusy ? "Use this paper instead" : "Rebuild workflow"}</button> : <div className="paper-fulltext-missing"><strong>PDF needed</strong><span>Europe PMC does not have this paper’s full text yet. Upload the PDF below.</span></div>}
+          </article>}
+        </div>
+        <div className="paper-upload-divider"><span>or use a local copy</span></div>
+        <label className="paper-upload">
+          <FileInput size={15} aria-hidden="true" />
+          <span>{intakeBusy ? "Choose another paper to replace this intake" : review ? "Choose or drop another paper" : "Choose or drop PDF or text"}</span>
+          <input type="file" accept=".pdf,.txt,.md,text/plain,application/pdf" aria-label="Choose methods paper" onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (file) { setSourceChooserRequest(null); void onFile(file); }
+            event.target.value = "";
+          }} />
+        </label>
+        {!review && <button type="button" className="paper-example" onClick={() => { setSourceChooserRequest(null); void onExample(); }}>Try the RNA-seq methods example</button>}
+      </>}
       {dropError && <p className="paper-drop-error" role="alert">{dropError}</p>}
-      {!review && <button type="button" className="paper-example" disabled={loading} onClick={() => void onExample()}>Try the RNA-seq methods example</button>}
+      {intake.activity.status !== "idle" && <section className={`paper-job phase-${presentation.tone}`} role={presentation.tone === "error" ? "alert" : undefined} aria-live={presentation.tone === "error" ? "assertive" : undefined}>
+        {presentation.tone !== "error" && <span className="paper-job-phase-announcement" role="status" aria-live="polite" aria-atomic="true">{presentation.headline}</span>}
+        <header>
+          {intakeBusy ? <LoaderCircle className="spin" size={16} aria-hidden="true" /> : presentation.tone === "ready" ? <CheckCircle2 size={16} aria-hidden="true" /> : <CircleAlert size={16} aria-hidden="true" />}
+          <span><strong>{presentation.headline}</strong><small className="paper-job-source" title={activitySource?.label}>{activitySource?.label}</small></span>
+          <span className="paper-job-readout">{runningActivity && <PaperElapsed key={runningActivity.requestId} startedAtMs={runningActivity.startedAtMs} />}<em>{presentation.badge}</em></span>
+        </header>
+        {running && <div className={`paper-job-progress ${presentation.progressPercent === undefined ? "indeterminate" : ""}`} role="progressbar" aria-live="off" aria-label={presentation.headline} aria-valuemin={0} aria-valuemax={100} aria-valuenow={presentation.progressPercent}><i style={presentation.progressPercent === undefined ? undefined : { width: `${presentation.progressPercent}%` }} /></div>}
+        <p aria-live="off">{presentation.detail}</p>
+        <details className="paper-job-details">
+          <summary>Details <ChevronDown size={11} /></summary>
+          <dl>
+            <div><dt>Phase</dt><dd>{intake.activity.status === "running" ? intake.activity.stage.replaceAll("_", " ") : intake.activity.status}</dd></div>
+            {intake.activity.status === "failed" && <div><dt>Code</dt><dd>{intake.activity.code}</dd></div>}
+            {activityArtifact && <div><dt>Paper</dt><dd>{activityArtifact.reused ? "cached · " : ""}{formatResourceBytes(activityArtifact.size_bytes)} · {activityArtifact.digest.slice(0, 18)}…</dd></div>}
+            {currentReceipt && <div><dt>Extraction</dt><dd>{currentReceipt.review.extracted_via}</dd></div>}
+            {currentReceipt?.cache && <div><dt>Cache</dt><dd>{currentReceipt.cache.extraction ? "text reused" : "fresh text"} · {currentReceipt.cache.reconstruction ? "draft reused" : "fresh draft"}</dd></div>}
+            {Object.entries(currentReceipt?.durationsMs ?? {}).map(([stage, duration]) => <div key={stage}><dt>{stage.replaceAll("_", " ")}</dt><dd>{duration} ms</dd></div>)}
+          </dl>
+          {currentReceipt?.review.warnings.map((warning) => <p key={warning}>{warning}</p>)}
+        </details>
+        <div className="paper-job-actions">
+          <small>{intake.activity.status === "failed" && !intake.activity.retryable ? "Retrying unchanged will not resolve this issue. Follow the message above, then process the paper again." : presentation.showingPrevious ? "The previous result remains below; its canvas is unchanged." : "The canvas changes only when you accept a draft."}</small>
+          {running && <button type="button" onClick={onCancel}>Cancel</button>}
+          {(intake.activity.status === "cancelled" || (intake.activity.status === "failed" && intake.activity.retryable)) && <button type="button" onClick={() => void onRetry()}>Try again</button>}
+        </div>
+      </section>}
       {review && <>
-        <div className="paper-meta"><span>Extracted via <strong>{review.extracted_via}</strong></span><span>{candidate?.assay}</span></div>
-        <nav className="paper-candidates" aria-label="Reconstructed Workflows">
+        <div className="paper-meta"><span>Extracted via <strong>{review.extracted_via}</strong></span><span>{paperResultLabel}</span></div>
+        {review.outcome === "drafts_ready" && review.candidates.length > 0 && <nav className="paper-candidates" aria-label="Reconstructed Workflows">
           {review.candidates.map((item, index) => <button key={`${item.name}-${index}`} type="button" className={active === index ? "active" : ""} onClick={() => { setAttentionStep(0); onSelect(index); }}><strong>{item.name}</strong><span>{item.role} · {item.graph.nodes.length} nodes{applied === index ? " · on canvas" : ""}</span></button>)}
-        </nav>
+        </nav>}
+        {review.outcome !== "drafts_ready" && <section className={`paper-outcome outcome-${review.outcome}`}>
+          <header><CircleAlert size={16} /><span><strong>{review.outcome === "recognized_unsupported" ? "What Somite found" : "No workflow was claimed"}</strong><small>{review.outcome === "recognized_unsupported" ? "Recognized methods are retained without guessed tools or wiring." : "The paper was readable, but it did not yield a reconstructable computational track."}</small></span></header>
+          {review.mentions.length > 0 ? <div className="paper-method-mentions">{review.mentions.map((mention, index) => <details key={`${mention.normalized_name}-${mention.source_location ?? index}`}>
+            <summary><span><strong>{mention.display_name}</strong><small>{mention.operation_class ?? mention.support}</small></span><em>{mention.source_location ?? "method evidence"}</em><ChevronDown size={11} /></summary>
+            <p>{mention.evidence}</p>
+          </details>)}</div> : <p>Somite found no method evidence strong enough to turn into an executable draft.</p>}
+          {review.warnings.length > 0 && <details className="paper-outcome-notes"><summary>Why no draft was built <ChevronDown size={11} /></summary>{review.warnings.map((warning) => <p key={warning}>{warning}</p>)}</details>}
+        </section>}
+        {review.resources.length > 0 && <section className="paper-resources" aria-label="Cited data">
+          <header><span><Database size={16} aria-hidden="true" /><span><strong>Cited data</strong><small>{resourcesLoading ? "Checking NCBI and Ensembl…" : `${review.resources.length} accession${review.resources.length === 1 ? "" : "s"} found in the paper`}</small></span></span>{resourceResolution && <em>{resourceResolution.groups.reduce((count, group) => count + group.results.length, 0)} available item{resourceResolution.groups.reduce((count, group) => count + group.results.length, 0) === 1 ? "" : "s"}</em>}</header>
+          {resourcesLoading && <><div className="paper-resource-loading"><LoaderCircle className="spin" size={14} /><span>Resolving cited collections to exact downloadable records</span></div><div className="paper-resource-pending">{review.resources.map((resource) => <span key={resource.accession}><strong>{resource.accession}</strong><small>{resource.source_location ?? resource.role.replaceAll("_", " ")}</small></span>)}</div></>}
+          {resourceError && <p className="paper-resource-error" role="alert">Could not check cited data. The paper result is still available. {resourceError}</p>}
+          {resourceResolution?.groups.map((group, groupIndex) => {
+            const available = group.results.length;
+            const collection = ["bioproject", "sra_study", "sra_sample", "sra_experiment"].includes(group.citation.kind);
+            return <details className={`paper-resource-group ${available ? "available" : "unavailable"}`} key={group.citation.accession} open={groupIndex === 0 && available > 0 && group.citation.role === "reads"}>
+              <summary><span><strong>{group.citation.accession}</strong><small>{group.citation.source_location ?? group.citation.role.replaceAll("_", " ")}</small></span><em>{available ? `${available} ${group.citation.role === "reads" ? "run" : "record"}${available === 1 ? "" : "s"}` : "Not resolved"}</em><ChevronDown size={12} /></summary>
+              <p>{group.citation.context}</p>
+              {collection && available > 1 && <div className="paper-resource-guidance"><CircleAlert size={13} /><span>This citation is a collection. Choose the exact run used by this workflow; Somite will not silently pick one.</span></div>}
+              {group.results.map((result) => {
+                const used = paperResourceApplied(candidate, result.request.value);
+                const canUseReads = result.request.kind === "sra";
+                const noSlot = canUseReads && !nextPaperReadSlot(candidate);
+                return <article className="paper-resource-result" key={result.key}>
+                  <span><strong>{result.accession}</strong><small>{result.title}</small><em>{result.tags.join(" · ")}</em></span>
+                  {canUseReads ? <button type="button" disabled={intakeBusy || used || noSlot || addingResource !== null} onClick={() => {
+                    setAddingResource(result.key);
+                    void onUseResource(active, result).finally(() => setAddingResource(null));
+                  }}>{addingResource === result.key ? "Adding…" : used ? "Used in draft" : !candidate ? "No workflow draft" : noSlot ? "Read inputs filled" : "Use these reads"}</button> : <small className="paper-resource-found">Located in {result.provider}</small>}
+                </article>;
+              })}
+              {!available && <div className="paper-resource-empty">Somite kept this citation and its paper context, but no compatible downloadable record was returned.</div>}
+            </details>;
+          })}
+        </section>}
         {candidate && <div className="paper-review">
-          <button type="button" className="paper-apply" disabled={applied === active} onClick={() => onApply(active)}>{applied === active ? "Workflow is on the canvas" : attentionItems.length ? "Add draft to canvas" : "Use ready workflow on the canvas"}</button>
+          <button type="button" className="paper-apply" disabled={applied === active || !canApplyCandidate} onClick={() => onApply(active)}>{intakeBusy ? "Waiting for current paper intake" : applied === active ? "Workflow is on the canvas" : attentionItems.length ? "Add draft to canvas" : "Use ready workflow on the canvas"}</button>
           {applied !== active && <p className="paper-draft-note">Prepare the known inputs here, then add the reviewed draft when you are ready.</p>}
+          {unsupportedMentions.length > 0 && <div className="paper-draft-omissions" role="status"><CircleAlert size={15} /><span><strong>{unsupportedMentions.length} paper method{unsupportedMentions.length === 1 ? " is" : "s are"} not represented in this draft</strong><small>The supported draft remains available. Review the omitted evidence under provenance.</small></span></div>}
 
           <section className={`paper-guided-setup ${attentionItems.length ? "needs-attention" : "ready"}`}>
             {!currentAttention ? <div className="paper-guided-ready"><CheckCircle2 size={18} /><span><strong>Setup complete</strong><small>Every deterministic requirement is satisfied. Preparation can begin after you add the workflow.</small></span></div> : <>
@@ -888,19 +1087,19 @@ export function PaperPanel({ review, active, applied, loading, preparingField, o
                 const key = `${currentAttention.id}:${field.name}`;
                 if (field.input_mode === "file") return <label className={`paper-intake-field ${preparingField === key ? "busy" : ""}`} key={field.name}>
                   <FileInput size={13} /><span><strong>{field.label}</strong><small>{value ? value.split("/").at(-1) : "Choose from this computer"}</small></span><em>{preparingField === key ? "Importing…" : value ? "Replace" : "Choose"}</em>
-                  <input type="file" disabled={preparingField !== null} aria-label={`Choose ${field.label}`} onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; if (file) void onAttachInput(active, currentAttention, field.name, file); }} />
+                  <input type="file" disabled={intakeBusy || preparingField !== null} aria-label={`Choose ${field.label}`} onChange={(event) => { const file = event.currentTarget.files?.[0]; event.currentTarget.value = ""; if (file) void onAttachInput(active, currentAttention, field.name, file); }} />
                 </label>;
-                if (field.input_mode === "text") return <label className="paper-intake-text" key={field.name}><span>{field.label}</span><input defaultValue={value} onBlur={(event) => void onSetInput(active, currentAttention, field.name, event.currentTarget.value)} /></label>;
+                if (field.input_mode === "text") return <label className="paper-intake-text" key={field.name}><span>{field.label}</span><input defaultValue={value} disabled={intakeBusy} onBlur={(event) => void onSetInput(active, currentAttention, field.name, event.currentTarget.value)} /></label>;
                 return null;
               })}
-              {currentAttention.fields.some((field) => field.input_mode === "connection" || field.input_mode === "choice") && <button type="button" className="paper-canvas-resolution" onClick={() => onApply(active)}>{applied === active ? "Reconnect this input on the canvas" : "Add draft to connect this input"}</button>}
+              {currentAttention.fields.some((field) => field.input_mode === "connection" || field.input_mode === "choice") && <button type="button" className="paper-canvas-resolution" disabled={intakeBusy} onClick={() => onApply(active)}>{applied === active ? "Reconnect this input on the canvas" : "Add draft to connect this input"}</button>}
               {currentAttention.resolutions.some((resolution) => resolution.source_url) && <div className="paper-resolution-links">{currentAttention.resolutions.filter((resolution) => resolution.source_url).map((resolution) => <a key={resolution.id} href={resolution.source_url} target="_blank" rel="noreferrer"><ExternalLink size={11} />Official guide</a>)}</div>}
               {currentAttention.recipes.map((recipe) => <details className="paper-recipe" key={recipe.id}>
                 <summary><span><strong>{recipe.title}</strong><small>Reusable recipe · v{recipe.version}</small></span><ChevronDown size={12} /></summary>
                 <p>{recipe.summary}</p><ol>{recipe.steps.map((step) => <li key={step}>{step}</li>)}</ol>
                 {recipe.source_url && <a href={recipe.source_url} target="_blank" rel="noreferrer"><ExternalLink size={11} />Open recipe source</a>}
               </details>)}
-              {currentAttention.escalatable && <button type="button" className="paper-agent-escalation" onClick={() => onEscalate(candidate, currentAttention)}><MessageSquare size={12} />Ask Agent with this evidence</button>}
+              {currentAttention.escalatable && <button type="button" className="paper-agent-escalation" disabled={intakeBusy} onClick={() => onEscalate(candidate, currentAttention)}><MessageSquare size={12} />Ask Agent with this evidence</button>}
               {attentionItems.length > 1 && <nav className="paper-attention-nav" aria-label="Paper setup steps"><button type="button" disabled={currentAttentionStep === 0} onClick={() => setAttentionStep(Math.max(0, currentAttentionStep - 1))}><ChevronLeft size={12} />Back</button><span>{attentionItems.map((item, index) => <button key={item.id} type="button" className={index === currentAttentionStep ? "active" : ""} aria-label={`Go to paper setup step ${index + 1}`} onClick={() => setAttentionStep(index)} />)}</span><button type="button" disabled={currentAttentionStep === attentionItems.length - 1} onClick={() => setAttentionStep(Math.min(attentionItems.length - 1, currentAttentionStep + 1))}>Next<ChevronRight size={12} /></button></nav>}
             </>}
           </section>
@@ -916,6 +1115,13 @@ export function PaperPanel({ review, active, applied, loading, preparingField, o
               {(resolutionCounts.adapter ?? 0) > 0 && <span className="attention">{resolutionCounts.adapter} adapters</span>}
             </div>
             {candidate.warnings.length > 0 && <details className="paper-study-notes"><summary>{candidate.warnings.length} study note{candidate.warnings.length === 1 ? "" : "s"}</summary>{candidate.warnings.map((warning) => <p className="paper-warning" key={warning}>{warning}</p>)}</details>}
+            {unsupportedMentions.length > 0 && <details className="paper-omitted-methods">
+              <summary><span><strong>Methods not represented in this draft</strong><small>{unsupportedMentions.length} retained paper mention{unsupportedMentions.length === 1 ? "" : "s"}</small></span><ChevronDown size={12} /></summary>
+              <div>{unsupportedMentions.map((mention, index) => <article key={`${mention.normalized_name}-${mention.source_location ?? index}`}>
+                <header><strong>{mention.display_name}</strong><span>{mention.operation_class ?? "unclassified method"}</span><em>{mention.source_location ?? "paper evidence"}</em></header>
+                <p>{mention.evidence}</p>
+              </article>)}</div>
+            </details>}
             <div className="evidence-list">
               {candidate.evidence.map((evidence, index) => <details key={`${evidence.target_kind}-${evidence.target_id}-${index}`} className={`evidence-item ${evidence.status}`}><summary><i /><strong>{evidence.target_id}</strong><span>{evidence.source_location ?? evidence.status}</span></summary><p>{evidence.detail}</p>{evidence.resolution_label && <small className={`paper-resolution kind-${evidence.resolution_kind}`} title={evidence.resolution_detail}>{evidence.resolution_label}</small>}{applied === active && <button type="button" onClick={() => onEvidence(evidence)}>Show on canvas</button>}</details>)}
               {!candidate.evidence.length && <p className="panel-empty">No method evidence was strong enough to place a tool.</p>}
@@ -925,10 +1131,6 @@ export function PaperPanel({ review, active, applied, loading, preparingField, o
       </>}
     </section>
   );
-}
-
-function LoaderMark() {
-  return <span className="loader-mark" aria-hidden="true" />;
 }
 
 export function InspectorPanel({

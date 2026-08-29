@@ -23,10 +23,14 @@ test("server-renders the Somite web shell", async () => {
 });
 
 test("starter preview is removed and the real canvas is wired", async () => {
-  const [page, app, panels, css, packageJson] = await Promise.all([
+  const [page, app, panels, paperIntake, paperIntakeApi, paperReading, catalogExpansion, css, packageJson] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/SomiteApp.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/WorkspacePanels.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/paperIntake.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/paperIntakeApi.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/paperReading.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/catalogExpansion.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
   ]);
@@ -34,8 +38,10 @@ test("starter preview is removed and the real canvas is wired", async () => {
   assert.match(app, /ReactFlowProvider/);
   assert.match(app, /api\/graph\/validate/);
   assert.match(app, /api\/run/);
-  assert.match(app, /api\/paper/);
-  assert.match(app, /api\/papers\/biorxiv\/reconstruct/);
+  assert.match(app, /createPaperIntakeCoordinator/);
+  assert.match(paperIntakeApi, /api\/papers\/uploads/);
+  assert.match(paperIntakeApi, /api\/papers\/intakes/);
+  assert.match(paperIntakeApi, /api\/papers\/biorxiv\/reconstruct/);
   assert.match(app, /panActivationKeyCode="Space"/);
   assert.match(app, /pairedCompanion/);
   assert.match(app, /onConnectEnd=/);
@@ -55,10 +61,46 @@ test("starter preview is removed and the real canvas is wired", async () => {
   assert.match(panels, /Search bioRxiv/);
   assert.match(panels, /onDrop=\{handlePaperDrop\}/);
   assert.match(panels, /Drop one PDF or text file/);
+  assert.match(paperIntake, /previous\?\.controller\.abort/);
+  assert.match(paperIntake, /normalizedPaperReview/);
+  assert.match(panels, /The previous result remains below/);
+  assert.match(panels, /Try again/);
+  assert.match(panels, /paper-job-phase-announcement[^>]+role="status"[^>]+aria-live="polite"/);
+  assert.match(panels, /paper-job-progress[^>]+role="progressbar"[^>]+aria-live="off"/);
+  assert.match(panels, /<p aria-live="off">\{presentation\.detail\}<\/p>/);
+  assert.doesNotMatch(panels, /role=\{presentation\.tone === "error" \? "alert" : "status"\}/);
+  assert.match(panels, /window\.setInterval\(\(\) => setNowMs\(Date\.now\(\)\), 1_000\)/);
+  assert.match(panels, /if \(nowMs - startedAtMs < 1_000\) return null/);
+  assert.match(panels, /\{runningActivity && <PaperElapsed/);
+  assert.match(panels, /intake\.activity\.status === "failed" && intake\.activity\.retryable/);
+  assert.match(panels, /Retrying unchanged will not resolve this issue/);
+  assert.match(panels, /paperIntakeIsBusy\(intake\.activity\)/);
   assert.match(panels, /Preprint · not peer reviewed/);
   assert.match(panels, /Use ready workflow on the canvas/);
   assert.match(panels, /Add draft to canvas/);
+  assert.match(panels, /Methods not represented in this draft/);
+  assert.match(panels, /Methods retained/);
+  assert.match(panels, /No workflow identified/);
+  assert.doesNotMatch(panels, /review\.outcome\.replaceAll\("_", " "\)/);
+  assert.match(panels, /Paper reading/);
+  assert.match(panels, /Native PDF text/);
+  assert.match(panels, /Scanned PDF OCR/);
+  assert.match(panels, /no agent required/);
+  assert.match(paperReading, /Somite managed Pixi/);
+  assert.match(paperReading, /Restart Somite to recheck/);
+  assert.match(css, /\.paper-reading-guidance \{[^}]*font-size: 10px/);
+  assert.match(css, /\.paper-reading-tools article p \{[^}]*font-size: 10px/);
+  assert.match(css, /\.paper-job > p \{[^}]*font-size: 10px/);
+  assert.match(css, /\.paper-job-actions button \{[^}]*font-size: 10px/);
   assert.match(panels, /Browse Nextflow workflows/);
+  assert.match(panels, /catalogExpansion\?\.operatorId === operator\.id/);
+  assert.match(catalogExpansion, /Building process graph…/);
+  assert.match(panels, /role=\{activity\.phase === "failed" \? "alert" : "status"\}/);
+  assert.match(panels, /aria-busy=\{activity\?\.phase === "resolving"\}/);
+  assert.match(panels, /Try again/);
+  assert.match(panels, /Dismiss/);
+  assert.match(css, /\.catalog-expansion-feedback/);
+  assert.match(app, /setCatalogExpansion\(\{ operatorId: operator\.id, title: operator\.title, phase: "resolving" \}\)/);
   assert.match(panels, /Search by organism, name, or accession/);
   assert.match(panels, /filter\(\(operator\) => !isSource\(operator\)\)/);
   assert.doesNotMatch(panels, /Library Modes|Quick Add|Workflow Engines|Open a local Snakemake project/);

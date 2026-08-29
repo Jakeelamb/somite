@@ -2,6 +2,11 @@
   "id": "align.minimap2",
   "title": "minimap2",
   "palette": ["Assembly"],
+  "paper": {
+    "aliases": ["minimap2"],
+    "operation_class": "read_alignment",
+    "assays": ["assembly", "variants"]
+  },
   "kind": "external",
   "cost": "high",
   "bin": "minimap2",

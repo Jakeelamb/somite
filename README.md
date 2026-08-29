@@ -1,15 +1,35 @@
-# Somite
+<p align="center">
+  <img src="web/public/favicon.svg" width="80" height="80" alt="Somite logo">
+</p>
+
+<h1 align="center">Somite</h1>
+
+<p align="center">
+  <a href="https://github.com/Jakeelamb/somite/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Jakeelamb/somite/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg"></a>
+  <a href="rust-toolchain.toml"><img alt="Rust 1.96" src="https://img.shields.io/badge/rust-1.96-orange.svg"></a>
+  <a href=".nvmrc"><img alt="Node 22.13+" src="https://img.shields.io/badge/node-22.13%2B-43853d.svg"></a>
+</p>
 
 Somite is a local-first visual builder for reproducible bioinformatics
 workflows. Search for tools and public data, drag them onto an infinite canvas,
 connect typed ports, inspect the resulting DAG, and compile the same graph into
 a Nextflow workflow with a Pixi environment.
 
+> [!IMPORTANT]
+> Somite is in active pre-1.0 development. The first release will ship as
+> source; there is not yet a standalone desktop or binary install. Review
+> generated workflow packages before running them with research data.
+
 ## Start the app
 
-Requirements: Rust, Pixi, and Node.js 22.13 or newer.
+Requirements: [Rust](https://www.rust-lang.org/tools/install),
+[Pixi](https://pixi.sh/latest/installation/), and Node.js 22.13 or newer. The
+repository pins the supported Rust and minimum Node.js versions.
 
 ```bash
+git clone https://github.com/Jakeelamb/somite.git
+cd somite
 cd web
 npm ci
 cd ..
@@ -74,6 +94,39 @@ user through one unresolved input, checkpoint, or method decision at a time;
 attached files clear the shared assessment immediately. Evidence excerpts,
 PDF page locations, compatibility inferences, supported tools, and study notes
 remain available under progressive provenance disclosure.
+
+Paper intake also retains cited SRA studies, experiments, samples, runs,
+BioProjects, BioSamples, assemblies, and Ensembl identifiers with their nearby
+paper text and PDF page. Somite checks those citations through the same cached
+NCBI/Ensembl source adapters used by Add. A collection is presented as its exact
+downloadable runs instead of being silently reduced to the first result. Choosing
+one run replaces the next unresolved local-read placeholder with the native,
+version-pinned `sra.prefetch -> sra.fasterq_dump` recipe and immediately refreshes
+the draft's deterministic readiness assessment. Before acceptance this remains
+draft-only. Once that candidate is on the canvas, the same explicit choice
+applies the source delta immediately, selects the new fetch nodes, and preserves
+unrelated canvas work.
+
+Local paper intake reports its live stage inside the Paper panel: copying the
+content-addressed file, extracting native text or bounded OCR, locating and
+recognizing methods, assessing drafts, and the terminal result. Identical bytes
+reuse one stored artifact and retry starts from that artifact rather than
+uploading again. Failures keep the exact reason visible, offer retry only when
+repeating the operation is safe, and otherwise explain that the configuration
+must change; the previous draft and canvas stay unchanged.
+Recognized-but-unsupported methods, a paper with no reconstructable workflow,
+and extraction failure are three different results. A workflow is “ready to
+review” only when every exported Candidate is non-empty and validates against
+the current Catalog.
+
+The Machine panel checks paper-reading dependencies without an agent. Somite
+looks for Poppler and Tesseract first in the project-local managed environment
+at `.somite/tools/paper/.pixi/envs/default/bin`, then the project's normal
+`.pixi/envs/default/bin`, and finally `PATH`; the panel reports the exact source
+or an actionable missing-tool explanation. Deployments can bound intake with
+`SOMITE_PAPER_MAX_UPLOAD_BYTES`, `SOMITE_PAPER_MAX_TEXT_BYTES`,
+`SOMITE_PAPER_MAX_OCR_PAGES`, `SOMITE_PAPER_COMMAND_TIMEOUT_SECONDS`, and
+`SOMITE_PAPER_MAX_ACTIVE_JOBS`.
 
 ## Bring your own agent
 
@@ -186,12 +239,26 @@ and [operator contract](docs/operator-contract.md).
 ## Verify a checkout
 
 ```bash
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo build --workspace --release --locked
+
 cd web
 npm run typecheck
 npm run lint
 npm test
 ```
 
-Somite is licensed under Apache-2.0.
+## Community and release policy
+
+Bug reports and user-outcome proposals are welcome through
+[GitHub Issues](https://github.com/Jakeelamb/somite/issues); workflow questions
+belong in [Discussions](https://github.com/Jakeelamb/somite/discussions). See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the development contract and verification
+gate. Report vulnerabilities privately as described in
+[SECURITY.md](SECURITY.md).
+
+Release changes are recorded in [CHANGELOG.md](CHANGELOG.md), and the exact
+maintainer procedure is documented in [RELEASING.md](RELEASING.md). Somite is
+licensed under the [Apache License 2.0](LICENSE).

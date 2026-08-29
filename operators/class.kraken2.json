@@ -2,6 +2,11 @@
   "id": "class.kraken2",
   "title": "Kraken2",
   "palette": ["Metagenomics"],
+  "paper": {
+    "aliases": ["Kraken2", "Kraken 2"],
+    "operation_class": "taxonomic_classification",
+    "assays": ["metagenome"]
+  },
   "kind": "external",
   "cost": "high",
   "bin": "kraken2",

@@ -2,6 +2,11 @@
   "id": "qc.busco",
   "title": "BUSCO",
   "palette": ["QC"],
+  "paper": {
+    "aliases": ["BUSCO"],
+    "operation_class": "assembly_quality_control",
+    "assays": ["assembly"]
+  },
   "kind": "external",
   "cost": "high",
   "bin": "busco",

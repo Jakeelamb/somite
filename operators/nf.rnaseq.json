@@ -2,6 +2,11 @@
   "id": "nf.rnaseq",
   "title": "nf-core/rnaseq reference",
   "palette": ["References", "nf-core"],
+  "paper": {
+    "aliases": ["nf-core/rnaseq", "nf-core rnaseq"],
+    "operation_class": "compound_workflow",
+    "assays": ["rna-seq"]
+  },
   "kind": "reference",
   "cost": "low",
   "params": {

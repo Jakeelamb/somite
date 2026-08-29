@@ -1,0 +1,3 @@
+Methods
+RNA-seq reads were evaluated. STAR was compared but not used for this analysis.
+In a second comparison, we compared STAR; reads were aligned with HISAT2.

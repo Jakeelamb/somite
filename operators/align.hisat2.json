@@ -2,6 +2,11 @@
   "id": "align.hisat2",
   "title": "HISAT2",
   "palette": ["RNA"],
+  "paper": {
+    "aliases": ["HISAT2"],
+    "operation_class": "read_alignment",
+    "assays": ["rna-seq"]
+  },
   "kind": "external",
   "cost": "high",
   "bin": "hisat2",

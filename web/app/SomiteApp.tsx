@@ -74,9 +74,17 @@ import {
   ToolchainPanel,
 } from "./WorkspacePanels";
 import { CanvasAnnotations } from "./CanvasAnnotations";
-import type { SourceRequest } from "./sourceBuilder";
+import type { SourceRequest, SourceSearchResult } from "./sourceBuilder";
 import { preventBrowserZoomOutsideCanvas } from "./canvasGestures";
-import { paperResolutionAgentPrompt } from "./paperResolution";
+import { nextPaperReadSlot, paperCanvasUpdate, paperResolutionAgentPrompt, replacePaperReadSlot } from "./paperResolution";
+import {
+  createPaperIntakeCoordinator,
+  paperCandidateCanApply,
+  paperIntakeIsBusy,
+  paperIntakePresentation,
+  type PaperIntakeCoordinator,
+} from "./paperIntake";
+import { createPaperIntakeHttpTransport } from "./paperIntakeApi";
 import {
   continuationEdge,
   nextContinuationPosition,
@@ -98,7 +106,6 @@ import type {
   ParamValue,
   PaperCandidate,
   PaperEvidence,
-  PaperReview,
   PaperSearchResult,
   ExportPlan,
   ProjectSession,
@@ -118,12 +125,14 @@ import { SOMITE_SERVER, jsonRequest } from "./api";
 import { mergeAgentSnapshots, unseenAgentTransactions } from "./agentState";
 import { readinessAgentPrompt, readinessSummary } from "./readinessState";
 import { appendStrokePoint, canvasColor as getCanvasColor, canvasPalette, createCanvasAnnotation, nextAnnotationId } from "./canvasPresentation";
+import type { CatalogExpansionActivity } from "./catalogExpansion";
 
 const SNAP: [number, number] = [20, 20];
 const HISTORY_LIMIT = 80;
 const READ_ONE_PATTERN = /(?:^|[_.])R?1(?:[_.]|$)/i;
 const READ_TWO_PATTERN = /(?:^|[_.])R?2(?:[_.]|$)/i;
 const countFormatter = new Intl.NumberFormat();
+const paperIntakeTransport = createPaperIntakeHttpTransport();
 
 type SomiteNodeData = Record<string, unknown> & {
   graphNode: SomiteGraphNode;
@@ -428,16 +437,21 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const [agentSnapshot, setAgentSnapshot] = useState<AgentSnapshot>({ connected: false, connecting: false, busy: false, config_options: [], cursor: 0, events: [] });
   const [agentDiscovery, setAgentDiscovery] = useState<AgentDiscovery | null>(null);
   const [agentDiscoveryLoading, setAgentDiscoveryLoading] = useState(false);
-  const [paperReview, setPaperReview] = useState<PaperReview | null>(null);
+  const paperIntakeCoordinatorRef = useRef<PaperIntakeCoordinator | null>(null);
+  if (!paperIntakeCoordinatorRef.current) paperIntakeCoordinatorRef.current = createPaperIntakeCoordinator(paperIntakeTransport);
+  const paperIntakeCoordinator = paperIntakeCoordinatorRef.current;
+  const [paperIntake, setPaperIntake] = useState(() => paperIntakeCoordinator.getState());
+  const paperReview = paperIntake.current?.review ?? null;
   const [activePaperCandidate, setActivePaperCandidate] = useState(0);
   const [appliedPaperCandidate, setAppliedPaperCandidate] = useState<number | null>(null);
-  const [paperLoading, setPaperLoading] = useState(false);
+  const paperBusy = paperIntakeIsBusy(paperIntake.activity);
   const [paperPreparingField, setPaperPreparingField] = useState<string | null>(null);
   const [nfcoreCatalog, setNfcoreCatalog] = useState<NfcoreCatalog | null>(null);
   const [snakemakeCatalog, setSnakemakeCatalog] = useState<SnakemakeCatalog | null>(null);
   const [categoryOpen, setCategoryOpen] = useState<Record<string, boolean>>({});
   const [favorites, setFavorites] = useState<Set<string>>(new Set());
   const [recent, setRecent] = useState<string[]>([]);
+  const [catalogExpansion, setCatalogExpansion] = useState<CatalogExpansionActivity | null>(null);
   const [workflowTitle, setWorkflowTitle] = useState("Untitled workflow");
   const [titleEditing, setTitleEditing] = useState(false);
   const [dirty, setDirty] = useState(false);
@@ -453,6 +467,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const [history, setHistory] = useState<History>({ past: [], future: [] });
   const [libraryStateLoaded, setLibraryStateLoaded] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const presentedPaperRequestRef = useRef(0);
   const dragSnapshotRef = useRef<SomiteGraph | null>(null);
   const paramHistoryKeyRef = useRef<string | null>(null);
   const connectionStartRef = useRef<Pick<PendingConnection, "nodeId" | "port"> | null>(null);
@@ -478,6 +493,22 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const semanticKey = useMemo(() => semanticGraphKey(somiteGraph(workflowTitle, nodes, edges, annotations)), [annotations, edges, nodes, workflowTitle]);
   semanticKeyRef.current = semanticKey;
   graphSnapshotRef.current = somiteGraph(workflowTitle, nodes, edges, annotations);
+
+  useEffect(() => {
+    return paperIntakeCoordinator.subscribe((next) => {
+      setPaperIntake(next);
+      const activity = next.activity;
+      if (activity.status !== "idle") {
+        const presentation = paperIntakePresentation(next);
+        setStatus(`${presentation.headline} · ${activity.source.label}`);
+      }
+      const requestId = next.current?.requestId;
+      if (!requestId || presentedPaperRequestRef.current === requestId) return;
+      presentedPaperRequestRef.current = requestId;
+      setActivePaperCandidate(0);
+      setAppliedPaperCandidate(null);
+    });
+  }, [paperIntakeCoordinator]);
 
   useEffect(() => {
     const previous = previousSemanticKeyRef.current;
@@ -953,20 +984,27 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       const revision = operator.params.revision?.default;
       const isNfcore = operator.id.startsWith("nf.");
       if (!isNfcore && !operator.expandable) {
-        setStatus(`${operator.title} has no resolved rule graph in the official catalog yet · Somite did not add an opaque node`);
+        const detail = `${operator.title} has no resolved rule graph in the official catalog yet · Somite did not add an opaque node`;
+        setCatalogExpansion({ operatorId: operator.id, title: operator.title, phase: "failed", detail });
+        setStatus(detail);
         return;
       }
       if (typeof revision !== "string") {
-        setStatus(`Could not import ${operator.title} — missing pinned revision`);
+        const detail = `Could not import ${operator.title} — missing pinned revision`;
+        setCatalogExpansion({ operatorId: operator.id, title: operator.title, phase: "failed", detail });
+        setStatus(detail);
         return;
       }
       const target = position ?? pendingAddPosition ?? canvasCenter();
+      setCatalogExpansion({ operatorId: operator.id, title: operator.title, phase: "resolving" });
       setStatus(`Resolving ${operator.title} into its process graph…`);
       const workflow = isNfcore
         ? `nf-core/${operator.id.slice(3)}`
         : operator.params.repository?.default;
       if (typeof workflow !== "string") {
-        setStatus(`Could not import ${operator.title} — missing workflow provenance`);
+        const detail = `Could not import ${operator.title} — missing workflow provenance`;
+        setCatalogExpansion({ operatorId: operator.id, title: operator.title, phase: "failed", detail });
+        setStatus(detail);
         return;
       }
       void jsonRequest<WorkflowGraphResponse>(isNfcore ? "/api/catalog/nfcore/expand" : "/api/catalog/snakemake/expand", {
@@ -974,10 +1012,18 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ workflow, revision }),
       }).then((imported) => {
+        setCatalogExpansion((current) => current?.operatorId === operator.id ? null : current);
         insertImportedGraph(imported, target, `Expanded ${operator.title} ${revision}${imported.cached ? " · cached" : ""}`, operator.id);
-      }).catch((error) => setStatus(`Could not expand ${operator.title} — ${errorMessage(error)}`));
+      }).catch((error) => {
+        const detail = errorMessage(error);
+        setCatalogExpansion((current) => current?.operatorId === operator.id
+          ? { operatorId: operator.id, title: operator.title, phase: "failed", detail }
+          : current);
+        setStatus(`Could not expand ${operator.title} — ${detail}`);
+      });
       return;
     }
+    setCatalogExpansion(null);
     remember();
     const id = nextNodeId(operator, nodes);
     const graphNode = makeGraphNode(operator, id, position ?? pendingConnection?.position ?? pendingAddPosition ?? canvasCenter(), params);
@@ -1030,7 +1076,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       } else {
         const operator = requireOperator("ensembl.sequence");
         const id = nextNodeId(operator, nodes);
-        created.push(makeGraphNode(operator, id, center, { accession: request.value, sequence_type: request.sequenceType ?? "genomic" }));
+        created.push(makeGraphNode(operator, id, center, { accession: request.value, sequence_type: request.sequenceType ?? request.sequence_type ?? "genomic" }));
       }
       const graphNodes = [...nodes.map((node) => node.data.graphNode), ...created];
       setNodes((current) => [...current.map((node) => ({ ...node, selected: false })), ...created.map((node) => ({ ...flowNode(node, operatorMap), selected: true }))]);
@@ -1071,6 +1117,53 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     }
   }, [remember, setNodes, upload]);
 
+  const updatePaperCandidateGraph = useCallback(async (index: number, previousGraph: SomiteGraph, graph: SomiteGraph) => {
+    const assessment = await jsonRequest<ReadinessSnapshot>("/api/readiness", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(graph),
+    });
+    paperIntakeCoordinator.updateReview((current) => ({
+      ...current,
+      candidates: current.candidates.map((entry, candidateIndex) => candidateIndex === index ? { ...entry, graph, assessment } : entry),
+    }));
+    const canvasGraph = paperCanvasUpdate(appliedPaperCandidate, index, previousGraph, graph, graphSnapshotRef.current);
+    if (!canvasGraph) return false;
+
+    remember();
+    const previousNodeIds = new Set(previousGraph.nodes.map((node) => node.id));
+    const addedNodeIds = graph.nodes.filter((node) => !previousNodeIds.has(node.id)).map((node) => node.id);
+    const added = new Set(addedNodeIds);
+    setNodes((current) => {
+      const existing = new Map(current.map((node) => [node.id, node]));
+      return canvasGraph.nodes.map((graphNode) => {
+        const node = existing.get(graphNode.id);
+        if (!node) return { ...flowNode(graphNode, operatorMap), selected: added.has(graphNode.id) };
+        return {
+          ...node,
+          position: graphNode.layout,
+          selected: addedNodeIds.length ? added.has(graphNode.id) : node.selected,
+          data: { ...node.data, graphNode },
+        };
+      });
+    });
+    setEdges((current) => {
+      const existing = new Map(current.map((edge) => [edge.id, edge]));
+      return canvasGraph.edges.map((graphEdge) => {
+        const edge = existing.get(graphEdge.id);
+        const rebuilt = flowEdge(graphEdge, canvasGraph.nodes);
+        return edge ? { ...rebuilt, selected: edge.selected } : rebuilt;
+      });
+    });
+    if (addedNodeIds.length) {
+      setSelectedIds(addedNodeIds);
+      const addedNodes = graph.nodes.filter((node) => added.has(node.id)).map((node) => flowNode(node, operatorMap));
+      window.setTimeout(() => void flow?.fitView({ nodes: addedNodes, padding: .6, duration: 280, maxZoom: 1 }), 0);
+    }
+    setDirty(true);
+    return true;
+  }, [appliedPaperCandidate, flow, operatorMap, paperIntakeCoordinator, remember, setEdges, setNodes]);
+
   const updatePaperCandidateParameter = useCallback(async (index: number, item: ReadinessItem, field: string, value: ParamValue) => {
     const candidate = paperReview?.candidates[index];
     if (!candidate) return;
@@ -1081,17 +1174,45 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
         params: { ...(node.params ?? {}), [field]: value },
       } : node),
     };
-    const assessment = await jsonRequest<ReadinessSnapshot>("/api/readiness", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(graph),
-    });
-    setPaperReview((current) => current ? {
-      ...current,
-      candidates: current.candidates.map((entry, candidateIndex) => candidateIndex === index ? { ...entry, graph, assessment } : entry),
-    } : current);
-    if (appliedPaperCandidate === index) setAppliedPaperCandidate(null);
-  }, [appliedPaperCandidate, paperReview]);
+    await updatePaperCandidateGraph(index, candidate.graph, graph);
+  }, [paperReview, updatePaperCandidateGraph]);
+
+  const usePaperResource = useCallback(async (index: number, result: SourceSearchResult) => {
+    const candidate = paperReview?.candidates[index];
+    if (!candidate || result.request.kind !== "sra") return;
+    const slot = nextPaperReadSlot(candidate);
+    if (!slot) {
+      setStatus("Every read input in this draft already has a source");
+      return;
+    }
+    const prefetchOperator = operatorMap.get("sra.prefetch");
+    const fasterqOperator = operatorMap.get("sra.fasterq_dump");
+    if (!prefetchOperator || !fasterqOperator) {
+      setStatus("Could not use cited reads — the native SRA recipe is unavailable");
+      return;
+    }
+    const occupied = new Set([...candidate.graph.nodes, ...graphSnapshotRef.current.nodes].map((node) => node.id));
+    occupied.delete(slot.id);
+    const uniqueId = (base: string) => {
+      let id = base;
+      let suffix = 2;
+      while (occupied.has(id)) id = `${base}-${suffix++}`;
+      occupied.add(id);
+      return id;
+    };
+    const prefetch = makeGraphNode(prefetchOperator, uniqueId(`${slot.id}-fetch`), slot.layout, { accession: result.request.value });
+    prefetch.note = `Cited paper resource · ${result.request.value} · ${result.provider}`;
+    const fasterq = makeGraphNode(fasterqOperator, uniqueId(`${slot.id}-reads`), { x: slot.layout.x + 220, y: slot.layout.y });
+    const graph = replacePaperReadSlot(candidate.graph, slot.id, prefetch, fasterq);
+    setStatus(`Adding cited run ${result.request.value} to ${candidate.name}…`);
+    try {
+      const canvasUpdated = await updatePaperCandidateGraph(index, candidate.graph, graph);
+      setStatus(`${result.request.value} now supplies ${slot.id} · ${canvasUpdated ? "added to canvas" : "draft updated"} · readiness refreshed`);
+    } catch (error) {
+      setStatus(`Could not use ${result.request.value} — ${errorMessage(error)}`);
+      throw error;
+    }
+  }, [operatorMap, paperReview, updatePaperCandidateGraph]);
 
   const attachPaperInput = useCallback(async (index: number, item: ReadinessItem, field: string, file: File) => {
     const key = `${item.id}:${field}`;
@@ -1125,6 +1246,10 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   }, [agentDiscovery, agentDiscoveryLoading, agentSnapshot.connected, refreshAgentDiscovery]);
 
   const installPaperCandidate = useCallback((candidate: PaperCandidate, index: number) => {
+    if (!paperCandidateCanApply(paperReview, candidate, paperBusy)) {
+      setStatus(paperBusy ? "Wait for the active paper intake to finish" : "This paper did not produce a usable workflow draft");
+      return;
+    }
     remember();
     const graphNodes = normalizeImportedNodeLayouts(candidate.graph.nodes);
     const nextNodes = graphNodes.map((node) => flowNode(node, operatorMap));
@@ -1136,62 +1261,34 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     setDirty(true);
     setStatus(`Rebuilt ${candidate.name} · ${candidate.graph.nodes.length} nodes · review evidence before running`);
     window.setTimeout(() => void flow?.fitView({ padding: .24, duration: 280, maxZoom: 1 }), 0);
-  }, [flow, operatorMap, remember, setEdges, setNodes]);
+  }, [flow, operatorMap, paperBusy, paperReview, remember, setEdges, setNodes]);
+
+  const openPaperIntakeSurface = useCallback(() => {
+    setPaperVisible(true);
+    setLibraryVisible(false);
+    setProjectVisible(false);
+  }, []);
 
   const rebuildPaper = useCallback(async (file: File) => {
-    setPaperVisible(true);
-    setLibraryVisible(false);
-    setProjectVisible(false);
-    setPaperLoading(true);
-    setStatus(`Reading ${file.name}…`);
-    try {
-      const uploaded = await upload(file);
-      const review = await jsonRequest<PaperReview>("/api/paper", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: uploaded.path }) });
-      setPaperReview(review);
-      setActivePaperCandidate(0);
-      setAppliedPaperCandidate(null);
-      setStatus(review.candidates.length ? `Found ${review.candidates.length} workflow draft${review.candidates.length === 1 ? "" : "s"} in ${file.name} · review before using` : `No workflow candidates were found in ${file.name}`);
-    } catch (error) {
-      setStatus(`Could not rebuild paper — ${errorMessage(error)}`);
-    } finally {
-      setPaperLoading(false);
-    }
-  }, [upload]);
+    openPaperIntakeSurface();
+    await paperIntakeCoordinator.start({ kind: "local", label: file.name, file });
+  }, [openPaperIntakeSurface, paperIntakeCoordinator]);
+
+  const retryPaper = useCallback(async () => {
+    await paperIntakeCoordinator.retry();
+  }, [paperIntakeCoordinator]);
+
+  const cancelPaper = useCallback(() => paperIntakeCoordinator.cancel(), [paperIntakeCoordinator]);
 
   const openExamplePaper = useCallback(async () => {
-    setPaperVisible(true);
-    setLibraryVisible(false);
-    setProjectVisible(false);
-    setPaperLoading(true);
-    setStatus("Reading the RNA-seq methods example…");
-    try {
-      const review = await jsonRequest<PaperReview>("/api/paper", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: "testdata/papers/rnaseq_methods.txt" }) });
-      setPaperReview(review);
-      setActivePaperCandidate(0);
-      setAppliedPaperCandidate(null);
-      setStatus(`Found ${review.candidates.length} example workflow draft${review.candidates.length === 1 ? "" : "s"} · review before using`);
-    } catch (error) {
-      setStatus(`Could not rebuild example — ${errorMessage(error)}`);
-    } finally {
-      setPaperLoading(false);
-    }
-  }, []);
+    openPaperIntakeSurface();
+    await paperIntakeCoordinator.start({ kind: "path", label: "RNA-seq methods example", path: "testdata/papers/cited_resources_methods.txt" });
+  }, [openPaperIntakeSurface, paperIntakeCoordinator]);
 
   const rebuildBiorxivPaper = useCallback(async (paper: PaperSearchResult) => {
-    setPaperLoading(true);
-    setStatus(`Reading ${paper.title}…`);
-    try {
-      const review = await jsonRequest<PaperReview>("/api/papers/biorxiv/reconstruct", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: paper.id }) });
-      setPaperReview(review);
-      setActivePaperCandidate(0);
-      setAppliedPaperCandidate(null);
-      setStatus(review.candidates.length ? `Found ${review.candidates.length} workflow draft${review.candidates.length === 1 ? "" : "s"} in ${paper.title} · review before using` : `No workflow candidates were found in ${paper.title}`);
-    } catch (error) {
-      setStatus(`Could not rebuild bioRxiv paper — ${errorMessage(error)}`);
-    } finally {
-      setPaperLoading(false);
-    }
-  }, []);
+    openPaperIntakeSurface();
+    await paperIntakeCoordinator.start({ kind: "biorxiv", label: paper.title, id: paper.id });
+  }, [openPaperIntakeSurface, paperIntakeCoordinator]);
 
   const addDroppedFiles = useCallback(async (files: File[], position: { x: number; y: number }) => {
     if (!files.length) return;
@@ -1878,7 +1975,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
           <button type="button" aria-label={allViewersHidden ? "Show All Viewers" : "Hide All Viewers"} title={allViewersHidden ? "Show all viewers" : "Hide all viewers"} disabled={!nodes.length} onClick={toggleAllViewers}>{allViewersHidden ? <Eye size={16} aria-hidden="true" /> : <EyeOff size={16} aria-hidden="true" />}</button>
         </div>
 
-        {libraryVisible && <div className="panel-layer" onPointerDown={(event) => event.stopPropagation()}><LibraryPanel operators={availableOperators} query={query} filterQuery={deferredQuery} favorites={favorites} recent={recent} categoryOpen={categoryOpen} searchInputRef={searchInputRef} continuation={pendingConnection} onQuery={setQuery} onClose={() => { setLibraryVisible(false); setPendingConnection(null); }} onAddOperator={addOperator} onAddSource={addSource} onImportFiles={(files) => addDroppedFiles(files, canvasCenter())} onToggleFavorite={(id) => setFavorites((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; })} onToggleCategory={(title, open) => setCategoryOpen((current) => ({ ...current, [title]: open }))} /></div>}
+        {libraryVisible && <div className="panel-layer" onPointerDown={(event) => event.stopPropagation()}><LibraryPanel operators={availableOperators} query={query} filterQuery={deferredQuery} favorites={favorites} recent={recent} categoryOpen={categoryOpen} searchInputRef={searchInputRef} continuation={pendingConnection} catalogExpansion={catalogExpansion} onQuery={setQuery} onClose={() => { setLibraryVisible(false); setPendingConnection(null); setCatalogExpansion(null); }} onAddOperator={addOperator} onAddSource={addSource} onImportFiles={(files) => addDroppedFiles(files, canvasCenter())} onToggleFavorite={(id) => setFavorites((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; })} onToggleCategory={(title, open) => setCategoryOpen((current) => ({ ...current, [title]: open }))} onDismissCatalogExpansion={() => { setStatus(`${catalogExpansion?.title ?? "Workflow"} was not added · canvas unchanged`); setCatalogExpansion(null); }} /></div>}
 
         {projectVisible && <div className="project-layer" onPointerDown={(event) => event.stopPropagation()}><ProjectPanel projectName={session.project_name} graphPath={session.graph_path} onImportProject={importLocalProject} onClose={() => setProjectVisible(false)} /></div>}
 
@@ -1888,7 +1985,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
 
         {toolchainVisible && <div className="toolchain-layer" onPointerDown={(event) => event.stopPropagation()}><ToolchainPanel plan={exportPlan} pixiReady={system?.tools.pixi} loading={exportLoading} downloading={exportDownloading} onDownload={downloadBundle} onClose={() => setToolchainVisible(false)} /></div>}
 
-        {paperVisible && <div className="paper-layer" onPointerDown={(event) => event.stopPropagation()}><PaperPanel review={paperReview} active={activePaperCandidate} applied={appliedPaperCandidate} loading={paperLoading} preparingField={paperPreparingField} onFile={rebuildPaper} onExample={openExamplePaper} onReconstruct={rebuildBiorxivPaper} onSelect={setActivePaperCandidate} onApply={(index) => { const candidate = paperReview?.candidates[index]; if (candidate) installPaperCandidate(candidate, index); }} onAttachInput={attachPaperInput} onSetInput={setPaperInput} onEscalate={askAgentAboutPaperItem} onEvidence={focusPaperEvidence} onClose={() => setPaperVisible(false)} /></div>}
+        {paperVisible && <div className="paper-layer" onPointerDown={(event) => event.stopPropagation()}><PaperPanel intake={paperIntake} active={activePaperCandidate} applied={appliedPaperCandidate} preparingField={paperPreparingField} onFile={rebuildPaper} onRetry={retryPaper} onCancel={cancelPaper} onExample={openExamplePaper} onReconstruct={rebuildBiorxivPaper} onSelect={setActivePaperCandidate} onApply={(index) => { const candidate = paperReview?.candidates[index]; if (candidate) installPaperCandidate(candidate, index); }} onUseResource={usePaperResource} onAttachInput={attachPaperInput} onSetInput={setPaperInput} onEscalate={askAgentAboutPaperItem} onEvidence={focusPaperEvidence} onClose={() => setPaperVisible(false)} /></div>}
 
         {readinessVisible && readiness && <div className={`readiness-layer ${agentVisible ? "with-agent" : ""}`} onPointerDown={(event) => event.stopPropagation()}><ReadinessPanel snapshot={readiness} evidence={validationEvidence} onResolve={resolveRequirement} onFocus={focusRequirement} onAttachFile={attachRequirementFile} onAskAssistant={askAssistantAboutRequirement} onClose={() => setReadinessVisible(false)} /></div>}
 

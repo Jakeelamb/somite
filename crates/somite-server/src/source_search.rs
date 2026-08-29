@@ -98,7 +98,8 @@ pub fn search_ensembl(query: &str) -> Vec<SearchResult> {
 
 fn search_sra(query: &str) -> Vec<SearchResult> {
     let term = ncbi_term(query);
-    let ids = esearch("sra", &term, 4);
+    let (record_limit, result_limit) = sra_search_limits(query);
+    let ids = esearch("sra", &term, record_limit);
     let Some(summary) = esummary("sra", &ids) else {
         return Vec::new();
     };
@@ -106,8 +107,34 @@ fn search_sra(query: &str) -> Vec<SearchResult> {
         .flat_map(sra_results)
         .collect::<Vec<_>>();
     results.sort_by_key(|result| !result.accession.eq_ignore_ascii_case(query));
-    results.truncate(8);
+    results.truncate(result_limit);
     results
+}
+
+fn sra_search_limits(query: &str) -> (usize, usize) {
+    let collection = query
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .map(str::to_ascii_uppercase)
+        .any(|token| {
+            [
+                "SRP", "ERP", "DRP", "SRX", "ERX", "DRX", "SRS", "ERS", "DRS",
+            ]
+            .iter()
+            .any(|prefix| {
+                token.strip_prefix(prefix).is_some_and(|digits| {
+                    digits.len() >= 6 && digits.chars().all(|character| character.is_ascii_digit())
+                })
+            }) || ["PRJNA", "PRJEB", "PRJDB"].iter().any(|prefix| {
+                token.strip_prefix(prefix).is_some_and(|digits| {
+                    digits.len() >= 6 && digits.chars().all(|character| character.is_ascii_digit())
+                })
+            })
+        });
+    if collection {
+        (16, 24)
+    } else {
+        (4, 8)
+    }
 }
 
 fn search_assemblies(query: &str) -> Vec<SearchResult> {
@@ -531,5 +558,12 @@ mod tests {
             NcbiSearchPlan::Reads
         );
         assert_eq!(ncbi_search_plan("human"), NcbiSearchPlan::Both);
+    }
+
+    #[test]
+    fn collection_queries_offer_more_runs_without_expanding_general_searches() {
+        assert_eq!(sra_search_limits("PRJNA300706 sra"), (16, 24));
+        assert_eq!(sra_search_limits("SRP151479"), (16, 24));
+        assert_eq!(sra_search_limits("human RNA-seq"), (4, 8));
     }
 }

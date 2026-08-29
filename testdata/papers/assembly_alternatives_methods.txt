@@ -1,0 +1,3 @@
+Methods
+PacBio HiFi reads were assembled in separate comparisons using hifiasm,
+FALCON-Unzip, and Flye. BUSCO evaluated each assembly independently.

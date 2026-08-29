@@ -1,4 +1,4 @@
-import type { PaperCandidate, ReadinessItem } from "./types";
+import type { PaperCandidate, ReadinessItem, SomiteGraph, SomiteGraphNode } from "./types";
 
 export function paperAttentionItems(candidate: PaperCandidate | null | undefined) {
   return candidate?.assessment.items ?? [];
@@ -11,6 +11,100 @@ export function paperSupportedCount(candidate: PaperCandidate | null | undefined
 export function paperParameterValue(candidate: PaperCandidate, nodeId: string, field: string) {
   const value = candidate.graph.nodes.find((node) => node.id === nodeId)?.params?.[field];
   return typeof value === "string" ? value : value == null ? "" : String(value);
+}
+
+export function nextPaperReadSlot(candidate: PaperCandidate | null | undefined) {
+  return candidate?.graph.nodes.find((node) => {
+    if (node.operator === "files.import_paired") {
+      return !String(node.params?.r1 ?? "").trim() && !String(node.params?.r2 ?? "").trim();
+    }
+    return node.operator === "files.import" && !String(node.params?.path ?? "").trim();
+  }) ?? null;
+}
+
+export function paperResourceApplied(candidate: PaperCandidate | null | undefined, accession: string) {
+  return candidate?.graph.nodes.some((node) => node.operator === "sra.prefetch" && node.params?.accession === accession) ?? false;
+}
+
+function sameGraphValue(left: unknown, right: unknown) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+export function paperCanvasUpdate(
+  appliedCandidate: number | null,
+  candidateIndex: number,
+  previous: SomiteGraph,
+  updated: SomiteGraph,
+  canvas: SomiteGraph,
+) {
+  if (appliedCandidate !== candidateIndex) return null;
+
+  const previousNodes = new Map(previous.nodes.map((node) => [node.id, node]));
+  const updatedNodeIds = new Set(updated.nodes.map((node) => node.id));
+  const removedNodeIds = new Set(previous.nodes.filter((node) => !updatedNodeIds.has(node.id)).map((node) => node.id));
+  const changedNodes = updated.nodes.filter((node) => {
+    const prior = previousNodes.get(node.id);
+    return !prior || !sameGraphValue(prior, node);
+  });
+  const changedNodeIds = new Set(changedNodes.map((node) => node.id));
+  const canvasNodes = new Map(canvas.nodes.map((node) => [node.id, node]));
+  const nodes = [
+    ...canvas.nodes.filter((node) => !removedNodeIds.has(node.id) && !changedNodeIds.has(node.id)),
+    ...changedNodes.map((node) => {
+      const current = canvasNodes.get(node.id);
+      return current ? { ...node, layout: current.layout, color: current.color ?? node.color } : node;
+    }),
+  ];
+
+  const previousEdges = new Map(previous.edges.map((edge) => [edge.id, edge]));
+  const updatedEdgeIds = new Set(updated.edges.map((edge) => edge.id));
+  const changedEdges = updated.edges.filter((edge) => {
+    const prior = previousEdges.get(edge.id);
+    return !prior || !sameGraphValue(prior, edge);
+  });
+  const changedEdgeIds = new Set(changedEdges.map((edge) => edge.id));
+  const removedEdgeIds = new Set(previous.edges.filter((edge) => !updatedEdgeIds.has(edge.id)).map((edge) => edge.id));
+  const edges = [
+    ...canvas.edges.filter((edge) => !removedEdgeIds.has(edge.id)
+      && !changedEdgeIds.has(edge.id)
+      && !removedNodeIds.has(edge.from_node)
+      && !removedNodeIds.has(edge.to_node)),
+    ...changedEdges,
+  ];
+
+  return { ...canvas, nodes, edges };
+}
+
+export function replacePaperReadSlot(
+  graph: SomiteGraph,
+  slotId: string,
+  prefetch: SomiteGraphNode,
+  fasterq: SomiteGraphNode,
+) {
+  const slot = graph.nodes.find((node) => node.id === slotId);
+  if (!slot || !["files.import", "files.import_paired"].includes(slot.operator)) return graph;
+  const rewired = graph.edges
+    .filter((edge) => edge.to_node !== slotId)
+    .map((edge) => edge.from_node !== slotId ? edge : {
+      ...edge,
+      id: `e-${fasterq.id}-${slot.operator === "files.import" ? "r1" : edge.from_port}-${edge.to_node}-${edge.to_port}`,
+      from_node: fasterq.id,
+      from_port: slot.operator === "files.import" ? "r1" : edge.from_port,
+    });
+  return {
+    ...graph,
+    nodes: [...graph.nodes.filter((node) => node.id !== slotId), prefetch, fasterq],
+    edges: [
+      ...rewired,
+      {
+        id: `e-${prefetch.id}-sra-${fasterq.id}-sra`,
+        from_node: prefetch.id,
+        from_port: "sra",
+        to_node: fasterq.id,
+        to_port: "sra",
+      },
+    ],
+  };
 }
 
 export function paperResolutionAgentPrompt(candidate: PaperCandidate, item: ReadinessItem) {

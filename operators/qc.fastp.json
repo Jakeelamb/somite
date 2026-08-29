@@ -2,6 +2,11 @@
   "id": "qc.fastp",
   "title": "fastp",
   "palette": ["QC"],
+  "paper": {
+    "aliases": ["fastp"],
+    "operation_class": "read_trimming",
+    "assays": ["rna-seq", "metagenome", "variants"]
+  },
   "kind": "external",
   "cost": "high",
   "bin": "fastp",

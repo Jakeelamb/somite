@@ -1,0 +1,3 @@
+Methods
+Phylogeny subsampling used the R package phytools. Models were fit in the R
+statistical computing environment with OUwie.

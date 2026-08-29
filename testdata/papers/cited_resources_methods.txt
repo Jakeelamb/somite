@@ -1,0 +1,3 @@
+METHODS
+
+Paired-end RNA-seq reads from NCBI BioProject PRJNA300706 were assessed with FastQC and aligned using STAR. Sequence data for the study are available under SRA accession SRP151479.

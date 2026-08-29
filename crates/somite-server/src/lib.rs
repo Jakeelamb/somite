@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -27,13 +28,16 @@ use somite_linker::{
 use somite_ops::{current_pixi_platform, Catalog, Operator};
 use somite_ops::{nfcore, snakemake, snakemake_local, workflow};
 use somite_paper::{
-    extract_from_path, reconstruct, Assay, CandidateRole, EvidenceStatus, EvidenceTarget,
-    ExtractVia,
+    extract_from_path, extract_from_path_with_toolchain, reconstruct, resource_citations, Assay,
+    CandidateRole, EvidenceStatus, EvidenceTarget, ExtractVia, ExtractionLimits,
+    ExtractionProgress, ExtractionToolchain, MethodSupport, PaperError, ReconstructionOutcome,
+    ResourceCitationKind, ResourceRole,
 };
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::watch;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{watch, Notify, Semaphore};
 use tower_http::cors::CorsLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
 
 mod agent;
@@ -65,6 +69,18 @@ pub enum ServerError {
     InvalidFilename,
     #[error("upload: {0}")]
     Upload(String),
+    #[error("paper upload exceeds the {limit_bytes} byte limit")]
+    PaperUploadTooLarge { limit_bytes: u64 },
+    #[error("unsupported paper upload: {0}")]
+    UnsupportedPaperUpload(String),
+    #[error("paper artifact not found: {0}")]
+    PaperArtifactNotFound(String),
+    #[error("paper intake job not found: {0}")]
+    PaperIntakeNotFound(String),
+    #[error("paper intake capacity is full; wait for an active job to finish")]
+    PaperIntakeBusy,
+    #[error("paper intake request: {0}")]
+    InvalidPaperIntake(String),
     #[error("run: {0}")]
     Run(String),
     #[error("run not found: {0}")]
@@ -83,6 +99,8 @@ pub enum ServerError {
     WorkflowImport(String),
     #[error("source search: {0}")]
     SourceSearch(String),
+    #[error("source request: {0}")]
+    InvalidSourceRequest(String),
     #[error("agent: {0}")]
     Agent(#[from] agent::AgentError),
     #[error("export: {0}")]
@@ -109,11 +127,18 @@ impl IntoResponse for ServerError {
             Self::MissingUpload
             | Self::InvalidFilename
             | Self::InvalidProjectPath(_)
+            | Self::InvalidSourceRequest(_)
+            | Self::InvalidPaperIntake(_)
             | Self::Literature(
                 literature::LiteratureError::InvalidQuery
                 | literature::LiteratureError::InvalidPaperId,
             ) => StatusCode::BAD_REQUEST,
-            Self::RunNotFound(_) => StatusCode::NOT_FOUND,
+            Self::PaperUploadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::UnsupportedPaperUpload(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Self::PaperIntakeBusy => StatusCode::SERVICE_UNAVAILABLE,
+            Self::RunNotFound(_)
+            | Self::PaperArtifactNotFound(_)
+            | Self::PaperIntakeNotFound(_) => StatusCode::NOT_FOUND,
             Self::Io(_)
             | Self::Json(_)
             | Self::Catalog(_)
@@ -217,6 +242,33 @@ pub struct SystemProfile {
     pub gpus: Vec<String>,
     pub os: String,
     pub tools: ToolReadiness,
+    pub paper_extraction: PaperExtractionPreflight,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PaperExtractionPreflight {
+    pub native_pdf_text: bool,
+    pub scanned_pdf_ocr: bool,
+    pub tools: Vec<PaperExtractionToolReadiness>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PaperExtractionToolReadiness {
+    pub name: String,
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<PaperToolSource>,
+    pub detail: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaperToolSource {
+    ManagedPixi,
+    ProjectPixi,
+    SystemPath,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -305,13 +357,59 @@ pub struct BiorxivPaperRequest {
     pub id: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PaperResponse {
     pub extracted_via: String,
+    pub outcome: String,
+    pub warnings: Vec<String>,
+    pub mentions: Vec<PaperMethodMention>,
+    pub resources: Vec<PaperResourceCitation>,
     pub candidates: Vec<PaperCandidate>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PaperMethodMention {
+    pub display_name: String,
+    pub normalized_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation_class: Option<String>,
+    pub evidence: String,
+    pub support: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_location: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PaperResourceCitation {
+    pub accession: String,
+    pub kind: String,
+    pub role: String,
+    pub context: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_location: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PaperResourceResolveRequest {
+    pub resources: Vec<PaperResourceCitation>,
+}
+
 #[derive(Debug, Serialize)]
+pub struct PaperResourceResolution {
+    pub groups: Vec<PaperResourceGroup>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PaperResourceGroup {
+    pub citation: PaperResourceCitation,
+    pub provider: String,
+    pub status: String,
+    pub results: Vec<source_search::SearchResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PaperCandidate {
     pub name: String,
     pub role: String,
@@ -322,7 +420,7 @@ pub struct PaperCandidate {
     pub assessment: WorkflowAssessment,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PaperEvidence {
     pub target_kind: String,
     pub target_id: String,
@@ -338,6 +436,200 @@ pub struct PaperEvidence {
     pub resolution_required: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_location: Option<String>,
+}
+
+const DEFAULT_MAX_PAPER_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+const DEFAULT_MAX_EXTRACTED_TEXT_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_MAX_PAPER_OCR_PAGES: usize = 200;
+const DEFAULT_PAPER_COMMAND_TIMEOUT_SECONDS: u64 = 120;
+const DEFAULT_MAX_ACTIVE_PAPER_EXECUTIONS: usize = 2;
+const PAPER_MULTIPART_OVERHEAD_BYTES: u64 = 1024 * 1024;
+const MAX_ACTIVE_PAPER_INTAKES: usize = 256;
+const PAPER_EXTRACTOR_REVISION: &str = "somite-paper-extractor-v2";
+const PAPER_RECONSTRUCTOR_REVISION: &str = "somite-paper-reconstructor-v4";
+
+#[derive(Clone, Copy, Debug)]
+struct PaperLimits {
+    max_upload_bytes: u64,
+    max_extracted_text_bytes: u64,
+    max_ocr_pages: usize,
+    command_timeout: Duration,
+    max_active_executions: usize,
+}
+
+impl PaperLimits {
+    fn from_environment() -> Self {
+        Self {
+            max_upload_bytes: bounded_environment_bytes(
+                "SOMITE_PAPER_MAX_UPLOAD_BYTES",
+                DEFAULT_MAX_PAPER_UPLOAD_BYTES,
+            ),
+            max_extracted_text_bytes: bounded_environment_bytes(
+                "SOMITE_PAPER_MAX_TEXT_BYTES",
+                DEFAULT_MAX_EXTRACTED_TEXT_BYTES,
+            ),
+            max_ocr_pages: bounded_environment_u64(
+                "SOMITE_PAPER_MAX_OCR_PAGES",
+                DEFAULT_MAX_PAPER_OCR_PAGES as u64,
+                10_000,
+            ) as usize,
+            command_timeout: Duration::from_secs(bounded_environment_u64(
+                "SOMITE_PAPER_COMMAND_TIMEOUT_SECONDS",
+                DEFAULT_PAPER_COMMAND_TIMEOUT_SECONDS,
+                3_600,
+            )),
+            max_active_executions: bounded_environment_u64(
+                "SOMITE_PAPER_MAX_ACTIVE_JOBS",
+                DEFAULT_MAX_ACTIVE_PAPER_EXECUTIONS as u64,
+                32,
+            ) as usize,
+        }
+    }
+}
+
+fn bounded_environment_bytes(name: &str, fallback: u64) -> u64 {
+    bounded_environment_u64(name, fallback, 1024 * 1024 * 1024)
+}
+
+fn bounded_environment_u64(name: &str, fallback: u64, maximum: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (1..=maximum).contains(value))
+        .unwrap_or(fallback)
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaperMediaKind {
+    Pdf,
+    Text,
+}
+
+impl PaperMediaKind {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Pdf => "pdf",
+            Self::Text => "txt",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PaperArtifactResponse {
+    pub digest: String,
+    pub path: String,
+    pub filename: String,
+    pub size_bytes: u64,
+    pub media_kind: PaperMediaKind,
+    pub reused: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct StoredPaperArtifact {
+    schema_version: u32,
+    digest: String,
+    size_bytes: u64,
+    media_kind: PaperMediaKind,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct StoredPaperDisplayName {
+    schema_version: u32,
+    source_digest: String,
+    filename: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PaperIntakeRequest {
+    pub digest: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PaperIntakeStartQuery {
+    idempotency_key: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaperIntakePhase {
+    Queued,
+    Extracting,
+    LocatingMethods,
+    RecognizingMethods,
+    AssessingDrafts,
+    Completed,
+    Failed,
+    Cancelling,
+    Cancelled,
+}
+
+impl PaperIntakePhase {
+    fn terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PaperIntakeProgress {
+    pub completed: usize,
+    pub total: usize,
+    pub unit: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PaperCacheUse {
+    pub extraction: bool,
+    pub reconstruction: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PaperFailure {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PaperIntakeStatusResponse {
+    pub job_id: String,
+    pub source_digest: String,
+    pub phase: PaperIntakePhase,
+    pub progress: PaperIntakeProgress,
+    pub durations_ms: BTreeMap<String, u64>,
+    pub cache: PaperCacheUse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<PaperResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<PaperFailure>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PaperIntakeStartResponse {
+    pub job_id: String,
+    pub source_digest: String,
+    pub phase: PaperIntakePhase,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ExtractedPaperCache {
+    schema_version: u32,
+    source_digest: String,
+    extractor_revision: String,
+    extracted_via: String,
+    text: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ReconstructedPaperCache {
+    schema_version: u32,
+    source_digest: String,
+    extracted_text_digest: String,
+    reconstructor_revision: String,
+    catalog_revision: String,
+    response: PaperResponse,
 }
 
 #[derive(Debug, Serialize)]
@@ -409,13 +701,18 @@ pub struct WebProject {
     catalog: Catalog,
     pixi: Option<PathBuf>,
     runs: Mutex<BTreeMap<String, Arc<RunJob>>>,
+    paper_intakes: Mutex<BTreeMap<String, Arc<PaperIntakeJob>>>,
+    paper_execution: Arc<Semaphore>,
     graph_lock: Mutex<()>,
     agent: agent::AgentBridge,
     mcp_capability: RuntimeCapability,
     transaction_replays: Mutex<BTreeMap<String, TransactionReplay>>,
     run_replays: Mutex<BTreeMap<String, RunReplay>>,
+    paper_intake_replays: Mutex<BTreeMap<String, PaperIntakeReplay>>,
     replay_sequence: AtomicU64,
     sequence: AtomicU64,
+    paper_limits: PaperLimits,
+    paper_tools: PaperToolchainState,
     source_search_cache: Mutex<BTreeMap<String, (Instant, Vec<source_search::SearchResult>)>>,
     paper_search_cache: Mutex<BTreeMap<String, (Instant, Vec<literature::PaperSearchResult>)>>,
 }
@@ -487,6 +784,14 @@ struct RunJob {
     validation: Option<ValidationContext>,
 }
 
+#[derive(Debug)]
+struct PaperIntakeJob {
+    status: Mutex<PaperIntakeStatusResponse>,
+    cancel: Arc<AtomicBool>,
+    cancelled: Notify,
+    created_at: Instant,
+}
+
 #[derive(Debug, Clone)]
 struct TransactionReplay {
     request_digest: String,
@@ -498,6 +803,13 @@ struct TransactionReplay {
 struct RunReplay {
     request_digest: String,
     result: RunStartResponse,
+    sequence: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PaperIntakeReplay {
+    request_digest: String,
+    result: PaperIntakeStartResponse,
     sequence: u64,
 }
 
@@ -533,19 +845,27 @@ impl WebProject {
             mcp_command,
             mcp_capability.0.clone(),
         );
+        let paper_tools = PaperToolchainState::detect(&root);
+        let paper_limits = PaperLimits::from_environment();
+        let paper_execution = Arc::new(Semaphore::new(paper_limits.max_active_executions));
         Ok(Self {
             root,
             graph_path,
             catalog,
             pixi: pixi_executable(),
             runs: Mutex::new(BTreeMap::new()),
+            paper_intakes: Mutex::new(BTreeMap::new()),
+            paper_execution,
             graph_lock: Mutex::new(()),
             agent,
             mcp_capability,
             transaction_replays: Mutex::new(BTreeMap::new()),
             run_replays: Mutex::new(BTreeMap::new()),
+            paper_intake_replays: Mutex::new(BTreeMap::new()),
             replay_sequence: AtomicU64::new(0),
             sequence: AtomicU64::new(0),
+            paper_limits,
+            paper_tools,
             source_search_cache: Mutex::new(BTreeMap::new()),
             paper_search_cache: Mutex::new(BTreeMap::new()),
         })
@@ -667,6 +987,143 @@ impl WebProject {
         self.root.join(".somite/uploads")
     }
 
+    fn papers_dir(&self) -> PathBuf {
+        self.root.join(".somite/papers")
+    }
+
+    fn resolve_paper_artifact(
+        &self,
+        digest: &str,
+        max_size_bytes: u64,
+    ) -> Result<(StoredPaperArtifact, PathBuf), ServerError> {
+        let hex = paper_digest_hex(digest)?;
+        let objects = self.papers_dir().join("objects");
+        let directory = objects.join(hex);
+        let directory_metadata = std::fs::symlink_metadata(&directory)
+            .map_err(|_| ServerError::PaperArtifactNotFound(digest.to_owned()))?;
+        if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+            return Err(ServerError::InvalidPaperIntake(
+                "paper artifact object path must be a regular non-symlink directory".to_owned(),
+            ));
+        }
+        let canonical_objects = objects
+            .canonicalize()
+            .map_err(|_| ServerError::PaperArtifactNotFound(digest.to_owned()))?;
+        let canonical_directory = directory
+            .canonicalize()
+            .map_err(|_| ServerError::PaperArtifactNotFound(digest.to_owned()))?;
+        if canonical_directory.parent() != Some(canonical_objects.as_path()) {
+            return Err(ServerError::InvalidPaperIntake(
+                "paper artifact object path escapes the content-addressed store".to_owned(),
+            ));
+        }
+
+        let metadata_path = directory.join("artifact.json");
+        let metadata_file = std::fs::symlink_metadata(&metadata_path)
+            .map_err(|_| ServerError::PaperArtifactNotFound(digest.to_owned()))?;
+        if metadata_file.file_type().is_symlink() || !metadata_file.is_file() {
+            return Err(ServerError::InvalidPaperIntake(
+                "paper artifact metadata must be a regular non-symlink file".to_owned(),
+            ));
+        }
+        let canonical_metadata = metadata_path
+            .canonicalize()
+            .map_err(|_| ServerError::PaperArtifactNotFound(digest.to_owned()))?;
+        if canonical_metadata.parent() != Some(canonical_directory.as_path()) {
+            return Err(ServerError::InvalidPaperIntake(
+                "paper artifact metadata escapes its content-addressed object directory".to_owned(),
+            ));
+        }
+        let metadata: StoredPaperArtifact = std::fs::read(&canonical_metadata)
+            .map_err(|_| ServerError::PaperArtifactNotFound(digest.to_owned()))
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(ServerError::from))?;
+        if metadata.schema_version != 1 || metadata.digest != digest {
+            return Err(ServerError::InvalidPaperIntake(
+                "paper artifact metadata does not match its content address".to_owned(),
+            ));
+        }
+        if metadata.size_bytes > max_size_bytes {
+            return Err(ServerError::PaperUploadTooLarge {
+                limit_bytes: max_size_bytes,
+            });
+        }
+        let payload = directory.join(format!("payload.{}", metadata.media_kind.extension()));
+        let before_open = std::fs::symlink_metadata(&payload)
+            .map_err(|_| ServerError::PaperArtifactNotFound(digest.to_owned()))?;
+        if before_open.file_type().is_symlink() || !before_open.is_file() {
+            return Err(ServerError::InvalidPaperIntake(
+                "paper artifact payload must be a regular non-symlink file".to_owned(),
+            ));
+        }
+        let canonical_payload = payload
+            .canonicalize()
+            .map_err(|_| ServerError::PaperArtifactNotFound(digest.to_owned()))?;
+        if canonical_payload.parent() != Some(canonical_directory.as_path()) {
+            return Err(ServerError::InvalidPaperIntake(
+                "paper artifact payload escapes its content-addressed object directory".to_owned(),
+            ));
+        }
+
+        let mut file = std::fs::File::open(&canonical_payload)
+            .map_err(|_| ServerError::PaperArtifactNotFound(digest.to_owned()))?;
+        let opened = file
+            .metadata()
+            .map_err(|_| ServerError::PaperArtifactNotFound(digest.to_owned()))?;
+        if !opened.is_file() || !same_file_identity(&before_open, &opened) {
+            return Err(ServerError::InvalidPaperIntake(
+                "paper artifact payload changed while it was being opened".to_owned(),
+            ));
+        }
+        if opened.len() != metadata.size_bytes {
+            return Err(ServerError::InvalidPaperIntake(
+                "paper artifact size does not match its metadata".to_owned(),
+            ));
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut size = 0_u64;
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            size = size.checked_add(count as u64).ok_or_else(|| {
+                ServerError::InvalidPaperIntake(
+                    "paper artifact size exceeds the supported range".to_owned(),
+                )
+            })?;
+            hasher.update(&buffer[..count]);
+        }
+        if size != metadata.size_bytes {
+            return Err(ServerError::InvalidPaperIntake(
+                "paper artifact size changed while verifying its content address".to_owned(),
+            ));
+        }
+        let verified_digest = format!("blake3:{}", hasher.finalize().to_hex());
+        if verified_digest != digest {
+            return Err(ServerError::InvalidPaperIntake(
+                "paper artifact bytes do not match their content address".to_owned(),
+            ));
+        }
+
+        let after_read = std::fs::symlink_metadata(&payload)
+            .map_err(|_| ServerError::PaperArtifactNotFound(digest.to_owned()))?;
+        let final_payload = payload
+            .canonicalize()
+            .map_err(|_| ServerError::PaperArtifactNotFound(digest.to_owned()))?;
+        if after_read.file_type().is_symlink()
+            || !after_read.is_file()
+            || !same_file_identity(&opened, &after_read)
+            || final_payload != canonical_payload
+        {
+            return Err(ServerError::InvalidPaperIntake(
+                "paper artifact payload changed while verifying its content address".to_owned(),
+            ));
+        }
+        Ok((metadata, canonical_payload))
+    }
+
     fn resolve_project_file(&self, relative: &str) -> Result<PathBuf, ServerError> {
         let supplied = Path::new(relative);
         if supplied.is_absolute() {
@@ -683,6 +1140,31 @@ impl WebProject {
         }
         Ok(resolved)
     }
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.file_type() == right.file_type()
+        && left.modified().ok() == right.modified().ok()
+}
+
+fn paper_digest_hex(digest: &str) -> Result<&str, ServerError> {
+    digest
+        .strip_prefix("blake3:")
+        .filter(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| {
+            ServerError::InvalidPaperIntake(
+                "digest must be an algorithm-prefixed BLAKE3 content identity".to_owned(),
+            )
+        })
 }
 
 fn local_server_url() -> String {
@@ -716,6 +1198,11 @@ pub fn app(project: WebProject) -> Router {
         .allow_origin(HeaderValue::from_static("http://localhost:3000"))
         .allow_methods([Method::GET, Method::POST, Method::PUT])
         .allow_headers([header::CONTENT_TYPE]);
+    let paper_body_limit = project
+        .paper_limits
+        .max_upload_bytes
+        .saturating_add(PAPER_MULTIPART_OVERHEAD_BYTES)
+        .min(usize::MAX as u64) as usize;
     let project = Arc::new(project);
     Router::new()
         .route("/api/health", get(health))
@@ -730,6 +1217,10 @@ pub fn app(project: WebProject) -> Router {
             post(import_local_snakemake),
         )
         .route("/api/sources/search", get(search_sources))
+        .route(
+            "/api/paper/resources/resolve",
+            post(resolve_paper_resources),
+        )
         .route("/api/papers/search", get(search_papers))
         .route("/api/graph", put(save_graph))
         .route("/api/graph/autosave", put(autosave_graph))
@@ -761,11 +1252,25 @@ pub fn app(project: WebProject) -> Router {
         .route("/api/export", post(export_bundle))
         .route("/api/paper", post(rebuild_paper))
         .route(
+            "/api/papers/uploads",
+            post(upload_paper)
+                .layer::<_, std::convert::Infallible>(DefaultBodyLimit::max(paper_body_limit))
+                .layer(RequestBodyLimitLayer::new(paper_body_limit)),
+        )
+        .route("/api/papers/intakes", post(start_paper_intake))
+        .route("/api/papers/intakes/{job_id}", get(paper_intake_status))
+        .route(
+            "/api/papers/intakes/{job_id}/cancel",
+            post(cancel_paper_intake),
+        )
+        .route(
             "/api/papers/biorxiv/reconstruct",
             post(rebuild_biorxiv_paper),
         )
-        .route("/api/files", post(upload_file))
-        .layer(DefaultBodyLimit::disable())
+        .route(
+            "/api/files",
+            post(upload_file).layer(DefaultBodyLimit::disable()),
+        )
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn_with_state(
@@ -853,8 +1358,8 @@ async fn session(
     Ok(Json(project.session()?))
 }
 
-async fn system_profile() -> Json<SystemProfile> {
-    Json(detect_system_profile())
+async fn system_profile(State(project): State<Arc<WebProject>>) -> Json<SystemProfile> {
+    Json(detect_system_profile(&project.paper_tools))
 }
 
 #[derive(Debug, Deserialize)]
@@ -868,13 +1373,31 @@ async fn search_sources(
     Query(request): Query<SourceSearchQuery>,
 ) -> Result<Json<source_search::SearchResponse>, ServerError> {
     let query = request.q.trim();
-    if !(2..=120).contains(&query.len())
-        || query.chars().any(char::is_control)
-        || !matches!(request.provider.as_str(), "ncbi" | "ensembl")
-    {
-        return Err(ServerError::SourceSearch("invalid query".to_owned()));
+    if !valid_source_query(query, &request.provider) {
+        return Err(ServerError::InvalidSourceRequest(
+            "invalid query".to_owned(),
+        ));
     }
-    let key = format!("{}:{}", request.provider, query.to_ascii_lowercase());
+    let results = cached_source_results(&project, query, &request.provider).await?;
+    Ok(Json(source_search::SearchResponse {
+        query: query.to_owned(),
+        provider: request.provider,
+        results,
+    }))
+}
+
+fn valid_source_query(query: &str, provider: &str) -> bool {
+    (2..=120).contains(&query.len())
+        && !query.chars().any(char::is_control)
+        && matches!(provider, "ncbi" | "ensembl")
+}
+
+async fn cached_source_results(
+    project: &Arc<WebProject>,
+    query: &str,
+    provider: &str,
+) -> Result<Vec<source_search::SearchResult>, ServerError> {
+    let key = format!("{}:{}", provider, query.to_ascii_lowercase());
     if let Some((_, results)) = project
         .source_search_cache
         .lock()
@@ -883,16 +1406,10 @@ async fn search_sources(
         .filter(|(created, _)| created.elapsed() < Duration::from_secs(600))
         .cloned()
     {
-        return Ok(Json(source_search::SearchResponse {
-            query: query.to_owned(),
-            provider: request.provider,
-            results,
-        }));
+        return Ok(results);
     }
-    let owned_query = query.to_owned();
-    let provider = request.provider.clone();
-    let worker_provider = provider.clone();
-    let worker_query = owned_query.clone();
+    let worker_provider = provider.to_owned();
+    let worker_query = query.to_owned();
     let results = tokio::task::spawn_blocking(move || match worker_provider.as_str() {
         "ncbi" => source_search::search_ncbi(&worker_query),
         "ensembl" => source_search::search_ensembl(&worker_query),
@@ -905,11 +1422,85 @@ async fn search_sources(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(key, (Instant::now(), results.clone()));
-    Ok(Json(source_search::SearchResponse {
-        query: owned_query,
-        provider,
-        results,
-    }))
+    Ok(results)
+}
+
+async fn resolve_paper_resources(
+    State(project): State<Arc<WebProject>>,
+    Json(request): Json<PaperResourceResolveRequest>,
+) -> Result<Json<PaperResourceResolution>, ServerError> {
+    if request.resources.len() > 32
+        || request
+            .resources
+            .iter()
+            .any(|resource| !valid_paper_resource(resource))
+    {
+        return Err(ServerError::InvalidSourceRequest(
+            "invalid paper resource request".to_owned(),
+        ));
+    }
+    let mut groups = Vec::with_capacity(request.resources.len());
+    for citation in request.resources {
+        let provider = if citation.kind == "ensembl" {
+            "ensembl"
+        } else {
+            "ncbi"
+        };
+        let query = match (citation.role.as_str(), citation.kind.as_str()) {
+            ("reads", _) => Some(format!("{} sra", citation.accession)),
+            ("sample_metadata", "sra_sample" | "biosample")
+            | (
+                "unknown",
+                "sra_study" | "sra_sample" | "sra_experiment" | "sra_run" | "bioproject",
+            ) => Some(format!("{} sra", citation.accession)),
+            ("reference", "assembly") => Some(format!("{} reference genome", citation.accession)),
+            ("annotation", "ensembl") | ("reference", "ensembl") => {
+                Some(citation.accession.clone())
+            }
+            _ => None,
+        };
+        let mut results = match query {
+            Some(query) => cached_source_results(&project, &query, provider).await?,
+            None => Vec::new(),
+        };
+        results.retain(|result| match citation.role.as_str() {
+            "reads" => result.data_kind == "Reads",
+            "reference" => result.data_kind == "Reference",
+            _ => true,
+        });
+        groups.push(PaperResourceGroup {
+            citation,
+            provider: provider.to_owned(),
+            status: if results.is_empty() {
+                "unavailable".to_owned()
+            } else {
+                "available".to_owned()
+            },
+            results,
+        });
+    }
+    Ok(Json(PaperResourceResolution { groups }))
+}
+
+fn valid_paper_resource(resource: &PaperResourceCitation) -> bool {
+    if resource.context.len() > 1_000
+        || resource
+            .source_location
+            .as_ref()
+            .is_some_and(|value| value.len() > 80)
+        || !matches!(
+            resource.role.as_str(),
+            "reads" | "reference" | "annotation" | "sample_metadata" | "unknown"
+        )
+    {
+        return false;
+    }
+    resource_citations(&resource.accession)
+        .into_iter()
+        .any(|citation| {
+            citation.accession == resource.accession
+                && paper_resource_kind_label(citation.kind) == resource.kind
+        })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1179,31 +1770,9 @@ fn import_nfcore_graph(
     let work = root.join(".somite/catalog/preview").join(&key);
     std::fs::create_dir_all(&work)?;
     let dot_path = work.join("workflow.dot");
-    let _ = std::fs::remove_file(&dot_path);
-    let output = Command::new("timeout")
-        .arg("120s")
-        .arg(nextflow)
-        .args([
-            "run",
-            &request.workflow,
-            "-r",
-            &request.revision,
-            "-profile",
-            "test",
-            "-preview",
-            "-with-dag",
-        ])
-        .arg(&dot_path)
-        .args(["--outdir", "results"])
-        .current_dir(&work)
-        .output()?;
+    let output = run_nfcore_preview(&nextflow, &work, request, &dot_path)?;
     if !output.status.success() || !dot_path.is_file() {
-        let detail = String::from_utf8_lossy(&output.stderr);
-        let detail = detail
-            .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("Nextflow did not produce a DAG");
+        let detail = nfcore_preview_failure_detail(&work, &output);
         return Err(ServerError::WorkflowImport(format!(
             "{}@{} could not be previewed: {detail}",
             request.workflow, request.revision
@@ -1230,6 +1799,138 @@ fn import_nfcore_graph(
     }
     std::fs::write(cache_path, serde_json::to_vec_pretty(&response)?)?;
     Ok(response)
+}
+
+fn run_nfcore_preview(
+    nextflow: &Path,
+    work: &Path,
+    request: &WorkflowGraphRequest,
+    dot_path: &Path,
+) -> std::io::Result<std::process::Output> {
+    let output = run_nfcore_preview_attempt(nextflow, work, request, dot_path, None)?;
+    if output.status.success() && dot_path.is_file()
+        || !nfcore_preview_needs_legacy_parser(work, &output)
+    {
+        return Ok(output);
+    }
+    run_nfcore_preview_attempt(nextflow, work, request, dot_path, Some("v1"))
+}
+
+fn run_nfcore_preview_attempt(
+    nextflow: &Path,
+    work: &Path,
+    request: &WorkflowGraphRequest,
+    dot_path: &Path,
+    syntax_parser: Option<&str>,
+) -> std::io::Result<std::process::Output> {
+    remove_preview_artifact(dot_path)?;
+    remove_preview_artifact(&work.join(".nextflow.log"))?;
+    let mut command = Command::new("timeout");
+    command
+        .arg("120s")
+        .arg(nextflow)
+        .args([
+            "run",
+            &request.workflow,
+            "-r",
+            &request.revision,
+            "-profile",
+            "test",
+            "-preview",
+            "-with-dag",
+        ])
+        .arg(dot_path)
+        .args(["--outdir", "results"])
+        .current_dir(work);
+    match syntax_parser {
+        Some(parser) => command.env("NXF_SYNTAX_PARSER", parser),
+        None => command.env_remove("NXF_SYNTAX_PARSER"),
+    };
+    command.output()
+}
+
+fn remove_preview_artifact(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn nfcore_preview_needs_legacy_parser(work: &Path, output: &std::process::Output) -> bool {
+    if output.status.code() == Some(124) {
+        return false;
+    }
+    let evidence = nfcore_preview_failure_evidence(work, output).to_ascii_lowercase();
+    evidence.contains("config parsing failed")
+        || evidence.contains("configparseexception")
+        || evidence.contains("_nf_config")
+            && (evidence.contains(" is not defined @ line ")
+                || evidence.contains("unexpected input"))
+        || evidence.contains("configparserv2")
+            && evidence.contains("multiplecompilationerrorsexception")
+}
+
+fn nfcore_preview_failure_evidence(work: &Path, output: &std::process::Output) -> String {
+    let log = std::fs::read_to_string(work.join(".nextflow.log")).unwrap_or_default();
+    format!(
+        "{}\n{}\n{log}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    )
+}
+
+fn nfcore_preview_failure_detail(work: &Path, output: &std::process::Output) -> String {
+    let log = std::fs::read_to_string(work.join(".nextflow.log")).unwrap_or_default();
+    if let Some(detail) = concise_nextflow_log_failure(&log) {
+        return detail;
+    }
+    if output.status.code() == Some(124) {
+        return "Nextflow preview timed out after 120 seconds".to_owned();
+    }
+    last_nonempty_output_line(&output.stderr)
+        .or_else(|| last_nonempty_output_line(&output.stdout))
+        .unwrap_or_else(|| "Nextflow did not produce a DAG".to_owned())
+}
+
+fn concise_nextflow_log_failure(log: &str) -> Option<String> {
+    let headline = log.lines().rev().find_map(|line| {
+        let error = line
+            .split_once(" ERROR ")
+            .map(|(_, error)| error)
+            .or_else(|| line.trim().strip_prefix("ERROR "))?;
+        Some(
+            error
+                .rsplit_once(" - ")
+                .map_or(error, |(_, message)| message)
+                .trim()
+                .to_owned(),
+        )
+    });
+    let diagnostic = log.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if !trimmed.contains(" is not defined @ line ") && !trimmed.contains("Unexpected input") {
+            return None;
+        }
+        let diagnostic = trimmed.find('`').map_or(trimmed, |start| &trimmed[start..]);
+        Some(diagnostic.to_owned())
+    });
+    match (headline, diagnostic) {
+        (Some(headline), Some(diagnostic)) if headline != diagnostic => {
+            Some(format!("{headline}: {diagnostic}"))
+        }
+        (Some(headline), _) => Some(headline),
+        (None, Some(diagnostic)) => Some(diagnostic),
+        (None, None) => None,
+    }
+}
+
+fn last_nonempty_output_line(output: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_owned())
 }
 
 async fn validate_graph(
@@ -1906,7 +2607,7 @@ fn queue_run(
         if !agent::valid_idempotency_key(key) {
             return Err(ServerError::Agent(agent::AgentError::InvalidIdempotencyKey));
         }
-        if let Some(replay) = replays.get(key) {
+        if let Some(replay) = replays.get(key).cloned() {
             if replay.request_digest != request_digest {
                 return Err(ServerError::Agent(agent::AgentError::IdempotencyConflict));
             }
@@ -2687,6 +3388,691 @@ fn install_cached_nfcore(root: &Path, catalog: &mut Catalog) {
     }
 }
 
+fn paper_progress(phase: PaperIntakePhase) -> PaperIntakeProgress {
+    let (completed, message) = match phase {
+        PaperIntakePhase::Queued => (0, "Waiting to read paper"),
+        PaperIntakePhase::Extracting => (0, "Extracting paper text"),
+        PaperIntakePhase::LocatingMethods => (1, "Locating methods and cited data"),
+        PaperIntakePhase::RecognizingMethods => (2, "Recognizing described methods"),
+        PaperIntakePhase::AssessingDrafts => (3, "Assessing reconstructed drafts"),
+        PaperIntakePhase::Completed => (4, "Paper intake completed"),
+        PaperIntakePhase::Failed => (4, "Paper intake failed"),
+        PaperIntakePhase::Cancelling => (0, "Stopping paper intake"),
+        PaperIntakePhase::Cancelled => (4, "Paper intake cancelled"),
+    };
+    PaperIntakeProgress {
+        completed,
+        total: 4,
+        unit: "stages".to_owned(),
+        message: message.to_owned(),
+    }
+}
+
+fn update_paper_phase(job: &PaperIntakeJob, phase: PaperIntakePhase) {
+    let mut status = job
+        .status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if status.phase.terminal() || status.phase == PaperIntakePhase::Cancelling {
+        return;
+    }
+    status.phase = phase;
+    status.progress = paper_progress(phase);
+}
+
+fn update_paper_extraction_progress(job: &PaperIntakeJob, progress: ExtractionProgress) {
+    let mut status = job
+        .status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if status.phase.terminal() || status.phase == PaperIntakePhase::Cancelling {
+        return;
+    }
+    status.phase = PaperIntakePhase::Extracting;
+    status.progress = match progress {
+        ExtractionProgress::NativeText => PaperIntakeProgress {
+            completed: 0,
+            total: 4,
+            unit: "stages".to_owned(),
+            message: "Reading embedded PDF text".to_owned(),
+        },
+        ExtractionProgress::Rasterizing { page, total } => PaperIntakeProgress {
+            completed: page.saturating_sub(1),
+            total,
+            unit: "pages".to_owned(),
+            message: format!("Preparing OCR page {page} of {total}"),
+        },
+        ExtractionProgress::Ocr { page, total } => PaperIntakeProgress {
+            completed: page.saturating_sub(1),
+            total,
+            unit: "pages".to_owned(),
+            message: format!("Reading OCR page {page} of {total}"),
+        },
+        ExtractionProgress::PageComplete { page, total } => PaperIntakeProgress {
+            completed: page,
+            total,
+            unit: "pages".to_owned(),
+            message: format!("Read OCR page {page} of {total}"),
+        },
+    };
+}
+
+fn paper_intake_snapshot(job: &PaperIntakeJob) -> PaperIntakeStatusResponse {
+    job.status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn paper_intake_observable_changed(
+    initial: &PaperIntakeStatusResponse,
+    current: &PaperIntakeStatusResponse,
+) -> bool {
+    initial.phase != current.phase
+        || initial.progress.completed != current.progress.completed
+        || initial.progress.total != current.progress.total
+        || initial.progress.unit != current.progress.unit
+        || initial.progress.message != current.progress.message
+}
+
+fn paper_failure(code: &str, message: impl Into<String>, retryable: bool) -> PaperFailure {
+    PaperFailure {
+        code: code.to_owned(),
+        message: message.into(),
+        retryable,
+    }
+}
+
+fn extraction_failure(error: &PaperError) -> PaperFailure {
+    match error {
+        PaperError::MissingTool { .. } => {
+            paper_failure("missing_extraction_dependency", error.to_string(), true)
+        }
+        PaperError::Limit(_) => paper_failure("paper_extraction_limit", error.to_string(), false),
+        PaperError::Timeout { .. } => {
+            paper_failure("paper_extraction_timeout", error.to_string(), true)
+        }
+        PaperError::Cancelled => {
+            paper_failure("paper_extraction_cancelled", error.to_string(), true)
+        }
+        _ => paper_failure("paper_extraction_failed", error.to_string(), true),
+    }
+}
+
+fn finish_paper_failure(job: &PaperIntakeJob, failure: PaperFailure, total_started: Instant) {
+    if job.cancel.load(Ordering::Acquire) {
+        finish_paper_cancelled(job, total_started);
+        return;
+    }
+    let mut status = job
+        .status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if status.phase.terminal() {
+        return;
+    }
+    status
+        .durations_ms
+        .insert("total".to_owned(), duration_millis(total_started.elapsed()));
+    status.phase = PaperIntakePhase::Failed;
+    status.progress = paper_progress(PaperIntakePhase::Failed);
+    status.result = None;
+    status.failure = Some(failure);
+}
+
+fn finish_paper_cancelled(job: &PaperIntakeJob, total_started: Instant) {
+    let mut status = job
+        .status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if status.phase.terminal() {
+        return;
+    }
+    status
+        .durations_ms
+        .insert("total".to_owned(), duration_millis(total_started.elapsed()));
+    status.phase = PaperIntakePhase::Cancelled;
+    status.progress = paper_progress(PaperIntakePhase::Cancelled);
+    status.result = None;
+    status.failure = None;
+}
+
+fn finish_paper_success(job: &PaperIntakeJob, response: PaperResponse, total_started: Instant) {
+    if job.cancel.load(Ordering::Acquire) {
+        finish_paper_cancelled(job, total_started);
+        return;
+    }
+    let mut status = job
+        .status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if status.phase.terminal() || status.phase == PaperIntakePhase::Cancelling {
+        return;
+    }
+    status
+        .durations_ms
+        .insert("total".to_owned(), duration_millis(total_started.elapsed()));
+    status.phase = PaperIntakePhase::Completed;
+    status.progress = paper_progress(PaperIntakePhase::Completed);
+    status.result = Some(response);
+    status.failure = None;
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn extraction_cache_path(project: &WebProject, digest: &str) -> Result<PathBuf, ServerError> {
+    let hex = paper_digest_hex(digest)?;
+    Ok(project
+        .papers_dir()
+        .join("cache/extracted")
+        .join(hex)
+        .join(format!("{PAPER_EXTRACTOR_REVISION}.json")))
+}
+
+fn reconstruction_cache_path(
+    project: &WebProject,
+    digest: &str,
+    text_digest: &str,
+    catalog_revision: &str,
+) -> Result<PathBuf, ServerError> {
+    let source_hex = paper_digest_hex(digest)?;
+    let key = content_digest(&serde_json::to_vec(&(
+        text_digest,
+        PAPER_RECONSTRUCTOR_REVISION,
+        catalog_revision,
+    ))?);
+    let key_hex = paper_digest_hex(&key)?;
+    Ok(project
+        .papers_dir()
+        .join("cache/reconstructed")
+        .join(source_hex)
+        .join(format!("{key_hex}.json")))
+}
+
+fn read_json_cache<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+}
+
+fn write_json_cache<T: Serialize>(
+    project: &WebProject,
+    path: &Path,
+    value: &T,
+) -> Result<(), ServerError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| ServerError::Paper("paper cache path has no parent".to_owned()))?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".{}.tmp", project.next_id("paper-cache")));
+    let encoded = serde_json::to_vec(value)?;
+    if let Err(error) = std::fs::write(&temporary, encoded) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(ServerError::Io(error));
+    }
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(ServerError::Io(error));
+    }
+    Ok(())
+}
+
+fn record_paper_duration(job: &PaperIntakeJob, stage: &str, started: Instant) {
+    job.status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .durations_ms
+        .insert(stage.to_owned(), duration_millis(started.elapsed()));
+}
+
+fn paper_stage_duration_key(phase: PaperIntakePhase) -> Option<&'static str> {
+    match phase {
+        PaperIntakePhase::LocatingMethods => Some("locating_methods"),
+        PaperIntakePhase::RecognizingMethods => Some("recognizing_methods"),
+        PaperIntakePhase::AssessingDrafts => Some("assessing_drafts"),
+        _ => None,
+    }
+}
+
+fn execute_paper_intake(
+    project: Arc<WebProject>,
+    job: Arc<PaperIntakeJob>,
+    artifact: StoredPaperArtifact,
+    path: PathBuf,
+) {
+    let total_started = job.created_at;
+    if job.cancel.load(Ordering::Acquire) {
+        finish_paper_cancelled(&job, total_started);
+        return;
+    }
+
+    update_paper_phase(&job, PaperIntakePhase::Extracting);
+    let extraction_started = Instant::now();
+    let extraction_path = match extraction_cache_path(&project, &artifact.digest) {
+        Ok(path) => path,
+        Err(error) => {
+            finish_paper_failure(
+                &job,
+                paper_failure("paper_cache_key_failed", error.to_string(), true),
+                total_started,
+            );
+            return;
+        }
+    };
+    let extracted = read_json_cache::<ExtractedPaperCache>(&extraction_path).filter(|cached| {
+        cached.schema_version == 1
+            && cached.source_digest == artifact.digest
+            && cached.extractor_revision == PAPER_EXTRACTOR_REVISION
+    });
+    let extracted = match extracted {
+        Some(extracted) => {
+            job.status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .cache
+                .extraction = true;
+            extracted
+        }
+        None => {
+            let limits = ExtractionLimits {
+                max_pages: project.paper_limits.max_ocr_pages,
+                max_text_bytes: project
+                    .paper_limits
+                    .max_extracted_text_bytes
+                    .min(usize::MAX as u64) as usize,
+                command_timeout: project.paper_limits.command_timeout,
+            };
+            let tools = paper_extraction_toolchain(&project.paper_tools);
+            let extracted = match extract_from_path_with_toolchain(
+                &path,
+                limits,
+                &tools,
+                || job.cancel.load(Ordering::Acquire),
+                |progress| update_paper_extraction_progress(&job, progress),
+            ) {
+                Ok(extracted) => extracted,
+                Err(PaperError::Cancelled) => {
+                    finish_paper_cancelled(&job, total_started);
+                    return;
+                }
+                Err(error) => {
+                    finish_paper_failure(&job, extraction_failure(&error), total_started);
+                    return;
+                }
+            };
+            let cached = ExtractedPaperCache {
+                schema_version: 1,
+                source_digest: artifact.digest.clone(),
+                extractor_revision: PAPER_EXTRACTOR_REVISION.to_owned(),
+                extracted_via: extract_via_label(extracted.via).to_owned(),
+                text: extracted.text,
+            };
+            if cached.text.len() as u64 <= project.paper_limits.max_extracted_text_bytes {
+                if job.cancel.load(Ordering::Acquire) {
+                    finish_paper_cancelled(&job, total_started);
+                    return;
+                }
+                if let Err(error) = write_json_cache(&project, &extraction_path, &cached) {
+                    finish_paper_failure(
+                        &job,
+                        paper_failure("paper_cache_write_failed", error.to_string(), true),
+                        total_started,
+                    );
+                    return;
+                }
+            }
+            cached
+        }
+    };
+    record_paper_duration(&job, "extraction", extraction_started);
+    if extracted.text.len() as u64 > project.paper_limits.max_extracted_text_bytes {
+        finish_paper_failure(
+            &job,
+            paper_failure(
+                "extracted_text_too_large",
+                format!(
+                    "extracted text exceeds the {} byte safety limit",
+                    project.paper_limits.max_extracted_text_bytes
+                ),
+                false,
+            ),
+            total_started,
+        );
+        return;
+    }
+    if job.cancel.load(Ordering::Acquire) {
+        finish_paper_cancelled(&job, total_started);
+        return;
+    }
+
+    let reconstruction_started = Instant::now();
+    let text_digest = content_digest(extracted.text.as_bytes());
+    let catalog_revision = match project.catalog.catalog_revision() {
+        Ok(revision) => revision,
+        Err(error) => {
+            finish_paper_failure(
+                &job,
+                paper_failure("catalog_identity_failed", error.to_string(), false),
+                total_started,
+            );
+            return;
+        }
+    };
+    let reconstruction_path = match reconstruction_cache_path(
+        &project,
+        &artifact.digest,
+        &text_digest,
+        &catalog_revision,
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            finish_paper_failure(
+                &job,
+                paper_failure("paper_cache_key_failed", error.to_string(), true),
+                total_started,
+            );
+            return;
+        }
+    };
+    let reconstructed =
+        read_json_cache::<ReconstructedPaperCache>(&reconstruction_path).filter(|cached| {
+            cached.schema_version == 1
+                && cached.source_digest == artifact.digest
+                && cached.extracted_text_digest == text_digest
+                && cached.reconstructor_revision == PAPER_RECONSTRUCTOR_REVISION
+                && cached.catalog_revision == catalog_revision
+        });
+    let response = match reconstructed {
+        Some(cached) => {
+            let mut status = job
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            status.cache.reconstruction = true;
+            cached.response
+        }
+        None => {
+            let mut active_stage: Option<(PaperIntakePhase, Instant)> = None;
+            let response = paper_response_with_progress(
+                &project.catalog,
+                &extracted.extracted_via,
+                &extracted.text,
+                |phase| {
+                    if let Some((previous, started)) = active_stage.take() {
+                        if let Some(key) = paper_stage_duration_key(previous) {
+                            record_paper_duration(&job, key, started);
+                        }
+                    }
+                    update_paper_phase(&job, phase);
+                    active_stage = Some((phase, Instant::now()));
+                },
+            );
+            if let Some((last, started)) = active_stage {
+                if let Some(key) = paper_stage_duration_key(last) {
+                    record_paper_duration(&job, key, started);
+                }
+            }
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    finish_paper_failure(
+                        &job,
+                        paper_failure("paper_reconstruction_failed", error.to_string(), true),
+                        total_started,
+                    );
+                    return;
+                }
+            };
+            if job.cancel.load(Ordering::Acquire) {
+                finish_paper_cancelled(&job, total_started);
+                return;
+            }
+            let cached = ReconstructedPaperCache {
+                schema_version: 1,
+                source_digest: artifact.digest.clone(),
+                extracted_text_digest: text_digest,
+                reconstructor_revision: PAPER_RECONSTRUCTOR_REVISION.to_owned(),
+                catalog_revision,
+                response: response.clone(),
+            };
+            if let Err(error) = write_json_cache(&project, &reconstruction_path, &cached) {
+                finish_paper_failure(
+                    &job,
+                    paper_failure("paper_cache_write_failed", error.to_string(), true),
+                    total_started,
+                );
+                return;
+            }
+            response
+        }
+    };
+    record_paper_duration(&job, "reconstruction", reconstruction_started);
+    finish_paper_success(&job, response, total_started);
+}
+
+async fn start_paper_intake(
+    State(project): State<Arc<WebProject>>,
+    Query(query): Query<PaperIntakeStartQuery>,
+    Json(request): Json<PaperIntakeRequest>,
+) -> Result<(StatusCode, Json<PaperIntakeStartResponse>), ServerError> {
+    let requested_digest = request.digest;
+    let resolver = Arc::clone(&project);
+    let resolve_digest = requested_digest.clone();
+    let max_size_bytes = project.paper_limits.max_upload_bytes;
+    let (artifact, path) = tokio::task::spawn_blocking(move || {
+        resolver.resolve_paper_artifact(&resolve_digest, max_size_bytes)
+    })
+    .await
+    .map_err(|error| {
+        ServerError::Paper(format!(
+            "paper artifact verifier stopped unexpectedly: {error}"
+        ))
+    })??;
+    let request_digest = content_digest(&serde_json::to_vec(&("paper_intake", &requested_digest))?);
+    let mut replays = project
+        .paper_intake_replays
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(key) = query.idempotency_key.as_deref() {
+        if !agent::valid_idempotency_key(key) {
+            return Err(ServerError::InvalidPaperIntake(
+                "invalid idempotency key".to_owned(),
+            ));
+        }
+        if let Some(replay) = replays.get(key).cloned() {
+            if replay.request_digest != request_digest {
+                return Err(ServerError::InvalidPaperIntake(
+                    "idempotency key was already used for a different paper".to_owned(),
+                ));
+            }
+            let retained = project
+                .paper_intakes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&replay.result.job_id);
+            if retained {
+                let mut response = replay.result;
+                response.replayed = true;
+                return Ok((StatusCode::ACCEPTED, Json(response)));
+            }
+            replays.remove(key);
+        }
+    }
+
+    let job_id = project.next_id("paper");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let job = Arc::new(PaperIntakeJob {
+        status: Mutex::new(PaperIntakeStatusResponse {
+            job_id: job_id.clone(),
+            source_digest: artifact.digest.clone(),
+            phase: PaperIntakePhase::Queued,
+            progress: paper_progress(PaperIntakePhase::Queued),
+            durations_ms: BTreeMap::new(),
+            cache: PaperCacheUse::default(),
+            result: None,
+            failure: None,
+        }),
+        cancel,
+        cancelled: Notify::new(),
+        created_at: Instant::now(),
+    });
+    {
+        let mut jobs = project
+            .paper_intakes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while jobs.len() >= MAX_ACTIVE_PAPER_INTAKES {
+            let expired = jobs.iter().find_map(|(id, existing)| {
+                paper_intake_snapshot(existing)
+                    .phase
+                    .terminal()
+                    .then(|| id.clone())
+            });
+            if let Some(expired) = expired {
+                jobs.remove(&expired);
+                replays.retain(|_, replay| replay.result.job_id != expired);
+            } else {
+                return Err(ServerError::PaperIntakeBusy);
+            }
+        }
+        jobs.insert(job_id.clone(), Arc::clone(&job));
+    }
+
+    let worker_project = Arc::clone(&project);
+    let paper_execution = Arc::clone(&project.paper_execution);
+    tokio::spawn(async move {
+        let permit = tokio::select! {
+            permit = paper_execution.acquire_owned() => permit,
+            _ = job.cancelled.notified() => {
+                finish_paper_cancelled(&job, job.created_at);
+                return;
+            }
+        };
+        let Ok(_permit) = permit else {
+            finish_paper_failure(
+                &job,
+                paper_failure(
+                    "paper_execution_unavailable",
+                    "paper intake execution capacity is unavailable",
+                    true,
+                ),
+                job.created_at,
+            );
+            return;
+        };
+        if job.cancel.load(Ordering::Acquire) {
+            finish_paper_cancelled(&job, job.created_at);
+            return;
+        }
+        let worker_job = Arc::clone(&job);
+        let result = tokio::task::spawn_blocking(move || {
+            execute_paper_intake(worker_project, worker_job, artifact, path)
+        })
+        .await;
+        if let Err(error) = result {
+            finish_paper_failure(
+                &job,
+                paper_failure(
+                    "paper_worker_failed",
+                    format!("paper worker stopped unexpectedly: {error}"),
+                    true,
+                ),
+                job.created_at,
+            );
+        }
+    });
+
+    let response = PaperIntakeStartResponse {
+        job_id,
+        source_digest: requested_digest,
+        phase: PaperIntakePhase::Queued,
+        replayed: false,
+    };
+    if let Some(key) = query.idempotency_key {
+        if replays.len() >= 1_024 {
+            if let Some(oldest) = replays
+                .iter()
+                .min_by_key(|(_, replay)| replay.sequence)
+                .map(|(key, _)| key.clone())
+            {
+                replays.remove(&oldest);
+            }
+        }
+        replays.insert(
+            key,
+            PaperIntakeReplay {
+                request_digest,
+                result: response.clone(),
+                sequence: project.replay_sequence.fetch_add(1, Ordering::Relaxed),
+            },
+        );
+    }
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+fn find_paper_intake(
+    project: &WebProject,
+    job_id: &str,
+) -> Result<Arc<PaperIntakeJob>, ServerError> {
+    project
+        .paper_intakes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(job_id)
+        .cloned()
+        .ok_or_else(|| ServerError::PaperIntakeNotFound(job_id.to_owned()))
+}
+
+async fn paper_intake_status(
+    State(project): State<Arc<WebProject>>,
+    AxumPath(job_id): AxumPath<String>,
+    Query(query): Query<RunStatusQuery>,
+) -> Result<Json<PaperIntakeStatusResponse>, ServerError> {
+    let job = find_paper_intake(&project, &job_id)?;
+    let wait = Duration::from_millis(query.wait_ms.min(25_000));
+    let started = Instant::now();
+    let initial = paper_intake_snapshot(&job);
+    if wait.is_zero() || initial.phase.terminal() {
+        return Ok(Json(initial));
+    }
+    loop {
+        let remaining = wait.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Ok(Json(paper_intake_snapshot(&job)));
+        }
+        tokio::time::sleep(Duration::from_millis(100).min(remaining)).await;
+        let snapshot = paper_intake_snapshot(&job);
+        if snapshot.phase.terminal()
+            || paper_intake_observable_changed(&initial, &snapshot)
+            || started.elapsed() >= wait
+        {
+            return Ok(Json(snapshot));
+        }
+    }
+}
+
+async fn cancel_paper_intake(
+    State(project): State<Arc<WebProject>>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Result<Json<PaperIntakeStatusResponse>, ServerError> {
+    let job = find_paper_intake(&project, &job_id)?;
+    {
+        let mut status = job
+            .status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !status.phase.terminal() {
+            status.phase = PaperIntakePhase::Cancelling;
+            status.progress = paper_progress(PaperIntakePhase::Cancelling);
+            job.cancel.store(true, Ordering::Release);
+            job.cancelled.notify_one();
+        }
+    }
+    Ok(Json(paper_intake_snapshot(&job)))
+}
+
 async fn rebuild_paper(
     State(project): State<Arc<WebProject>>,
     Json(request): Json<PaperRequest>,
@@ -2723,9 +4109,60 @@ fn paper_response(
     extracted_via: &str,
     text: &str,
 ) -> Result<PaperResponse, ServerError> {
+    paper_response_with_progress(catalog, extracted_via, text, |_| {})
+}
+
+fn paper_response_with_progress(
+    catalog: &Catalog,
+    extracted_via: &str,
+    text: &str,
+    mut progress: impl FnMut(PaperIntakePhase),
+) -> Result<PaperResponse, ServerError> {
+    progress(PaperIntakePhase::LocatingMethods);
+    let resources = resource_citations(text)
+        .into_iter()
+        .map(|citation| PaperResourceCitation {
+            accession: citation.accession,
+            kind: paper_resource_kind_label(citation.kind).to_owned(),
+            role: paper_resource_role_label(citation.role).to_owned(),
+            context: citation.context,
+            source_location: (matches!(extracted_via, "poppler" | "ocr"))
+                .then(|| citation.page.map(|page| format!("PDF page {page}")))
+                .flatten(),
+        })
+        .collect();
+    progress(PaperIntakePhase::RecognizingMethods);
     let reconstruction = reconstruct(catalog, text);
+    let outcome = reconstruction_outcome_label(reconstruction.outcome).to_owned();
+    let warnings = reconstruction.warnings;
+    let mentions = reconstruction
+        .mentions
+        .into_iter()
+        .map(|mention| {
+            let (support, operator_id) = match mention.support {
+                MethodSupport::Operator(operator_id) => ("operator".to_owned(), Some(operator_id)),
+                MethodSupport::Unsupported => ("unsupported".to_owned(), None),
+            };
+            PaperMethodMention {
+                display_name: mention.display_name,
+                normalized_name: mention.normalized_name,
+                operation_class: mention.operation_class,
+                evidence: mention.evidence,
+                support,
+                operator_id,
+                source_location: (matches!(extracted_via, "poppler" | "ocr"))
+                    .then(|| mention.page.map(|page| format!("PDF page {page}")))
+                    .flatten(),
+            }
+        })
+        .collect();
+    progress(PaperIntakePhase::AssessingDrafts);
     Ok(PaperResponse {
         extracted_via: extracted_via.to_owned(),
+        outcome,
+        warnings,
+        mentions,
+        resources,
         candidates: reconstruction
             .candidates
             .into_iter()
@@ -2774,6 +4211,37 @@ fn paper_response(
             })
             .collect::<Result<Vec<_>, _>>()?,
     })
+}
+
+fn reconstruction_outcome_label(outcome: ReconstructionOutcome) -> &'static str {
+    match outcome {
+        ReconstructionOutcome::DraftsReady => "drafts_ready",
+        ReconstructionOutcome::RecognizedUnsupported => "recognized_unsupported",
+        ReconstructionOutcome::NoReconstructableMethods => "no_reconstructable_methods",
+    }
+}
+
+fn paper_resource_kind_label(kind: ResourceCitationKind) -> &'static str {
+    match kind {
+        ResourceCitationKind::SraStudy => "sra_study",
+        ResourceCitationKind::SraSample => "sra_sample",
+        ResourceCitationKind::SraExperiment => "sra_experiment",
+        ResourceCitationKind::SraRun => "sra_run",
+        ResourceCitationKind::BioProject => "bioproject",
+        ResourceCitationKind::BioSample => "biosample",
+        ResourceCitationKind::Assembly => "assembly",
+        ResourceCitationKind::Ensembl => "ensembl",
+    }
+}
+
+fn paper_resource_role_label(role: ResourceRole) -> &'static str {
+    match role {
+        ResourceRole::Reads => "reads",
+        ResourceRole::Reference => "reference",
+        ResourceRole::Annotation => "annotation",
+        ResourceRole::SampleMetadata => "sample_metadata",
+        ResourceRole::Unknown => "unknown",
+    }
 }
 
 fn support_kind_label(kind: SupportKind) -> &'static str {
@@ -2852,7 +4320,7 @@ fn evidence_status_label(status: EvidenceStatus) -> &'static str {
     }
 }
 
-fn detect_system_profile() -> SystemProfile {
+fn detect_system_profile(paper_tools: &PaperToolchainState) -> SystemProfile {
     let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
     let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let os_release = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
@@ -2892,6 +4360,7 @@ fn detect_system_profile() -> SystemProfile {
         .find_map(|line| line.strip_prefix("PRETTY_NAME="))
         .map(|value| value.trim_matches('"').to_owned())
         .unwrap_or_else(|| std::env::consts::OS.to_owned());
+    let paper_extraction = paper_extraction_preflight(paper_tools);
     SystemProfile {
         cpu,
         physical_cores,
@@ -2907,6 +4376,159 @@ fn detect_system_profile() -> SystemProfile {
             nextflow: executable("nextflow"),
             snakemake: executable("snakemake"),
         },
+        paper_extraction,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedPaperTool {
+    path: PathBuf,
+    source: PaperToolSource,
+}
+
+#[derive(Clone, Debug)]
+struct PaperToolchainState {
+    unavailable_directory: PathBuf,
+    pdftotext: Option<ResolvedPaperTool>,
+    pdfinfo: Option<ResolvedPaperTool>,
+    pdftoppm: Option<ResolvedPaperTool>,
+    tesseract: Option<ResolvedPaperTool>,
+}
+
+impl PaperToolchainState {
+    fn detect(project_root: &Path) -> Self {
+        Self {
+            unavailable_directory: project_root.join(".somite/tools/paper/unavailable"),
+            pdftotext: resolve_paper_tool(project_root, "pdftotext"),
+            pdfinfo: resolve_paper_tool(project_root, "pdfinfo"),
+            pdftoppm: resolve_paper_tool(project_root, "pdftoppm"),
+            tesseract: resolve_paper_tool(project_root, "tesseract"),
+        }
+    }
+
+    #[cfg(test)]
+    fn unavailable(project_root: &Path) -> Self {
+        Self {
+            unavailable_directory: project_root.join(".somite/tools/paper/unavailable"),
+            pdftotext: None,
+            pdfinfo: None,
+            pdftoppm: None,
+            tesseract: None,
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<&ResolvedPaperTool> {
+        match name {
+            "pdftotext" => self.pdftotext.as_ref(),
+            "pdfinfo" => self.pdfinfo.as_ref(),
+            "pdftoppm" => self.pdftoppm.as_ref(),
+            "tesseract" => self.tesseract.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn command_path(&self, name: &str) -> PathBuf {
+        self.get(name)
+            .map(|tool| tool.path.clone())
+            .unwrap_or_else(|| executable_candidate(&self.unavailable_directory, name))
+    }
+}
+
+fn resolve_paper_tool(project_root: &Path, name: &str) -> Option<ResolvedPaperTool> {
+    let candidates = [
+        (
+            project_root.join(".somite/tools/paper/.pixi/envs/default/bin"),
+            PaperToolSource::ManagedPixi,
+        ),
+        (
+            project_root.join(".pixi/envs/default/bin"),
+            PaperToolSource::ProjectPixi,
+        ),
+    ];
+    for (directory, source) in candidates {
+        let path = executable_candidate(&directory, name);
+        if executable_file(&path) {
+            return Some(ResolvedPaperTool { path, source });
+        }
+    }
+    executable_path(name).map(|path| ResolvedPaperTool {
+        path,
+        source: PaperToolSource::SystemPath,
+    })
+}
+
+fn paper_tool_readiness(
+    paper_tools: &PaperToolchainState,
+    name: &str,
+    pixi_package: &str,
+    purpose: &str,
+) -> PaperExtractionToolReadiness {
+    match paper_tools.get(name) {
+        Some(resolved) => PaperExtractionToolReadiness {
+            name: name.to_owned(),
+            available: true,
+            path: Some(resolved.path.display().to_string()),
+            source: Some(resolved.source),
+            detail: format!("{purpose} is available."),
+        },
+        None => PaperExtractionToolReadiness {
+            name: name.to_owned(),
+            available: false,
+            path: None,
+            source: None,
+            detail: format!(
+                "{purpose} needs {name}. Add {pixi_package} to Somite's managed or project Pixi environment, or provide {name} on PATH."
+            ),
+        },
+    }
+}
+
+fn paper_extraction_preflight(paper_tools: &PaperToolchainState) -> PaperExtractionPreflight {
+    let tools = vec![
+        paper_tool_readiness(
+            paper_tools,
+            "pdftotext",
+            "conda-forge::poppler",
+            "Native PDF text extraction",
+        ),
+        paper_tool_readiness(
+            paper_tools,
+            "pdfinfo",
+            "conda-forge::poppler",
+            "PDF page counting for bounded OCR",
+        ),
+        paper_tool_readiness(
+            paper_tools,
+            "pdftoppm",
+            "conda-forge::poppler",
+            "PDF page rendering for OCR",
+        ),
+        paper_tool_readiness(
+            paper_tools,
+            "tesseract",
+            "conda-forge::tesseract",
+            "Scanned-page text recognition",
+        ),
+    ];
+    let available = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool.name == name)
+            .is_some_and(|tool| tool.available)
+    };
+    PaperExtractionPreflight {
+        native_pdf_text: available("pdftotext"),
+        scanned_pdf_ocr: available("pdfinfo") && available("pdftoppm") && available("tesseract"),
+        tools,
+    }
+}
+
+fn paper_extraction_toolchain(paper_tools: &PaperToolchainState) -> ExtractionToolchain {
+    ExtractionToolchain {
+        pdftotext: paper_tools.command_path("pdftotext"),
+        pdfinfo: paper_tools.command_path("pdfinfo"),
+        pdftoppm: paper_tools.command_path("pdftoppm"),
+        tesseract: paper_tools.command_path("tesseract"),
     }
 }
 
@@ -2953,18 +4575,40 @@ fn executable(binary: &str) -> bool {
     executable_path(binary).is_some()
 }
 
+fn executable_candidate(directory: &Path, binary: &str) -> PathBuf {
+    directory.join(format!("{binary}{}", std::env::consts::EXE_SUFFIX))
+}
+
+fn executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 fn executable_path(binary: &str) -> Option<PathBuf> {
     std::env::var_os("PATH")
         .as_deref()
         .into_iter()
         .flat_map(std::env::split_paths)
-        .map(|directory| directory.join(binary))
-        .find(|path| path.is_file())
+        .map(|directory| executable_candidate(&directory, binary))
+        .find(|path| executable_file(path))
         .or_else(|| {
             std::env::var_os("HOME")
                 .map(PathBuf::from)
-                .map(|home| home.join(".local/bin").join(binary))
-                .filter(|path| path.is_file())
+                .map(|home| executable_candidate(&home.join(".local/bin"), binary))
+                .filter(|path| executable_file(path))
         })
 }
 
@@ -3009,6 +4653,308 @@ async fn upload_file(
                 .and_then(|name| name.to_str())
                 .unwrap_or(&filename)
                 .to_owned(),
+        }));
+    }
+    Err(ServerError::MissingUpload)
+}
+
+struct IncomingPaperFile {
+    path: PathBuf,
+    retained: bool,
+}
+
+impl IncomingPaperFile {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            retained: false,
+        }
+    }
+
+    fn retain(&mut self) {
+        self.retained = true;
+    }
+}
+
+impl Drop for IncomingPaperFile {
+    fn drop(&mut self) {
+        if !self.retained {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[derive(Default)]
+struct Utf8StreamValidator {
+    tail: Vec<u8>,
+}
+
+impl Utf8StreamValidator {
+    fn push(&mut self, bytes: &[u8]) -> bool {
+        let joined;
+        let candidate = if self.tail.is_empty() {
+            bytes
+        } else {
+            joined = self
+                .tail
+                .iter()
+                .copied()
+                .chain(bytes.iter().copied())
+                .collect::<Vec<_>>();
+            joined.as_slice()
+        };
+        match std::str::from_utf8(candidate) {
+            Ok(_) => {
+                self.tail.clear();
+                true
+            }
+            Err(error) if error.error_len().is_some() => false,
+            Err(error) => {
+                self.tail = candidate[error.valid_up_to()..].to_vec();
+                self.tail.len() <= 3
+            }
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.tail.is_empty()
+    }
+}
+
+fn paper_media_kind(
+    filename: &str,
+    content_type: Option<&str>,
+) -> Result<PaperMediaKind, ServerError> {
+    if filename.len() > 255 || filename.chars().any(char::is_control) {
+        return Err(ServerError::InvalidFilename);
+    }
+    let extension = Path::new(filename)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let kind = match extension.as_str() {
+        "pdf" => PaperMediaKind::Pdf,
+        "txt" | "md" => PaperMediaKind::Text,
+        _ => {
+            return Err(ServerError::UnsupportedPaperUpload(
+                "choose one PDF, text, or Markdown file".to_owned(),
+            ))
+        }
+    };
+    let compatible = content_type.is_none_or(|content_type| match kind {
+        PaperMediaKind::Pdf => {
+            matches!(content_type, "application/pdf" | "application/octet-stream")
+        }
+        PaperMediaKind::Text => {
+            content_type.starts_with("text/") || content_type == "application/octet-stream"
+        }
+    });
+    if !compatible {
+        return Err(ServerError::UnsupportedPaperUpload(format!(
+            "{content_type} does not match {extension}",
+            content_type = content_type.unwrap_or("unknown content type")
+        )));
+    }
+    Ok(kind)
+}
+
+async fn install_immutable_file(
+    temporary: &Path,
+    destination: &Path,
+    expected_size: u64,
+    expected_digest: Option<&str>,
+) -> Result<bool, ServerError> {
+    let reused = match tokio::fs::hard_link(temporary, destination).await {
+        Ok(()) => false,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => true,
+        Err(error) => return Err(ServerError::Io(error)),
+    };
+    let actual_size = tokio::fs::metadata(destination).await?.len();
+    if actual_size != expected_size {
+        return Err(ServerError::Upload(
+            "content-addressed paper object has an unexpected size".to_owned(),
+        ));
+    }
+    if reused {
+        if let Some(expected_digest) = expected_digest {
+            let mut input = tokio::fs::File::open(destination).await?;
+            let mut hasher = blake3::Hasher::new();
+            let mut buffer = vec![0_u8; 64 * 1024];
+            loop {
+                let read = input.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+            let actual_digest = format!("blake3:{}", hasher.finalize().to_hex());
+            if actual_digest != expected_digest {
+                return Err(ServerError::Upload(
+                    "content-addressed paper object does not match its digest".to_owned(),
+                ));
+            }
+        }
+    }
+    tokio::fs::remove_file(temporary).await?;
+    Ok(reused)
+}
+
+async fn store_paper_display_name(
+    project: &WebProject,
+    source_hex: &str,
+    source_digest: &str,
+    filename: &str,
+) -> Result<(), ServerError> {
+    let record = StoredPaperDisplayName {
+        schema_version: 1,
+        source_digest: source_digest.to_owned(),
+        filename: filename.to_owned(),
+    };
+    let encoded = serde_json::to_vec_pretty(&record)?;
+    let directory = project.papers_dir().join("display-names").join(source_hex);
+    tokio::fs::create_dir_all(&directory).await?;
+    let name_digest = blake3::hash(filename.as_bytes()).to_hex();
+    let destination = directory.join(format!("{name_digest}.json"));
+    let temporary = directory.join(format!(".{}.tmp", project.next_id("display-name")));
+    let mut temporary_guard = IncomingPaperFile::new(temporary.clone());
+    tokio::fs::write(&temporary, &encoded).await?;
+    let reused =
+        install_immutable_file(&temporary, &destination, encoded.len() as u64, None).await?;
+    temporary_guard.retain();
+    if reused && tokio::fs::read(&destination).await? != encoded {
+        return Err(ServerError::Upload(
+            "paper display-name metadata does not match its stored record".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn upload_paper(
+    State(project): State<Arc<WebProject>>,
+    mut multipart: Multipart,
+) -> Result<Json<PaperArtifactResponse>, ServerError> {
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ServerError::Upload(error.to_string()))?
+    {
+        if field.name() != Some("file") {
+            continue;
+        }
+        let supplied = field.file_name().ok_or(ServerError::InvalidFilename)?;
+        let filename = Path::new(supplied)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or(ServerError::InvalidFilename)?
+            .to_owned();
+        let content_type = field.content_type().map(str::to_owned);
+        let media_kind = paper_media_kind(&filename, content_type.as_deref())?;
+        let incoming = project.papers_dir().join("incoming");
+        tokio::fs::create_dir_all(&incoming).await?;
+        let temporary = incoming.join(format!("{}.part", project.next_id("paper-upload")));
+        let mut temporary_guard = IncomingPaperFile::new(temporary.clone());
+        let mut output = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .await?;
+        let mut hasher = blake3::Hasher::new();
+        let mut size_bytes = 0_u64;
+        let mut leading = Vec::with_capacity(8);
+        let mut utf8 = Utf8StreamValidator::default();
+        while let Some(chunk) = field
+            .chunk()
+            .await
+            .map_err(|error| ServerError::Upload(error.to_string()))?
+        {
+            size_bytes = size_bytes.saturating_add(chunk.len() as u64);
+            if size_bytes > project.paper_limits.max_upload_bytes {
+                return Err(ServerError::PaperUploadTooLarge {
+                    limit_bytes: project.paper_limits.max_upload_bytes,
+                });
+            }
+            if leading.len() < 8 {
+                let remaining = 8 - leading.len();
+                leading.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            }
+            if matches!(media_kind, PaperMediaKind::Text)
+                && (!utf8.push(&chunk) || chunk.contains(&0))
+            {
+                return Err(ServerError::UnsupportedPaperUpload(
+                    "text and Markdown papers must contain valid UTF-8 text".to_owned(),
+                ));
+            }
+            hasher.update(&chunk);
+            output.write_all(&chunk).await?;
+        }
+        output.flush().await?;
+        drop(output);
+        if size_bytes == 0 {
+            return Err(ServerError::UnsupportedPaperUpload(
+                "paper file is empty".to_owned(),
+            ));
+        }
+        if matches!(media_kind, PaperMediaKind::Pdf) && !leading.starts_with(b"%PDF-") {
+            return Err(ServerError::UnsupportedPaperUpload(
+                "the uploaded .pdf does not contain a PDF header".to_owned(),
+            ));
+        }
+        if matches!(media_kind, PaperMediaKind::Text) && leading.starts_with(b"%PDF-") {
+            return Err(ServerError::UnsupportedPaperUpload(
+                "PDF bytes must be uploaded with a .pdf filename".to_owned(),
+            ));
+        }
+        if matches!(media_kind, PaperMediaKind::Text) && !utf8.complete() {
+            return Err(ServerError::UnsupportedPaperUpload(
+                "text and Markdown papers must contain complete UTF-8 text".to_owned(),
+            ));
+        }
+
+        let digest = format!("blake3:{}", hasher.finalize().to_hex());
+        let hex = paper_digest_hex(&digest)?;
+        let object_directory = project.papers_dir().join("objects").join(hex);
+        tokio::fs::create_dir_all(&object_directory).await?;
+        let destination = object_directory.join(format!("payload.{}", media_kind.extension()));
+        let reused =
+            install_immutable_file(&temporary, &destination, size_bytes, Some(&digest)).await?;
+        temporary_guard.retain();
+
+        let metadata = StoredPaperArtifact {
+            schema_version: 1,
+            digest: digest.clone(),
+            size_bytes,
+            media_kind,
+        };
+        let metadata_bytes = serde_json::to_vec_pretty(&metadata)?;
+        let metadata_temporary =
+            object_directory.join(format!(".artifact-{}.tmp", project.next_id("metadata")));
+        let mut metadata_guard = IncomingPaperFile::new(metadata_temporary.clone());
+        tokio::fs::write(&metadata_temporary, &metadata_bytes).await?;
+        let metadata_destination = object_directory.join("artifact.json");
+        let metadata_reused = install_immutable_file(
+            &metadata_temporary,
+            &metadata_destination,
+            metadata_bytes.len() as u64,
+            None,
+        )
+        .await?;
+        metadata_guard.retain();
+        if metadata_reused && tokio::fs::read(&metadata_destination).await? != metadata_bytes {
+            return Err(ServerError::Upload(
+                "content-addressed paper metadata does not match the stored object".to_owned(),
+            ));
+        }
+        store_paper_display_name(&project, hex, &digest, &filename).await?;
+
+        return Ok(Json(PaperArtifactResponse {
+            digest,
+            path: display_path(&project.root, &destination),
+            filename,
+            size_bytes,
+            media_kind,
+            reused,
         }));
     }
     Err(ServerError::MissingUpload)
@@ -3170,6 +5116,253 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("run did not reach {expected}");
+    }
+
+    fn multipart_upload_request(
+        uri: &str,
+        boundary: &str,
+        filename: &str,
+        content_type: &str,
+        contents: &[u8],
+    ) -> Request<Body> {
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: {content_type}\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend_from_slice(contents);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .expect("multipart request")
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        serde_json::from_slice(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("response body")
+                .to_bytes(),
+        )
+        .expect("response json")
+    }
+
+    async fn wait_for_paper_phase(
+        router: &Router,
+        job_id: &str,
+        expected: &str,
+    ) -> serde_json::Value {
+        for _ in 0..200 {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/papers/intakes/{job_id}?wait_ms=100"))
+                        .body(Body::empty())
+                        .expect("paper status request"),
+                )
+                .await
+                .expect("paper status response");
+            let status = response_json(response).await;
+            if status["phase"] == expected {
+                return status;
+            }
+            if matches!(
+                status["phase"].as_str(),
+                Some("completed" | "failed" | "cancelled")
+            ) {
+                panic!(
+                    "paper intake reached {} before {expected}: {status}",
+                    status["phase"]
+                );
+            }
+        }
+        panic!("paper intake did not reach {expected}");
+    }
+
+    fn test_paper_intake_job(id: &str, phase: PaperIntakePhase) -> Arc<PaperIntakeJob> {
+        Arc::new(PaperIntakeJob {
+            status: Mutex::new(PaperIntakeStatusResponse {
+                job_id: id.to_owned(),
+                source_digest: format!("blake3:{}", "0".repeat(64)),
+                phase,
+                progress: paper_progress(phase),
+                durations_ms: BTreeMap::new(),
+                cache: PaperCacheUse::default(),
+                result: None,
+                failure: None,
+            }),
+            cancel: Arc::new(AtomicBool::new(false)),
+            cancelled: Notify::new(),
+            created_at: Instant::now(),
+        })
+    }
+
+    fn write_test_executable(path: &Path, contents: &[u8]) {
+        std::fs::write(path, contents).expect("test executable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(path)
+                .expect("test executable metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(path, permissions).expect("test executable permissions");
+        }
+    }
+
+    #[test]
+    fn nfcore_preview_scopes_legacy_config_parser_to_nextflow_child() {
+        let temporary = TempDir::new().expect("temporary preview");
+        let nextflow = temporary.path().join("nextflow");
+        let inherited_parser = std::env::var_os("NXF_SYNTAX_PARSER");
+        write_test_executable(
+            &nextflow,
+            br#"#!/bin/sh
+printf '%s\n' "${NXF_SYNTAX_PARSER:-default}" >> parser-attempts
+if [ "${NXF_SYNTAX_PARSER:-}" != "v1" ]; then
+  printf '%s\n' 'ERROR nextflow.cli.Launcher - Config parsing failed' > .nextflow.log
+  exit 1
+fi
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-with-dag" ]; then
+    shift
+    dot_path=$1
+  fi
+  shift
+done
+printf '%s\n' 'digraph workflow { input -> output }' > "$dot_path"
+"#,
+        );
+        let dot_path = temporary.path().join("workflow.dot");
+        let request = WorkflowGraphRequest {
+            workflow: "nf-core/pangenome".to_owned(),
+            revision: "1.1.3".to_owned(),
+        };
+
+        let output = run_nfcore_preview(&nextflow, temporary.path(), &request, &dot_path)
+            .expect("preview child");
+
+        assert!(
+            output.status.success(),
+            "legacy parser was not scoped to the preview child: {}",
+            nfcore_preview_failure_detail(temporary.path(), &output)
+        );
+        assert!(dot_path.is_file(), "preview child did not produce a DAG");
+        assert_eq!(
+            std::fs::read_to_string(temporary.path().join("parser-attempts"))
+                .expect("parser attempts"),
+            "default\nv1\n"
+        );
+        assert_eq!(std::env::var_os("NXF_SYNTAX_PARSER"), inherited_parser);
+    }
+
+    #[test]
+    fn nfcore_preview_surfaces_config_parser_diagnostic_from_log() {
+        let temporary = TempDir::new().expect("temporary preview");
+        let nextflow = temporary.path().join("nextflow");
+        write_test_executable(
+            &nextflow,
+            br#"#!/bin/sh
+cat > .nextflow.log <<'LOG'
+Aug-28 17:45:47.405 [main] ERROR nextflow.cli.Launcher - Config parsing failed
+nextflow.exception.ConfigParseException: Config parsing failed
+Caused by: org.codehaus.groovy.control.MultipleCompilationErrorsException: startup failed:
+_nf_config: 396: `manifest` is not defined @ line 396, column 33.
+LOG
+exit 1
+"#,
+        );
+        let dot_path = temporary.path().join("workflow.dot");
+        let request = WorkflowGraphRequest {
+            workflow: "nf-core/pangenome".to_owned(),
+            revision: "1.1.3".to_owned(),
+        };
+
+        let output = run_nfcore_preview(&nextflow, temporary.path(), &request, &dot_path)
+            .expect("preview child");
+        let detail = nfcore_preview_failure_detail(temporary.path(), &output);
+
+        assert!(detail.contains("Config parsing failed"), "{detail}");
+        assert!(
+            detail.contains("`manifest` is not defined @ line 396"),
+            "{detail}"
+        );
+        assert!(!detail.contains("did not produce a DAG"), "{detail}");
+    }
+
+    #[test]
+    fn nfcore_preview_does_not_retry_non_parser_failures() {
+        let temporary = TempDir::new().expect("temporary preview");
+        let nextflow = temporary.path().join("nextflow");
+        write_test_executable(
+            &nextflow,
+            br#"#!/bin/sh
+printf '%s\n' "${NXF_SYNTAX_PARSER:-default}" >> parser-attempts
+printf '%s\n' 'ERROR nextflow.scm.AssetManager - Unable to clone repository: network is unreachable' > .nextflow.log
+exit 1
+"#,
+        );
+        let dot_path = temporary.path().join("workflow.dot");
+        let request = WorkflowGraphRequest {
+            workflow: "nf-core/pangenome".to_owned(),
+            revision: "1.1.3".to_owned(),
+        };
+
+        let output = run_nfcore_preview(&nextflow, temporary.path(), &request, &dot_path)
+            .expect("preview child");
+
+        assert!(!output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(temporary.path().join("parser-attempts"))
+                .expect("parser attempts"),
+            "default\n"
+        );
+        assert_eq!(
+            nfcore_preview_failure_detail(temporary.path(), &output),
+            "Unable to clone repository: network is unreachable"
+        );
+    }
+
+    #[test]
+    fn nfcore_preview_does_not_classify_a_stale_log() {
+        let temporary = TempDir::new().expect("temporary preview");
+        std::fs::write(
+            temporary.path().join(".nextflow.log"),
+            "ERROR nextflow.cli.Launcher - Config parsing failed\n",
+        )
+        .expect("stale Nextflow log");
+        let nextflow = temporary.path().join("nextflow");
+        write_test_executable(
+            &nextflow,
+            br#"#!/bin/sh
+printf '%s\n' "${NXF_SYNTAX_PARSER:-default}" >> parser-attempts
+exit 1
+"#,
+        );
+        let dot_path = temporary.path().join("workflow.dot");
+        let request = WorkflowGraphRequest {
+            workflow: "nf-core/pangenome".to_owned(),
+            revision: "1.1.3".to_owned(),
+        };
+
+        let output = run_nfcore_preview(&nextflow, temporary.path(), &request, &dot_path)
+            .expect("preview child");
+
+        assert!(!output.status.success());
+        assert_eq!(
+            std::fs::read_to_string(temporary.path().join("parser-attempts"))
+                .expect("parser attempts"),
+            "default\n"
+        );
+        assert!(!temporary.path().join(".nextflow.log").exists());
     }
 
     #[test]
@@ -4215,13 +6408,23 @@ mod tests {
         let temp = TempDir::new().expect("temporary project");
         let operators = temp.path().join("operators");
         std::fs::create_dir(&operators).expect("operator directory");
-        for (filename, id, title) in [
-            ("fastqc.json", "qc.fastqc", "FastQC"),
-            ("star.json", "align.star", "STAR"),
+        for (filename, id, title, paper) in [
+            (
+                "fastqc.json",
+                "qc.fastqc",
+                "FastQC",
+                r#"{"aliases":["FastQC","Fast QC"],"operation_class":"quality_control","assays":["qc","rna-seq"]}"#,
+            ),
+            (
+                "star.json",
+                "align.star",
+                "STAR",
+                r#"{"aliases":["STAR"],"operation_class":"read_alignment","assays":["rna-seq"]}"#,
+            ),
         ] {
             std::fs::write(
                 operators.join(filename),
-                format!(r#"{{"id":"{id}","title":"{title}","palette":[],"kind":"external","params":{{}},"ports":{{"in":[],"out":[]}},"argv":[],"outputs":{{}}}}"#),
+                format!(r#"{{"id":"{id}","title":"{title}","palette":[],"paper":{paper},"kind":"external","params":{{}},"ports":{{"in":[],"out":[]}},"argv":[],"outputs":{{}}}}"#),
             )
             .expect("operator schema");
         }
@@ -4233,7 +6436,7 @@ mod tests {
         std::fs::create_dir_all(&uploads).expect("uploads directory");
         std::fs::write(
             uploads.join("methods.txt"),
-            "RNA-seq reads were assessed with FastQC and aligned using STAR.",
+            "RNA-seq reads from NCBI BioProject PRJNA300706 were assessed with FastQC and aligned using STAR.",
         )
         .expect("methods text");
         let response = app(project)
@@ -4256,6 +6459,10 @@ mod tests {
             .to_bytes();
         let review: serde_json::Value = serde_json::from_slice(&body).expect("paper review");
         assert_eq!(review["extracted_via"], "text");
+        assert_eq!(review["resources"][0]["accession"], "PRJNA300706");
+        assert_eq!(review["resources"][0]["kind"], "bioproject");
+        assert_eq!(review["resources"][0]["role"], "reads");
+        assert!(review["resources"][0]["source_location"].is_null());
         assert!(review["candidates"]
             .as_array()
             .is_some_and(|items| !items.is_empty()));
@@ -4268,6 +6475,40 @@ mod tests {
         assert!(review["candidates"][0]["assessment"]["graph_revision"]
             .as_str()
             .is_some_and(|revision| revision.starts_with("blake3:")));
+    }
+
+    #[tokio::test]
+    async fn paper_endpoint_never_exports_an_empty_candidate_as_ready() {
+        let (temp, project) = fixture_project();
+        let uploads = temp.path().join(".somite/uploads");
+        std::fs::create_dir_all(&uploads).expect("uploads directory");
+        std::fs::write(
+            uploads.join("prose.txt"),
+            "This article discusses the history of algebra without a computational methods workflow.",
+        )
+        .expect("prose fixture");
+        let response = app(project)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/paper")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"path":".somite/uploads/prose.txt"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let review: serde_json::Value = serde_json::from_slice(&body).expect("paper review");
+        assert_eq!(review["outcome"], "no_reconstructable_methods");
+        assert_eq!(review["candidates"], serde_json::json!([]));
+        assert_eq!(review["mentions"], serde_json::json!([]));
     }
 
     #[test]
@@ -4320,6 +6561,25 @@ mod tests {
             .await
             .expect("reconstruction response");
         assert_eq!(reconstruction.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn paper_resource_resolution_rejects_forged_citations_before_network_access() {
+        let (_temp, project) = fixture_project();
+        let response = app(project)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/paper/resources/resolve")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"resources":[{"accession":"SRR123456","kind":"assembly","role":"reads","context":"paper"}]}"#,
+                    ))
+                    .expect("resource request"),
+            )
+            .await
+            .expect("resource response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -4382,6 +6642,1126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_biological_upload_can_exceed_the_default_json_body_limit() {
+        let (temp, project) = fixture_project();
+        let contents = vec![b'A'; 3 * 1024 * 1024];
+        let response = app(project)
+            .oneshot(multipart_upload_request(
+                "/api/files",
+                "large-biological-upload",
+                "reads.fastq",
+                "application/octet-stream",
+                &contents,
+            ))
+            .await
+            .expect("large generic upload response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::metadata(temp.path().join(".somite/uploads/reads.fastq"))
+                .expect("large generic upload")
+                .len(),
+            contents.len() as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_api_routes_keep_axums_default_body_limit() {
+        let (_temp, project) = fixture_project();
+        let response = app(project)
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/api/graph")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(vec![b' '; 3 * 1024 * 1024]))
+                    .expect("oversized graph request"),
+            )
+            .await
+            .expect("oversized graph response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn paper_upload_is_bounded_and_content_addressed_without_changing_generic_uploads() {
+        let (temp, project) = fixture_project();
+        let router = app(project);
+        let pdf = b"%PDF-1.4\nminimal paper fixture\n%%EOF\n";
+
+        let first = router
+            .clone()
+            .oneshot(multipart_upload_request(
+                "/api/papers/uploads",
+                "paper-one",
+                "first.pdf",
+                "application/pdf",
+                pdf,
+            ))
+            .await
+            .expect("first paper upload");
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = response_json(first).await;
+        assert_eq!(first["reused"], false);
+        assert_eq!(first["size_bytes"], pdf.len());
+        assert_eq!(first["media_kind"], "pdf");
+        assert!(first["digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("blake3:")));
+
+        let second = router
+            .clone()
+            .oneshot(multipart_upload_request(
+                "/api/papers/uploads",
+                "paper-two",
+                "renamed.pdf",
+                "application/pdf",
+                pdf,
+            ))
+            .await
+            .expect("second paper upload");
+        assert_eq!(second.status(), StatusCode::OK);
+        let second = response_json(second).await;
+        assert_eq!(second["reused"], true);
+        assert_eq!(second["digest"], first["digest"]);
+        assert_eq!(second["path"], first["path"]);
+        assert_eq!(second["filename"], "renamed.pdf");
+
+        let object_path = temp
+            .path()
+            .join(first["path"].as_str().expect("object path"));
+        assert_eq!(std::fs::read(object_path).expect("paper object"), pdf);
+        assert_eq!(
+            std::fs::read_dir(temp.path().join(".somite/papers/objects"))
+                .expect("paper objects")
+                .count(),
+            1
+        );
+        let source_hex = paper_digest_hex(first["digest"].as_str().expect("paper digest"))
+            .expect("paper digest hex");
+        let mut display_names = std::fs::read_dir(
+            temp.path()
+                .join(".somite/papers/display-names")
+                .join(source_hex),
+        )
+        .expect("paper display names")
+        .map(|entry| {
+            let entry = entry.expect("paper display-name entry");
+            let record: StoredPaperDisplayName = serde_json::from_slice(
+                &std::fs::read(entry.path()).expect("paper display-name record"),
+            )
+            .expect("paper display-name JSON");
+            record.filename
+        })
+        .collect::<Vec<_>>();
+        display_names.sort();
+        assert_eq!(display_names, ["first.pdf", "renamed.pdf"]);
+
+        let generic = router
+            .oneshot(multipart_upload_request(
+                "/api/files",
+                "generic-file",
+                "reads.fastq",
+                "application/octet-stream",
+                b"@read\nACGT\n+\n!!!!\n",
+            ))
+            .await
+            .expect("generic upload");
+        assert_eq!(generic.status(), StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn simultaneous_identical_paper_uploads_converge_on_one_object() {
+        let (temp, project) = fixture_project();
+        let router = app(project);
+        let pdf = b"%PDF-1.4\nconcurrent paper fixture\n%%EOF\n";
+        let first = router.clone().oneshot(multipart_upload_request(
+            "/api/papers/uploads",
+            "paper-race-one",
+            "first.pdf",
+            "application/pdf",
+            pdf,
+        ));
+        let second = router.clone().oneshot(multipart_upload_request(
+            "/api/papers/uploads",
+            "paper-race-two",
+            "second.pdf",
+            "application/pdf",
+            pdf,
+        ));
+        let (first, second) = tokio::join!(first, second);
+        let first = first.expect("first upload response");
+        let second = second.expect("second upload response");
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+        let first = response_json(first).await;
+        let second = response_json(second).await;
+        assert_eq!(first["digest"], second["digest"]);
+        assert_eq!(first["path"], second["path"]);
+        assert_ne!(first["reused"], second["reused"]);
+        assert_eq!(
+            std::fs::read_dir(temp.path().join(".somite/papers/objects"))
+                .expect("paper objects")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_paper_upload_fails_closed_on_same_size_object_corruption() {
+        let (temp, project) = fixture_project();
+        let router = app(project);
+        let pdf = b"%PDF-1.4\nimmutable paper fixture\n%%EOF\n";
+        let first = router
+            .clone()
+            .oneshot(multipart_upload_request(
+                "/api/papers/uploads",
+                "paper-integrity-one",
+                "paper.pdf",
+                "application/pdf",
+                pdf,
+            ))
+            .await
+            .expect("first paper upload");
+        let first = response_json(first).await;
+        let object = temp
+            .path()
+            .join(first["path"].as_str().expect("paper object path"));
+        let mut corrupt = pdf.to_vec();
+        corrupt[12] ^= 1;
+        std::fs::write(&object, &corrupt).expect("corrupt paper object");
+
+        let second = router
+            .oneshot(multipart_upload_request(
+                "/api/papers/uploads",
+                "paper-integrity-two",
+                "paper-again.pdf",
+                "application/pdf",
+                pdf,
+            ))
+            .await
+            .expect("second paper upload");
+        assert_eq!(second.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let error = response_json(second).await;
+        assert!(error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("does not match its digest")));
+        assert_eq!(
+            std::fs::read(object).expect("corrupt object retained"),
+            corrupt
+        );
+    }
+
+    #[tokio::test]
+    async fn paper_intake_rejects_a_same_size_mutated_content_addressed_payload() {
+        let (temp, project) = fixture_project();
+        let router = app(project);
+        let contents = b"Paper methods without a reconstructable workflow.";
+        let upload = router
+            .clone()
+            .oneshot(multipart_upload_request(
+                "/api/papers/uploads",
+                "paper-intake-integrity",
+                "methods.txt",
+                "text/plain",
+                contents,
+            ))
+            .await
+            .expect("paper upload response");
+        assert_eq!(upload.status(), StatusCode::OK);
+        let upload = response_json(upload).await;
+        let payload = temp
+            .path()
+            .join(upload["path"].as_str().expect("paper payload path"));
+        let mut mutated = contents.to_vec();
+        mutated[8] ^= 1;
+        std::fs::write(&payload, &mutated).expect("mutated paper payload");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/papers/intakes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "digest": upload["digest"] }).to_string(),
+                    ))
+                    .expect("paper intake request"),
+            )
+            .await
+            .expect("paper intake response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = response_json(response).await;
+        assert!(error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("content address")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paper_intake_rejects_a_payload_symlink_that_escapes_the_object_directory() {
+        let (temp, project) = fixture_project();
+        let router = app(project);
+        let contents = b"Paper methods without a reconstructable workflow.";
+        let upload = router
+            .clone()
+            .oneshot(multipart_upload_request(
+                "/api/papers/uploads",
+                "paper-intake-symlink",
+                "methods.txt",
+                "text/plain",
+                contents,
+            ))
+            .await
+            .expect("paper upload response");
+        assert_eq!(upload.status(), StatusCode::OK);
+        let upload = response_json(upload).await;
+        let payload = temp
+            .path()
+            .join(upload["path"].as_str().expect("paper payload path"));
+        let outside = temp.path().join("outside-paper.txt");
+        std::fs::write(&outside, contents).expect("outside paper payload");
+        std::fs::remove_file(&payload).expect("remove stored payload");
+        std::os::unix::fs::symlink(&outside, &payload).expect("paper payload symlink");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/papers/intakes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "digest": upload["digest"] }).to_string(),
+                    ))
+                    .expect("paper intake request"),
+            )
+            .await
+            .expect("paper intake response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let error = response_json(response).await;
+        assert!(error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("regular non-symlink file")));
+    }
+
+    #[tokio::test]
+    async fn oversized_paper_upload_is_rejected_and_partial_file_is_removed() {
+        let (_temp, mut project) = fixture_project();
+        project.paper_limits.max_upload_bytes = 12;
+        let incoming = project.root.join(".somite/papers/incoming");
+        let response = app(project)
+            .oneshot(multipart_upload_request(
+                "/api/papers/uploads",
+                "paper-too-large",
+                "methods.txt",
+                "text/plain",
+                b"this paper exceeds the configured test limit",
+            ))
+            .await
+            .expect("oversized upload response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!incoming
+            .read_dir()
+            .is_ok_and(|mut entries| entries.next().is_some()));
+    }
+
+    #[tokio::test]
+    async fn missing_paper_tools_are_preflighted_and_fail_intake_actionably() {
+        let (temp, mut project) = fixture_project();
+        project.paper_tools = PaperToolchainState::unavailable(temp.path());
+        let router = app(project);
+
+        let system = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/system")
+                    .body(Body::empty())
+                    .expect("system request"),
+            )
+            .await
+            .expect("system response");
+        assert_eq!(system.status(), StatusCode::OK);
+        let system = response_json(system).await;
+        assert_eq!(system["paper_extraction"]["native_pdf_text"], false);
+        assert_eq!(system["paper_extraction"]["scanned_pdf_ocr"], false);
+        let tools = system["paper_extraction"]["tools"]
+            .as_array()
+            .expect("paper tool preflight");
+        assert_eq!(tools.len(), 4);
+        assert!(tools.iter().all(|tool| tool["available"] == false));
+        assert!(tools.iter().all(|tool| tool["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("conda-forge::"))));
+
+        let upload = router
+            .clone()
+            .oneshot(multipart_upload_request(
+                "/api/papers/uploads",
+                "missing-tools-paper",
+                "scan.pdf",
+                "application/pdf",
+                b"%PDF-1.4\nimage-only fixture\n%%EOF\n",
+            ))
+            .await
+            .expect("paper upload");
+        let upload = response_json(upload).await;
+        let started = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/papers/intakes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "digest": upload["digest"] }).to_string(),
+                    ))
+                    .expect("paper intake request"),
+            )
+            .await
+            .expect("paper intake response");
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+        let started = response_json(started).await;
+        let failed = wait_for_paper_phase(
+            &router,
+            started["job_id"].as_str().expect("paper job id"),
+            "failed",
+        )
+        .await;
+        assert_eq!(failed["failure"]["code"], "missing_extraction_dependency");
+        assert!(failed["failure"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("pdfinfo")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paper_intake_enforces_the_configured_ocr_page_limit() {
+        let (temp, mut project) = fixture_project();
+        let bin = temp
+            .path()
+            .join(".somite/tools/paper/.pixi/envs/default/bin");
+        std::fs::create_dir_all(&bin).expect("managed Pixi bin directory");
+        write_test_executable(
+            &executable_candidate(&bin, "pdftotext"),
+            b"#!/bin/sh\nprintf 'short image-only layer'\n",
+        );
+        write_test_executable(
+            &executable_candidate(&bin, "pdfinfo"),
+            b"#!/bin/sh\nprintf 'Pages: 2\\n'\n",
+        );
+        for name in ["pdftoppm", "tesseract"] {
+            write_test_executable(&executable_candidate(&bin, name), b"#!/bin/sh\nexit 0\n");
+        }
+        project.paper_tools = PaperToolchainState::detect(temp.path());
+        project.paper_limits.max_ocr_pages = 1;
+        let router = app(project);
+        let upload = router
+            .clone()
+            .oneshot(multipart_upload_request(
+                "/api/papers/uploads",
+                "ocr-page-limit",
+                "scan.pdf",
+                "application/pdf",
+                b"%PDF-1.4\nimage-only fixture\n%%EOF\n",
+            ))
+            .await
+            .expect("paper upload");
+        let upload = response_json(upload).await;
+        let started = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/papers/intakes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "digest": upload["digest"] }).to_string(),
+                    ))
+                    .expect("paper intake request"),
+            )
+            .await
+            .expect("paper intake response");
+        let started = response_json(started).await;
+        let failed = wait_for_paper_phase(
+            &router,
+            started["job_id"].as_str().expect("paper job id"),
+            "failed",
+        )
+        .await;
+        assert_eq!(failed["failure"]["code"], "paper_extraction_limit");
+        assert!(failed["failure"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("2 pages") && message.contains("1 pages")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn paper_intake_reports_determinate_ocr_page_progress() {
+        let (temp, mut project) = fixture_project();
+        let bin = temp
+            .path()
+            .join(".somite/tools/paper/.pixi/envs/default/bin");
+        std::fs::create_dir_all(&bin).expect("managed Pixi bin directory");
+        write_test_executable(
+            &executable_candidate(&bin, "pdftotext"),
+            b"#!/bin/sh\nprintf 'short image-only layer'\n",
+        );
+        write_test_executable(
+            &executable_candidate(&bin, "pdfinfo"),
+            b"#!/bin/sh\nprintf 'Pages: 1\\n'\n",
+        );
+        write_test_executable(
+            &executable_candidate(&bin, "pdftoppm"),
+            b"#!/bin/sh\nfor last in \"$@\"; do :; done\nprintf 'fake png' > \"${last}.png\"\n",
+        );
+        write_test_executable(
+            &executable_candidate(&bin, "tesseract"),
+            b"#!/bin/sh\nsleep 0.25\nprintf 'Methods RNA sequencing reads were quality checked with FastQC before downstream analysis.'\n",
+        );
+        project.paper_tools = PaperToolchainState::detect(temp.path());
+        let router = app(project);
+        let upload = router
+            .clone()
+            .oneshot(multipart_upload_request(
+                "/api/papers/uploads",
+                "ocr-progress",
+                "scan.pdf",
+                "application/pdf",
+                b"%PDF-1.4\nimage-only fixture\n%%EOF\n",
+            ))
+            .await
+            .expect("paper upload");
+        let upload = response_json(upload).await;
+        let started = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/papers/intakes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "digest": upload["digest"] }).to_string(),
+                    ))
+                    .expect("paper intake request"),
+            )
+            .await
+            .expect("paper intake response");
+        let started = response_json(started).await;
+        let job_id = started["job_id"].as_str().expect("paper job id");
+        let mut observed_page_progress = false;
+        for _ in 0..100 {
+            let status = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/papers/intakes/{job_id}"))
+                        .body(Body::empty())
+                        .expect("paper status request"),
+                )
+                .await
+                .expect("paper status response");
+            let status = response_json(status).await;
+            if status["progress"]["unit"] == "pages"
+                && status["progress"]["total"] == 1
+                && status["progress"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("OCR page 1 of 1"))
+            {
+                observed_page_progress = true;
+                break;
+            }
+            if matches!(
+                status["phase"].as_str(),
+                Some("completed" | "failed" | "cancelled")
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            observed_page_progress,
+            "OCR page progress was never visible"
+        );
+        let completed = wait_for_paper_phase(&router, job_id, "completed").await;
+        assert_eq!(completed["result"]["extracted_via"], "ocr");
+    }
+
+    #[tokio::test]
+    async fn paper_status_long_poll_returns_when_progress_changes_without_a_phase_change() {
+        let (_temp, project) = fixture_project();
+        let job = test_paper_intake_job("paper-progress-poll", PaperIntakePhase::Extracting);
+        project
+            .paper_intakes
+            .lock()
+            .expect("paper jobs")
+            .insert("paper-progress-poll".to_owned(), Arc::clone(&job));
+        let router = app(project);
+        let request = router.oneshot(
+            Request::builder()
+                .uri("/api/papers/intakes/paper-progress-poll?wait_ms=5000")
+                .body(Body::empty())
+                .expect("paper long-poll request"),
+        );
+        let change = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            update_paper_extraction_progress(&job, ExtractionProgress::Ocr { page: 2, total: 3 });
+        };
+        let started = Instant::now();
+        let (response, ()) = tokio::join!(request, change);
+        let response = response.expect("paper long-poll response");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "paper progress poll waited {:?}",
+            started.elapsed()
+        );
+        let status = response_json(response).await;
+        assert_eq!(status["phase"], "extracting");
+        assert_eq!(status["progress"]["unit"], "pages");
+        assert_eq!(status["progress"]["completed"], 1);
+        assert_eq!(status["progress"]["total"], 3);
+        assert_eq!(status["progress"]["message"], "Reading OCR page 2 of 3");
+    }
+
+    #[tokio::test]
+    async fn paper_cancel_route_reaches_a_retained_cancelled_status() {
+        let (_temp, mut project) = fixture_project();
+        project.paper_execution = Arc::new(Semaphore::new(0));
+        let router = app(project);
+        let upload = router
+            .clone()
+            .oneshot(multipart_upload_request(
+                "/api/papers/uploads",
+                "paper-cancel-upload",
+                "article.txt",
+                "text/plain",
+                b"A queued paper intake that will be cancelled.",
+            ))
+            .await
+            .expect("paper upload");
+        let upload = response_json(upload).await;
+        let started = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/papers/intakes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "digest": upload["digest"] }).to_string(),
+                    ))
+                    .expect("paper intake request"),
+            )
+            .await
+            .expect("paper intake response");
+        let started = response_json(started).await;
+        let job_id = started["job_id"].as_str().expect("paper job id");
+        assert_eq!(started["phase"], "queued");
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/papers/intakes/{job_id}/cancel"))
+                    .body(Body::empty())
+                    .expect("cancel request"),
+            )
+            .await
+            .expect("cancel response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        assert!(matches!(
+            response["phase"].as_str(),
+            Some("cancelling" | "cancelled")
+        ));
+        let cancelled = wait_for_paper_phase(&router, job_id, "cancelled").await;
+        assert!(cancelled["failure"].is_null());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn paper_cancel_route_stops_active_ocr_cleans_workspace_and_releases_capacity() {
+        let (temp, mut project) = fixture_project();
+        let bin = temp
+            .path()
+            .join(".somite/tools/paper/.pixi/envs/default/bin");
+        std::fs::create_dir_all(&bin).expect("managed Pixi bin directory");
+        write_test_executable(
+            &executable_candidate(&bin, "pdftotext"),
+            b"#!/bin/sh\nprintf 'short image-only layer'\n",
+        );
+        write_test_executable(
+            &executable_candidate(&bin, "pdfinfo"),
+            b"#!/bin/sh\nprintf 'Pages: 1\\n'\n",
+        );
+        let prefix_record = temp.path().join("ocr-prefix");
+        write_test_executable(
+            &executable_candidate(&bin, "pdftoppm"),
+            format!(
+                "#!/bin/sh\nfor last in \"$@\"; do :; done\nprintf '%s' \"$last\" > '{}'\nprintf 'fake png' > \"${{last}}.png\"\n",
+                prefix_record.display()
+            )
+            .as_bytes(),
+        );
+        let child_record = temp.path().join("ocr-child-pid");
+        write_test_executable(
+            &executable_candidate(&bin, "tesseract"),
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec sleep 30\n",
+                child_record.display()
+            )
+            .as_bytes(),
+        );
+        project.paper_tools = PaperToolchainState::detect(temp.path());
+        let execution = Arc::new(Semaphore::new(1));
+        project.paper_execution = Arc::clone(&execution);
+        let router = app(project);
+
+        let upload = router
+            .clone()
+            .oneshot(multipart_upload_request(
+                "/api/papers/uploads",
+                "active-ocr-cancel",
+                "scan.pdf",
+                "application/pdf",
+                b"%PDF-1.4\nimage-only fixture\n%%EOF\n",
+            ))
+            .await
+            .expect("paper upload response");
+        let upload = response_json(upload).await;
+        let started = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/papers/intakes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "digest": upload["digest"] }).to_string(),
+                    ))
+                    .expect("paper intake request"),
+            )
+            .await
+            .expect("paper intake response");
+        assert_eq!(started.status(), StatusCode::ACCEPTED);
+        let started = response_json(started).await;
+        let job_id = started["job_id"].as_str().expect("paper job id").to_owned();
+
+        let mut child_pid = None;
+        for _ in 0..200 {
+            if let Ok(pid) = std::fs::read_to_string(&child_record) {
+                child_pid = pid.trim().parse::<u32>().ok();
+                if child_pid.is_some() && execution.available_permits() == 0 {
+                    break;
+                }
+            }
+            let status = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/papers/intakes/{job_id}"))
+                        .body(Body::empty())
+                        .expect("paper status request"),
+                )
+                .await
+                .expect("paper status response");
+            let status = response_json(status).await;
+            assert!(
+                !matches!(
+                    status["phase"].as_str(),
+                    Some("completed" | "failed" | "cancelled")
+                ),
+                "paper intake terminated before active OCR: {status}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let child_pid = child_pid.expect("active OCR child PID");
+        let prefix = std::fs::read_to_string(&prefix_record).expect("OCR workspace prefix");
+        let workspace = PathBuf::from(prefix)
+            .parent()
+            .expect("OCR workspace directory")
+            .to_owned();
+        assert!(workspace.is_dir(), "OCR workspace should be active");
+        assert!(Path::new(&format!("/proc/{child_pid}")).exists());
+        assert_eq!(execution.available_permits(), 0);
+
+        let cancel_started = Instant::now();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/api/papers/intakes/{job_id}/cancel"))
+                    .body(Body::empty())
+                    .expect("cancel request"),
+            )
+            .await
+            .expect("cancel response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let cancelled = wait_for_paper_phase(&router, &job_id, "cancelled").await;
+        assert!(cancelled["failure"].is_null());
+        assert!(
+            cancel_started.elapsed() < Duration::from_secs(2),
+            "active OCR cancellation took {:?}",
+            cancel_started.elapsed()
+        );
+
+        for _ in 0..100 {
+            if !workspace.exists()
+                && !Path::new(&format!("/proc/{child_pid}")).exists()
+                && execution.available_permits() == 1
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!workspace.exists(), "OCR workspace was not removed");
+        assert!(
+            !Path::new(&format!("/proc/{child_pid}")).exists(),
+            "OCR child process was not reaped"
+        );
+        assert_eq!(execution.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn paper_intake_admission_is_bounded_when_every_retained_job_is_active() {
+        let (_temp, project) = fixture_project();
+        {
+            let mut jobs = project.paper_intakes.lock().expect("paper jobs");
+            for index in 0..MAX_ACTIVE_PAPER_INTAKES {
+                let id = format!("paper-active-{index}");
+                jobs.insert(
+                    id.clone(),
+                    test_paper_intake_job(&id, PaperIntakePhase::Extracting),
+                );
+            }
+        }
+        let router = app(project);
+        let upload = router
+            .clone()
+            .oneshot(multipart_upload_request(
+                "/api/papers/uploads",
+                "paper-cap-upload",
+                "article.txt",
+                "text/plain",
+                b"Methods without a reconstructable workflow.",
+            ))
+            .await
+            .expect("paper upload");
+        let upload = response_json(upload).await;
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/papers/intakes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "digest": upload["digest"] }).to_string(),
+                    ))
+                    .expect("paper intake request"),
+            )
+            .await
+            .expect("paper intake response");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let error = response_json(response).await;
+        assert!(error["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("capacity is full")));
+    }
+
+    #[tokio::test]
+    async fn paper_intake_retries_from_digest_and_reuses_both_cache_layers() {
+        let (_temp, project) = fixture_project();
+        let router = app(project);
+        let upload = router
+            .clone()
+            .oneshot(multipart_upload_request(
+                "/api/papers/uploads",
+                "paper-text",
+                "article.txt",
+                "text/plain",
+                b"This article discusses morphology without a computational methods workflow.",
+            ))
+            .await
+            .expect("paper upload");
+        assert_eq!(upload.status(), StatusCode::OK);
+        let upload = response_json(upload).await;
+        let digest = upload["digest"].as_str().expect("paper digest");
+        let start_body = serde_json::json!({ "digest": digest }).to_string();
+
+        let first = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/papers/intakes?idempotency_key=paper-intake-one")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(start_body.clone()))
+                    .expect("first intake request"),
+            )
+            .await
+            .expect("first intake response");
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first = response_json(first).await;
+        assert_eq!(first["replayed"], false);
+        let first_job = first["job_id"].as_str().expect("first job id");
+
+        let replay = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/papers/intakes?idempotency_key=paper-intake-one")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(start_body.clone()))
+                    .expect("replayed intake request"),
+            )
+            .await
+            .expect("replayed intake response");
+        assert_eq!(replay.status(), StatusCode::ACCEPTED);
+        let replay = response_json(replay).await;
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["job_id"], first["job_id"]);
+
+        let completed = wait_for_paper_phase(&router, first_job, "completed").await;
+        assert_eq!(completed["result"]["outcome"], "no_reconstructable_methods");
+        assert_eq!(completed["cache"]["extraction"], false);
+        assert_eq!(completed["cache"]["reconstruction"], false);
+        for stage in [
+            "extraction",
+            "locating_methods",
+            "recognizing_methods",
+            "assessing_drafts",
+            "reconstruction",
+            "total",
+        ] {
+            assert!(
+                completed["durations_ms"].get(stage).is_some(),
+                "missing {stage} duration: {completed}"
+            );
+        }
+
+        let retry = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/papers/intakes?idempotency_key=paper-intake-two")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(start_body))
+                    .expect("retry intake request"),
+            )
+            .await
+            .expect("retry intake response");
+        assert_eq!(retry.status(), StatusCode::ACCEPTED);
+        let retry = response_json(retry).await;
+        let retried = wait_for_paper_phase(
+            &router,
+            retry["job_id"].as_str().expect("retry job id"),
+            "completed",
+        )
+        .await;
+        assert_eq!(retried["cache"]["extraction"], true);
+        assert_eq!(retried["cache"]["reconstruction"], true);
+        assert_eq!(retried["result"], completed["result"]);
+    }
+
+    #[tokio::test]
+    async fn same_paper_with_a_new_catalog_reuses_extraction_but_rebuilds_reconstruction() {
+        let (temp, project) = fixture_project();
+        let graph_path = temp.path().join("graph.somite.json");
+        let first_catalog_revision = project
+            .catalog
+            .catalog_revision()
+            .expect("catalog revision");
+        let router = app(project);
+        let upload = router
+            .clone()
+            .oneshot(multipart_upload_request(
+                "/api/papers/uploads",
+                "paper-catalog-one",
+                "article.txt",
+                "text/plain",
+                b"This article discusses morphology without a computational methods workflow.",
+            ))
+            .await
+            .expect("paper upload");
+        assert_eq!(upload.status(), StatusCode::OK);
+        let upload = response_json(upload).await;
+        let digest = upload["digest"].as_str().expect("paper digest").to_owned();
+        let first = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/papers/intakes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "digest": digest }).to_string(),
+                    ))
+                    .expect("first intake request"),
+            )
+            .await
+            .expect("first intake response");
+        let first = response_json(first).await;
+        let completed = wait_for_paper_phase(
+            &router,
+            first["job_id"].as_str().expect("first paper job id"),
+            "completed",
+        )
+        .await;
+        assert_eq!(completed["cache"]["extraction"], false);
+        assert_eq!(completed["cache"]["reconstruction"], false);
+        drop(router);
+
+        std::fs::write(
+            temp.path().join("operators/test.noop.json"),
+            r#"{"id":"test.noop","title":"No-op revised","palette":[],"kind":"external","bin":"true","argv":["true"]}"#,
+        )
+        .expect("revised no-op operator");
+        let second_project =
+            WebProject::open(temp.path(), &graph_path).expect("reopened web project");
+        let second_catalog_revision = second_project
+            .catalog
+            .catalog_revision()
+            .expect("revised catalog revision");
+        assert_ne!(second_catalog_revision, first_catalog_revision);
+        let second_router = app(second_project);
+        let second = second_router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/papers/intakes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "digest": digest }).to_string(),
+                    ))
+                    .expect("second intake request"),
+            )
+            .await
+            .expect("second intake response");
+        let second = response_json(second).await;
+        let rebuilt = wait_for_paper_phase(
+            &second_router,
+            second["job_id"].as_str().expect("second paper job id"),
+            "completed",
+        )
+        .await;
+        assert_eq!(rebuilt["cache"]["extraction"], true);
+        assert_eq!(rebuilt["cache"]["reconstruction"], false);
+        assert_eq!(rebuilt["result"], completed["result"]);
+    }
+
+    #[tokio::test]
+    async fn stale_paper_idempotency_replay_is_refreshed_after_job_eviction() {
+        let (temp, project) = fixture_project();
+        let contents = b"A paper without a reconstructable computational workflow.";
+        let digest = format!("blake3:{}", blake3::hash(contents).to_hex());
+        let source_hex = paper_digest_hex(&digest).expect("paper digest");
+        let object_directory = temp.path().join(".somite/papers/objects").join(source_hex);
+        std::fs::create_dir_all(&object_directory).expect("paper object directory");
+        std::fs::write(object_directory.join("payload.txt"), contents).expect("paper object");
+        std::fs::write(
+            object_directory.join("artifact.json"),
+            serde_json::to_vec_pretty(&StoredPaperArtifact {
+                schema_version: 1,
+                digest: digest.clone(),
+                size_bytes: contents.len() as u64,
+                media_kind: PaperMediaKind::Text,
+            })
+            .expect("paper metadata"),
+        )
+        .expect("paper metadata file");
+        let request_digest = content_digest(
+            &serde_json::to_vec(&("paper_intake", &digest)).expect("request identity"),
+        );
+        project
+            .paper_intake_replays
+            .lock()
+            .expect("paper replays")
+            .insert(
+                "stale-paper-key".to_owned(),
+                PaperIntakeReplay {
+                    request_digest,
+                    result: PaperIntakeStartResponse {
+                        job_id: "paper-evicted".to_owned(),
+                        source_digest: digest.clone(),
+                        phase: PaperIntakePhase::Queued,
+                        replayed: false,
+                    },
+                    sequence: 0,
+                },
+            );
+        let router = app(project);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/papers/intakes?idempotency_key=stale-paper-key")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "digest": digest }).to_string(),
+                    ))
+                    .expect("paper intake request"),
+            )
+            .await
+            .expect("paper intake response");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let started = response_json(response).await;
+        assert_eq!(started["replayed"], false);
+        assert_ne!(started["job_id"], "paper-evicted");
+        let completed = wait_for_paper_phase(
+            &router,
+            started["job_id"].as_str().expect("paper job id"),
+            "completed",
+        )
+        .await;
+        assert_eq!(completed["phase"], "completed");
+    }
+
+    #[tokio::test]
+    async fn extracted_text_limit_fails_the_job_with_an_actionable_code() {
+        let (_temp, mut project) = fixture_project();
+        project.paper_limits.max_extracted_text_bytes = 16;
+        let router = app(project);
+        let upload = router
+            .clone()
+            .oneshot(multipart_upload_request(
+                "/api/papers/uploads",
+                "paper-text-limit",
+                "article.txt",
+                "text/plain",
+                b"This extracted paper text exceeds sixteen bytes.",
+            ))
+            .await
+            .expect("paper upload");
+        let upload = response_json(upload).await;
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/papers/intakes")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "digest": upload["digest"] }).to_string(),
+                    ))
+                    .expect("paper intake request"),
+            )
+            .await
+            .expect("paper intake response");
+        let started = response_json(response).await;
+        let failed = wait_for_paper_phase(
+            &router,
+            started["job_id"].as_str().expect("paper job id"),
+            "failed",
+        )
+        .await;
+        assert_eq!(failed["failure"]["code"], "paper_extraction_limit");
+        assert_eq!(failed["result"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
     async fn autosave_validates_and_writes_a_recovery_graph() {
         let (temp, project) = fixture_project();
         let response = app(project)
@@ -4407,6 +7787,41 @@ mod tests {
     fn cpu_profile_counts_physical_cores_and_threads() {
         let fixture = "processor: 0\nmodel name: Example CPU\nphysical id: 0\ncore id: 0\n\nprocessor: 1\nmodel name: Example CPU\nphysical id: 0\ncore id: 0\n\nprocessor: 2\nmodel name: Example CPU\nphysical id: 0\ncore id: 1\n";
         assert_eq!(parse_cpuinfo(fixture), ("Example CPU".to_owned(), 2, 3));
+    }
+
+    #[tokio::test]
+    async fn system_profile_reports_the_managed_pixi_paper_toolchain_paths() {
+        let (temp, mut project) = fixture_project();
+        let bin = temp
+            .path()
+            .join(".somite/tools/paper/.pixi/envs/default/bin");
+        std::fs::create_dir_all(&bin).expect("managed Pixi bin directory");
+        for name in ["pdftotext", "pdfinfo", "pdftoppm", "tesseract"] {
+            let path = executable_candidate(&bin, name);
+            write_test_executable(&path, b"#!/bin/sh\nexit 0\n");
+        }
+        project.paper_tools = PaperToolchainState::detect(temp.path());
+        let response = app(project)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/system")
+                    .body(Body::empty())
+                    .expect("system request"),
+            )
+            .await
+            .expect("system response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let profile = response_json(response).await;
+        assert_eq!(profile["paper_extraction"]["native_pdf_text"], true);
+        assert_eq!(profile["paper_extraction"]["scanned_pdf_ocr"], true);
+        let tools = profile["paper_extraction"]["tools"]
+            .as_array()
+            .expect("paper tools");
+        assert_eq!(tools.len(), 4);
+        assert!(tools.iter().all(|tool| tool["source"] == "managed_pixi"));
+        assert!(tools.iter().all(|tool| tool["path"]
+            .as_str()
+            .is_some_and(|path| path.contains(".somite/tools/paper/.pixi"))));
     }
 
     #[test]

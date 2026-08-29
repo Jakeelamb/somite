@@ -2,6 +2,11 @@
   "id": "align.bwa",
   "title": "BWA-MEM",
   "palette": ["Variants"],
+  "paper": {
+    "aliases": ["BWA-MEM", "BWA MEM"],
+    "operation_class": "read_alignment",
+    "assays": ["variants"]
+  },
   "kind": "external",
   "cost": "high",
   "bin": "bwa",

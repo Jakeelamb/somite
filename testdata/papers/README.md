@@ -6,6 +6,50 @@ This corpus has two layers:
 - Full primary-source papers are downloaded into gitignored `pdf/` and `raw/`
   directories for end-to-end extraction and reconstruction tests.
 
+`gold.tsv` is the versioned, machine-readable contract for every committed text
+fixture. Add or change a row only after reviewing the corresponding fixture;
+recognizer output must never rewrite the gold expectations automatically.
+Ordinary `cargo test -p somite-paper` fails if a committed `.txt` fixture has no
+gold row, an input cannot be extracted, a candidate is empty or invalid, or any
+annotated expectation fails.
+
+## Gold schema and metrics
+
+Schema version 2 has 18 tab-separated fields. Use `-` for no annotation,
+commas for lists, semicolons for multiple assertions, `>` for ordered paths,
+and `|` for branch arms or alternatives.
+
+| field | assertion |
+|---|---|
+| `fixture` | committed text input relative to this directory |
+| `extract_via` | required `utf8`, `poppler`, or `tesseract` extraction path |
+| `outcome` | exact reconstruction outcome |
+| `tracks` | exact set of candidate assay tracks |
+| `expected_entities` | exact normalized method-entity set used for recall and precision |
+| `forbidden_entities` | explicit false-positive identities that must remain absent |
+| `required_operators` | reviewed operators required across candidates |
+| `forbidden_operators` | comparison, covered, or otherwise non-executable operators |
+| `required_unsupported` | unsupported identities that must remain as evidence |
+| `expected_candidates` | exact candidate count, including zero-outcome cases |
+| `required_paths` | ordered reachability, for example `files.import>align.star` |
+| `required_branches` | one root reaching every arm, for example `source>qc|align` |
+| `separate_alternatives` | selectors that must each occur in a distinct candidate |
+| `parameters` | exact `selector:name=value` expectations |
+| `minimum_evidence_records` | lower bound across mentions and graph evidence |
+| `minimum_evidence_support_pct` | required exact-span support percentage |
+| `exact_runs` | exact SRA runs allowed to become read-source nodes |
+| `forbid_collection_reads` | requires collection citations to remain citations until an exact run is selected |
+
+Node selectors are operator IDs, except unsupported typed gaps use
+`gap:<reviewed tool name>`. The evaluator reports extraction, classification,
+entity recall, entity precision, operator support, candidates, nodes, typed
+edges, topology, parameters, evidence spans, and cited-resource selection as
+separate deterministic metrics. Run it with its concise corpus summary visible:
+
+```bash
+cargo test -p somite-paper committed_gold_manifest_reconstructs_through_the_public_interface -- --nocapture
+```
+
 Run `scripts/fetch-paper-corpus` from anywhere in the checkout. Downloads are
 pinned by SHA-256. A checksum failure stops before replacing an existing paper.
 This is deliberate: two early corpus files had valid PDFs with the wrong papers.
@@ -22,8 +66,8 @@ This is deliberate: two early corpus files had valid PDFs with the wrong papers.
 | `pdf/wood_kraken2.pdf` | [PMC6883579](https://pmc.ncbi.nlm.nih.gov/articles/PMC6883579/) | CC BY | reads → Kraken2, not minimap2 or nf-core/taxprofiler |
 | `raw/cwl_workflows_pmc.txt` + PDF | [PMC10662043](https://pmc.ncbi.nlm.nih.gov/articles/PMC10662043/) | CC BY | separate HISAT2 RNA-seq and BWA/GATK germline branches |
 | `raw/sarek_pmc.txt` + PDF | [PMC7111497](https://pmc.ncbi.nlm.nih.gov/articles/PMC7111497/) | PMC dataset | named Sarek compound, not duplicated internal bricks |
-| `raw/minto_pmc.txt` + PDF | [PMC9580859](https://pmc.ncbi.nlm.nih.gov/articles/PMC9580859/) | CC BY | metagenome preprocessing, assembly and binning gaps |
-| `raw/scrnabox_pmc.txt` + PDF | [PMC11443813](https://pmc.ncbi.nlm.nih.gov/articles/PMC11443813/) | CC BY | Cell Ranger → optional SoupX → Seurat → DoubletFinder |
+| `raw/minto_pmc.txt` + PDF | [PMC9580859](https://pmc.ncbi.nlm.nih.gov/articles/PMC9580859/) | CC BY | retain unsupported preprocessing/assembly methods; no guessed executable draft |
+| `raw/scrnabox_pmc.txt` + PDF | [PMC11443813](https://pmc.ncbi.nlm.nih.gov/articles/PMC11443813/) | CC BY | retain Cell Ranger, SoupX, Seurat, and DoubletFinder; no guessed executable draft |
 
 The PMC assets come from the [current NLM PMC article dataset on
 AWS](https://pmc.ncbi.nlm.nih.gov/tools/pmcaws/), not scraped article pages.
@@ -45,3 +89,16 @@ to be complete once `pdf/` exists.
 | `kraken2_methods.txt` | reads → Kraken2 |
 | `aphis_assembly_methods.txt` | HiFi + Hi-C → hifiasm → YaHS → BUSCO |
 | `rnaseq_methods.txt` | FastQC → fastp → STAR → featureCounts → DESeq2 |
+| `cited_resources_methods.txt` | cited BioProject/SRA collections → exact selectable runs |
+| `comparison_only_methods.txt` | retain STAR comparison evidence, execute only HISAT2 |
+| `assembly_alternatives_methods.txt` | hifiasm, FALCON, and Flye as separate candidates |
+| `unsupported_te_methods.txt` | retain exact unsupported TE method identities without guessed nodes |
+| `unsupported_statistics_methods.txt` | retain exact statistical methods without a fake draft |
+| `no_reconstructable_methods.txt` | deterministic no-method outcome with zero candidates |
+
+The fetched full-paper gate is intentionally explicit and all-or-nothing:
+
+```bash
+scripts/fetch-paper-corpus
+SOMITE_PAPER_CORPUS=required cargo test -p somite-paper downloaded_real_paper_corpus_reconstructs -- --nocapture
+```

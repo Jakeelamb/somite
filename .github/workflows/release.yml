@@ -1,0 +1,75 @@
+name: Publish source release
+
+on:
+  push:
+    tags:
+      - "v[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  release:
+    name: Verify and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Select pinned Rust toolchain
+        run: rustup show
+      - name: Verify tag and package versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_package="$(cargo pkgid -p somite-cli)"
+          cargo_version="${cargo_package##*#}"
+          web_version="$(node -p "require('./web/package.json').version")"
+          lock_version="$(node -p "require('./web/package-lock.json').version")"
+          lock_package_version="$(node -p "require('./web/package-lock.json').packages[''].version")"
+          test "$tag_version" = "$cargo_version"
+          test "$tag_version" = "$web_version"
+          test "$tag_version" = "$lock_version"
+          test "$tag_version" = "$lock_package_version"
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint Rust
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test Rust
+        run: cargo test --workspace --locked
+      - name: Build Rust release targets
+        run: cargo build --workspace --release --locked
+      - name: Install locked web dependencies
+        working-directory: web
+        run: npm ci
+      - name: Typecheck web app
+        working-directory: web
+        run: npm run typecheck
+      - name: Lint web app
+        working-directory: web
+        run: npm run lint
+      - name: Build and test web app
+        working-directory: web
+        run: npm test
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME"
+          --repo "$GITHUB_REPOSITORY"
+          --verify-tag
+          --generate-notes
+          --title "Somite $GITHUB_REF_NAME"

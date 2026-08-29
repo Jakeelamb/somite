@@ -153,6 +153,7 @@ fn rejects_unsupported_execution_honestly() {
         outputs: BTreeMap::new(),
         stdout: None,
         resolution: None,
+        paper: None,
     };
     catalog.ops.insert(reference.id.clone(), reference.clone());
     let mut rejected = graph.clone();

@@ -212,6 +212,19 @@ pub struct OperatorResolutionSpec {
     pub recipes: Vec<OperatorResolutionRecipeSpec>,
 }
 
+/// Evidence-recognition metadata for reconstructing papers. It identifies a
+/// reviewed Operator in prose but does not change that Operator's execution.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PaperRecognitionSpec {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_class: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assays: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Operator {
@@ -240,6 +253,8 @@ pub struct Operator {
     pub stdout: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution: Option<OperatorResolutionSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paper: Option<PaperRecognitionSpec>,
 }
 
 fn high() -> Cost {
@@ -480,7 +495,12 @@ impl Catalog {
                 .resolution
                 .as_ref()
                 .is_some_and(|resolution| resolution.kind == OperatorResolutionKind::Adapter);
-            if node.ports != operator.ir_ports() && !structural_adapter {
+            let valid_workflow_reference = operator.id == "workflow.reference"
+                && operator.kind == OpKind::Reference
+                && workflow::reference_node_contract_is_valid(node);
+            if (node.ports != operator.ir_ports() && !structural_adapter)
+                && !valid_workflow_reference
+            {
                 return Err(OpsError::PortContractMismatch {
                     node: node.id.clone(),
                     operator: node.operator.clone(),
@@ -644,6 +664,7 @@ mod tests {
             outputs: BTreeMap::new(),
             stdout: None,
             resolution: None,
+            paper: None,
         };
         let a = render_argv(&op, &b).unwrap();
         assert_eq!(a, vec!["-O", "/w/out/SRR1"]);
@@ -694,6 +715,7 @@ mod tests {
             outputs: BTreeMap::new(),
             stdout: None,
             resolution: None,
+            paper: None,
         };
         let a = render_argv(&op, &b).unwrap();
         assert_eq!(a, vec!["nextflow", "--outdir", "/w/out"]);
@@ -960,11 +982,25 @@ mod tests {
         renamed.title = "A clearer FastQC label".into();
         renamed.palette = vec!["Different".into(), "Grouping".into()];
         renamed.cost = Cost::Low;
+        renamed.paper = Some(PaperRecognitionSpec {
+            aliases: vec!["Fast QC".into()],
+            operation_class: Some("quality_control".into()),
+            assays: vec!["qc".into(), "rna-seq".into()],
+        });
         renamed
             .params
             .values_mut()
             .for_each(|parameter| parameter.label = Some("Friendlier label".into()));
         assert_eq!(renamed.revision().unwrap(), revision);
+        let catalog_revision = catalog.catalog_revision().unwrap();
+        let mut renamed_catalog = catalog.clone();
+        renamed_catalog
+            .ops
+            .insert(renamed.id.clone(), renamed.clone());
+        assert_ne!(
+            renamed_catalog.catalog_revision().unwrap(),
+            catalog_revision
+        );
 
         let mut changed = operator.clone();
         changed.argv.push("--quiet".into());
@@ -1005,6 +1041,118 @@ mod tests {
         assert!(matches!(
             catalog.pin_graph(&mut graph),
             Err(OpsError::RevisionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn catalog_accepts_nextflow_reference_fan_in_ports() {
+        let catalog =
+            Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
+                .unwrap();
+        let reference_revision = catalog.revision("workflow.reference").unwrap();
+        let dot = r#"digraph workflow {
+          v0 [label="NFCORE_PANGENOME:ODGI"];
+          v1 [label="NFCORE_PANGENOME:DRAW"];
+          v2 [label="NFCORE_PANGENOME:ODGI_DRAW_MULTIQC"];
+          v0 -> v2;
+          v1 -> v2;
+        }"#;
+        let mut graph = workflow::graph_from_dot(
+            workflow::DotFlavor::Nextflow,
+            "nf-core/pangenome",
+            "1.1.3",
+            &reference_revision,
+            dot,
+        )
+        .expect("Nextflow graph");
+
+        catalog
+            .pin_graph(&mut graph)
+            .expect("catalog should preserve valid structural fan-in ports");
+    }
+
+    #[test]
+    fn catalog_rejects_malformed_dynamic_reference_ports_and_provenance() {
+        let catalog =
+            Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
+                .unwrap();
+        let reference_revision = catalog.revision("workflow.reference").unwrap();
+        let dot = r#"digraph workflow {
+          v0 [label="NFCORE_PANGENOME:ODGI"];
+          v1 [label="NFCORE_PANGENOME:DRAW"];
+          v2 [label="NFCORE_PANGENOME:ODGI_DRAW_MULTIQC"];
+          v0 -> v2;
+          v1 -> v2;
+        }"#;
+        let graph = workflow::graph_from_dot(
+            workflow::DotFlavor::Nextflow,
+            "nf-core/pangenome",
+            "1.1.3",
+            &reference_revision,
+            dot,
+        )
+        .expect("Nextflow graph");
+
+        let mut malformed_ports = graph.clone();
+        malformed_ports
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "odgi-draw-multiqc")
+            .and_then(|node| node.ports.iter_mut().find(|port| port.name == "in_2"))
+            .expect("second fan-in port")
+            .ty = PortType::Table;
+        assert!(matches!(
+            catalog.pin_graph(&mut malformed_ports),
+            Err(OpsError::PortContractMismatch { .. })
+        ));
+
+        let mut missing_provenance = graph;
+        missing_provenance
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "odgi-draw-multiqc")
+            .expect("fan-in node")
+            .params
+            .remove("component");
+        assert!(matches!(
+            catalog.pin_graph(&mut missing_provenance),
+            Err(OpsError::PortContractMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn catalog_still_rejects_ordinary_operator_port_mismatches() {
+        let catalog =
+            Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
+                .unwrap();
+        let operator = catalog.get("qc.fastqc").unwrap();
+        let mut graph = Graph {
+            schema_version: SCHEMA_VERSION,
+            name: None,
+            nodes: vec![Node {
+                id: "fastqc1".into(),
+                operator: operator.id.clone(),
+                operator_revision: operator.revision().unwrap(),
+                ports: operator.ir_ports(),
+                params: BTreeMap::new(),
+                layout: Layout { x: 0.0, y: 0.0 },
+                note: None,
+                color: None,
+            }],
+            edges: Vec::new(),
+            annotations: Vec::new(),
+        };
+        graph.nodes[0].ports.push(Port {
+            name: "invented".into(),
+            dir: Direction::In,
+            ty: PortType::Directory,
+            union: Vec::new(),
+            optional: true,
+        });
+
+        assert!(matches!(
+            catalog.pin_graph(&mut graph),
+            Err(OpsError::PortContractMismatch { .. })
         ));
     }
 }

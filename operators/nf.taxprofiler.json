@@ -2,6 +2,11 @@
   "id": "nf.taxprofiler",
   "title": "nf-core/taxprofiler reference",
   "palette": ["References", "nf-core"],
+  "paper": {
+    "aliases": ["nf-core/taxprofiler"],
+    "operation_class": "compound_workflow",
+    "assays": ["metagenome"]
+  },
   "kind": "reference",
   "cost": "low",
   "params": {

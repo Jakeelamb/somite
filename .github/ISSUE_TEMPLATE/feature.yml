@@ -1,0 +1,36 @@
+name: Feature request
+description: Propose a user outcome or workflow capability.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to accomplish, and where does the current workflow stop you?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe what success should feel like from the user's point of view.
+    validations:
+      required: true
+  - type: textarea
+    id: workflow
+    attributes:
+      label: Example workflow
+      description: Include representative inputs, tools, outputs, and scientific constraints without private data.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Reproducibility or provenance requirements
+      description: Note any versions, reference resources, validation evidence, or audit requirements that must be preserved.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Current workaround
+      description: How do you handle this today?

@@ -192,10 +192,43 @@ transaction is one undoable browser history entry.
 a draft for review, not a claim that the paper supplied an executable graph.
 Literature discovery is not a graph source: selecting or reconstructing a
 bioRxiv record cannot mutate the Graph. Only explicit acceptance of a Candidate
-graph creates a Graph transaction.
+graph creates its first Graph transaction. After acceptance, an explicit intake
+choice such as “Use these reads” is a normal Graph edit: it applies the Candidate
+delta to that on-canvas graph while off-canvas Candidates remain drafts.
+
+**Reconstruction outcome** — one explicit scientific result, independent of
+the transport job state. `DraftsReady` means at least one non-empty Candidate
+validates against both Graph and Catalog contracts. `RecognizedUnsupported`
+means computational methods and their evidence were retained but no safe
+Candidate can be built. `NoReconstructableMethods` means neither an executable
+nor a reviewed unsupported method track was found. Extraction failure is not a
+Reconstruction outcome because no reliable source text was available.
 
 **Candidate graph** — one named interpretation of a distinct method track.
-Parallel analyses and mutually exclusive alternatives remain separate.
+Parallel analyses and mutually exclusive alternatives remain separate. A
+Candidate is never empty or source-only; all exported Candidates validate
+before they cross the `somite-paper` boundary.
+
+**Method mention** — a normalized method identity plus its exact surface name,
+nearby evidence, optional source page, operation class, and either a reviewed
+Operator identity or explicit unsupported status. Recognition does not invent
+ports, edges, parameters, or equivalence between related tool names.
+
+**Paper artifact** — an immutable, size-bounded local PDF or text object keyed
+by its BLAKE3 content digest. Original filenames are display metadata. Uploading
+identical bytes reuses the artifact; retry references its digest and does not
+upload the bytes again.
+
+**Paper intake job** — the observable attempt to copy a local paper, extract
+its methods, and build Candidate graphs. Queued, text extraction, bounded OCR,
+method location, recognition, assessment, cancellation, and terminal phases are
+transport lifecycle state, distinct from Reconstruction outcome. A terminal job
+retains stage timings, cache reuse, result or actionable error. Failure never
+mutates the previous Reconstruction or Graph.
+
+**Paper extraction cache** — normalized source text keyed by artifact digest and
+extractor version. Reconstruction is cached separately by extracted-text key and
+Catalog digest, so reviewed recognition changes do not rerun Poppler or OCR.
 
 **Evidence** — retained source text or explicit inference attached to a
 reconstructed node or edge. Operator support is shown separately as built-in,
@@ -204,6 +237,17 @@ evidence strength is never used as a proxy for executability.
 
 **Source location** — the exact PDF page when the extraction preserves page
 separators. It is optional for plain text and JATS sources and never fabricated.
+
+**Resource citation** — an accession-shaped paper claim retained with its
+accession family, inferred scientific role, nearby paper text, and optional
+Source location. A citation is evidence, not yet an executable input.
+
+**Resolved resource group** — the current provider records returned for one
+Resource citation through Somite's NCBI or Ensembl source boundary. Study,
+experiment, sample, and BioProject identifiers are collections and may resolve
+to several exact runs. Somite requires an explicit run choice and records that
+run accession in the draft Graph; it never treats a sample identifier as a
+downloadable run or silently chooses the first member of a collection.
 
 ## Invariants
 
@@ -218,6 +262,10 @@ separators. It is optional for plain text and JATS sources and never fabricated.
   physical `Directory` shape alone is insufficient.
 - Package metadata alone never substitutes for an operator contract.
 - Imported structure and paper inference are labeled honestly.
+- No paper Candidate is empty, source-only, or invalid, and no caller infers a
+  ready outcome solely from Candidate count.
+- Paper artifact identity is content-based; filenames and retries do not create
+  duplicate scientific bytes.
 - All persisted graph writes are validated by the Rust graph model.
 - Generated engine syntax never introduces an unmapped executable node.
 - Workflow name, presentation-only layout, notes, Canvas annotations, and Node

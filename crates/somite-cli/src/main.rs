@@ -9,7 +9,7 @@ use somite_bundle::{
 use somite_cook::{cook_graph, NodeState, Project};
 use somite_ir::Graph;
 use somite_ops::{current_pixi_platform, snakemake_local, Catalog};
-use somite_paper::{extract_from_path, reconstruct};
+use somite_paper::{extract_from_path, reconstruct, Reconstruction};
 
 fn operators_dir() -> PathBuf {
     if let Ok(p) = env::var("SOMITE_OPERATORS") {
@@ -229,17 +229,42 @@ fn paper_cmd(path: &Path) -> Result<()> {
     let extracted = extract_from_path(path)?;
     eprintln!("# via={:?}", extracted.via);
     let r = reconstruct(&cat, &extracted.text);
+
+    let Some(candidate) = r.active() else {
+        for line in no_candidate_diagnostics(&r) {
+            eprintln!("{line}");
+        }
+        return Ok(());
+    };
+
     for w in &r.warnings {
         eprintln!("warning: {w}");
     }
     eprintln!(
         "# assay={:?} nodes={} edges={}",
-        r.assay,
-        r.graph.nodes.len(),
-        r.graph.edges.len()
+        candidate.assay,
+        candidate.graph.nodes.len(),
+        candidate.graph.edges.len()
     );
-    println!("{}", serde_json::to_string_pretty(&r.graph)?);
+    println!("{}", serde_json::to_string_pretty(&candidate.graph)?);
     Ok(())
+}
+
+fn no_candidate_diagnostics(reconstruction: &Reconstruction) -> Vec<String> {
+    let mut lines = vec![format!("# outcome={:?}", reconstruction.outcome)];
+    lines.extend(
+        reconstruction
+            .mentions
+            .iter()
+            .map(|mention| format!("method: {}", mention.display_name)),
+    );
+    lines.extend(
+        reconstruction
+            .warnings
+            .iter()
+            .map(|warning| format!("warning: {warning}")),
+    );
+    lines
 }
 
 #[cfg(test)]
@@ -299,5 +324,26 @@ mod tests {
                     .to_string()
             ))
         );
+    }
+
+    #[test]
+    fn paper_without_a_draft_reports_the_truthful_outcome_and_methods() {
+        let catalog = Catalog::load_dir(&operators_dir()).expect("operator catalog");
+        let reconstruction = reconstruct(
+            &catalog,
+            "Methods\nNanopore reads were trimmed with Porechop and analyzed with dnaPipeTE.",
+        );
+        assert!(reconstruction.active().is_none());
+
+        let diagnostics = no_candidate_diagnostics(&reconstruction);
+        assert!(diagnostics
+            .iter()
+            .any(|line| line == "# outcome=RecognizedUnsupported"));
+        assert!(diagnostics.iter().any(|line| line == "method: Porechop"));
+        assert!(diagnostics.iter().any(|line| line == "method: dnaPipeTE"));
+        assert!(diagnostics.iter().any(|line| {
+            line == "warning: Somite recognized these computational methods, but workflow support for them is not available yet."
+        }));
+        assert!(!diagnostics.iter().any(|line| line.contains("cover page")));
     }
 }

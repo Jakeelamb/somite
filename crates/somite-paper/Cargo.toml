@@ -3,6 +3,9 @@ name = "somite-paper"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
 description = "Drop a paper, emit a Somite graph. Same IR as the canvas."
 
 [dependencies]

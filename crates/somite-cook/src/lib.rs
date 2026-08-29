@@ -773,6 +773,7 @@ fn subst_glob(g: &str, b: &Bindings<'_>) -> String {
             outputs: BTreeMap::new(),
             stdout: None,
             resolution: None,
+            paper: None,
         },
         b,
     )

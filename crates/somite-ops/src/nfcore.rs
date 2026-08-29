@@ -91,6 +91,7 @@ impl Pipeline {
             outputs,
             stdout: None,
             resolution: None,
+            paper: None,
         }
     }
 }

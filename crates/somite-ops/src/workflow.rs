@@ -138,6 +138,42 @@ pub fn upgrade_reference_ports(graph: &mut Graph) -> usize {
     upgraded
 }
 
+/// Structural workflow references intentionally have node-local ports derived
+/// from the imported engine graph. Accept only the two shapes Somite itself
+/// emits, backed by the complete provenance tuple used by `graph_from_dot`.
+pub(crate) fn reference_node_contract_is_valid(node: &Node) -> bool {
+    if node.operator != "workflow.reference" || node.params.len() != 4 {
+        return false;
+    }
+    let Some(ParamValue::String(engine)) = node.params.get("engine") else {
+        return false;
+    };
+    let flavor = match engine.as_str() {
+        "nextflow" => DotFlavor::Nextflow,
+        "snakemake" => DotFlavor::Snakemake,
+        _ => return false,
+    };
+    let required_string = |name: &str| match node.params.get(name) {
+        Some(ParamValue::String(value)) if !value.trim().is_empty() => Some(value.as_str()),
+        _ => None,
+    };
+    if required_string("workflow").is_none() || required_string("revision").is_none() {
+        return false;
+    }
+    let Some(component) = required_string("component") else {
+        return false;
+    };
+
+    let input_count = node
+        .ports
+        .iter()
+        .filter(|port| port.dir == Direction::In)
+        .count();
+    let structural_ports = component_ports(flavor, component, false, input_count);
+    let read_boundary_ports = component_ports(flavor, component, true, 0);
+    node.ports == structural_ports || node.ports == read_boundary_ports
+}
+
 fn quoted_attribute(attributes: &str, key: &str) -> Option<String> {
     let index = attributes.find(key)? + key.len();
     let tail = attributes[index..].trim_start();

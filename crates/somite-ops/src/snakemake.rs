@@ -50,6 +50,7 @@ impl Workflow {
             outputs: BTreeMap::new(),
             stdout: None,
             resolution: None,
+            paper: None,
         }
     }
 }

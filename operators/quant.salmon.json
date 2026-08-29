@@ -2,6 +2,11 @@
   "id": "quant.salmon",
   "title": "Salmon",
   "palette": ["RNA"],
+  "paper": {
+    "aliases": ["Salmon"],
+    "operation_class": "transcript_quantification",
+    "assays": ["rna-seq"]
+  },
   "kind": "external",
   "cost": "high",
   "bin": "salmon",

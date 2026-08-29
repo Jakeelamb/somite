@@ -1,12 +1,14 @@
 //! Rebuild a graph from a paper's methods. Catalog is the snap; gaps are honest.
 //!
-//! PDF text uses what Omarchy already ships: poppler (`pdftotext` / `pdftoppm`)
-//! then Tesseract with the same flags as `omarchy capture text`.
+//! PDF text uses Poppler (`pdftotext` / `pdftoppm`) and falls back to
+//! Tesseract for image-only pages.
 
 use std::fs;
 use std::io;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 
 use somite_ir::{
     compatible, Direction, Edge, Graph, Layout, Node, ParamValue, Port, PortType, SCHEMA_VERSION,
@@ -22,11 +24,19 @@ pub enum PaperError {
     Pdf(String),
     #[error("tesseract: {0}")]
     Ocr(String),
+    #[error("paper extraction cancelled")]
+    Cancelled,
+    #[error("paper extraction limit: {0}")]
+    Limit(String),
+    #[error("{tool} exceeded its {seconds} second timeout")]
+    Timeout { tool: String, seconds: u64 },
+    #[error("{tool} is unavailable; searched the configured paper toolchain and PATH ({package})")]
+    MissingTool { tool: String, package: String },
     #[error("{0}")]
     Msg(String),
 }
 
-/// How the bytes became text. Same tools Omarchy installs.
+/// How the source bytes became text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtractVia {
     Utf8,
@@ -38,6 +48,50 @@ pub enum ExtractVia {
 pub struct Extracted {
     pub text: String,
     pub via: ExtractVia,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExtractionLimits {
+    pub max_pages: usize,
+    pub max_text_bytes: usize,
+    pub command_timeout: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtractionToolchain {
+    pub pdftotext: PathBuf,
+    pub pdfinfo: PathBuf,
+    pub pdftoppm: PathBuf,
+    pub tesseract: PathBuf,
+}
+
+impl Default for ExtractionToolchain {
+    fn default() -> Self {
+        Self {
+            pdftotext: PathBuf::from("pdftotext"),
+            pdfinfo: PathBuf::from("pdfinfo"),
+            pdftoppm: PathBuf::from("pdftoppm"),
+            tesseract: PathBuf::from("tesseract"),
+        }
+    }
+}
+
+impl Default for ExtractionLimits {
+    fn default() -> Self {
+        Self {
+            max_pages: 200,
+            max_text_bytes: 64 * 1024 * 1024,
+            command_timeout: Duration::from_secs(120),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtractionProgress {
+    NativeText,
+    Rasterizing { page: usize, total: usize },
+    Ocr { page: usize, total: usize },
+    PageComplete { page: usize, total: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,28 +123,121 @@ pub struct CandidateGraph {
     pub evidence: Vec<EvidenceRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconstructionOutcome {
+    DraftsReady,
+    RecognizedUnsupported,
+    NoReconstructableMethods,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MethodSupport {
+    Operator(String),
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MethodMention {
+    pub display_name: String,
+    pub normalized_name: String,
+    pub operation_class: Option<String>,
+    pub evidence: String,
+    pub page: Option<usize>,
+    pub support: MethodSupport,
+}
+
 #[derive(Debug, Clone)]
 pub struct Reconstruction {
+    pub outcome: ReconstructionOutcome,
     pub candidates: Vec<CandidateGraph>,
-    active: usize,
+    pub mentions: Vec<MethodMention>,
+    pub warnings: Vec<String>,
+    active: Option<usize>,
 }
 
 impl Reconstruction {
-    fn new(candidates: Vec<CandidateGraph>) -> Self {
-        debug_assert!(!candidates.is_empty());
+    fn with_mentions(
+        catalog: &Catalog,
+        candidates: Vec<CandidateGraph>,
+        mentions: Vec<MethodMention>,
+    ) -> Self {
+        let mut warnings = candidates
+            .iter()
+            .flat_map(|candidate| candidate.warnings.iter().cloned())
+            .collect::<Vec<_>>();
+        let mut accepted = Vec::new();
+        for candidate in candidates {
+            if candidate.graph.nodes.is_empty()
+                || !candidate_has_reviewed_method(catalog, &candidate)
+            {
+                continue;
+            }
+            if let Err(error) = candidate
+                .graph
+                .validate()
+                .map_err(|error| error.to_string())
+                .and_then(|_| {
+                    catalog
+                        .verify_graph(&candidate.graph)
+                        .map_err(|error| error.to_string())
+                })
+            {
+                warnings.push(format!(
+                    "discarded invalid candidate {}: {error}",
+                    candidate.name
+                ));
+                continue;
+            }
+            accepted.push(candidate);
+        }
+        let candidates = accepted;
+        let outcome = if candidates.is_empty() {
+            if mentions.is_empty() {
+                ReconstructionOutcome::NoReconstructableMethods
+            } else {
+                ReconstructionOutcome::RecognizedUnsupported
+            }
+        } else {
+            ReconstructionOutcome::DraftsReady
+        };
+        if warnings.is_empty() {
+            match outcome {
+                ReconstructionOutcome::RecognizedUnsupported => warnings.push(
+                    "Somite recognized these computational methods, but workflow support for them is not available yet."
+                        .into(),
+                ),
+                ReconstructionOutcome::NoReconstructableMethods => warnings.push(
+                    "Somite could not identify a computational workflow in the extracted text. Confirm that the paper includes readable methods or provide a clearer methods section."
+                        .into(),
+                ),
+                ReconstructionOutcome::DraftsReady => {}
+            }
+        }
+        let active = (!candidates.is_empty()).then_some(0);
         Self {
+            outcome,
             candidates,
-            active: 0,
+            mentions,
+            warnings,
+            active,
         }
     }
 
-    pub fn active_index(&self) -> usize {
+    pub fn active_index(&self) -> Option<usize> {
         self.active
+    }
+
+    pub fn active(&self) -> Option<&CandidateGraph> {
+        self.active.and_then(|index| self.candidates.get(index))
+    }
+
+    pub fn active_mut(&mut self) -> Option<&mut CandidateGraph> {
+        self.active.and_then(|index| self.candidates.get_mut(index))
     }
 
     pub fn activate(&mut self, index: usize) -> bool {
         if index < self.candidates.len() {
-            self.active = index;
+            self.active = Some(index);
             true
         } else {
             false
@@ -99,24 +246,20 @@ impl Reconstruction {
 
     pub fn warn_all(&mut self, warning: impl Into<String>) {
         let warning = warning.into();
+        self.warnings.insert(0, warning.clone());
         for candidate in &mut self.candidates {
             candidate.warnings.insert(0, warning.clone());
         }
     }
 }
 
-impl std::ops::Deref for Reconstruction {
-    type Target = CandidateGraph;
-
-    fn deref(&self) -> &Self::Target {
-        &self.candidates[self.active]
-    }
-}
-
-impl std::ops::DerefMut for Reconstruction {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.candidates[self.active]
-    }
+fn candidate_has_reviewed_method(catalog: &Catalog, candidate: &CandidateGraph) -> bool {
+    candidate.graph.nodes.iter().any(|node| {
+        catalog
+            .ops
+            .get(&node.operator)
+            .is_some_and(|operator| operator.paper.is_some())
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +282,36 @@ pub struct EvidenceRecord {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceCitationKind {
+    SraStudy,
+    SraSample,
+    SraExperiment,
+    SraRun,
+    BioProject,
+    BioSample,
+    Assembly,
+    Ensembl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceRole {
+    Reads,
+    Reference,
+    Annotation,
+    SampleMetadata,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceCitation {
+    pub accession: String,
+    pub kind: ResourceCitationKind,
+    pub role: ResourceRole,
+    pub context: String,
+    pub page: Option<usize>,
+}
+
 impl EvidenceTarget {
     pub fn id(&self) -> &str {
         match self {
@@ -157,53 +330,245 @@ const RNA_COMPOUND_COVERS: &[&str] = &[
 const VAR_COMPOUND_COVERS: &[&str] = &["align.bwa", "var.haplotypecaller"];
 const MAG_COMPOUND_COVERS: &[&str] = &["class.kraken2"];
 
-/// Catalog bricks the methods section can name. nf-core compounds only if named.
-const BRICKS: &[(&str, &[&str])] = &[
-    ("qc.fastqc", &["fastqc"]),
-    (
-        "qc.fastp",
+#[derive(Clone, Copy)]
+struct UnsupportedMethodSpec {
+    display_name: &'static str,
+    normalized_name: &'static str,
+    operation_class: &'static str,
+    aliases: &'static [&'static str],
+    input_shape: Option<PortType>,
+    output_shape: Option<PortType>,
+    may_be_gap: bool,
+}
+
+impl UnsupportedMethodSpec {
+    const fn gap(
+        display_name: &'static str,
+        normalized_name: &'static str,
+        operation_class: &'static str,
+        aliases: &'static [&'static str],
+        input_shape: PortType,
+        output_shape: PortType,
+    ) -> Self {
+        Self {
+            display_name,
+            normalized_name,
+            operation_class,
+            aliases,
+            input_shape: Some(input_shape),
+            output_shape: Some(output_shape),
+            may_be_gap: true,
+        }
+    }
+
+    const fn mention_only(
+        display_name: &'static str,
+        normalized_name: &'static str,
+        operation_class: &'static str,
+        aliases: &'static [&'static str],
+    ) -> Self {
+        Self {
+            display_name,
+            normalized_name,
+            operation_class,
+            aliases,
+            input_shape: None,
+            output_shape: None,
+            may_be_gap: false,
+        }
+    }
+}
+
+/// High-confidence computational methods that Somite can retain as paper
+/// evidence but cannot yet represent as reviewed executable operators. Only
+/// entries with reviewed input/output shapes and `may_be_gap` set can
+/// become typed gap nodes. Mention-only entries remain evidence and never wire.
+const UNSUPPORTED_METHODS: &[UnsupportedMethodSpec] = &[
+    UnsupportedMethodSpec::gap(
+        "Ballgown",
+        "ballgown",
+        "differential_expression",
+        &["ballgown"],
+        PortType::Gtf,
+        PortType::Table,
+    ),
+    UnsupportedMethodSpec::gap(
+        "Kallisto",
+        "kallisto",
+        "transcript_quantification",
+        &["kallisto"],
+        PortType::Fastq,
+        PortType::Table,
+    ),
+    UnsupportedMethodSpec::gap(
+        "MultiQC",
+        "multiqc",
+        "aggregate_qc",
+        &["multiqc"],
+        PortType::Directory,
+        PortType::Html,
+    ),
+    UnsupportedMethodSpec::gap(
+        "Picard",
+        "picard",
+        "bam_processing",
+        &["picard", "markduplicates"],
+        PortType::Bam,
+        PortType::Bam,
+    ),
+    UnsupportedMethodSpec::gap(
+        "Mutect2",
+        "mutect2",
+        "variant_calling",
+        &["mutect2", "mutect"],
+        PortType::Bam,
+        PortType::Vcf,
+    ),
+    UnsupportedMethodSpec::gap(
+        "MetaBAT",
+        "metabat",
+        "binning",
+        &["metabat"],
+        PortType::Bam,
+        PortType::Directory,
+    ),
+    UnsupportedMethodSpec::gap(
+        "SPAdes",
+        "spades",
+        "assemble",
+        &["spades"],
+        PortType::Fastq,
+        PortType::Directory,
+    ),
+    UnsupportedMethodSpec::gap(
+        "Cell Ranger",
+        "cellranger",
+        "single_cell_preprocessing",
+        &["cellranger", "cell ranger"],
+        PortType::Fastq,
+        PortType::Directory,
+    ),
+    UnsupportedMethodSpec::gap(
+        "SoupX",
+        "soupx",
+        "ambient_rna_correction",
+        &["soupx"],
+        PortType::Directory,
+        PortType::Directory,
+    ),
+    UnsupportedMethodSpec::gap(
+        "Seurat",
+        "seurat",
+        "single_cell_analysis",
+        &["seurat"],
+        PortType::Directory,
+        PortType::Directory,
+    ),
+    UnsupportedMethodSpec::gap(
+        "DoubletFinder",
+        "doubletfinder",
+        "doublet_detection",
+        &["doubletfinder", "doublet finder"],
+        PortType::Directory,
+        PortType::Directory,
+    ),
+    UnsupportedMethodSpec::mention_only("Cutadapt", "cutadapt", "trim", &["cutadapt"]),
+    UnsupportedMethodSpec::mention_only("Trimmomatic", "trimmomatic", "trim", &["trimmomatic"]),
+    UnsupportedMethodSpec::mention_only(
+        "Trim Galore",
+        "trimgalore",
+        "trim",
+        &["trim galore", "trimgalore"],
+    ),
+    UnsupportedMethodSpec::mention_only("Porechop", "porechop", "trim", &["porechop"]),
+    UnsupportedMethodSpec::mention_only(
+        "dnaPipeTE",
+        "dnapipete",
+        "repeat_discovery",
+        &["dnapipete", "dna pipe te"],
+    ),
+    UnsupportedMethodSpec::mention_only("PiRATE", "pirate", "repeat_annotation", &["pirate"]),
+    UnsupportedMethodSpec::mention_only("dipSPAdes", "dipspades", "assemble", &["dipspades"]),
+    UnsupportedMethodSpec::mention_only(
+        "RepeatModeler",
+        "repeatmodeler",
+        "repeat_discovery",
+        &["repeatmodeler"],
+    ),
+    UnsupportedMethodSpec::mention_only("Bowtie2", "bowtie2", "align", &["bowtie2"]),
+    UnsupportedMethodSpec::mention_only("seqkit", "seqkit", "sequence_processing", &["seqkit"]),
+    UnsupportedMethodSpec::mention_only(
+        "parseRM.pl",
+        "parsermpl",
+        "repeat_summary",
+        &["parserm.pl"],
+    ),
+    UnsupportedMethodSpec::mention_only("LTRpred", "ltrpred", "ltr_annotation", &["ltrpred"]),
+    UnsupportedMethodSpec::mention_only(
+        "Trinotate",
+        "trinotate",
+        "transcript_annotation",
+        &["trinotate"],
+    ),
+    UnsupportedMethodSpec::mention_only(
+        "CD-HIT-est",
+        "cdhitest",
+        "sequence_clustering",
+        &["cd-hit-est"],
+    ),
+    UnsupportedMethodSpec::mention_only("Trinity", "trinity", "assemble", &["trinity"]),
+    UnsupportedMethodSpec::mention_only(
+        "FALCON",
+        "falcon",
+        "assemble",
+        &["falcon-unzip", "falcon unzip", "falcon"],
+    ),
+    UnsupportedMethodSpec::mention_only("Flye", "flye", "assemble", &["flye"]),
+    UnsupportedMethodSpec::mention_only(
+        "Purge_Dups",
+        "purgedups",
+        "purge_haplotigs",
         &[
-            "fastp",
-            "cutadapt",
-            "trimmomatic",
-            "trim galore",
-            "trimgalore",
+            "purge_dups",
+            "purge dups",
+            "purge_haplotigs",
+            "purge haplotigs",
         ],
     ),
-    ("align.star", &["star"]),
-    ("align.hisat2", &["hisat2", "hisat"]),
-    ("align.bwa", &["bwa-mem", "bwa mem", "bwa"]),
-    ("align.minimap2", &["minimap2", "minimap"]),
-    (
-        "quant.featurecounts",
-        &["featurecounts", "feature counts", "rsubread"],
+    UnsupportedMethodSpec::mention_only("Salsa", "salsa", "scaffold", &["salsa"]),
+    UnsupportedMethodSpec::mention_only(
+        "RepeatMasker",
+        "repeatmasker",
+        "repeat_annotation",
+        &["repeatmasker", "repeat masker"],
     ),
-    ("quant.salmon", &["salmon"]),
-    ("quant.stringtie", &["stringtie"]),
-    ("diff.deseq2", &["deseq2", "deseq"]),
-    ("class.kraken2", &["kraken2", "kraken"]),
-    ("var.haplotypecaller", &["haplotypecaller", "gatk"]),
-    ("asm.hifiasm", &["hifiasm"]),
-    ("asm.yahs", &["yahs"]),
-    ("qc.busco", &["busco"]),
-    ("nf.rnaseq", &["nf-core/rnaseq", "nf-core rnaseq"]),
-    ("nf.sarek", &["nf-core/sarek", "sarek"]),
-    ("nf.mag", &["nf-core/mag"]),
-    ("nf.taxprofiler", &["nf-core/taxprofiler"]),
-];
-
-const GAPS: &[(&str, &[&str])] = &[
-    ("Ballgown", &["ballgown"]),
-    ("Kallisto", &["kallisto"]),
-    ("MultiQC", &["multiqc"]),
-    ("Picard", &["picard", "markduplicates"]),
-    ("Mutect2", &["mutect"]),
-    ("MetaBAT", &["metabat"]),
-    ("SPAdes", &["spades"]),
-    ("Cell Ranger", &["cellranger", "cell ranger"]),
-    ("SoupX", &["soupx"]),
-    ("Seurat", &["seurat"]),
-    ("DoubletFinder", &["doubletfinder", "doublet finder"]),
+    UnsupportedMethodSpec::mention_only(
+        "phytools",
+        "phytools",
+        "phylogenetic_analysis",
+        &["r package phytools", "phytools"],
+    ),
+    UnsupportedMethodSpec::mention_only("OUwie", "ouwie", "phylogenetic_modeling", &["ouwie"]),
+    UnsupportedMethodSpec::mention_only(
+        "R",
+        "r",
+        "statistical_analysis",
+        &[
+            "r statistical computing environment",
+            "r statistical environment",
+            "using r version",
+        ],
+    ),
+    UnsupportedMethodSpec::mention_only(
+        "Custom script",
+        "custom-script",
+        "custom_analysis",
+        &[
+            "custom perl script",
+            "custom python script",
+            "custom script",
+        ],
+    ),
 ];
 
 #[derive(Clone, Copy)]
@@ -261,25 +626,65 @@ pub fn text_from_path(path: &Path) -> Result<String, PaperError> {
 }
 
 pub fn extract_from_path(path: &Path) -> Result<Extracted, PaperError> {
+    extract_from_path_with_control(path, ExtractionLimits::default(), || false, |_| {})
+}
+
+pub fn extract_from_path_with_control(
+    path: &Path,
+    limits: ExtractionLimits,
+    cancelled: impl Fn() -> bool,
+    progress: impl FnMut(ExtractionProgress),
+) -> Result<Extracted, PaperError> {
+    extract_from_path_with_toolchain(
+        path,
+        limits,
+        &ExtractionToolchain::default(),
+        cancelled,
+        progress,
+    )
+}
+
+pub fn extract_from_path_with_toolchain(
+    path: &Path,
+    limits: ExtractionLimits,
+    tools: &ExtractionToolchain,
+    cancelled: impl Fn() -> bool,
+    mut progress: impl FnMut(ExtractionProgress),
+) -> Result<Extracted, PaperError> {
     let ext = path
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
     if ext != "pdf" {
+        let size = fs::metadata(path)?.len();
+        if size > limits.max_text_bytes as u64 {
+            return Err(PaperError::Limit(format!(
+                "text source is {size} bytes; limit is {} bytes",
+                limits.max_text_bytes
+            )));
+        }
+        if cancelled() {
+            return Err(PaperError::Cancelled);
+        }
         return Ok(Extracted {
             text: fs::read_to_string(path)?,
             via: ExtractVia::Utf8,
         });
     }
-    let layer = pdftotext(path)?;
+    progress(ExtractionProgress::NativeText);
+    let layer = match pdftotext(path, &limits, tools, &cancelled) {
+        Ok(layer) => layer,
+        Err(PaperError::MissingTool { tool, .. }) if tool == "pdftotext" => String::new(),
+        Err(error) => return Err(error),
+    };
     if text_layer_ok(&layer) {
         return Ok(Extracted {
             text: layer,
             via: ExtractVia::Poppler,
         });
     }
-    let ocr = pdf_ocr(path)?;
+    let ocr = pdf_ocr(path, &limits, tools, &cancelled, &mut progress)?;
     Ok(Extracted {
         text: ocr,
         via: ExtractVia::Tesseract,
@@ -291,19 +696,22 @@ fn text_layer_ok(s: &str) -> bool {
     letters >= 400
 }
 
-fn pdftotext(path: &Path) -> Result<String, PaperError> {
-    let out = Command::new("pdftotext")
-        .args(["-layout", "-q"])
-        .arg(path)
-        .arg("-")
-        .output()
-        .map_err(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
-                PaperError::Pdf("pdftotext not on PATH (poppler)".into())
-            } else {
-                PaperError::Io(e)
-            }
-        })?;
+fn pdftotext(
+    path: &Path,
+    limits: &ExtractionLimits,
+    tools: &ExtractionToolchain,
+    cancelled: &impl Fn() -> bool,
+) -> Result<String, PaperError> {
+    let mut command = Command::new(&tools.pdftotext);
+    command.args(["-layout", "-q"]).arg(path).arg("-");
+    let out = command_output(
+        command,
+        "pdftotext",
+        ToolFamily::Pdf,
+        limits.command_timeout,
+        limits.max_text_bytes,
+        cancelled,
+    )?;
     if !out.status.success() {
         return Err(PaperError::Pdf(
             String::from_utf8_lossy(&out.stderr).trim().into(),
@@ -312,97 +720,274 @@ fn pdftotext(path: &Path) -> Result<String, PaperError> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Same Tesseract flags as `/usr/share/omarchy/bin/omarchy-capture-text`.
-fn pdf_ocr(path: &Path) -> Result<String, PaperError> {
+static OCR_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct OcrWorkspace(PathBuf);
+
+impl Drop for OcrWorkspace {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn pdf_ocr(
+    path: &Path,
+    limits: &ExtractionLimits,
+    tools: &ExtractionToolchain,
+    cancelled: &impl Fn() -> bool,
+    progress: &mut impl FnMut(ExtractionProgress),
+) -> Result<String, PaperError> {
+    let pages = pdf_page_count(path, limits, tools, cancelled)?;
+    if pages == 0 {
+        return Err(PaperError::Pdf("pdfinfo reported zero pages".into()));
+    }
+    if pages > limits.max_pages {
+        return Err(PaperError::Limit(format!(
+            "PDF contains {pages} pages; OCR limit is {} pages",
+            limits.max_pages
+        )));
+    }
     let dir = std::env::temp_dir().join(format!(
-        "somite-ocr-{}-{}",
+        "somite-ocr-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        OCR_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     ));
     fs::create_dir_all(&dir)?;
-    let prefix = dir.join("p");
-    let raster = Command::new("pdftoppm")
-        .args(["-png", "-r", "300", "-l", "30"])
-        .arg(path)
-        .arg(&prefix)
-        .output()
-        .map_err(|e| {
-            if e.kind() == io::ErrorKind::NotFound {
-                PaperError::Pdf("pdftoppm not on PATH (poppler)".into())
-            } else {
-                PaperError::Io(e)
-            }
-        });
-    let raster = match raster {
-        Ok(o) => o,
-        Err(e) => {
-            let _ = fs::remove_dir_all(&dir);
-            return Err(e);
-        }
-    };
-    if !raster.status.success() {
-        let _ = fs::remove_dir_all(&dir);
-        return Err(PaperError::Pdf(
-            String::from_utf8_lossy(&raster.stderr).trim().into(),
-        ));
-    }
-    let langs = std::env::var("OMARCHY_OCR_LANGS").unwrap_or_else(|_| "eng".into());
-    let mut pages: Vec<PathBuf> = fs::read_dir(&dir)?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("png"))
-        .collect();
-    pages.sort();
+    let workspace = OcrWorkspace(dir);
+    let prefix = workspace.0.join("page");
+    let page_image = workspace.0.join("page.png");
+    let langs = std::env::var("SOMITE_OCR_LANGS")
+        .or_else(|_| std::env::var("OMARCHY_OCR_LANGS"))
+        .unwrap_or_else(|_| "eng".into());
     let mut text = String::new();
-    for p in &pages {
-        let out = Command::new("tesseract")
-            .arg(p)
-            .arg("stdout")
-            .args([
-                "--oem",
-                "1",
-                "--psm",
-                "6",
-                "-l",
-                &langs,
-                "--dpi",
-                "300",
-                "-c",
-                "preserve_interword_spaces=1",
-            ])
-            .output()
-            .map_err(|e| {
-                if e.kind() == io::ErrorKind::NotFound {
-                    PaperError::Ocr("tesseract not on PATH".into())
-                } else {
-                    PaperError::Io(e)
-                }
-            });
-        match out {
-            Ok(o) if o.status.success() => {
-                text.push_str(&String::from_utf8_lossy(&o.stdout));
-                text.push('\u{000c}');
-            }
-            Ok(o) => {
-                let _ = fs::remove_dir_all(&dir);
-                return Err(PaperError::Ocr(
-                    String::from_utf8_lossy(&o.stderr).trim().into(),
-                ));
-            }
-            Err(e) => {
-                let _ = fs::remove_dir_all(&dir);
-                return Err(e);
-            }
+    for page in 1..=pages {
+        if cancelled() {
+            return Err(PaperError::Cancelled);
         }
+        progress(ExtractionProgress::Rasterizing { page, total: pages });
+        let mut raster = Command::new(&tools.pdftoppm);
+        raster
+            .args(["-png", "-r", "300", "-f"])
+            .arg(page.to_string())
+            .arg("-l")
+            .arg(page.to_string())
+            .arg("-singlefile")
+            .arg(path)
+            .arg(&prefix);
+        let raster = command_output(
+            raster,
+            "pdftoppm",
+            ToolFamily::Pdf,
+            limits.command_timeout,
+            1024 * 1024,
+            cancelled,
+        )?;
+        if !raster.status.success() {
+            return Err(PaperError::Pdf(
+                String::from_utf8_lossy(&raster.stderr).trim().into(),
+            ));
+        }
+        if !page_image.is_file() {
+            return Err(PaperError::Pdf(format!(
+                "pdftoppm did not render PDF page {page}"
+            )));
+        }
+        progress(ExtractionProgress::Ocr { page, total: pages });
+        let mut tesseract = Command::new(&tools.tesseract);
+        tesseract.arg(&page_image).arg("stdout").args([
+            "--oem",
+            "1",
+            "--psm",
+            "6",
+            "-l",
+            &langs,
+            "--dpi",
+            "300",
+            "-c",
+            "preserve_interword_spaces=1",
+        ]);
+        let remaining = limits.max_text_bytes.saturating_sub(text.len());
+        if remaining == 0 {
+            return Err(PaperError::Limit(format!(
+                "OCR text exceeds {} bytes",
+                limits.max_text_bytes
+            )));
+        }
+        let out = command_output(
+            tesseract,
+            "tesseract",
+            ToolFamily::Ocr,
+            limits.command_timeout,
+            remaining,
+            cancelled,
+        )?;
+        if !out.status.success() {
+            return Err(PaperError::Ocr(
+                String::from_utf8_lossy(&out.stderr).trim().into(),
+            ));
+        }
+        text.push_str(&String::from_utf8_lossy(&out.stdout));
+        text.push('\u{000c}');
+        if text.len() > limits.max_text_bytes {
+            return Err(PaperError::Limit(format!(
+                "OCR text exceeds {} bytes",
+                limits.max_text_bytes
+            )));
+        }
+        let _ = fs::remove_file(&page_image);
+        progress(ExtractionProgress::PageComplete { page, total: pages });
     }
-    let _ = fs::remove_dir_all(&dir);
     if text.chars().filter(|c| c.is_ascii_alphabetic()).count() < 40 {
         return Err(PaperError::Ocr("tesseract produced almost no text".into()));
     }
     Ok(text)
+}
+
+fn pdf_page_count(
+    path: &Path,
+    limits: &ExtractionLimits,
+    tools: &ExtractionToolchain,
+    cancelled: &impl Fn() -> bool,
+) -> Result<usize, PaperError> {
+    let mut command = Command::new(&tools.pdfinfo);
+    command.arg(path);
+    let output = command_output(
+        command,
+        "pdfinfo",
+        ToolFamily::Pdf,
+        limits.command_timeout,
+        1024 * 1024,
+        cancelled,
+    )?;
+    if !output.status.success() {
+        return Err(PaperError::Pdf(
+            String::from_utf8_lossy(&output.stderr).trim().into(),
+        ));
+    }
+    parse_pdf_page_count(&String::from_utf8_lossy(&output.stdout))
+        .ok_or_else(|| PaperError::Pdf("pdfinfo did not report a page count".into()))
+}
+
+fn parse_pdf_page_count(output: &str) -> Option<usize> {
+    output.lines().find_map(|line| {
+        line.strip_prefix("Pages:")
+            .and_then(|value| value.trim().parse().ok())
+    })
+}
+
+#[derive(Clone, Copy)]
+enum ToolFamily {
+    Pdf,
+    Ocr,
+}
+
+struct CapturedOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn command_output(
+    mut command: Command,
+    tool: &str,
+    family: ToolFamily,
+    timeout: Duration,
+    stdout_limit: usize,
+    cancelled: &impl Fn() -> bool,
+) -> Result<CapturedOutput, PaperError> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            PaperError::MissingTool {
+                tool: tool.to_owned(),
+                package: match family {
+                    ToolFamily::Pdf => "poppler",
+                    ToolFamily::Ocr => "tesseract",
+                }
+                .to_owned(),
+            }
+        } else {
+            PaperError::Io(error)
+        }
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| PaperError::Msg(format!("could not capture {tool} stdout")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| PaperError::Msg(format!("could not capture {tool} stderr")))?;
+    let stdout_reader = std::thread::spawn(move || read_limited(stdout, stdout_limit));
+    let stderr_reader = std::thread::spawn(move || read_limited(stderr, 1024 * 1024));
+    let started = Instant::now();
+    let mut cancelled_result = false;
+    let mut timed_out = false;
+    let status = loop {
+        if cancelled() {
+            cancelled_result = true;
+            let _ = child.kill();
+            break child.wait()?;
+        }
+        if started.elapsed() >= timeout {
+            timed_out = true;
+            let _ = child.kill();
+            break child.wait()?;
+        }
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let (stdout, stdout_exceeded) = stdout_reader
+        .join()
+        .map_err(|_| PaperError::Msg(format!("{tool} stdout reader stopped")))??;
+    let (stderr, _) = stderr_reader
+        .join()
+        .map_err(|_| PaperError::Msg(format!("{tool} stderr reader stopped")))??;
+    if cancelled_result {
+        return Err(PaperError::Cancelled);
+    }
+    if timed_out {
+        return Err(PaperError::Timeout {
+            tool: tool.to_owned(),
+            seconds: timeout.as_secs().max(1),
+        });
+    }
+    if stdout_exceeded {
+        return Err(PaperError::Limit(format!(
+            "{tool} output exceeds the {stdout_limit} byte limit"
+        )));
+    }
+    Ok(CapturedOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_limited(mut reader: impl Read, limit: usize) -> io::Result<(Vec<u8>, bool)> {
+    let mut captured = Vec::new();
+    let mut exceeded = false;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(captured.len());
+        let retained = read.min(remaining);
+        captured.extend_from_slice(&buffer[..retained]);
+        exceeded |= retained < read;
+    }
+    Ok((captured, exceeded))
 }
 
 pub fn reconstruct(catalog: &Catalog, text: &str) -> Reconstruction {
@@ -428,6 +1013,9 @@ pub fn reconstruct(catalog: &Catalog, text: &str) -> Reconstruction {
         scan = text;
         low = text.to_ascii_lowercase();
     }
+    // Mentions stay anchored to the exact Methods slice even when a very short
+    // section makes graph reconstruction conservatively scan the full text.
+    let mentions = method_mentions(catalog, text, focus);
     let tracks = detected_assays(&low);
     if tracks.len() > 1 {
         let candidates = tracks
@@ -442,17 +1030,271 @@ pub fn reconstruct(catalog: &Catalog, text: &str) -> Reconstruction {
                 }
             })
             .collect();
-        return Reconstruction::new(candidates);
+        return Reconstruction::with_mentions(catalog, candidates, mentions);
     }
     if assay == Assay::Assembly {
-        return Reconstruction::new(build_assembly_candidates(
+        return Reconstruction::with_mentions(
             catalog,
-            scan,
-            &low,
-            CandidateRole::Primary,
+            build_assembly_candidates(catalog, scan, &low, CandidateRole::Primary),
+            mentions,
+        );
+    }
+    Reconstruction::with_mentions(
+        catalog,
+        vec![build_bricks(catalog, text, scan, &low, assay)],
+        mentions,
+    )
+}
+
+fn method_mentions(catalog: &Catalog, full: &str, scan: &str) -> Vec<MethodMention> {
+    let scan_offset = scan.as_ptr() as usize - full.as_ptr() as usize;
+    let mut found = Vec::<(usize, MethodMention)>::new();
+
+    for operator in catalog.ops.values() {
+        let Some(recognition) = &operator.paper else {
+            continue;
+        };
+        let Some((alias, range)) = recognition
+            .aliases
+            .iter()
+            .filter_map(|alias| find_method_match(scan, alias).map(|range| (alias, range)))
+            .min_by_key(|(_, range)| range.start)
+        else {
+            continue;
+        };
+        let offset = scan_offset + range.start;
+        found.push((
+            offset,
+            MethodMention {
+                display_name: method_display_name(scan, &range, alias),
+                normalized_name: normalize_method_name(&operator.title),
+                operation_class: recognition.operation_class.clone(),
+                evidence: snippet_at(scan, &range),
+                page: Some(page_for_offset(full, offset)),
+                support: MethodSupport::Operator(operator.id.clone()),
+            },
         ));
     }
-    Reconstruction::new(vec![build_bricks(catalog, text, scan, &low, assay)])
+
+    for spec in UNSUPPORTED_METHODS {
+        debug_assert!(
+            !spec.display_name.is_empty()
+                && (!spec.may_be_gap
+                    || (spec.input_shape.is_some() && spec.output_shape.is_some())),
+            "unsupported methods require a canonical identity; gap-capable methods also require reviewed input and output shapes"
+        );
+        let Some((alias, range)) = spec
+            .aliases
+            .iter()
+            .filter_map(|alias| find_method_match(scan, alias).map(|range| (*alias, range)))
+            .min_by_key(|(_, range)| range.start)
+        else {
+            continue;
+        };
+        let offset = scan_offset + range.start;
+        found.push((
+            offset,
+            MethodMention {
+                display_name: method_display_name(scan, &range, alias),
+                normalized_name: spec.normalized_name.into(),
+                operation_class: Some(spec.operation_class.into()),
+                evidence: snippet_at(scan, &range),
+                page: Some(page_for_offset(full, offset)),
+                support: MethodSupport::Unsupported,
+            },
+        ));
+    }
+
+    found.sort_by_key(|(offset, _)| *offset);
+    let mut mentions = Vec::<MethodMention>::new();
+    for (_, mention) in found {
+        if !mentions
+            .iter()
+            .any(|existing| existing.normalized_name == mention.normalized_name)
+        {
+            mentions.push(mention);
+        }
+    }
+    mentions
+}
+
+fn find_method_match(text: &str, alias: &str) -> Option<std::ops::Range<usize>> {
+    let exact_case = ambiguous_acronym(alias);
+    let source_alias = alias;
+    let low = text.to_ascii_lowercase();
+    let alias = alias.to_ascii_lowercase();
+    let first = alias.chars().next()?;
+    low.char_indices()
+        .filter(|(_, character)| *character == first)
+        .find_map(|(start, _)| {
+            let alias_end = match_alias_at(&low, start, &alias)?;
+            if exact_case && &text[start..alias_end] != source_alias {
+                return None;
+            }
+            let before = start == 0 || !low.as_bytes()[start - 1].is_ascii_alphanumeric();
+            let end = citation_suffix_end(&low, alias_end).unwrap_or(alias_end);
+            let after = end == low.len() || !low.as_bytes()[end].is_ascii_alphanumeric();
+            (before && after && !method_match_negated(&low, start)).then_some(start..end)
+        })
+}
+
+fn method_display_name(text: &str, range: &std::ops::Range<usize>, alias: &str) -> String {
+    let low = text.to_ascii_lowercase();
+    let alias = alias.to_ascii_lowercase();
+    let surface_end = match_alias_at(&low, range.start, &alias).unwrap_or(range.end);
+    text[range.start..surface_end].to_owned()
+}
+
+fn ambiguous_acronym(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias.len() <= 4
+        && alias
+            .bytes()
+            .all(|byte| byte.is_ascii_alphabetic() && byte.is_ascii_uppercase())
+}
+
+fn citation_suffix_end(text: &str, alias_end: usize) -> Option<usize> {
+    let digit_count = text[alias_end..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    if digit_count < 2 {
+        return None;
+    }
+    let citation_end = alias_end + digit_count;
+    (citation_end == text.len() || !text.as_bytes()[citation_end].is_ascii_alphanumeric())
+        .then_some(citation_end)
+}
+
+fn match_alias_at(text: &str, start: usize, alias: &str) -> Option<usize> {
+    let mut cursor = start;
+    let mut alias_chars = alias.chars().peekable();
+    while let Some(expected) = alias_chars.next() {
+        if expected.is_whitespace() {
+            while alias_chars
+                .peek()
+                .is_some_and(|character| character.is_whitespace())
+            {
+                alias_chars.next();
+            }
+            let before_whitespace = cursor;
+            while let Some(character) = text[cursor..].chars().next() {
+                if !character.is_whitespace() {
+                    break;
+                }
+                cursor += character.len_utf8();
+            }
+            if cursor == before_whitespace {
+                return None;
+            }
+            continue;
+        }
+
+        let actual = text[cursor..].chars().next()?;
+        if actual != expected {
+            return None;
+        }
+        cursor += actual.len_utf8();
+    }
+    Some(cursor)
+}
+
+fn method_match_negated(low: &str, start: usize) -> bool {
+    let mut context_start = start.saturating_sub(64);
+    while !low.is_char_boundary(context_start) {
+        context_start -= 1;
+    }
+    let context = &low[context_start..start];
+    let clause = context
+        .rsplit(['.', ';', '\n'])
+        .next()
+        .unwrap_or(context)
+        .trim_end();
+    [
+        "without",
+        "did not use",
+        "not using",
+        "rather than",
+        "instead of",
+    ]
+    .iter()
+    .any(|negation| clause.ends_with(negation))
+}
+
+fn has_executable_method_match(text: &str, aliases: &[String]) -> bool {
+    aliases.iter().any(|alias| {
+        let mut offset = 0;
+        while offset < text.len() {
+            let Some(local) = find_method_match(&text[offset..], alias) else {
+                return false;
+            };
+            let range = offset + local.start..offset + local.end;
+            if !method_match_comparison_only(text, &range) {
+                return true;
+            }
+            offset = range.end;
+        }
+        false
+    })
+}
+
+fn method_match_comparison_only(text: &str, range: &std::ops::Range<usize>) -> bool {
+    let low = text.to_ascii_lowercase();
+    let clause_start = low[..range.start]
+        .rfind(['.', ';', '\n'])
+        .map_or(0, |position| position + 1);
+    let before = low[clause_start..range.start].trim_end();
+    let clause_end = low[range.end..]
+        .find(['.', ';', '\n'])
+        .map_or(low.len(), |position| range.end + position);
+    let after = low[range.end..clause_end].trim_start();
+
+    ["not used", "not selected", "not retained"]
+        .iter()
+        .any(|denial| after.contains(denial))
+        || ["compared", "comparing", "benchmarked", "evaluated"]
+            .iter()
+            .any(|comparison| before.ends_with(comparison))
+}
+
+fn snippet_at(text: &str, range: &std::ops::Range<usize>) -> String {
+    let mut start = range.start.saturating_sub(48);
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (range.end + 48).min(text.len());
+    while end < text.len() && !text.is_char_boundary(end) {
+        end += 1;
+    }
+    text[start..end].trim().to_owned()
+}
+
+fn page_for_offset(text: &str, offset: usize) -> usize {
+    text[..offset]
+        .bytes()
+        .filter(|byte| *byte == b'\x0c')
+        .count()
+        + 1
+}
+
+fn normalize_method_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn assay_recognition_label(assay: Assay) -> Option<&'static str> {
+    match assay {
+        Assay::Assembly => Some("assembly"),
+        Assay::RnaSeq => Some("rna-seq"),
+        Assay::Variants => Some("variants"),
+        Assay::Metagenome => Some("metagenome"),
+        Assay::SingleCell => Some("single-cell"),
+        Assay::Qc => Some("qc"),
+        Assay::Mixed | Assay::Unknown => None,
+    }
 }
 
 fn build_bricks(
@@ -522,60 +1364,64 @@ fn build_bricks(
         None
     };
 
-    let named_nf_rnaseq = mentions(low, &["nf-core/rnaseq", "nf-core rnaseq"]);
-    let named_nf_sarek = mentions(low, &["nf-core/sarek", "sarek"]);
-    let named_nf_tax = mentions(low, &["nf-core/taxprofiler"]);
-    let named_nf_mag = mentions(low, &["nf-core/mag"]);
+    let catalog_mentions = method_mentions(catalog, full, scan);
+    let named_operator = |id: &str| {
+        catalog_mentions.iter().any(
+            |mention| matches!(&mention.support, MethodSupport::Operator(operator) if operator == id),
+        )
+    };
+    let named_nf_rnaseq = named_operator("nf.rnaseq");
+    let named_nf_sarek = named_operator("nf.sarek");
+    let named_nf_tax = named_operator("nf.taxprofiler");
+    let named_nf_mag = named_operator("nf.mag");
 
-    for (op, needles) in BRICKS {
-        if !mentions(low, needles) {
+    for mention in &catalog_mentions {
+        let MethodSupport::Operator(op) = &mention.support else {
             continue;
+        };
+        let Some(operator) = catalog.ops.get(op) else {
+            continue;
+        };
+        let Some(recognition) = &operator.paper else {
+            continue;
+        };
+        if !has_executable_method_match(scan, &recognition.aliases) {
+            continue;
+        }
+        if let Some(assay) = assay_recognition_label(assay) {
+            if !recognition.assays.is_empty()
+                && !recognition
+                    .assays
+                    .iter()
+                    .any(|candidate| candidate == assay)
+            {
+                continue;
+            }
         }
         // A full protocol often names comparison tools from other assays. A
         // domain-incompatible mention is evidence, not a runnable step.
-        if matches!(
-            (*op, assay),
-            (
-                "align.star"
-                    | "align.hisat2"
-                    | "quant.featurecounts"
-                    | "quant.salmon"
-                    | "quant.stringtie"
-                    | "diff.deseq2"
-                    | "nf.rnaseq",
-                Assay::Variants | Assay::Metagenome
-            ) | (
-                "align.bwa" | "var.haplotypecaller" | "nf.sarek",
-                Assay::RnaSeq | Assay::Metagenome
-            ) | (
-                "class.kraken2" | "nf.mag" | "nf.taxprofiler",
-                Assay::RnaSeq | Assay::Variants
-            )
-        ) {
+        if op == "nf.rnaseq" && !named_nf_rnaseq {
             continue;
         }
-        if *op == "nf.rnaseq" && !named_nf_rnaseq {
+        if op == "nf.sarek" && !named_nf_sarek {
             continue;
         }
-        if *op == "nf.sarek" && !named_nf_sarek {
+        if op == "nf.taxprofiler" && !named_nf_tax {
             continue;
         }
-        if *op == "nf.taxprofiler" && !named_nf_tax {
+        if op == "nf.mag" && !named_nf_mag {
             continue;
         }
-        if *op == "nf.mag" && !named_nf_mag {
+        if named_nf_rnaseq && RNA_COMPOUND_COVERS.contains(&op.as_str()) {
             continue;
         }
-        if named_nf_rnaseq && RNA_COMPOUND_COVERS.contains(op) {
+        if named_nf_sarek && VAR_COMPOUND_COVERS.contains(&op.as_str()) {
             continue;
         }
-        if named_nf_sarek && VAR_COMPOUND_COVERS.contains(op) {
+        if (named_nf_tax || named_nf_mag) && MAG_COMPOUND_COVERS.contains(&op.as_str()) {
             continue;
         }
-        if (named_nf_tax || named_nf_mag) && MAG_COMPOUND_COVERS.contains(op) {
-            continue;
-        }
-        if *op == "diff.deseq2"
+        if op == "diff.deseq2"
             && !mentions(
                 low,
                 &[
@@ -589,66 +1435,45 @@ fn build_bricks(
         {
             continue;
         }
-        let q = needles.iter().find_map(|n| snippet(scan, n));
-        add(&mut g, op, vec![], q);
+        add(&mut g, op, vec![], Some(mention.evidence.clone()));
     }
 
-    for (tool, needles) in GAPS {
-        if !mentions(low, needles) {
+    for spec in UNSUPPORTED_METHODS.iter().filter(|spec| spec.may_be_gap) {
+        let (Some(input_shape), Some(output_shape)) = (spec.input_shape, spec.output_shape) else {
+            debug_assert!(false, "gap-capable method lacks reviewed shapes");
+            continue;
+        };
+        let Some(range) = spec
+            .aliases
+            .iter()
+            .filter_map(|alias| find_method_match(scan, alias))
+            .min_by_key(|range| range.start)
+        else {
+            continue;
+        };
+        if named_nf_rnaseq && ["kallisto", "multiqc"].contains(&spec.normalized_name) {
             continue;
         }
-        if named_nf_rnaseq && ["Kallisto", "MultiQC"].contains(tool) {
+        if named_nf_sarek && ["picard", "mutect2"].contains(&spec.normalized_name) {
             continue;
         }
-        if named_nf_sarek && ["Picard", "Mutect2"].contains(tool) {
-            continue;
-        }
-        let q = needles.iter().find_map(|n| snippet(scan, n));
+        let q = Some(snippet_at(scan, &range));
         if let Some(id) = add(
             &mut g,
             "gap.missing",
             vec![
-                ("tool", ParamValue::String((*tool).into())),
+                ("tool", ParamValue::String(spec.display_name.into())),
                 ("quote", ParamValue::String(q.clone().unwrap_or_default())),
             ],
-            q.or_else(|| Some(format!("paper used {tool}; not a brick yet — wrap it"))),
+            q.or_else(|| {
+                Some(format!(
+                    "paper used {}; not a brick yet — wrap it",
+                    spec.display_name
+                ))
+            }),
         ) {
             if let Some(n) = g.nodes.iter_mut().find(|n| n.id == id) {
-                n.ports = match *tool {
-                    "Ballgown" => vec![
-                        p_in("in", PortType::Gtf, vec![PortType::Gtf]),
-                        p_out("out", PortType::Table),
-                    ],
-                    "Picard" => vec![
-                        p_in("in", PortType::Bam, vec![PortType::Bam]),
-                        p_out("out", PortType::Bam),
-                    ],
-                    "Cell Ranger" => vec![
-                        p_in(
-                            "in",
-                            PortType::Fastq,
-                            vec![PortType::Fastq, PortType::FastqGz],
-                        ),
-                        p_out("out", PortType::Directory),
-                    ],
-                    "SoupX" | "Seurat" | "DoubletFinder" => vec![
-                        p_in(
-                            "in",
-                            PortType::Directory,
-                            vec![PortType::Directory, PortType::Table],
-                        ),
-                        p_out("out", PortType::Directory),
-                    ],
-                    "Kallisto" => vec![
-                        p_in(
-                            "in",
-                            PortType::Fastq,
-                            vec![PortType::Fastq, PortType::FastqGz],
-                        ),
-                        p_out("out", PortType::Table),
-                    ],
-                    _ => n.ports.clone(),
-                };
+                n.ports = reviewed_gap_ports(input_shape, output_shape);
             }
         }
     }
@@ -752,11 +1577,6 @@ fn build_bricks(
         None
     };
 
-    if g.nodes.is_empty() {
-        warnings.push(
-            "no tools or assay I could map. drop a methods section, not a cover page.".into(),
-        );
-    }
     if assay == Assay::Mixed {
         warnings.push(
             "multiple assay workflows detected; typed branches are shown together until named subworkflows land"
@@ -841,11 +1661,19 @@ fn build_bricks(
         {
             wire(&mut g, &bwa, converter);
         }
-        for downstream in g.nodes.clone().into_iter().filter(|node| {
-            node.operator == "var.haplotypecaller"
-                || node.params.get("tool") == Some(&ParamValue::String("Picard".into()))
-        }) {
-            wire(&mut g, converter, &downstream.id);
+        let picard = g
+            .nodes
+            .iter()
+            .find(|node| node.params.get("tool") == Some(&ParamValue::String("Picard".into())))
+            .map(|node| node.id.clone());
+        let next = picard.or_else(|| {
+            g.nodes
+                .iter()
+                .find(|node| node.operator == "var.haplotypecaller")
+                .map(|node| node.id.clone())
+        });
+        if let Some(next) = next {
+            wire(&mut g, converter, &next);
         }
     }
     if let Some(gt) = &gtf {
@@ -1525,12 +2353,7 @@ fn build_assembly(
                 gap(&mut g, method.name, note, gap_from_reads())
             })
         }
-        None => add(
-            &mut g,
-            "asm.hifiasm",
-            vec![],
-            Some("assembler not named — hifiasm is the default HiFi brick".into()),
-        ),
+        None => None,
     };
     let purge = if mentioned(low, &["purge_dups", "purge haplotigs", "purge_haplotigs"]) {
         gap(
@@ -1848,8 +2671,18 @@ pub fn methods_window(text: &str) -> &str {
         if start.saturating_mul(10) < text.len().saturating_mul(9) {
             let search_from = next_line(text, start);
             let end = find_heading(text, ENDS, search_from).unwrap_or(text.len());
-            let slice = &text[start..end];
-            if slice.len() >= 200 {
+            // `pdftotext -layout` can emit the right column before a left-column
+            // Methods heading. Include only the pre-heading text from that same
+            // PDF page, never an earlier page or the full front matter.
+            let page_start = text[..start]
+                .rfind('\u{000c}')
+                .map(|separator| separator + 1)
+                .unwrap_or(start);
+            let slice = &text[page_start..end];
+            // Preserve a real, compact Methods section as the evidence range.
+            // Graph reconstruction independently decides whether it needs the
+            // wider body for context.
+            if slice.len() >= 40 {
                 return slice;
             }
         }
@@ -1927,22 +2760,197 @@ fn heading_in_line(line: &str, headings: &[&str]) -> Option<usize> {
 }
 
 fn accessions(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for w in text.split(|c: char| !c.is_ascii_alphanumeric()) {
-        let u = w.to_ascii_uppercase();
-        if u.len() < 6 {
-            continue;
-        }
-        let prefix_ok = u.starts_with("SRR")
-            || u.starts_with("ERR")
-            || u.starts_with("DRR")
-            || u.starts_with("SRS")
-            || u.starts_with("ERS");
-        if prefix_ok && u.chars().skip(3).all(|c| c.is_ascii_digit()) && !out.contains(&u) {
-            out.push(u);
+    resource_citations(text)
+        .into_iter()
+        .filter(|citation| citation.kind == ResourceCitationKind::SraRun)
+        .map(|citation| citation.accession)
+        .collect()
+}
+
+/// Extract accession-shaped paper resources with enough surrounding evidence
+/// for callers to resolve them without treating every citation as workflow input.
+pub fn resource_citations(text: &str) -> Vec<ResourceCitation> {
+    let mut citations = Vec::<ResourceCitation>::new();
+    for (page_index, page) in text.split('\u{000c}').enumerate() {
+        let lines = page.lines().collect::<Vec<_>>();
+        for (line_index, line) in lines.iter().enumerate() {
+            let context = [
+                line_index.checked_sub(1).and_then(|index| lines.get(index)),
+                Some(line),
+                lines.get(line_index + 1),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+            for token in line.split(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '_' | '.'))
+            }) {
+                let accession = token
+                    .trim_matches(|character: char| !character.is_ascii_alphanumeric())
+                    .to_ascii_uppercase();
+                let Some(kind) = resource_citation_kind(&accession) else {
+                    continue;
+                };
+                let line_role = resource_role(kind, line);
+                let role = if line_role == ResourceRole::Unknown {
+                    resource_role(kind, &context)
+                } else {
+                    line_role
+                };
+                if let Some(existing) = citations
+                    .iter_mut()
+                    .find(|citation| citation.accession == accession)
+                {
+                    if resource_role_priority(role) > resource_role_priority(existing.role) {
+                        existing.role = role;
+                        existing.context = context.clone();
+                        existing.page = Some(page_index + 1);
+                    }
+                    continue;
+                }
+                citations.push(ResourceCitation {
+                    accession,
+                    kind,
+                    role,
+                    context: context.clone(),
+                    page: Some(page_index + 1),
+                });
+            }
         }
     }
-    out
+    citations
+}
+
+fn resource_citation_kind(accession: &str) -> Option<ResourceCitationKind> {
+    let digits_after = |prefix: &str| {
+        accession.strip_prefix(prefix).is_some_and(|value| {
+            value.len() >= 6 && value.chars().all(|character| character.is_ascii_digit())
+        })
+    };
+    if ["SRR", "ERR", "DRR"]
+        .iter()
+        .any(|prefix| digits_after(prefix))
+    {
+        return Some(ResourceCitationKind::SraRun);
+    }
+    if ["SRP", "ERP", "DRP"]
+        .iter()
+        .any(|prefix| digits_after(prefix))
+    {
+        return Some(ResourceCitationKind::SraStudy);
+    }
+    if ["SRX", "ERX", "DRX"]
+        .iter()
+        .any(|prefix| digits_after(prefix))
+    {
+        return Some(ResourceCitationKind::SraExperiment);
+    }
+    if ["SRS", "ERS", "DRS"]
+        .iter()
+        .any(|prefix| digits_after(prefix))
+    {
+        return Some(ResourceCitationKind::SraSample);
+    }
+    if ["PRJNA", "PRJEB", "PRJDB"]
+        .iter()
+        .any(|prefix| digits_after(prefix))
+    {
+        return Some(ResourceCitationKind::BioProject);
+    }
+    if ["SAMN", "SAMEA", "SAMD"]
+        .iter()
+        .any(|prefix| digits_after(prefix))
+    {
+        return Some(ResourceCitationKind::BioSample);
+    }
+    if ["GCA_", "GCF_"].iter().any(|prefix| {
+        accession.strip_prefix(prefix).is_some_and(|value| {
+            let mut parts = value.split('.');
+            parts.next().is_some_and(|digits| {
+                !digits.is_empty() && digits.chars().all(|character| character.is_ascii_digit())
+            }) && parts.next().is_none_or(|version| {
+                !version.is_empty() && version.chars().all(|character| character.is_ascii_digit())
+            }) && parts.next().is_none()
+        })
+    }) {
+        return Some(ResourceCitationKind::Assembly);
+    }
+    let ensembl = accession.strip_prefix("ENS")?;
+    ensembl.char_indices().find_map(|(index, character)| {
+        if !matches!(character, 'G' | 'T' | 'P')
+            || !ensembl[..index]
+                .chars()
+                .all(|value| value.is_ascii_uppercase())
+        {
+            return None;
+        }
+        let mut parts = ensembl[index + 1..].split('.');
+        let digits = parts.next()?;
+        (!digits.is_empty()
+            && digits.chars().all(|value| value.is_ascii_digit())
+            && parts.next().is_none_or(|version| {
+                !version.is_empty() && version.chars().all(|value| value.is_ascii_digit())
+            })
+            && parts.next().is_none())
+        .then_some(ResourceCitationKind::Ensembl)
+    })
+}
+
+fn resource_role(kind: ResourceCitationKind, context: &str) -> ResourceRole {
+    let lower = context.to_ascii_lowercase();
+    if kind == ResourceCitationKind::Assembly
+        || ["genome assembly", "reference genome", "genomic reference"]
+            .iter()
+            .any(|needle| lower.contains(needle))
+    {
+        return ResourceRole::Reference;
+    }
+    if kind == ResourceCitationKind::Ensembl {
+        return ResourceRole::Annotation;
+    }
+    if matches!(
+        kind,
+        ResourceCitationKind::SraStudy
+            | ResourceCitationKind::SraSample
+            | ResourceCitationKind::SraExperiment
+            | ResourceCitationKind::SraRun
+    ) || [
+        "rna-seq",
+        "dna-seq",
+        "wgs",
+        "paired-end",
+        "sequence data",
+        "sequencing reads",
+        "sra accession",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return ResourceRole::Reads;
+    }
+    if ["annotation", "gene model", "gtf", "gff"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+    {
+        return ResourceRole::Annotation;
+    }
+    if matches!(kind, ResourceCitationKind::BioSample) {
+        return ResourceRole::SampleMetadata;
+    }
+    ResourceRole::Unknown
+}
+
+fn resource_role_priority(role: ResourceRole) -> u8 {
+    match role {
+        ResourceRole::Unknown => 0,
+        ResourceRole::SampleMetadata => 1,
+        ResourceRole::Annotation => 2,
+        ResourceRole::Reads => 3,
+        ResourceRole::Reference => 4,
+    }
 }
 
 fn genome_token(low: &str) -> Option<&'static str> {
@@ -1967,8 +2975,14 @@ fn snippet(text: &str, needle: &str) -> Option<String> {
     let low = text.to_ascii_lowercase();
     let n = needle.to_ascii_lowercase();
     let i = low.find(&n)?;
-    let start = i.saturating_sub(48);
-    let end = (i + n.len() + 48).min(text.len());
+    let mut start = i.saturating_sub(48);
+    while !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (i + n.len() + 48).min(text.len());
+    while end < text.len() && !text.is_char_boundary(end) {
+        end += 1;
+    }
     let s = text[start..end].trim();
     if s.is_empty() {
         return None;
@@ -2141,6 +3155,17 @@ fn p_in_opt(name: &str, ty: PortType, union: Vec<PortType>) -> Port {
     }
 }
 
+fn reviewed_gap_ports(input: PortType, output: PortType) -> Vec<Port> {
+    let union = match input {
+        PortType::Fastq => vec![PortType::Fastq, PortType::FastqGz],
+        PortType::Fasta => vec![PortType::Fasta, PortType::FastaGz],
+        PortType::Gtf => vec![PortType::Gtf, PortType::GtfGz],
+        PortType::Directory => vec![PortType::Directory, PortType::Table],
+        _ => vec![input],
+    };
+    vec![p_in("in", input, union), p_out("out", output)]
+}
+
 fn gap_reads() -> Vec<Port> {
     vec![p_out("out", PortType::Fastq)]
 }
@@ -2256,11 +3281,11 @@ Whole genome sequencing libraries were aligned with BWA-MEM. Somatic variants
 were called with GATK Mutect2 following the sarek workflow.
 "#;
 
-    fn ops(r: &Reconstruction) -> Vec<&str> {
+    fn ops(r: &CandidateGraph) -> Vec<&str> {
         r.graph.nodes.iter().map(|n| n.operator.as_str()).collect()
     }
 
-    fn assert_wired(r: &Reconstruction) {
+    fn assert_wired(r: &CandidateGraph) {
         r.graph.validate().unwrap();
         for n in &r.graph.nodes {
             let deg = r
@@ -2282,11 +3307,783 @@ were called with GATK Mutect2 following the sarek workflow.
         .unwrap()
     }
 
+    #[derive(Debug)]
+    struct GoldCase {
+        line: usize,
+        fixture: String,
+        extract_via: ExtractVia,
+        outcome: ReconstructionOutcome,
+        tracks: Vec<String>,
+        expected_entities: Vec<String>,
+        forbidden_entities: Vec<String>,
+        required_operators: Vec<String>,
+        forbidden_operators: Vec<String>,
+        required_unsupported: Vec<String>,
+        expected_candidates: usize,
+        required_paths: Vec<Vec<String>>,
+        required_branches: Vec<GoldBranch>,
+        separate_alternatives: Vec<Vec<String>>,
+        parameters: Vec<GoldParameter>,
+        minimum_evidence_records: usize,
+        minimum_evidence_support_pct: usize,
+        exact_runs: Vec<String>,
+        forbid_collection_reads: bool,
+    }
+
+    #[derive(Debug)]
+    struct GoldBranch {
+        root: String,
+        arms: Vec<String>,
+    }
+
+    #[derive(Debug)]
+    struct GoldParameter {
+        selector: String,
+        name: String,
+        value: String,
+    }
+
+    type FullPaperCase<'a> = (
+        &'a str,
+        ReconstructionOutcome,
+        Option<Assay>,
+        &'a [&'a str],
+        &'a [&'a str],
+        &'a [&'a str],
+    );
+
+    #[derive(Default)]
+    struct MetricScore {
+        passed: usize,
+        checked: usize,
+        failures: Vec<String>,
+    }
+
+    impl MetricScore {
+        fn check(&mut self, condition: bool, failure: String) {
+            self.checked += 1;
+            if condition {
+                self.passed += 1;
+            } else {
+                self.failures.push(failure);
+            }
+        }
+    }
+
+    fn gold_list(value: &str) -> Vec<String> {
+        if value == "-" {
+            Vec::new()
+        } else {
+            value.split(',').map(str::to_owned).collect()
+        }
+    }
+
+    fn gold_assertions(value: &str) -> Vec<String> {
+        if value == "-" {
+            Vec::new()
+        } else {
+            value.split(';').map(str::to_owned).collect()
+        }
+    }
+
+    fn gold_tracks(value: &str, line: usize) -> Vec<String> {
+        let tracks = gold_list(value);
+        for track in &tracks {
+            assert!(
+                matches!(
+                    track.as_str(),
+                    "assembly"
+                        | "rna_seq"
+                        | "variants"
+                        | "metagenome"
+                        | "single_cell"
+                        | "qc"
+                        | "mixed"
+                        | "unknown"
+                ),
+                "gold.tsv line {line} has unknown track {track:?}"
+            );
+        }
+        tracks
+    }
+
+    fn gold_paths(value: &str, line: usize) -> Vec<Vec<String>> {
+        gold_assertions(value)
+            .into_iter()
+            .map(|path| {
+                let selectors = path.split('>').map(str::to_owned).collect::<Vec<_>>();
+                assert!(
+                    selectors.len() >= 2 && selectors.iter().all(|selector| !selector.is_empty()),
+                    "gold.tsv line {line} has invalid path {path:?}"
+                );
+                selectors
+            })
+            .collect()
+    }
+
+    fn gold_branches(value: &str, line: usize) -> Vec<GoldBranch> {
+        gold_assertions(value)
+            .into_iter()
+            .map(|branch| {
+                let (root, arms) = branch.split_once('>').unwrap_or_else(|| {
+                    panic!("gold.tsv line {line} has invalid branch {branch:?}")
+                });
+                let arms = arms.split('|').map(str::to_owned).collect::<Vec<_>>();
+                assert!(
+                    !root.is_empty()
+                        && arms.len() >= 2
+                        && arms.iter().all(|selector| !selector.is_empty()),
+                    "gold.tsv line {line} has invalid branch {branch:?}"
+                );
+                GoldBranch {
+                    root: root.to_owned(),
+                    arms,
+                }
+            })
+            .collect()
+    }
+
+    fn gold_alternatives(value: &str, line: usize) -> Vec<Vec<String>> {
+        gold_assertions(value)
+            .into_iter()
+            .map(|group| {
+                let selectors = group.split('|').map(str::to_owned).collect::<Vec<_>>();
+                assert!(
+                    selectors.len() >= 2 && selectors.iter().all(|selector| !selector.is_empty()),
+                    "gold.tsv line {line} has invalid alternatives {group:?}"
+                );
+                selectors
+            })
+            .collect()
+    }
+
+    fn gold_parameters(value: &str, line: usize) -> Vec<GoldParameter> {
+        gold_assertions(value)
+            .into_iter()
+            .map(|expectation| {
+                let (selector, parameter) = expectation.split_once(':').unwrap_or_else(|| {
+                    panic!("gold.tsv line {line} has invalid parameter {expectation:?}")
+                });
+                let (name, value) = parameter.split_once('=').unwrap_or_else(|| {
+                    panic!("gold.tsv line {line} has invalid parameter {expectation:?}")
+                });
+                assert!(
+                    !selector.is_empty() && !name.is_empty() && !value.is_empty(),
+                    "gold.tsv line {line} has invalid parameter {expectation:?}"
+                );
+                GoldParameter {
+                    selector: selector.to_owned(),
+                    name: name.to_owned(),
+                    value: value.to_owned(),
+                }
+            })
+            .collect()
+    }
+
+    fn gold_cases(root: &Path) -> Vec<GoldCase> {
+        let manifest = std::fs::read_to_string(root.join("gold.tsv")).expect("paper gold manifest");
+        assert!(
+            manifest.starts_with("# schema_version=2\n"),
+            "gold.tsv must declare schema_version=2"
+        );
+        manifest
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| !line.starts_with('#') && !line.starts_with("fixture\t"))
+            .map(|(index, line)| {
+                let fields = line.split('\t').collect::<Vec<_>>();
+                assert_eq!(
+                    fields.len(),
+                    18,
+                    "gold.tsv line {} must contain 18 tab-separated fields: {line:?}",
+                    index + 1
+                );
+                let extract_via = match fields[1] {
+                    "utf8" => ExtractVia::Utf8,
+                    "poppler" => ExtractVia::Poppler,
+                    "tesseract" => ExtractVia::Tesseract,
+                    value => panic!(
+                        "gold.tsv line {} has unknown extraction path {value:?}",
+                        index + 1
+                    ),
+                };
+                let outcome = match fields[2] {
+                    "drafts_ready" => ReconstructionOutcome::DraftsReady,
+                    "recognized_unsupported" => ReconstructionOutcome::RecognizedUnsupported,
+                    "no_reconstructable_methods" => ReconstructionOutcome::NoReconstructableMethods,
+                    value => panic!("gold.tsv line {} has unknown outcome {value:?}", index + 1),
+                };
+                let minimum_evidence_support_pct = fields[15].parse().unwrap_or_else(|_| {
+                    panic!(
+                        "gold.tsv line {} has invalid evidence support percentage",
+                        index + 1
+                    )
+                });
+                assert!(
+                    minimum_evidence_support_pct <= 100,
+                    "gold.tsv line {} evidence support percentage exceeds 100",
+                    index + 1
+                );
+                GoldCase {
+                    line: index + 1,
+                    fixture: fields[0].to_owned(),
+                    extract_via,
+                    outcome,
+                    tracks: gold_tracks(fields[3], index + 1),
+                    expected_entities: gold_list(fields[4]),
+                    forbidden_entities: gold_list(fields[5]),
+                    required_operators: gold_list(fields[6]),
+                    forbidden_operators: gold_list(fields[7]),
+                    required_unsupported: gold_list(fields[8]),
+                    expected_candidates: fields[9].parse().unwrap_or_else(|_| {
+                        panic!("gold.tsv line {} has invalid candidate count", index + 1)
+                    }),
+                    required_paths: gold_paths(fields[10], index + 1),
+                    required_branches: gold_branches(fields[11], index + 1),
+                    separate_alternatives: gold_alternatives(fields[12], index + 1),
+                    parameters: gold_parameters(fields[13], index + 1),
+                    minimum_evidence_records: fields[14].parse().unwrap_or_else(|_| {
+                        panic!("gold.tsv line {} has invalid evidence count", index + 1)
+                    }),
+                    minimum_evidence_support_pct,
+                    exact_runs: gold_list(fields[16]),
+                    forbid_collection_reads: fields[17].parse().unwrap_or_else(|_| {
+                        panic!("gold.tsv line {} has invalid resource boolean", index + 1)
+                    }),
+                }
+            })
+            .collect()
+    }
+
+    fn assay_gold_label(assay: Assay) -> &'static str {
+        match assay {
+            Assay::Assembly => "assembly",
+            Assay::RnaSeq => "rna_seq",
+            Assay::Variants => "variants",
+            Assay::Metagenome => "metagenome",
+            Assay::SingleCell => "single_cell",
+            Assay::Qc => "qc",
+            Assay::Mixed => "mixed",
+            Assay::Unknown => "unknown",
+        }
+    }
+
+    fn gold_node_selector(node: &Node) -> String {
+        if node.operator == "gap.missing" {
+            if let Some(ParamValue::String(tool)) = node.params.get("tool") {
+                return format!("gap:{tool}");
+            }
+        }
+        node.operator.clone()
+    }
+
+    fn candidate_contains_selector(candidate: &CandidateGraph, selector: &str) -> bool {
+        candidate
+            .graph
+            .nodes
+            .iter()
+            .any(|node| gold_node_selector(node) == selector)
+    }
+
+    fn candidate_reaches(candidate: &CandidateGraph, from: &str, to: &str) -> bool {
+        let targets = candidate
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| gold_node_selector(node) == to)
+            .map(|node| node.id.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut pending = candidate
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| gold_node_selector(node) == from)
+            .map(|node| node.id.clone())
+            .collect::<std::collections::VecDeque<_>>();
+        let mut visited = std::collections::BTreeSet::new();
+        while let Some(node) = pending.pop_front() {
+            if !visited.insert(node.clone()) {
+                continue;
+            }
+            if targets.contains(node.as_str()) {
+                return true;
+            }
+            for edge in candidate
+                .graph
+                .edges
+                .iter()
+                .filter(|edge| edge.from_node == node)
+            {
+                pending.push_back(edge.to_node.clone());
+            }
+        }
+        false
+    }
+
+    fn candidate_contains_path(candidate: &CandidateGraph, path: &[String]) -> bool {
+        path.windows(2)
+            .all(|pair| candidate_reaches(candidate, &pair[0], &pair[1]))
+    }
+
+    fn parameter_text(value: &ParamValue) -> String {
+        match value {
+            ParamValue::Bool(value) => value.to_string(),
+            ParamValue::Int(value) => value.to_string(),
+            ParamValue::Float(value) => value.to_string(),
+            ParamValue::String(value) => value.clone(),
+        }
+    }
+
+    #[test]
+    fn committed_gold_manifest_reconstructs_through_the_public_interface() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/papers");
+        let catalog = cat();
+        let cases = gold_cases(&root);
+        let declared = cases
+            .iter()
+            .map(|case| case.fixture.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let committed = std::fs::read_dir(&root)
+            .expect("paper fixtures directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .filter_map(|name| name.to_str().map(str::to_owned))
+            .filter(|name| name.ends_with(".txt"))
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut extraction = MetricScore::default();
+        for fixture in committed
+            .iter()
+            .filter(|fixture| !declared.contains(fixture.as_str()))
+        {
+            extraction.check(
+                false,
+                format!("gold.tsv has no row for committed fixture {fixture}"),
+            );
+        }
+        let mut classification = MetricScore::default();
+        let mut entity_recall = MetricScore::default();
+        let mut entity_precision = MetricScore::default();
+        let mut operator_support = MetricScore::default();
+        let mut candidates = MetricScore::default();
+        let mut nodes = MetricScore::default();
+        let mut typed_edges = MetricScore::default();
+        let mut topology = MetricScore::default();
+        let mut parameters = MetricScore::default();
+        let mut evidence_spans = MetricScore::default();
+        let mut resources = MetricScore::default();
+        let mut skipped = 0usize;
+        let mut draft_outcomes = 0usize;
+        let mut unsupported_outcomes = 0usize;
+        let mut empty_outcomes = 0usize;
+        let mut empty_candidates = 0usize;
+        let mut unsupported_mentions = 0usize;
+
+        for case in &cases {
+            let path = root.join(&case.fixture);
+            let extracted = match extract_from_path(&path) {
+                Ok(extracted) => extracted,
+                Err(error) => {
+                    extraction.check(
+                        false,
+                        format!(
+                            "gold.tsv line {} fixture {} input unavailable: {error}",
+                            case.line, case.fixture
+                        ),
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let prefix = format!("gold.tsv line {} fixture {}", case.line, case.fixture);
+            extraction.check(
+                extracted.via == case.extract_via,
+                format!(
+                    "{prefix}: extraction {:?}, expected {:?}",
+                    extracted.via, case.extract_via
+                ),
+            );
+            let reconstruction = reconstruct(&catalog, &extracted.text);
+            match reconstruction.outcome {
+                ReconstructionOutcome::DraftsReady => draft_outcomes += 1,
+                ReconstructionOutcome::RecognizedUnsupported => unsupported_outcomes += 1,
+                ReconstructionOutcome::NoReconstructableMethods => empty_outcomes += 1,
+            }
+            unsupported_mentions += reconstruction
+                .mentions
+                .iter()
+                .filter(|mention| mention.support == MethodSupport::Unsupported)
+                .count();
+            empty_candidates += reconstruction
+                .candidates
+                .iter()
+                .filter(|candidate| candidate.graph.nodes.is_empty())
+                .count();
+            let prefix = format!("gold.tsv line {} fixture {}", case.line, case.fixture);
+            classification.check(
+                reconstruction.outcome == case.outcome,
+                format!(
+                    "{prefix}: outcome {:?}, expected {:?}",
+                    reconstruction.outcome, case.outcome
+                ),
+            );
+            let actual_tracks = reconstruction
+                .candidates
+                .iter()
+                .map(|candidate| assay_gold_label(candidate.assay).to_owned())
+                .collect::<std::collections::BTreeSet<_>>();
+            let expected_tracks = case
+                .tracks
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            classification.check(
+                actual_tracks == expected_tracks,
+                format!("{prefix}: assay tracks {actual_tracks:?}, expected {expected_tracks:?}"),
+            );
+
+            let actual_entities = reconstruction
+                .mentions
+                .iter()
+                .map(|mention| mention.normalized_name.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            let expected_entities = case
+                .expected_entities
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            for expected in &expected_entities {
+                entity_recall.check(
+                    actual_entities.contains(expected),
+                    format!(
+                        "{prefix}: missing method entity {expected}; observed {actual_entities:?}"
+                    ),
+                );
+            }
+            for actual in &actual_entities {
+                entity_precision.check(
+                    expected_entities.contains(actual),
+                    format!(
+                        "{prefix}: false-positive method entity {actual}; expected {expected_entities:?}"
+                    ),
+                );
+            }
+            for forbidden in &case.forbidden_entities {
+                entity_precision.check(
+                    !actual_entities.contains(forbidden),
+                    format!(
+                        "{prefix}: forbidden method entity {forbidden}; observed {actual_entities:?}"
+                    ),
+                );
+            }
+
+            let operators = reconstruction
+                .candidates
+                .iter()
+                .flat_map(|candidate| candidate.graph.nodes.iter())
+                .map(|node| node.operator.as_str())
+                .collect::<Vec<_>>();
+            for required in &case.required_operators {
+                operator_support.check(
+                    operators.contains(&required.as_str()),
+                    format!(
+                        "{prefix}: missing required operator {required}; reconstructed {operators:?}"
+                    ),
+                );
+            }
+            for forbidden in &case.forbidden_operators {
+                operator_support.check(
+                    !operators.contains(&forbidden.as_str()),
+                    format!(
+                        "{prefix}: invented forbidden operator {forbidden}; reconstructed {operators:?}"
+                    ),
+                );
+            }
+            let unsupported = reconstruction
+                .mentions
+                .iter()
+                .filter(|mention| mention.support == MethodSupport::Unsupported)
+                .map(|mention| mention.normalized_name.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            for required in &case.required_unsupported {
+                operator_support.check(
+                    unsupported.contains(required.as_str()),
+                    format!(
+                        "{prefix}: missing unsupported method {required}; retained {unsupported:?}"
+                    ),
+                );
+            }
+
+            candidates.check(
+                reconstruction.candidates.len() == case.expected_candidates,
+                format!(
+                    "{prefix}: candidates {}, expected {}",
+                    reconstruction.candidates.len(),
+                    case.expected_candidates
+                ),
+            );
+            for (index, candidate) in reconstruction.candidates.iter().enumerate() {
+                nodes.check(
+                    !candidate.graph.nodes.is_empty(),
+                    format!("{prefix}: candidate {index} exported zero nodes"),
+                );
+                let validity = candidate
+                    .graph
+                    .validate()
+                    .map_err(|error| error.to_string())
+                    .and_then(|_| {
+                        catalog
+                            .verify_graph(&candidate.graph)
+                            .map_err(|error| error.to_string())
+                    });
+                typed_edges.check(
+                    validity.is_ok(),
+                    format!(
+                        "{prefix}: candidate {index} has invalid nodes or typed edges: {:?}",
+                        validity.err()
+                    ),
+                );
+            }
+
+            for path in &case.required_paths {
+                topology.check(
+                    reconstruction
+                        .candidates
+                        .iter()
+                        .any(|candidate| candidate_contains_path(candidate, path)),
+                    format!("{prefix}: missing ordered path {}", path.join(" > ")),
+                );
+            }
+            for branch in &case.required_branches {
+                topology.check(
+                    reconstruction.candidates.iter().any(|candidate| {
+                        branch
+                            .arms
+                            .iter()
+                            .all(|arm| candidate_reaches(candidate, &branch.root, arm))
+                    }),
+                    format!(
+                        "{prefix}: missing branch {} > {}",
+                        branch.root,
+                        branch.arms.join(" | ")
+                    ),
+                );
+            }
+            for alternatives in &case.separate_alternatives {
+                let placements = alternatives
+                    .iter()
+                    .map(|selector| {
+                        reconstruction
+                            .candidates
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, candidate)| {
+                                candidate_contains_selector(candidate, selector)
+                            })
+                            .map(|(index, _)| index)
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                let distinct = placements
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>();
+                topology.check(
+                    placements.iter().all(|indices| indices.len() == 1)
+                        && distinct.len() == alternatives.len(),
+                    format!(
+                        "{prefix}: alternatives were not separate {} placements={placements:?}",
+                        alternatives.join(" | ")
+                    ),
+                );
+            }
+
+            for expected in &case.parameters {
+                let actual = reconstruction
+                    .candidates
+                    .iter()
+                    .flat_map(|candidate| candidate.graph.nodes.iter())
+                    .filter(|node| gold_node_selector(node) == expected.selector)
+                    .filter_map(|node| node.params.get(&expected.name))
+                    .map(parameter_text)
+                    .collect::<Vec<_>>();
+                parameters.check(
+                    actual.contains(&expected.value),
+                    format!(
+                        "{prefix}: parameter {}:{} expected {:?}, observed {actual:?}",
+                        expected.selector, expected.name, expected.value
+                    ),
+                );
+            }
+
+            let evidence_records = reconstruction.mentions.len()
+                + reconstruction
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.evidence.len())
+                    .sum::<usize>();
+            evidence_spans.check(
+                evidence_records >= case.minimum_evidence_records,
+                format!(
+                    "{prefix}: retained {evidence_records} evidence records, expected at least {}",
+                    case.minimum_evidence_records
+                ),
+            );
+            let mut supported_evidence = 0usize;
+            let mut expected_evidence = 0usize;
+            for mention in &reconstruction.mentions {
+                expected_evidence += 1;
+                let supported = !mention.evidence.trim().is_empty()
+                    && mention.evidence.contains(&mention.display_name);
+                supported_evidence += usize::from(supported);
+                evidence_spans.check(
+                    supported,
+                    format!(
+                        "{prefix}: method {} lacks an exact evidence span",
+                        mention.normalized_name
+                    ),
+                );
+            }
+            for (index, candidate) in reconstruction.candidates.iter().enumerate() {
+                for node in &candidate.graph.nodes {
+                    expected_evidence += 1;
+                    let supported = candidate.evidence.iter().any(|record| {
+                        matches!(&record.target, EvidenceTarget::Node(id) if id == &node.id)
+                            && !record.detail.trim().is_empty()
+                    });
+                    supported_evidence += usize::from(supported);
+                    evidence_spans.check(
+                        supported,
+                        format!(
+                            "{prefix}: candidate {index} node {} lacks evidence",
+                            node.id
+                        ),
+                    );
+                }
+                for edge in &candidate.graph.edges {
+                    expected_evidence += 1;
+                    let supported = candidate.evidence.iter().any(|record| {
+                        matches!(&record.target, EvidenceTarget::Edge(id) if id == &edge.id)
+                            && !record.detail.trim().is_empty()
+                    });
+                    supported_evidence += usize::from(supported);
+                    evidence_spans.check(
+                        supported,
+                        format!(
+                            "{prefix}: candidate {index} edge {} lacks evidence",
+                            edge.id
+                        ),
+                    );
+                }
+            }
+            let support_pct = supported_evidence
+                .saturating_mul(100)
+                .checked_div(expected_evidence)
+                .unwrap_or(100);
+            evidence_spans.check(
+                support_pct >= case.minimum_evidence_support_pct,
+                format!(
+                    "{prefix}: evidence-span support {support_pct}%, expected at least {}%",
+                    case.minimum_evidence_support_pct
+                ),
+            );
+
+            let citations = resource_citations(&extracted.text);
+            let selected_runs = reconstruction
+                .candidates
+                .iter()
+                .flat_map(|candidate| candidate.graph.nodes.iter())
+                .filter(|node| node.operator == "sra.prefetch")
+                .filter_map(|node| match node.params.get("accession") {
+                    Some(ParamValue::String(accession)) => Some(accession.clone()),
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            for run in &selected_runs {
+                resources.check(
+                    citations.iter().any(|citation| {
+                        citation.kind == ResourceCitationKind::SraRun && citation.accession == *run
+                    }),
+                    format!("{prefix}: selected SRA run {run} lacks an exact run citation"),
+                );
+            }
+            if !case.exact_runs.is_empty() {
+                let expected_runs = case
+                    .exact_runs
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>();
+                resources.check(
+                    selected_runs == expected_runs,
+                    format!(
+                        "{prefix}: selected runs {selected_runs:?}, expected {expected_runs:?}"
+                    ),
+                );
+            }
+            if case.forbid_collection_reads {
+                let has_read_collection = citations.iter().any(|citation| {
+                    citation.role == ResourceRole::Reads
+                        && citation.kind != ResourceCitationKind::SraRun
+                });
+                resources.check(
+                    has_read_collection && selected_runs.is_empty(),
+                    format!(
+                        "{prefix}: collection citation became selected reads {selected_runs:?}"
+                    ),
+                );
+            }
+        }
+
+        let metrics = [
+            ("extraction", &extraction),
+            ("classification", &classification),
+            ("entity_recall", &entity_recall),
+            ("entity_precision", &entity_precision),
+            ("operator_support", &operator_support),
+            ("candidates", &candidates),
+            ("nodes", &nodes),
+            ("typed_edges", &typed_edges),
+            ("topology", &topology),
+            ("parameters", &parameters),
+            ("evidence_spans", &evidence_spans),
+            ("resources", &resources),
+        ];
+        let failures = metrics
+            .iter()
+            .flat_map(|(name, metric)| {
+                metric
+                    .failures
+                    .iter()
+                    .map(move |failure| format!("[{name}] {failure}"))
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "paper corpus summary: cases={} skipped={} outcomes={{drafts_ready:{draft_outcomes}, recognized_unsupported:{unsupported_outcomes}, no_reconstructable_methods:{empty_outcomes}}} empty_candidates={empty_candidates} unsupported_mentions={unsupported_mentions} metric_failures={}",
+            cases.len(),
+            skipped,
+            failures.len()
+        );
+        eprintln!(
+            "paper corpus metrics: {}",
+            metrics
+                .iter()
+                .map(|(name, metric)| format!("{name}={}/{}", metric.passed, metric.checked))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert!(
+            failures.is_empty(),
+            "paper gold regression failures:\n{}",
+            failures.join("\n")
+        );
+    }
+
     #[test]
     fn rnaseq_paper_builds_a_brick_dag() {
         let r = reconstruct(&cat(), RNA);
+        let r = r.active().expect("RNA-seq workflow draft");
         assert_eq!(r.assay, Assay::RnaSeq);
-        let ops = ops(&r);
+        let ops = ops(r);
         assert!(ops.contains(&"sra.prefetch"), "{ops:?}");
         assert!(ops.contains(&"sra.fasterq_dump"));
         assert!(ops.contains(&"qc.fastqc"));
@@ -2365,7 +4162,7 @@ were called with GATK Mutect2 following the sarek workflow.
             }),
             "counts should snap to DESeq2"
         );
-        assert_wired(&r);
+        assert_wired(r);
     }
 
     #[test]
@@ -2374,6 +4171,7 @@ were called with GATK Mutect2 following the sarek workflow.
             &cat(),
             "Paired-end RNA-seq reads were trimmed with fastp and aligned to the genome with STAR.",
         );
+        let r = r.active().expect("paired-read workflow draft");
         let source = r
             .graph
             .nodes
@@ -2400,8 +4198,9 @@ were called with GATK Mutect2 following the sarek workflow.
     #[test]
     fn nfcore_named_hides_star_inside_the_compound() {
         let r = reconstruct(&cat(), &fixture("nfcore_rnaseq_methods.txt"));
+        let r = r.active().expect("nf-core workflow draft");
         assert_eq!(r.assay, Assay::RnaSeq);
-        let ops = ops(&r);
+        let ops = ops(r);
         assert!(ops.contains(&"nf.rnaseq"), "{ops:?}");
         assert!(ops.contains(&"sheet.rnaseq"));
         assert!(ops.contains(&"qc.fastqc"));
@@ -2429,12 +4228,13 @@ were called with GATK Mutect2 following the sarek workflow.
             !ops.contains(&"align.star"),
             "STAR lives inside nf-core/rnaseq"
         );
-        assert_wired(&r);
+        assert_wired(r);
     }
 
     #[test]
     fn fastqc_only() {
         let r = reconstruct(&cat(), QC);
+        let r = r.active().expect("FastQC workflow draft");
         assert_eq!(r.assay, Assay::Qc);
         r.graph.validate().unwrap();
         assert!(r.graph.nodes.iter().any(|n| n.operator == "qc.fastqc"));
@@ -2444,24 +4244,354 @@ were called with GATK Mutect2 following the sarek workflow.
     #[test]
     fn variants_without_sarek_are_bwa_then_gatk() {
         let r = reconstruct(&cat(), VAR);
+        let r = r.active().expect("variant workflow draft");
         assert_eq!(r.assay, Assay::Variants);
-        let ops = ops(&r);
+        let ops = ops(r);
         assert!(ops.contains(&"nf.sarek"), "fixture names sarek: {ops:?}");
         assert!(!ops.contains(&"align.bwa"), "BWA is inside sarek");
-        assert_wired(&r);
+        assert_wired(r);
     }
 
     #[test]
     fn empty_is_honest() {
         let r = reconstruct(&cat(), "This paper is about the history of algebra.");
-        assert_eq!(r.assay, Assay::Unknown);
-        assert!(r.graph.nodes.is_empty());
+        assert_eq!(r.outcome, ReconstructionOutcome::NoReconstructableMethods);
+        assert!(r.candidates.is_empty());
+        assert!(r.mentions.is_empty());
+        assert!(r.active().is_none());
         assert!(!r.warnings.is_empty());
     }
 
     #[test]
+    fn unsupported_methods_are_retained_without_a_fake_candidate() {
+        let r = reconstruct(
+            &cat(),
+            "Methods\nOxford Nanopore reads were trimmed with Porechop. Raw reads were run through dnaPipeTE, which used Trinity to assemble repeats. RepeatMasker annotated the resulting repeat library. A custom Perl script combined the tables.\nResults",
+        );
+        assert_eq!(r.outcome, ReconstructionOutcome::RecognizedUnsupported);
+        assert!(r.candidates.is_empty());
+        let names = r
+            .mentions
+            .iter()
+            .map(|mention| mention.normalized_name.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "porechop",
+            "dnapipete",
+            "trinity",
+            "repeatmasker",
+            "custom-script",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}: {names:?}");
+        }
+        assert!(r
+            .mentions
+            .iter()
+            .all(|mention| !mention.evidence.is_empty()));
+    }
+
+    #[test]
+    fn exact_te_tool_identities_are_retained_without_collapsing_prefixes() {
+        let reconstruction = reconstruct(
+            &cat(),
+            "Methods\nPiRATE combined repeat evidence from RepeatModeler and dipSPAdes 3.12.0. Bowtie2 and seqkit processed reads; parseRM.pl summarized RepeatMasker output. LTRpred and Trinotate annotated candidates before CD-HIT-est clustering.\nResults",
+        );
+        let names = reconstruction
+            .mentions
+            .iter()
+            .map(|mention| mention.display_name.as_str())
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "PiRATE",
+            "dipSPAdes",
+            "RepeatModeler",
+            "Bowtie2",
+            "seqkit",
+            "parseRM.pl",
+            "LTRpred",
+            "Trinotate",
+            "CD-HIT-est",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}: {names:?}");
+        }
+        assert!(!names.contains(&"SPAdes"), "dipSPAdes collapsed: {names:?}");
+        assert!(!names.contains(&"Bowtie"), "Bowtie2 collapsed: {names:?}");
+        assert_eq!(
+            reconstruction.outcome,
+            ReconstructionOutcome::RecognizedUnsupported
+        );
+        assert!(reconstruction.candidates.is_empty());
+    }
+
+    #[test]
+    fn dipspades_does_not_add_an_spades_gap_to_a_supported_draft() {
+        let reconstruction = reconstruct(
+            &cat(),
+            "Methods\nRNA-seq reads were checked with FastQC. A separate dipSPAdes 3.12.0 analysis assembled repeat-associated reads.\nResults",
+        );
+        let candidate = reconstruction.active().expect("FastQC workflow draft");
+
+        assert!(reconstruction
+            .mentions
+            .iter()
+            .any(|mention| mention.display_name == "dipSPAdes"));
+        assert!(!candidate.graph.nodes.iter().any(|node| {
+            node.operator == "gap.missing"
+                && node.params.get("tool") == Some(&ParamValue::String("SPAdes".into()))
+        }));
+    }
+
+    #[test]
+    fn mention_only_methods_are_retained_without_guessed_gap_nodes() {
+        let reconstruction = reconstruct(
+            &cat(),
+            "Methods\nRNA-seq reads were checked with FastQC. Porechop and dnaPipeTE77 were reported for a separate repeat analysis.\nResults",
+        );
+        for expected in ["porechop", "dnapipete"] {
+            assert!(reconstruction
+                .mentions
+                .iter()
+                .any(|mention| mention.normalized_name == expected));
+        }
+        let candidate = reconstruction.active().expect("FastQC workflow draft");
+        assert!(ops(candidate).contains(&"qc.fastqc"));
+        assert!(!candidate
+            .graph
+            .nodes
+            .iter()
+            .any(|node| node.operator == "gap.missing"));
+    }
+
+    #[test]
+    fn source_and_gap_only_candidates_are_not_usable_drafts() {
+        let reconstruction = reconstruct(
+            &cat(),
+            "Methods\nPaired-end RNA-seq reads were analyzed with Ballgown.\nResults",
+        );
+
+        assert_eq!(
+            reconstruction.outcome,
+            ReconstructionOutcome::RecognizedUnsupported
+        );
+        assert!(reconstruction.candidates.is_empty());
+        assert!(reconstruction.active().is_none());
+        assert!(reconstruction.mentions.iter().any(|mention| {
+            mention.display_name == "Ballgown" && mention.support == MethodSupport::Unsupported
+        }));
+    }
+
+    #[test]
+    fn statistical_methods_are_not_misreported_as_a_cover_page() {
+        let r = reconstruct(
+            &cat(),
+            "Methods\nPhylogeny subsampling was performed with the R package phytools. All models were fit in the R statistical computing environment.\nResults",
+        );
+        assert_eq!(r.outcome, ReconstructionOutcome::RecognizedUnsupported);
+        let names = r
+            .mentions
+            .iter()
+            .map(|mention| mention.normalized_name.as_str())
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"phytools"), "{names:?}");
+        assert!(names.contains(&"r"), "{names:?}");
+        assert!(r.warnings.iter().any(|warning| {
+            warning
+                == "Somite recognized these computational methods, but workflow support for them is not available yet."
+        }));
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|warning| warning.contains("cover page")
+                    || warning.contains("no tools or assay"))
+        );
+    }
+
+    #[test]
+    fn catalog_method_mentions_use_the_exact_methods_occurrence() {
+        let text = "The abstract compares our results with FastQC reports.\n\u{000c}Methods\nReads were assessed with FastQC before alignment.\nResults";
+        assert!(
+            methods_window(text).starts_with("Methods"),
+            "unexpected methods window: {:?}",
+            methods_window(text)
+        );
+        let r = reconstruct(&cat(), text);
+        assert_eq!(r.outcome, ReconstructionOutcome::DraftsReady);
+        let mention = r
+            .mentions
+            .iter()
+            .find(|mention| mention.normalized_name == "fastqc")
+            .expect("FastQC method mention");
+        assert_eq!(mention.page, Some(2));
+        assert_eq!(mention.support, MethodSupport::Operator("qc.fastqc".into()));
+        assert!(mention.evidence.contains("assessed with FastQC"));
+    }
+
+    #[test]
+    fn two_column_methods_keep_same_page_text_emitted_before_the_heading() {
+        let text = "Abstract\nBackground only.\u{000c}Trimmomatic cleaned the reads before dnaPipeTE analysis and RepeatMasker annotation.\nMaterials and methods\nSamples were collected under permit.\nResults\nThe repeat landscape varied.";
+
+        let reconstruction = reconstruct(&cat(), text);
+        let mentions: Vec<_> = reconstruction
+            .mentions
+            .iter()
+            .map(|mention| (mention.display_name.as_str(), mention.page))
+            .collect::<Vec<_>>();
+
+        for method in ["Trimmomatic", "dnaPipeTE", "RepeatMasker"] {
+            assert!(
+                mentions.contains(&(method, Some(2))),
+                "same-page pre-heading method {method} was lost: {mentions:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_recognition_metadata_drives_supported_graph_nodes() {
+        let mut catalog = cat();
+        catalog
+            .ops
+            .get_mut("align.star")
+            .expect("STAR operator")
+            .paper
+            .as_mut()
+            .expect("STAR paper metadata")
+            .aliases = vec!["SpliceRocket".into()];
+
+        let reconstruction = reconstruct(
+            &catalog,
+            "Methods\nRNA-seq reads were aligned with SpliceRocket before quantification.\nResults",
+        );
+        let candidate = reconstruction
+            .active()
+            .expect("catalog-recognized RNA-seq draft");
+
+        assert!(candidate
+            .graph
+            .nodes
+            .iter()
+            .any(|node| node.operator == "align.star"));
+    }
+
+    #[test]
+    fn different_tools_and_negated_mentions_are_not_mapped_to_catalog_operators() {
+        let r = reconstruct(
+            &cat(),
+            "Methods\nReads were processed without FastQC and trimmed with Cutadapt before downstream analysis.\nResults",
+        );
+        let operators = r
+            .candidates
+            .iter()
+            .flat_map(|candidate| candidate.graph.nodes.iter())
+            .map(|node| node.operator.as_str())
+            .collect::<Vec<_>>();
+        assert!(!operators.contains(&"qc.fastqc"), "{operators:?}");
+        assert!(!operators.contains(&"qc.fastp"), "{operators:?}");
+        assert!(!r
+            .mentions
+            .iter()
+            .any(|mention| mention.normalized_name == "fastqc"));
+        assert!(r
+            .mentions
+            .iter()
+            .any(|mention| mention.normalized_name == "cutadapt"
+                && mention.support == MethodSupport::Unsupported));
+    }
+
+    #[test]
+    fn collapsed_citation_numbers_do_not_turn_numbered_tool_names_into_prefix_matches() {
+        let mut catalog = cat();
+        catalog
+            .ops
+            .get_mut("align.star")
+            .expect("STAR operator")
+            .paper
+            .as_mut()
+            .expect("STAR paper metadata")
+            .aliases = vec!["HISAT".into(), "Kraken".into()];
+
+        let reconstruction = reconstruct(
+            &catalog,
+            "Methods\nFaStP v0.23.4 trimmed reads and dnaPipeTE77 was used for repeat discovery. HISAT2 and Kraken2 were evaluated separately.\nResults",
+        );
+
+        let fastp = reconstruction
+            .mentions
+            .iter()
+            .find(|mention| mention.normalized_name == "fastp")
+            .expect("fastp mention");
+        assert_eq!(fastp.display_name, "FaStP");
+        assert!(fastp.evidence.contains("v0.23.4"));
+        let dnapipete = reconstruction
+            .mentions
+            .iter()
+            .find(|mention| mention.normalized_name == "dnapipete")
+            .expect("dnaPipeTE mention");
+        assert_eq!(dnapipete.display_name, "dnaPipeTE");
+        assert!(dnapipete.evidence.contains("dnaPipeTE77"));
+        assert!(!reconstruction
+            .mentions
+            .iter()
+            .any(|mention| { mention.support == MethodSupport::Operator("align.star".into()) }));
+    }
+
+    #[test]
+    fn hifi_input_does_not_invent_an_assembler() {
+        let r = reconstruct(
+            &cat(),
+            "Methods\nPacBio HiFi reads were generated for de novo genome assembly, but the assembler was not reported.\nResults",
+        );
+        assert!(!r.candidates.iter().any(|candidate| candidate
+            .graph
+            .nodes
+            .iter()
+            .any(|node| node.operator == "asm.hifiasm")));
+        assert_ne!(r.outcome, ReconstructionOutcome::DraftsReady);
+        assert!(r.candidates.is_empty());
+    }
+
+    #[test]
     fn accessions_scan() {
-        assert_eq!(accessions("see SRR1 and SRR123456"), vec!["SRR123456"]);
+        assert_eq!(
+            accessions("see SRR1, SRS123456, and SRR123456"),
+            vec!["SRR123456"]
+        );
+    }
+
+    #[test]
+    fn resource_citations_preserve_collections_roles_and_pages() {
+        let citations = resource_citations(
+            "Paired-end RNA-Seq datasets from NCBI BioProject PRJNA300706.\n\
+             Samples SAMN123456 and SRS123456 and run SRR123456 were retained.\u{000c}\
+             Sequence data are under SRP151479.\n\
+             Genome Assembly: PRJNA482115 and GCA_009914755.4.\n\
+             Annotation ENSAMXG00000012345.",
+        );
+        let citation = |accession: &str| {
+            citations
+                .iter()
+                .find(|citation| citation.accession == accession)
+                .unwrap_or_else(|| panic!("missing {accession}"))
+        };
+        assert_eq!(
+            citation("PRJNA300706").kind,
+            ResourceCitationKind::BioProject
+        );
+        assert_eq!(citation("PRJNA300706").role, ResourceRole::Reads);
+        assert_eq!(citation("PRJNA300706").page, Some(1));
+        assert_eq!(citation("SAMN123456").role, ResourceRole::SampleMetadata);
+        assert_eq!(citation("SRS123456").role, ResourceRole::Reads);
+        assert_eq!(citation("SRP151479").kind, ResourceCitationKind::SraStudy);
+        assert_eq!(citation("SRP151479").page, Some(2));
+        assert_eq!(citation("PRJNA482115").role, ResourceRole::Reference);
+        assert_eq!(
+            citation("GCA_009914755.4").kind,
+            ResourceCitationKind::Assembly
+        );
+        assert_eq!(
+            citation("ENSAMXG00000012345").kind,
+            ResourceCitationKind::Ensembl
+        );
     }
 
     #[test]
@@ -2472,6 +4602,7 @@ were called with GATK Mutect2 following the sarek workflow.
         )
         .unwrap();
         let r = reconstruct(&cat(), &raw);
+        let r = r.active().expect("assembly workflow draft");
         assert_eq!(r.assay, Assay::Assembly);
         r.graph.validate().unwrap();
         let ops: Vec<_> = r.graph.nodes.iter().map(|n| n.operator.as_str()).collect();
@@ -2526,10 +4657,13 @@ were called with GATK Mutect2 following the sarek workflow.
     fn linkage_scaffolding_paper_is_not_misread_as_rnaseq() {
         let text = "METHODS\nPaired DNA reads were aligned to a draft genome with BWA-MEM, filtered with samtools, and processed with GATK before VCFtools filtering. A meiotic linkage map was generated with JoinMap 4.1. Paired RNA-seq reads were aligned to the genomic scaffolds with BWA-MEM, then Rascaf and AGOUTI inferred supported linkages. The linkage and orientation evidence was combined with ALLMAPS to order and orient the scaffolds. FISH mapping provided physical validation.\nREFERENCES\nRNA-seq comparison paper.";
         let reconstruction = reconstruct(&cat(), text);
+        let reconstruction = reconstruction
+            .active()
+            .expect("linkage-scaffolding workflow draft");
 
         assert_eq!(reconstruction.assay, Assay::Assembly);
         assert_eq!(reconstruction.name, "Linkage-guided scaffolding");
-        let operators = ops(&reconstruction);
+        let operators = ops(reconstruction);
         for expected in [
             "files.import_fasta",
             "align.samtools_view",
@@ -2551,27 +4685,29 @@ were called with GATK Mutect2 following the sarek workflow.
         assert!(!operators.contains(&"asm.hifiasm"));
         reconstruction.graph.validate().unwrap();
         cat().verify_graph(&reconstruction.graph).unwrap();
-        assert_wired(&reconstruction);
+        assert_wired(reconstruction);
     }
 
     #[test]
     fn love_deseq2_workflow_is_star_counts_deseq() {
         let r = reconstruct(&cat(), &fixture("love_rnaseq_methods.txt"));
+        let r = r.active().expect("DESeq2 workflow draft");
         assert_eq!(r.assay, Assay::RnaSeq);
-        let ops = ops(&r);
+        let ops = ops(r);
         assert!(ops.contains(&"align.star"), "{ops:?}");
         assert!(ops.contains(&"quant.featurecounts"));
         assert!(ops.contains(&"diff.deseq2"));
         assert!(ops.contains(&"sra.prefetch"));
         assert!(!ops.contains(&"nf.rnaseq"));
-        assert_wired(&r);
+        assert_wired(r);
     }
 
     #[test]
     fn pertea_hisat_stringtie_ballgown() {
         let r = reconstruct(&cat(), &fixture("pertea_hisat_methods.txt"));
+        let r = r.active().expect("HISAT2 workflow draft");
         assert_eq!(r.assay, Assay::RnaSeq);
-        let ops = ops(&r);
+        let ops = ops(r);
         assert!(ops.contains(&"align.hisat2"), "{ops:?}");
         assert!(ops.contains(&"quant.stringtie"));
         assert!(ops.contains(&"qc.fastqc"));
@@ -2581,23 +4717,25 @@ were called with GATK Mutect2 following the sarek workflow.
             .iter()
             .any(|n| n.params.get("tool") == Some(&ParamValue::String("Ballgown".into())));
         assert!(has_ballgown, "Ballgown is not a brick yet — gap");
-        assert_wired(&r);
+        assert_wired(r);
     }
 
     #[test]
     fn gatk_best_practices_is_bwa_then_haplotypecaller() {
         let r = reconstruct(&cat(), &fixture("gatk_methods.txt"));
+        let r = r.active().expect("GATK workflow draft");
         assert_eq!(r.assay, Assay::Variants);
-        let ops = ops(&r);
+        let ops = ops(r);
         assert!(ops.contains(&"align.bwa"), "{ops:?}");
         assert!(ops.contains(&"var.haplotypecaller"));
         assert!(!ops.contains(&"nf.sarek"));
-        assert_wired(&r);
+        assert_wired(r);
     }
 
     #[test]
     fn vgp_is_falcon_purge_salsa_busco() {
         let r = reconstruct(&cat(), &fixture("vgp_assembly_methods.txt"));
+        let r = r.active().expect("VGP workflow draft");
         assert_eq!(r.assay, Assay::Assembly);
         let tools: Vec<_> = r
             .graph
@@ -2616,27 +4754,55 @@ were called with GATK Mutect2 following the sarek workflow.
                 .any(|t| t.contains("Purge") || t.contains("Salsa")),
             "{tools:?}"
         );
-        assert!(ops(&r).contains(&"qc.busco"));
-        assert!(!ops(&r).contains(&"nf.rnaseq"));
-        assert_wired(&r);
+        assert!(ops(r).contains(&"qc.busco"));
+        assert!(!ops(r).contains(&"nf.rnaseq"));
+        assert_wired(r);
     }
 
     #[test]
     fn kraken2_is_a_brick_not_taxprofiler() {
         let r = reconstruct(&cat(), &fixture("kraken2_methods.txt"));
+        let r = r.active().expect("Kraken2 workflow draft");
         assert_eq!(r.assay, Assay::Metagenome);
-        let ops = ops(&r);
+        let ops = ops(r);
         assert!(ops.contains(&"class.kraken2"), "{ops:?}");
         assert!(!ops.contains(&"nf.taxprofiler"));
         assert!(!ops.contains(&"nf.rnaseq"));
-        assert_wired(&r);
+        assert_wired(r);
     }
 
     #[test]
     fn star_is_not_a_substring_of_start() {
-        let r = reconstruct(&cat(), "The experiment will start next week with FastQC.");
-        assert!(!ops(&r).contains(&"align.star"));
-        assert!(ops(&r).contains(&"qc.fastqc"));
+        let r = reconstruct(
+            &cat(),
+            "The star-shaped experiment will start next week with FastQC.",
+        );
+        assert!(!r
+            .mentions
+            .iter()
+            .any(|mention| mention.normalized_name == "star"));
+        let r = r.active().expect("FastQC workflow draft");
+        assert!(!ops(r).contains(&"align.star"));
+        assert!(ops(r).contains(&"qc.fastqc"));
+    }
+
+    #[test]
+    fn comparison_only_tools_remain_evidence_not_executable_stages() {
+        let reconstruction = reconstruct(&cat(), &fixture("comparison_only_methods.txt"));
+        assert!(reconstruction
+            .mentions
+            .iter()
+            .any(|mention| mention.normalized_name == "star"));
+        let candidate = reconstruction.active().expect("HISAT2 workflow draft");
+        assert!(!ops(candidate).contains(&"align.star"));
+        assert!(ops(candidate).contains(&"align.hisat2"));
+    }
+
+    #[test]
+    fn evidence_snippets_do_not_slice_through_unicode() {
+        let text = format!("{}′{}BUSCO was used.", "a".repeat(47), "b".repeat(46));
+        let evidence = snippet(&text, "BUSCO").expect("BUSCO evidence");
+        assert!(evidence.contains("BUSCO"), "{evidence:?}");
     }
 
     #[test]
@@ -2675,10 +4841,11 @@ were called with GATK Mutect2 following the sarek workflow.
     fn strong_variant_evidence_beats_an_rnaseq_caveat() {
         let text = "GATK Best Practices uses BWA-MEM and HaplotypeCaller for variant calling. RNA-seq requires a different aligner.";
         let r = reconstruct(&cat(), text);
+        let r = r.active().expect("variant workflow draft");
         assert_eq!(r.assay, Assay::Variants);
-        assert!(ops(&r).contains(&"align.bwa"));
-        assert!(ops(&r).contains(&"var.haplotypecaller"));
-        assert!(!ops(&r).contains(&"align.star"));
+        assert!(ops(r).contains(&"align.bwa"));
+        assert!(ops(r).contains(&"var.haplotypecaller"));
+        assert!(!ops(r).contains(&"align.star"));
     }
 
     #[test]
@@ -2764,69 +4931,82 @@ were called with GATK Mutect2 following the sarek workflow.
     }
 
     #[test]
-    fn single_cell_methods_keep_analysis_chain() {
+    fn single_cell_gap_methods_are_retained_without_a_fake_draft() {
         let text = "Single-cell RNA sequencing FASTQs were processed with Cell Ranger. SoupX correction was optional before Seurat analysis and DoubletFinder.";
-        let r = reconstruct(&cat(), text);
-        assert_eq!(r.assay, Assay::SingleCell);
-        assert!(ops(&r).contains(&"files.import"));
-        let gaps: Vec<_> = r
-            .graph
-            .nodes
+        let reconstruction = reconstruct(&cat(), text);
+
+        assert_eq!(
+            reconstruction.outcome,
+            ReconstructionOutcome::RecognizedUnsupported
+        );
+        assert!(reconstruction.candidates.is_empty());
+        assert!(reconstruction.active().is_none());
+        let mentions: Vec<_> = reconstruction
+            .mentions
             .iter()
-            .filter_map(|n| match n.params.get("tool") {
-                Some(ParamValue::String(tool)) => Some(tool.as_str()),
-                _ => None,
-            })
+            .map(|mention| mention.display_name.as_str())
             .collect();
         for tool in ["Cell Ranger", "SoupX", "Seurat", "DoubletFinder"] {
-            assert!(gaps.contains(&tool), "missing {tool}: {gaps:?}");
+            assert!(mentions.contains(&tool), "missing {tool}: {mentions:?}");
         }
-        r.graph.validate().unwrap();
     }
 
     #[test]
     fn downloaded_real_paper_corpus_reconstructs() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/papers");
-        let cases: &[(&str, Assay, &[&str], &[&str])] = &[
+        let cases: &[FullPaperCase<'_>] = &[
             (
                 "pdf/love_f1000.pdf",
-                Assay::RnaSeq,
+                ReconstructionOutcome::DraftsReady,
+                Some(Assay::RnaSeq),
                 &["align.star", "quant.featurecounts", "diff.deseq2"],
                 &["nf.rnaseq"],
+                &[],
             ),
             (
                 "raw/pertea_hisat.txt",
-                Assay::RnaSeq,
+                ReconstructionOutcome::DraftsReady,
+                Some(Assay::RnaSeq),
                 &["align.hisat2", "quant.stringtie"],
                 &["align.bwa", "nf.rnaseq"],
+                &["ballgown"],
             ),
             (
                 "raw/gatk_best_practices.txt",
-                Assay::Variants,
+                ReconstructionOutcome::DraftsReady,
+                Some(Assay::Variants),
                 &["align.bwa", "var.haplotypecaller"],
                 &["nf.sarek", "align.hisat2"],
+                &["picard"],
             ),
             (
                 "pdf/cheng_hifiasm.pdf",
-                Assay::Assembly,
+                ReconstructionOutcome::DraftsReady,
+                Some(Assay::Assembly),
                 &["asm.hifiasm"],
                 &["nf.rnaseq"],
+                &[],
             ),
             (
                 "pdf/rhie_vgp.pdf",
-                Assay::Assembly,
+                ReconstructionOutcome::DraftsReady,
+                Some(Assay::Assembly),
                 &["qc.busco"],
                 &["nf.rnaseq"],
+                &["falcon", "purgedups", "salsa"],
             ),
             (
                 "pdf/wood_kraken2.pdf",
-                Assay::Metagenome,
+                ReconstructionOutcome::DraftsReady,
+                Some(Assay::Metagenome),
                 &["class.kraken2"],
                 &["align.minimap2", "nf.taxprofiler"],
+                &[],
             ),
             (
                 "raw/cwl_workflows_pmc.txt",
-                Assay::Mixed,
+                ReconstructionOutcome::DraftsReady,
+                Some(Assay::Mixed),
                 &[
                     "align.hisat2",
                     "align.bwa",
@@ -2834,35 +5014,66 @@ were called with GATK Mutect2 following the sarek workflow.
                     "var.haplotypecaller",
                 ],
                 &["nf.rnaseq", "nf.sarek"],
+                &[],
             ),
             (
                 "raw/sarek_pmc.txt",
-                Assay::Variants,
+                ReconstructionOutcome::DraftsReady,
+                Some(Assay::Variants),
                 &["nf.sarek"],
                 &["align.bwa", "var.haplotypecaller"],
+                &[],
             ),
             (
                 "raw/minto_pmc.txt",
-                Assay::Metagenome,
-                &["qc.fastp"],
+                ReconstructionOutcome::RecognizedUnsupported,
+                None,
+                &[],
                 &["nf.mag", "nf.taxprofiler"],
+                &["trimmomatic", "custom-script"],
             ),
             (
                 "raw/scrnabox_pmc.txt",
-                Assay::SingleCell,
-                &["files.import"],
+                ReconstructionOutcome::RecognizedUnsupported,
+                None,
+                &[],
                 &["nf.rnaseq"],
+                &["cellranger", "soupx", "seurat", "doubletfinder"],
             ),
         ];
         let mut checked = 0;
-        for (relative, assay, required, forbidden) in cases {
+        let mut missing = Vec::new();
+        for (relative, outcome, assay, required, forbidden, required_unsupported) in cases {
             let path = root.join(relative);
             if !path.is_file() {
+                missing.push(*relative);
                 continue;
             }
             checked += 1;
             let extracted = extract_from_path(&path).unwrap();
             let r = reconstruct(&cat(), &extracted.text);
+            assert_eq!(&r.outcome, outcome, "{}", path.display());
+            let unsupported = r
+                .mentions
+                .iter()
+                .filter(|mention| mention.support == MethodSupport::Unsupported)
+                .map(|mention| mention.normalized_name.as_str())
+                .collect::<Vec<_>>();
+            for method in *required_unsupported {
+                assert!(
+                    unsupported.contains(method),
+                    "{} missing unsupported {method}: {unsupported:?}",
+                    path.display()
+                );
+            }
+            let Some(assay) = assay else {
+                assert!(
+                    r.candidates.is_empty(),
+                    "{} exported a fake draft",
+                    path.display()
+                );
+                continue;
+            };
             if *assay == Assay::Mixed {
                 let assays: Vec<_> = r
                     .candidates
@@ -2911,8 +5122,11 @@ were called with GATK Mutect2 following the sarek workflow.
                 }
                 continue;
             }
-            assert_eq!(&r.assay, assay, "{}", path.display());
-            let actual = ops(&r);
+            let candidate = r
+                .active()
+                .unwrap_or_else(|| panic!("{} produced no workflow draft", path.display()));
+            assert_eq!(&candidate.assay, assay, "{}", path.display());
+            let actual = ops(candidate);
             for op in *required {
                 assert!(
                     actual.contains(op),
@@ -2927,29 +5141,133 @@ were called with GATK Mutect2 following the sarek workflow.
                     path.display()
                 );
             }
-            if relative.contains("scrnabox") {
-                let gaps: Vec<_> = r
-                    .graph
-                    .nodes
-                    .iter()
-                    .filter_map(|n| match n.params.get("tool") {
-                        Some(ParamValue::String(tool)) => Some(tool.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                for tool in ["Cell Ranger", "SoupX", "Seurat", "DoubletFinder"] {
-                    assert!(
-                        gaps.contains(&tool),
-                        "{} missing {tool}: {gaps:?}",
-                        path.display()
-                    );
-                }
-            }
-            r.graph.validate().unwrap();
+            candidate.graph.validate().unwrap();
         }
-        if root.join("pdf").is_dir() {
-            assert_eq!(checked, cases.len(), "downloaded corpus is incomplete");
+        let corpus_required = std::env::var("SOMITE_PAPER_CORPUS").as_deref() == Ok("required");
+        if corpus_required || root.join("pdf").is_dir() {
+            assert!(
+                missing.is_empty(),
+                "full paper corpus is incomplete; missing:\n{}",
+                missing.join("\n")
+            );
+            assert_eq!(checked, cases.len(), "full paper corpus count mismatch");
         }
+    }
+
+    #[test]
+    fn pdfinfo_page_count_is_parsed_without_accepting_unrelated_numbers() {
+        let output = "Title: example\nPages:          37\nFile size:      12345 bytes\n";
+        assert_eq!(parse_pdf_page_count(output), Some(37));
+        assert_eq!(parse_pdf_page_count("File size: 37 bytes\n"), None);
+    }
+
+    #[test]
+    fn active_extraction_child_is_killed_when_cancelled() {
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let trigger = std::sync::Arc::clone(&cancelled);
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            trigger.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let started = Instant::now();
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let result = command_output(
+            command,
+            "sleep",
+            ToolFamily::Pdf,
+            Duration::from_secs(30),
+            1024,
+            &|| cancelled.load(std::sync::atomic::Ordering::Acquire),
+        );
+        setter.join().expect("cancellation trigger");
+        assert!(matches!(result, Err(PaperError::Cancelled)));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancelled child lived for {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn active_extraction_child_is_killed_on_timeout() {
+        let started = Instant::now();
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let result = command_output(
+            command,
+            "sleep",
+            ToolFamily::Pdf,
+            Duration::from_millis(40),
+            1024,
+            &|| false,
+        );
+        assert!(matches!(result, Err(PaperError::Timeout { .. })));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "timed-out child lived for {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn missing_native_text_tool_falls_back_to_ocr_preflight() {
+        let directory = std::env::temp_dir().join(format!(
+            "somite-paper-tool-test-{}-{}",
+            std::process::id(),
+            OCR_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).expect("temporary paper directory");
+        let workspace = OcrWorkspace(directory);
+        let paper = workspace.0.join("scan.pdf");
+        fs::write(&paper, b"%PDF-1.4\n%%EOF\n").expect("PDF fixture");
+        let missing = workspace.0.join("not-installed");
+        let result = extract_from_path_with_toolchain(
+            &paper,
+            ExtractionLimits {
+                max_pages: 1,
+                max_text_bytes: 1024,
+                command_timeout: Duration::from_secs(1),
+            },
+            &ExtractionToolchain {
+                pdftotext: missing.join("pdftotext"),
+                pdfinfo: missing.join("pdfinfo"),
+                pdftoppm: missing.join("pdftoppm"),
+                tesseract: missing.join("tesseract"),
+            },
+            || false,
+            |_| {},
+        );
+        assert!(matches!(
+            result,
+            Err(PaperError::MissingTool { ref tool, .. }) if tool == "pdfinfo"
+        ));
+    }
+
+    #[test]
+    fn text_extraction_enforces_the_configured_byte_limit() {
+        let directory = std::env::temp_dir().join(format!(
+            "somite-paper-limit-test-{}-{}",
+            std::process::id(),
+            OCR_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&directory).expect("temporary paper directory");
+        let workspace = OcrWorkspace(directory);
+        let paper = workspace.0.join("methods.txt");
+        fs::write(&paper, "more than four bytes").expect("paper fixture");
+        let result = extract_from_path_with_control(
+            &paper,
+            ExtractionLimits {
+                max_pages: 1,
+                max_text_bytes: 4,
+                command_timeout: Duration::from_secs(1),
+            },
+            || false,
+            |_| {},
+        );
+        assert!(matches!(result, Err(PaperError::Limit(_))));
+        drop(workspace);
+        assert!(!paper.exists());
     }
 
     #[test]
@@ -2971,6 +5289,7 @@ were called with GATK Mutect2 following the sarek workflow.
     #[test]
     fn paper_ids_are_short() {
         let r = reconstruct(&cat(), RNA);
+        let r = r.active().expect("RNA-seq workflow draft");
         let ids: Vec<_> = r.graph.nodes.iter().map(|n| n.id.as_str()).collect();
         assert!(ids.contains(&"prefetch"), "{ids:?}");
         assert!(ids.contains(&"fasterq"));
@@ -2985,6 +5304,9 @@ were called with GATK Mutect2 following the sarek workflow.
             &cat(),
             "Methods\nPaired-end RNA-seq reads were checked with FastQC and aligned with STAR.",
         );
+        let reconstruction = reconstruction
+            .active()
+            .expect("workflow draft with evidence");
 
         let node_targets = reconstruction
             .evidence
@@ -3020,6 +5342,9 @@ were called with GATK Mutect2 following the sarek workflow.
             &cat(),
             "Methods\nRNA-seq reads were aligned with HISAT2, assembled with StringTie, and analyzed with Ballgown.",
         );
+        let reconstruction = reconstruction
+            .active()
+            .expect("workflow draft with missing implementation");
 
         assert!(reconstruction.evidence.iter().any(|record| {
             record.status == EvidenceStatus::MissingImplementation
@@ -3081,6 +5406,7 @@ were called with GATK Mutect2 following the sarek workflow.
             e.text
         );
         let r = reconstruct(&cat(), &e.text);
+        let r = r.active().expect("OCR workflow draft");
         assert_eq!(r.assay, Assay::RnaSeq);
         let ops: Vec<_> = r.graph.nodes.iter().map(|n| n.operator.as_str()).collect();
         assert!(

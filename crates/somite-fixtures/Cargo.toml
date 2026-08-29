@@ -3,6 +3,9 @@ name = "somite-fixtures"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
 description = "Content-addressed representative validation fixtures for Somite"
 
 [dependencies]

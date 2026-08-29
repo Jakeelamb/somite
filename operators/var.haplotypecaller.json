@@ -2,6 +2,11 @@
   "id": "var.haplotypecaller",
   "title": "GATK HaplotypeCaller",
   "palette": ["Variants"],
+  "paper": {
+    "aliases": ["GATK HaplotypeCaller", "HaplotypeCaller"],
+    "operation_class": "variant_calling",
+    "assays": ["variants"]
+  },
   "kind": "external",
   "cost": "high",
   "bin": "gatk",

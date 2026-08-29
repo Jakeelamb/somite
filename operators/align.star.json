@@ -2,6 +2,11 @@
   "id": "align.star",
   "title": "STAR",
   "palette": ["RNA"],
+  "paper": {
+    "aliases": ["STAR"],
+    "operation_class": "read_alignment",
+    "assays": ["rna-seq"]
+  },
   "kind": "external",
   "cost": "high",
   "bin": "STAR",

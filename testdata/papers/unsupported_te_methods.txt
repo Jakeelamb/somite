@@ -1,0 +1,7 @@
+Methods
+Oxford Nanopore reads were trimmed with Porechop. The reads were processed
+with dnaPipeTE, which used Trinity to assemble repeat sequences. RepeatMasker
+annotated the repeat library, and a custom Perl script combined the tables.
+PiRATE combined evidence from RepeatModeler and dipSPAdes 3.12.0. Bowtie2 and
+seqkit processed reads, parseRM.pl summarized repeats, and LTRpred plus
+Trinotate annotated sequences before CD-HIT-est clustering.

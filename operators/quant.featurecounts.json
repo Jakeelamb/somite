@@ -2,6 +2,11 @@
   "id": "quant.featurecounts",
   "title": "featureCounts",
   "palette": ["RNA"],
+  "paper": {
+    "aliases": ["featureCounts", "feature counts"],
+    "operation_class": "read_quantification",
+    "assays": ["rna-seq"]
+  },
   "kind": "external",
   "cost": "high",
   "bin": "featureCounts",

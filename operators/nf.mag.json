@@ -2,6 +2,11 @@
   "id": "nf.mag",
   "title": "nf-core/mag reference",
   "palette": ["References", "nf-core"],
+  "paper": {
+    "aliases": ["nf-core/mag"],
+    "operation_class": "compound_workflow",
+    "assays": ["metagenome"]
+  },
   "kind": "reference",
   "cost": "low",
   "params": {

@@ -17,4 +17,6 @@ members = [
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
+repository = "https://github.com/Jakeelamb/somite"
+rust-version = "1.96"
 version = "0.1.0"

@@ -2,6 +2,11 @@
   "id": "asm.yahs",
   "title": "YaHS",
   "palette": ["Assembly"],
+  "paper": {
+    "aliases": ["YaHS"],
+    "operation_class": "genome_scaffolding",
+    "assays": ["assembly"]
+  },
   "kind": "external",
   "cost": "high",
   "bin": "yahs",
