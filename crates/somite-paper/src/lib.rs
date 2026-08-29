@@ -1313,6 +1313,7 @@ fn build_bricks(
         nodes: vec![],
         edges: vec![],
         annotations: vec![],
+        variant_origin: None,
     };
 
     let add = |g: &mut Graph, op: &str, params: Vec<(&str, ParamValue)>, note: Option<String>| {
@@ -1336,6 +1337,7 @@ fn build_bricks(
             operator_revision: oper.revision().ok()?,
             ports: oper.ir_ports(),
             params: pmap,
+            source_workflow: None,
             layout: Layout { x: 0.0, y: 0.0 },
             note,
             color: None,
@@ -1985,6 +1987,7 @@ fn build_linkage_scaffolding(
         nodes: vec![],
         edges: vec![],
         annotations: vec![],
+        variant_origin: None,
     };
     let add =
         |graph: &mut Graph, op: &str, params: Vec<(&str, ParamValue)>, note: Option<String>| {
@@ -2012,6 +2015,7 @@ fn build_linkage_scaffolding(
                 operator_revision: operator.revision().ok()?,
                 ports: operator.ir_ports(),
                 params: parameter_map,
+                source_workflow: None,
                 layout: Layout { x: 0.0, y: 0.0 },
                 note,
                 color: None,
@@ -2246,6 +2250,7 @@ fn build_assembly(
         nodes: vec![],
         edges: vec![],
         annotations: vec![],
+        variant_origin: None,
     };
     let add = |g: &mut Graph, op: &str, params: Vec<(&str, ParamValue)>, note: Option<String>| {
         let Ok(oper) = catalog.get(op) else {
@@ -2268,6 +2273,7 @@ fn build_assembly(
             operator_revision: oper.revision().ok()?,
             ports: oper.ir_ports(),
             params: pmap,
+            source_workflow: None,
             layout: Layout { x: 0.0, y: 0.0 },
             note,
             color: None,

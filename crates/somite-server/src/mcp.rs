@@ -15,6 +15,7 @@ use somite_assessment::WorkflowAssessment;
 use crate::{source_search, GraphTransaction};
 
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const SOURCE_WORKFLOW_RESOLVE_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowOutput {
@@ -30,6 +31,17 @@ pub struct GraphOutput {
     pub schema_version: u32,
     pub nodes: Vec<NodeOutput>,
     pub edges: Vec<EdgeOutput>,
+    /// Exact source provenance for a promoted native workflow variant. This is
+    /// never a second executable graph.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_origin: Option<SourceWorkflowVariantOriginOutput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SourceWorkflowVariantOriginOutput {
+    pub source_node: NodeOutput,
+    #[serde(default)]
+    pub promoted_invocations: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -40,6 +52,9 @@ pub struct NodeOutput {
     pub ports: Vec<PortOutput>,
     #[serde(default)]
     pub params: BTreeMap<String, ParamValueOutput>,
+    /// Canonical source-backed workflow instance for a resolved collapsed workflow node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_workflow: Option<Value>,
     pub layout: LayoutOutput,
     pub note: Option<String>,
 }
@@ -72,10 +87,15 @@ pub enum PortTypeOutput {
     FastaGz,
     Gtf,
     GtfGz,
+    Gff3,
     Bam,
     Bai,
+    Sam,
     Vcf,
     VcfGz,
+    Bed,
+    Agp,
+    Chain,
     Table,
     Json,
     Html,
@@ -348,6 +368,105 @@ pub struct SourceSearchInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct NfcoreSourceResolveInput {
+    /// Exact nf-core repository name, for example `nf-core/rnaseq`.
+    pub workflow: String,
+    /// Exact release tag advertised by Somite's current cached nf-core catalog.
+    pub revision: String,
+    /// Full canvas state identity returned by `somite.workflow.get`.
+    pub base_state_revision: String,
+    /// Stable retry key. Reuse only when retrying this identical import.
+    pub idempotency_key: String,
+    /// Short human-readable transaction summary for activity and undo history.
+    pub summary: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct NfcoreSourceSearchInput {
+    /// Pipeline name, topic, or short scientific purpose.
+    pub query: String,
+    /// Maximum matches, from 1 through 50. Defaults to 12.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NfcoreSourceSearchOutput {
+    pub query: String,
+    pub provenance: String,
+    pub cached: bool,
+    pub total_matches: usize,
+    pub entries: Vec<NfcoreSourceSearchEntryOutput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NfcoreSourceSearchEntryOutput {
+    pub repository: String,
+    pub title: String,
+    pub description: String,
+    pub topics: Vec<String>,
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SourceWorkflowEditInput {
+    /// Full canvas state identity returned by `somite.workflow.get`.
+    pub base_state_revision: String,
+    /// Exact source workflow revision currently embedded in the collapsed node.
+    pub workflow_revision: String,
+    /// Stable retry key. Reuse only when retrying this identical edit.
+    pub idempotency_key: String,
+    /// Short human-readable transaction summary for activity and undo history.
+    pub summary: String,
+    /// One or more source-anchored semantic edits applied atomically.
+    pub edits: Vec<SourceWorkflowSemanticEditInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SourceWorkflowPromotionInput {
+    /// Full canvas state identity returned by `somite.workflow.get`.
+    pub base_state_revision: String,
+    /// Exact source workflow revision currently embedded in the collapsed node.
+    pub workflow_revision: String,
+    /// Exact source invocation id that already has a selected replacement.
+    pub invocation_id: String,
+    /// Stable retry key. Reuse only when retrying this identical promotion.
+    pub idempotency_key: String,
+    /// Short human-readable transaction summary for activity and undo history.
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SourceWorkflowSemanticEditInput {
+    SetParameter {
+        name: String,
+        binding: SourceWorkflowBindingInput,
+    },
+    ResetParameter {
+        name: String,
+    },
+    ReplaceInvocation {
+        invocation_id: String,
+        operator: String,
+        operator_revision: String,
+        #[serde(default)]
+        params: BTreeMap<String, ParamValueOutput>,
+    },
+    ResetInvocation {
+        invocation_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SourceWorkflowBindingInput {
+    ProjectFile { path: String },
+    ProjectDirectory { path: String },
+    Literal { value: ParamValueOutput },
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct RunInput {
     /// Run identifier returned by a start tool.
     pub run_id: String,
@@ -397,6 +516,7 @@ impl SomiteMcp {
     ) -> Result<Json<T>, CallToolResult> {
         let server_url = self.server_url.clone();
         let runtime_capability = self.runtime_capability.clone();
+        let timeout = http_timeout_for_tool(tool);
         let result = tokio::task::spawn_blocking(move || {
             HttpEndpoint::parse(&server_url)?.json(
                 &runtime_capability,
@@ -404,6 +524,7 @@ impl SomiteMcp {
                 method,
                 &path,
                 body.as_ref(),
+                timeout,
             )
         })
         .await
@@ -440,6 +561,14 @@ impl SomiteMcp {
     fn graph_body(graph: &GraphOutput) -> Result<Value, String> {
         serde_json::to_value(graph)
             .map_err(|error| format!("Could not encode the current graph: {error}"))
+    }
+}
+
+fn http_timeout_for_tool(tool: Option<&str>) -> Duration {
+    if tool == Some("somite.source_workflow.resolve_nfcore") {
+        SOURCE_WORKFLOW_RESOLVE_TIMEOUT
+    } else {
+        HTTP_TIMEOUT
     }
 }
 
@@ -538,6 +667,203 @@ impl SomiteMcp {
                 percent_encode(query),
             ),
             None,
+        )
+        .await
+    }
+
+    /// Resolve one catalog-advertised nf-core release as a pinned, collapsed
+    /// source workflow and atomically place it on an unchanged empty canvas.
+    /// Somite fetches the exact Git tag without interpreting workflow code,
+    /// resolves it to the full commit, verifies and stores every tracked source
+    /// byte, and commits one `workflow.source` node with no fabricated ports or
+    /// inner operators.
+    #[tool(
+        name = "somite.source_workflow.resolve_nfcore",
+        annotations(
+            title = "Resolve nf-core source workflow",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    pub async fn resolve_nfcore_source_workflow(
+        &self,
+        Parameters(input): Parameters<NfcoreSourceResolveInput>,
+    ) -> Result<Json<TransactionOutput>, CallToolResult> {
+        let workflow = input.workflow.trim();
+        let revision = input.revision.trim();
+        if !workflow.starts_with("nf-core/")
+            || workflow["nf-core/".len()..].is_empty()
+            || workflow["nf-core/".len()..].chars().any(|character| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_')
+            })
+            || revision.is_empty()
+            || revision.chars().any(|character| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '.' | '-' | '_')
+            })
+        {
+            return Err(tool_error(
+                "invalid_nfcore_source_request",
+                "Use an exact nf-core repository and catalog-advertised release tag.".to_owned(),
+                false,
+                Some("Refresh the Somite nf-core catalog and choose its exact release.".to_owned()),
+                None,
+                None,
+            ));
+        }
+        self.request(
+            Some("somite.source_workflow.resolve_nfcore"),
+            "POST",
+            "/api/agent/source-workflows/nfcore/resolve".to_owned(),
+            Some(serde_json::json!({
+                "workflow": workflow,
+                "revision": revision,
+                "base_state_revision": input.base_state_revision,
+                "idempotency_key": input.idempotency_key,
+                "summary": input.summary,
+            })),
+        )
+        .await
+    }
+
+    /// Search the current official nf-core pipeline catalog and return exact
+    /// repository/release pairs suitable for the source workflow resolver.
+    /// Results include catalog provenance and whether Somite used its local
+    /// cache because the upstream catalog was unavailable.
+    #[tool(
+        name = "somite.source_workflow.search_nfcore",
+        annotations(
+            title = "Search nf-core source workflows",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
+    )]
+    pub async fn search_nfcore_source_workflows(
+        &self,
+        Parameters(input): Parameters<NfcoreSourceSearchInput>,
+    ) -> Result<Json<NfcoreSourceSearchOutput>, CallToolResult> {
+        let query = input.query.trim();
+        if query.is_empty() || query.len() > 120 || query.chars().any(char::is_control) {
+            return Err(tool_error(
+                "invalid_nfcore_source_query",
+                "Query must contain 1 to 120 printable bytes.".to_owned(),
+                false,
+                Some("Use a pipeline name, topic, or short scientific purpose.".to_owned()),
+                None,
+                None,
+            ));
+        }
+        let limit = input.limit.unwrap_or(12).clamp(1, 50);
+        self.request(
+            Some("somite.source_workflow.search_nfcore"),
+            "GET",
+            format!(
+                "/api/source-workflows/nfcore/search?q={}&limit={limit}",
+                percent_encode(query)
+            ),
+            None,
+        )
+        .await
+    }
+
+    /// Apply parameter or invocation-replacement edits to a source-backed
+    /// Workflow variant. Replacements must pin an exact catalog operator
+    /// revision; incomplete channel knowledge is retained for readiness and
+    /// validation instead of rejecting the creative edit.
+    #[tool(
+        name = "somite.source_workflow.edit",
+        annotations(
+            title = "Edit source workflow parameters",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn edit_source_workflow(
+        &self,
+        Parameters(input): Parameters<SourceWorkflowEditInput>,
+    ) -> Result<Json<TransactionOutput>, CallToolResult> {
+        if input.edits.is_empty() || input.edits.len() > 64 {
+            return Err(tool_error(
+                "invalid_source_workflow_edits",
+                "Provide between 1 and 64 source workflow edits.".to_owned(),
+                false,
+                Some("Inspect the current source workflow and exact catalog operator contracts, then submit one coherent transaction.".to_owned()),
+                None,
+                None,
+            ));
+        }
+        let body = serde_json::to_value(input).map_err(|error| {
+            tool_error(
+                "invalid_source_workflow_edits",
+                format!("Could not encode source parameter edits: {error}"),
+                false,
+                None,
+                None,
+                None,
+            )
+        })?;
+        self.request(
+            Some("somite.source_workflow.edit"),
+            "POST",
+            "/api/agent/source-workflows/edit".to_owned(),
+            Some(body),
+        )
+        .await
+    }
+
+    /// Promote one selected source invocation replacement into an ordinary
+    /// native Somite node. The returned graph uses the normal typed ports,
+    /// edges, readiness, Nextflow, and Pixi paths while retaining the exact
+    /// pinned source workflow and invocation mapping as non-executable
+    /// provenance.
+    #[tool(
+        name = "somite.source_workflow.promote",
+        annotations(
+            title = "Promote source call to editable canvas",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    pub async fn promote_source_workflow_invocation(
+        &self,
+        Parameters(input): Parameters<SourceWorkflowPromotionInput>,
+    ) -> Result<Json<TransactionOutput>, CallToolResult> {
+        if input.invocation_id.trim().is_empty()
+            || input.invocation_id.len() > 512
+            || input.invocation_id.chars().any(char::is_control)
+        {
+            return Err(tool_error(
+                "invalid_source_workflow_invocation",
+                "Provide the exact printable invocation id from the current source workflow."
+                    .to_owned(),
+                false,
+                Some("Inspect the workflow, select a replacement with somite.source_workflow.edit, then promote that invocation.".to_owned()),
+                None,
+                None,
+            ));
+        }
+        let body = serde_json::to_value(input).map_err(|error| {
+            tool_error(
+                "invalid_source_workflow_promotion",
+                format!("Could not encode source workflow promotion: {error}"),
+                false,
+                None,
+                None,
+                None,
+            )
+        })?;
+        self.request(
+            Some("somite.source_workflow.promote"),
+            "POST",
+            "/api/agent/source-workflows/promote".to_owned(),
+            Some(body),
         )
         .await
     }
@@ -813,7 +1139,7 @@ impl ServerHandler for SomiteMcp {
                 Implementation::new("somite", env!("CARGO_PKG_VERSION")).with_title("Somite"),
             )
             .with_instructions(
-                "Somite is a typed visual bioinformatics workflow compiler. Before each edit, call somite.workflow.get and pass its state_revision as base_state_revision. Search exact operator contracts; never invent operator ids, ports, or parameters. Use somite.source.search for current NCBI or Ensembl reads, assemblies, genes, and references before generic web research. Give each intended edit, run, or validation a fresh idempotency_key; reuse it only to retry the identical call after a lost response. Apply one small coherent atomic transaction. If it is stale, inspect again, re-check intent, and retry once with a new key. Call somite.readiness.get after editing and resolve or report every required item before compile, run, or validation. After validation.start, call run.status with wait_ms up to 25000 until it reaches a terminal phase. Never claim a workflow is runnable unless validation completed successfully.".to_owned(),
+                "Somite is a creative visual bioinformatics workflow compiler. Before each edit, call somite.workflow.get and pass its state_revision as base_state_revision. Search exact operator contracts; never invent operator ids, revisions, ports, or parameters. Discover exact nf-core repository/release pairs with somite.source_workflow.search_nfcore, then import them with somite.source_workflow.resolve_nfcore; never add a fabricated nf.* execution operator or the bare workflow.source infrastructure operator. Edit source-backed intent through somite.source_workflow.edit. To rewire a selected invocation replacement, promote it with somite.source_workflow.promote: promotion crosses into a normal native typed graph while retaining exact non-executable source provenance. Never treat the retained source as a hidden executable layer. Invocation replacements are allowed before every channel is known: preserve the edit, inspect readiness, and help resolve indexing, conversion, connection, parameter, and Pixi environment work instead of refusing creativity. Use somite.source.search for current NCBI or Ensembl reads, assemblies, genes, and references before generic web research. Give each intended edit, run, or validation a fresh idempotency_key; reuse it only to retry the identical call after a lost response. Apply one small coherent atomic transaction. If it is stale, inspect again, re-check intent, and retry once with a new key. Call somite.readiness.get after editing and resolve or report every required item before compile, run, or validation. After validation.start, call run.status with wait_ms up to 25000 until it reaches a terminal phase. Never claim a workflow is runnable unless validation completed successfully.".to_owned(),
             )
     }
 }
@@ -949,6 +1275,17 @@ fn http_tool_error(tool: Option<&str>, message: String) -> CallToolResult {
         .and_then(|value| value.split_once(':'))
         .and_then(|(status, _)| status.parse::<u16>().ok());
     let (code, recovery) = match (tool, status) {
+        (Some("somite.source_workflow.resolve_nfcore"), status)
+            if status.is_none_or(|status| status >= 500) =>
+        {
+            (
+            "source_workflow_resolution_failed",
+            Some(
+                "A first exact source fetch can take several minutes. Retry with the same idempotency_key if the response was lost; Somite will return the original transaction without importing twice."
+                    .to_owned(),
+            ),
+            )
+        }
         (Some("somite.workflow.compile"), _) => (
             "compile_failed",
             Some(
@@ -1017,6 +1354,7 @@ impl HttpEndpoint {
         method: &str,
         path: &str,
         body: Option<&Value>,
+        timeout: Duration,
     ) -> Result<Value, String> {
         if !path.starts_with('/') || path.contains(['\r', '\n']) {
             return Err("invalid internal Somite path".to_owned());
@@ -1029,10 +1367,10 @@ impl HttpEndpoint {
         let mut stream = TcpStream::connect(&self.authority)
             .map_err(|error| format!("connect to Somite runtime: {error}"))?;
         stream
-            .set_read_timeout(Some(HTTP_TIMEOUT))
+            .set_read_timeout(Some(timeout))
             .map_err(|error| format!("set Somite read timeout: {error}"))?;
         stream
-            .set_write_timeout(Some(HTTP_TIMEOUT))
+            .set_write_timeout(Some(timeout))
             .map_err(|error| format!("set Somite write timeout: {error}"))?;
         let tool_header = tool
             .map(|tool| format!("X-Somite-Mcp-Tool: {tool}\r\n"))
@@ -1145,5 +1483,26 @@ mod tests {
     fn chunked_json_response_is_decoded() {
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n7\r\n{\"ok\":t\r\n4\r\nrue}\r\n0\r\n\r\n";
         assert_eq!(parse_http_response(response).unwrap()["ok"], true);
+    }
+
+    #[test]
+    fn schema_v3_port_types_deserialize_through_the_mcp_contract() {
+        for name in ["Gff3", "Sam", "Bed", "Agp", "Chain"] {
+            let port: PortTypeOutput =
+                serde_json::from_value(Value::String(name.to_owned())).expect("valid port type");
+            assert_eq!(serde_json::to_value(port).expect("port JSON"), name);
+        }
+    }
+
+    #[test]
+    fn first_nfcore_source_fetch_has_a_long_idempotent_bridge_timeout() {
+        assert_eq!(
+            http_timeout_for_tool(Some("somite.source_workflow.resolve_nfcore")),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            http_timeout_for_tool(Some("somite.workflow.get")),
+            Duration::from_secs(30)
+        );
     }
 }

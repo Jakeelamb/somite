@@ -30,6 +30,29 @@ function sameGraphValue(left: unknown, right: unknown) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
+export function paperCanvasOwnsCandidate(previous: SomiteGraph, canvas: SomiteGraph) {
+  if (previous.nodes.length === 0 || canvas.nodes.some((node) => Boolean(node.source_workflow))) return false;
+  const canvasNodes = new Map(canvas.nodes.map((node) => [node.id, node]));
+  if (!previous.nodes.every((node) => {
+    const current = canvasNodes.get(node.id);
+    return current
+      && !current.source_workflow
+      && current.operator === node.operator
+      && current.operator_revision === node.operator_revision
+      && sameGraphValue(current.ports, node.ports);
+  })) return false;
+
+  const canvasEdges = new Map(canvas.edges.map((edge) => [edge.id, edge]));
+  return previous.edges.every((edge) => {
+    const current = canvasEdges.get(edge.id);
+    return current
+      && current.from_node === edge.from_node
+      && current.from_port === edge.from_port
+      && current.to_node === edge.to_node
+      && current.to_port === edge.to_port;
+  });
+}
+
 export function paperCanvasUpdate(
   appliedCandidate: number | null,
   candidateIndex: number,
@@ -37,7 +60,7 @@ export function paperCanvasUpdate(
   updated: SomiteGraph,
   canvas: SomiteGraph,
 ) {
-  if (appliedCandidate !== candidateIndex) return null;
+  if (appliedCandidate !== candidateIndex || !paperCanvasOwnsCandidate(previous, canvas)) return null;
 
   const previousNodes = new Map(previous.nodes.map((node) => [node.id, node]));
   const updatedNodeIds = new Set(updated.nodes.map((node) => node.id));

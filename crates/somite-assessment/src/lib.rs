@@ -76,6 +76,7 @@ pub enum RequirementInputMode {
 pub enum SupportKind {
     InputRequired,
     ManagedTool,
+    SourceWorkflow,
     BuiltIn,
     SystemTool,
     ManualCheckpoint,
@@ -211,6 +212,295 @@ pub fn assess(graph: &Graph, catalog: &Catalog) -> Result<WorkflowAssessment, As
         });
         let support = assess_node(node, operator, resolution_unresolved);
         nodes.push(support);
+
+        if let Some(workflow) = &node.source_workflow {
+            for parameter in workflow.parameters.iter().filter(|parameter| {
+                parameter.required
+                    && !parameter.managed
+                    && parameter.default.is_none()
+                    && !workflow.bindings.contains_key(&parameter.name)
+            }) {
+                let input_mode = source_parameter_input_mode(parameter);
+                let hidden = parameter.hidden;
+                let editing_disabled = !workflow.capabilities.parameter_edits;
+                let label = parameter.label.trim();
+                let label = if label.is_empty() {
+                    parameter.name.as_str()
+                } else {
+                    label
+                };
+                let detail = [parameter.description.as_str(), parameter.help.as_str()]
+                    .into_iter()
+                    .find(|detail| !detail.trim().is_empty())
+                    .map_or_else(
+                        || {
+                            format!(
+                                "{} is required by the pinned source workflow before it can run.",
+                                parameter.name
+                            )
+                        },
+                        ToOwned::to_owned,
+                    );
+                items.push(AssessmentItem {
+                    id: format!("source-parameter:{}:{}", node.id, parameter.name),
+                    node_id: node.id.clone(),
+                    operator_id: node.operator.clone(),
+                    field: parameter.name.clone(),
+                    fields: (!hidden && !editing_disabled)
+                        .then(|| RequirementField {
+                            name: parameter.name.clone(),
+                            label: label.to_owned(),
+                            input_mode,
+                        })
+                        .into_iter()
+                        .collect(),
+                    title: if editing_disabled {
+                        format!("Review required source parameter {label}")
+                    } else {
+                        format!("Set {label}")
+                    },
+                    detail: if editing_disabled {
+                        format!(
+                            "{label} is required, but parameter editing is disabled because Somite cannot safely represent the complete pinned source schema. This value will not be guessed or offered through a control that cannot succeed."
+                        )
+                    } else if hidden {
+                        format!(
+                            "{label} is required but hidden by the pinned source schema. Somite will not guess or silently bind it."
+                        )
+                    } else {
+                        detail
+                    },
+                    kind: if !hidden
+                        && !editing_disabled
+                        && input_mode == RequirementInputMode::File
+                    {
+                        RequirementKind::Input
+                    } else {
+                        RequirementKind::Parameter
+                    },
+                    priority: 10 + node_priority(node_index),
+                    escalatable: false,
+                    resource_profile: None,
+                    resolutions: vec![AssessmentResolution {
+                        id: "configure".to_owned(),
+                        label: if hidden || editing_disabled {
+                            "Source schema review required".to_owned()
+                        } else if input_mode == RequirementInputMode::File {
+                            "Choose from project".to_owned()
+                        } else {
+                            "Configure workflow".to_owned()
+                        },
+                        detail: if editing_disabled {
+                            "The complete source schema is not safely editable in this release; review the exact upstream schema or use a future typed adapter."
+                                .to_owned()
+                        } else if hidden {
+                            "The source author marked this required parameter hidden; Somite keeps it as an explicit unsupported blocker.".to_owned()
+                        } else {
+                            format!("Open {} and set {label}.", node.id)
+                        },
+                        kind: if hidden || editing_disabled {
+                            ResolutionKind::Review
+                        } else {
+                            ResolutionKind::Configure
+                        },
+                        recommended: !hidden && !editing_disabled,
+                        download_bytes: None,
+                        stored_bytes: None,
+                        scientific_effect: None,
+                        source_url: None,
+                    }],
+                    recipes: Vec::new(),
+                });
+            }
+
+            for parameter in &workflow.unsupported_required_parameters {
+                let label = parameter.label.trim();
+                let label = if label.is_empty() {
+                    parameter.name.as_str()
+                } else {
+                    label
+                };
+                items.push(AssessmentItem {
+                    id: format!(
+                        "source-unsupported-parameter:{}:{}",
+                        node.id, parameter.name
+                    ),
+                    node_id: node.id.clone(),
+                    operator_id: node.operator.clone(),
+                    field: parameter.name.clone(),
+                    fields: Vec::new(),
+                    title: format!("Review required source parameter {label}"),
+                    detail: format!(
+                        "{label} is required by the pinned source, but Somite cannot safely represent its schema contract: {}. It remains an explicit blocker and will not be guessed.",
+                        parameter.reason
+                    ),
+                    kind: RequirementKind::Parameter,
+                    priority: 10 + node_priority(node_index),
+                    escalatable: false,
+                    resource_profile: None,
+                    resolutions: vec![AssessmentResolution {
+                        id: "review-source-schema".to_owned(),
+                        label: "Source schema review required".to_owned(),
+                        detail: "Use the exact upstream schema or a future typed adapter; this release cannot bind this required value safely."
+                            .to_owned(),
+                        kind: ResolutionKind::Review,
+                        recommended: false,
+                        download_bytes: None,
+                        stored_bytes: None,
+                        scientific_effect: None,
+                        source_url: None,
+                    }],
+                    recipes: Vec::new(),
+                });
+            }
+
+            if !workflow.capabilities.parameter_edits {
+                items.push(AssessmentItem {
+                    id: format!("source-schema:{}", node.id),
+                    node_id: node.id.clone(),
+                    operator_id: node.operator.clone(),
+                    field: "parameter_schema".to_owned(),
+                    fields: Vec::new(),
+                    title: "Review the source parameter schema".to_owned(),
+                    detail: "Somite cannot represent the complete pinned parameter schema with proven validation parity. The schema remains source-only and parameter editing is disabled rather than silently ignoring constraints."
+                        .to_owned(),
+                    kind: RequirementKind::Parameter,
+                    priority: 20 + node_priority(node_index),
+                    escalatable: false,
+                    resource_profile: None,
+                    resolutions: vec![AssessmentResolution {
+                        id: "review-source-schema".to_owned(),
+                        label: "Source schema review required".to_owned(),
+                        detail: "Review the exact upstream schema or use a future typed adapter that implements every retained constraint."
+                            .to_owned(),
+                        kind: ResolutionKind::Review,
+                        recommended: false,
+                        download_bytes: None,
+                        stored_bytes: None,
+                        scientific_effect: None,
+                        source_url: None,
+                    }],
+                    recipes: Vec::new(),
+                });
+            }
+
+            for replacement in &workflow.replacements {
+                let replacement_operator = catalog.get(&replacement.operator)?;
+                let original_call = workflow
+                    .invocations
+                    .iter()
+                    .find(|invocation| invocation.id == replacement.invocation_id)
+                    .map_or("the selected source call", |invocation| {
+                        invocation.name.as_str()
+                    });
+                let required_inputs = replacement_operator
+                    .ports
+                    .r#in
+                    .iter()
+                    .filter(|port| !port.optional)
+                    .map(|port| port.name.as_str())
+                    .collect::<Vec<_>>();
+                let outputs = replacement_operator
+                    .ports
+                    .out
+                    .iter()
+                    .map(|port| port.name.as_str())
+                    .collect::<Vec<_>>();
+                let pixi = if replacement_operator.pixi.is_empty() {
+                    "no additional Pixi packages".to_owned()
+                } else {
+                    replacement_operator.pixi.join(", ")
+                };
+                items.push(AssessmentItem {
+                    id: format!(
+                        "source-replacement:{}:{}",
+                        node.id, replacement.invocation_id
+                    ),
+                    node_id: node.id.clone(),
+                    operator_id: replacement.operator.clone(),
+                    field: format!("replacement:{}", replacement.invocation_id),
+                    fields: replacement_operator
+                        .ports
+                        .r#in
+                        .iter()
+                        .map(|port| RequirementField {
+                            name: port.name.clone(),
+                            label: port.name.clone(),
+                            input_mode: RequirementInputMode::Connection,
+                        })
+                        .collect(),
+                    title: format!("Check {} connections", replacement_operator.title),
+                    detail: format!(
+                        "{} replaces {}. Required inputs: {}. Outputs: {}. Pixi: {}. The edit is retained; connect or confirm the uncertain source channels, then validate with representative data.",
+                        replacement_operator.title,
+                        original_call,
+                        if required_inputs.is_empty() { "none".to_owned() } else { required_inputs.join(", ") },
+                        if outputs.is_empty() { "none".to_owned() } else { outputs.join(", ") },
+                        pixi,
+                    ),
+                    kind: RequirementKind::Adapter,
+                    priority: 25 + node_priority(node_index),
+                    escalatable: true,
+                    resource_profile: Some(format!("variant:{}", replacement.operator)),
+                    resolutions: vec![
+                        AssessmentResolution {
+                            id: "connect".to_owned(),
+                            label: "Review connections".to_owned(),
+                            detail: "Open the nested canvas and connect or confirm each replacement input and output.".to_owned(),
+                            kind: ResolutionKind::Connect,
+                            recommended: true,
+                            download_bytes: None,
+                            stored_bytes: None,
+                            scientific_effect: None,
+                            source_url: None,
+                        },
+                        AssessmentResolution {
+                            id: "agent".to_owned(),
+                            label: "Ask Agent to help".to_owned(),
+                            detail: "Give the Agent the retained source invocation and replacement contract so it can suggest indexing, conversion, and parameter steps.".to_owned(),
+                            kind: ResolutionKind::AddAdapter,
+                            recommended: false,
+                            download_bytes: None,
+                            stored_bytes: None,
+                            scientific_effect: None,
+                            source_url: None,
+                        },
+                    ],
+                    recipes: Vec::new(),
+                });
+            }
+
+            if !workflow.capabilities.exact_execution {
+                items.push(AssessmentItem {
+                    id: format!("source-environment:{}", node.id),
+                    node_id: node.id.clone(),
+                    operator_id: node.operator.clone(),
+                    field: "execution_environment".to_owned(),
+                    fields: Vec::new(),
+                    title: "Finish the execution environment".to_owned(),
+                    detail: "The source and parameters are pinned, but this workflow's task containers or Conda environments are not frozen on this machine yet."
+                        .to_owned(),
+                    kind: RequirementKind::ManagedResource,
+                    priority: 30 + node_priority(node_index),
+                    escalatable: false,
+                    resource_profile: Some("source-defined-tasks".to_owned()),
+                    resolutions: vec![AssessmentResolution {
+                        id: "setup".to_owned(),
+                        label: "Execution adapter required".to_owned(),
+                        detail: "This release can inspect and bind the pinned source, but cannot freeze its task environments yet."
+                            .to_owned(),
+                        kind: ResolutionKind::Setup,
+                        recommended: false,
+                        download_bytes: None,
+                        stored_bytes: None,
+                        scientific_effect: None,
+                        source_url: None,
+                    }],
+                    recipes: Vec::new(),
+                });
+            }
+            continue;
+        }
 
         if let Some(resolution) = &operator.resolution {
             if resolution_unresolved {
@@ -521,6 +811,49 @@ fn assess_node(
         .map(|resolution| resolution.recipes.iter().map(recipe).collect())
         .unwrap_or_default();
     let title = gap_title(node, operator);
+    if let Some(workflow) = &node.source_workflow {
+        let missing_parameter = workflow.parameters.iter().any(|parameter| {
+            parameter.required
+                && !parameter.managed
+                && parameter.default.is_none()
+                && !workflow.bindings.contains_key(&parameter.name)
+        });
+        let requires_action = missing_parameter
+            || !workflow.unsupported_required_parameters.is_empty()
+            || !workflow.capabilities.parameter_edits
+            || !workflow.capabilities.exact_execution
+            || !workflow.replacements.is_empty();
+        return NodeAssessment {
+            node_id: node.id.clone(),
+            operator_id: node.operator.clone(),
+            title: workflow.source.repository.clone(),
+            kind: SupportKind::SourceWorkflow,
+            label: if !workflow.replacements.is_empty() {
+                "Variant needs validation"
+            } else if requires_action {
+                "Setup needed"
+            } else {
+                "Pinned and ready"
+            }
+            .to_owned(),
+            detail: if workflow.replacements.is_empty() {
+                format!(
+                    "{} is retained at immutable revision {} with its source-backed outline.",
+                    workflow.source.repository, workflow.source.requested_revision
+                )
+            } else {
+                format!(
+                    "{} keeps immutable revision {} as its base and adds {} user replacement{} that must be connection-checked and validated.",
+                    workflow.source.repository,
+                    workflow.source.requested_revision,
+                    workflow.replacements.len(),
+                    if workflow.replacements.len() == 1 { "" } else { "s" },
+                )
+            },
+            requires_action,
+            recipes,
+        };
+    }
     if let Some(resolution) = &operator.resolution {
         let (kind, completed_label) = match resolution.kind {
             OperatorResolutionKind::ManualCheckpoint => {
@@ -604,6 +937,11 @@ fn assess_node(
             "Reviewed adapter required".to_owned(),
             "This structural reference is not executable yet.".to_owned(),
         ),
+        OpKind::Source => (
+            SupportKind::SourceWorkflow,
+            "Source workflow unavailable".to_owned(),
+            "This source operator is missing its pinned workflow instance.".to_owned(),
+        ),
     };
     NodeAssessment {
         node_id: node.id.clone(),
@@ -612,8 +950,24 @@ fn assess_node(
         kind,
         label,
         detail,
-        requires_action: operator.kind == OpKind::Reference,
+        requires_action: matches!(operator.kind, OpKind::Reference | OpKind::Source),
         recipes,
+    }
+}
+
+fn source_parameter_input_mode(
+    parameter: &somite_ir::WorkflowParameterField,
+) -> RequirementInputMode {
+    match parameter.format.as_deref() {
+        Some("file-path") => RequirementInputMode::File,
+        // Generic `path` does not say whether the workflow expects a file or
+        // directory. Make the user choose that binding kind in the inspector.
+        Some("path") => RequirementInputMode::Text,
+        // A browser file upload cannot satisfy a project Directory binding.
+        // Keep directories in the source inspector's typed path control.
+        Some("directory-path") => RequirementInputMode::Text,
+        _ if !parameter.choices.is_empty() => RequirementInputMode::Choice,
+        _ => RequirementInputMode::Text,
     }
 }
 
@@ -709,7 +1063,10 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    use somite_ir::{Edge, Layout, Node, SCHEMA_VERSION};
+    use somite_ir::{
+        Edge, Layout, Node, SourceWorkflowInstance, UnsupportedRequiredWorkflowParameter,
+        WorkflowBinding, WorkflowParameterField, SCHEMA_VERSION,
+    };
 
     use super::*;
 
@@ -730,6 +1087,7 @@ mod tests {
                 .iter()
                 .filter_map(|(name, spec)| spec.default.clone().map(|value| (name.clone(), value)))
                 .collect::<BTreeMap<_, _>>(),
+            source_workflow: None,
             layout: Layout { x: 0.0, y: 0.0 },
             note: None,
             color: None,
@@ -743,7 +1101,60 @@ mod tests {
             nodes,
             edges,
             annotations: Vec::new(),
+            variant_origin: None,
         }
+    }
+
+    fn source_workflow() -> SourceWorkflowInstance {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "workflow_revision": format!("blake3:{}", "a".repeat(64)),
+            "source": {
+                "provider": "nf_core",
+                "repository": "nf-core/pangenome",
+                "requested_revision": "1.1.3",
+                "resolved_revision": "3d02bd1df79f48b4bfdb4ad95d4ca0d7f6aeb337",
+                "source_digest": format!("blake3:{}", "b".repeat(64)),
+                "entrypoint": "main.nf",
+                "file_count": 170,
+                "source_bytes": 1_286_324
+            },
+            "parameters": [
+                {
+                    "name": "input",
+                    "label": "Input samplesheet",
+                    "group": "Input/output options",
+                    "type": "string",
+                    "required": true,
+                    "format": "file-path"
+                },
+                {
+                    "name": "n_haplotypes",
+                    "label": "Number of haplotypes",
+                    "group": "Input/output options",
+                    "type": "integer",
+                    "required": true,
+                    "minimum": 2
+                },
+                {
+                    "name": "outdir",
+                    "label": "Results directory",
+                    "group": "Input/output options",
+                    "type": "string",
+                    "required": true,
+                    "managed": true
+                }
+            ],
+            "capabilities": {
+                "exact_execution": false,
+                "parameter_edits": true,
+                "hierarchy_indexed": true,
+                "structural_edits": false,
+                "channel_contracts": false,
+                "source_edits": false
+            }
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -894,6 +1305,244 @@ mod tests {
             .iter()
             .any(|item| item.kind == RequirementKind::Adapter));
         assert!(!assessment.is_ready());
+    }
+
+    #[test]
+    fn source_workflow_reports_real_bindings_and_environment_without_adapter_noise() {
+        let catalog = catalog();
+        let mut source = node(&catalog, "pangenome", "workflow.source");
+        source.source_workflow = Some(source_workflow());
+        let assessment = assess(&graph(vec![source.clone()], Vec::new()), &catalog)
+            .expect("source workflow assessment");
+
+        assert_eq!(assessment.state, AssessmentState::NeedsAction);
+        assert_eq!(assessment.nodes[0].kind, SupportKind::SourceWorkflow);
+        assert_eq!(assessment.items.len(), 3);
+        assert!(assessment.items.iter().any(|item| {
+            item.field == "input" && item.fields[0].input_mode == RequirementInputMode::File
+        }));
+        assert!(assessment
+            .items
+            .iter()
+            .any(|item| item.field == "n_haplotypes"));
+        assert!(assessment
+            .items
+            .iter()
+            .any(|item| item.field == "execution_environment"));
+        let directory = source
+            .source_workflow
+            .as_ref()
+            .unwrap()
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == "outdir")
+            .unwrap();
+        assert_eq!(
+            source_parameter_input_mode(directory),
+            RequirementInputMode::Text,
+            "a directory binding must not be presented as a file upload"
+        );
+        assert!(!assessment
+            .items
+            .iter()
+            .any(|item| item.kind == RequirementKind::Adapter));
+
+        let workflow = source.source_workflow.as_mut().unwrap();
+        workflow.bindings.insert(
+            "input".into(),
+            WorkflowBinding::ProjectFile {
+                path: "data/samples.csv".into(),
+            },
+        );
+        workflow.bindings.insert(
+            "n_haplotypes".into(),
+            WorkflowBinding::Literal {
+                value: ParamValue::Int(4),
+            },
+        );
+        workflow.capabilities.exact_execution = true;
+        let assessment = assess(&graph(vec![source], Vec::new()), &catalog)
+            .expect("ready source workflow assessment");
+        assert!(assessment.is_ready());
+        assert_eq!(assessment.nodes[0].label, "Pinned and ready");
+    }
+
+    #[test]
+    fn creative_source_replacement_reports_connections_and_pixi_without_blocking_the_edit() {
+        let catalog = catalog();
+        let mut source = node(&catalog, "variant", "workflow.source");
+        let mut workflow = source_workflow();
+        workflow.scopes = serde_json::from_value(serde_json::json!([{
+            "id": "scope-main",
+            "title": "Main",
+            "kind": "entry_workflow",
+            "span": {"path": "main.nf", "start_line": 1, "end_line": 30}
+        }]))
+        .expect("source scope");
+        workflow.invocations = serde_json::from_value(serde_json::json!([{
+            "id": "call-align",
+            "caller": "scope-main",
+            "name": "BWAMEM2",
+            "span": {"path": "main.nf", "start_line": 20, "end_line": 20}
+        }]))
+        .expect("source invocation");
+        workflow.replacements = serde_json::from_value(serde_json::json!([{
+            "invocation_id": "call-align",
+            "operator": "align.bowtie2",
+            "operator_revision": catalog.revision("align.bowtie2").expect("Bowtie2 revision"),
+            "params": {"threads": 8}
+        }]))
+        .expect("source replacement");
+        source.source_workflow = Some(workflow);
+
+        let assessment =
+            assess(&graph(vec![source], Vec::new()), &catalog).expect("variant assessment");
+        let replacement = assessment
+            .items
+            .iter()
+            .find(|item| item.id == "source-replacement:variant:call-align")
+            .expect("replacement logic check");
+        assert_eq!(replacement.kind, RequirementKind::Adapter);
+        assert!(replacement.escalatable);
+        assert!(replacement.detail.contains("replaces BWAMEM2"));
+        assert!(!replacement.detail.contains("call-align"));
+        assert!(replacement.detail.contains("r1, index"));
+        assert!(replacement.detail.contains("bioconda::bowtie2"));
+        assert!(replacement
+            .resolutions
+            .iter()
+            .any(|resolution| resolution.kind == ResolutionKind::Connect));
+    }
+
+    #[test]
+    fn hidden_required_source_parameter_is_disclosed_but_not_attachable() {
+        let catalog = catalog();
+        let mut source = node(&catalog, "pangenome", "workflow.source");
+        let mut workflow = source_workflow();
+        workflow.parameters.push(
+            serde_json::from_value::<WorkflowParameterField>(serde_json::json!({
+                "name": "internal_reference",
+                "label": "Internal reference",
+                "group": "Internal",
+                "type": "string",
+                "format": "file-path",
+                "required": true,
+                "hidden": true
+            }))
+            .expect("hidden parameter"),
+        );
+        source.source_workflow = Some(workflow);
+
+        let assessment =
+            assess(&graph(vec![source], Vec::new()), &catalog).expect("source workflow assessment");
+        let blocker = assessment
+            .items
+            .iter()
+            .find(|item| item.field == "internal_reference")
+            .expect("hidden requirement remains visible");
+        assert!(blocker.fields.is_empty());
+        assert_eq!(blocker.kind, RequirementKind::Parameter);
+        assert_eq!(blocker.resolutions[0].kind, ResolutionKind::Review);
+        assert!(!blocker.resolutions[0].recommended);
+    }
+
+    #[test]
+    fn unsupported_required_source_parameter_remains_a_terminal_blocker() {
+        let catalog = catalog();
+        let mut source = node(&catalog, "pangenome", "workflow.source");
+        let mut workflow = source_workflow();
+        workflow.bindings.insert(
+            "n_haplotypes".into(),
+            WorkflowBinding::Literal {
+                value: ParamValue::Int(4),
+            },
+        );
+        workflow.capabilities.exact_execution = true;
+        workflow.capabilities.parameter_edits = true;
+        workflow
+            .unsupported_required_parameters
+            .push(UnsupportedRequiredWorkflowParameter {
+                name: "sample_overrides".into(),
+                label: "Sample overrides".into(),
+                group: "Input/output options".into(),
+                description: "Per-sample override records".into(),
+                reason: "type is not a supported primitive".into(),
+                hidden: false,
+            });
+        source.source_workflow = Some(workflow);
+
+        let assessment =
+            assess(&graph(vec![source], Vec::new()), &catalog).expect("source assessment");
+        assert!(!assessment.is_ready());
+        assert_eq!(assessment.required_count, 2);
+        let input = assessment
+            .items
+            .iter()
+            .find(|item| item.field == "input")
+            .expect("proven input action");
+        assert_eq!(input.fields.len(), 1);
+        assert_eq!(input.kind, RequirementKind::Input);
+        assert_eq!(input.resolutions[0].kind, ResolutionKind::Configure);
+        assert!(input.resolutions[0].recommended);
+        let blocker = assessment
+            .items
+            .iter()
+            .find(|item| item.field == "sample_overrides")
+            .expect("unsupported requirement");
+        assert_eq!(blocker.field, "sample_overrides");
+        assert!(blocker.fields.is_empty());
+        assert_eq!(blocker.kind, RequirementKind::Parameter);
+        assert_eq!(blocker.resolutions[0].kind, ResolutionKind::Review);
+        assert!(!blocker.resolutions[0].recommended);
+        assert!(!assessment
+            .items
+            .iter()
+            .any(|item| item.field == "parameter_schema"));
+        assert!(assessment.nodes[0].requires_action);
+        assert_eq!(assessment.nodes[0].label, "Setup needed");
+    }
+
+    #[test]
+    fn globally_disabled_source_parameter_edits_never_offer_failing_controls() {
+        let catalog = catalog();
+        let mut source = node(&catalog, "pangenome", "workflow.source");
+        let mut workflow = source_workflow();
+        workflow.capabilities.exact_execution = true;
+        workflow.capabilities.parameter_edits = false;
+        source.source_workflow = Some(workflow);
+
+        let assessment =
+            assess(&graph(vec![source], Vec::new()), &catalog).expect("source assessment");
+        assert_eq!(assessment.required_count, 3);
+        assert!(assessment.items.iter().all(|item| {
+            item.fields.is_empty()
+                && item.kind == RequirementKind::Parameter
+                && item.resolutions.len() == 1
+                && item.resolutions[0].kind == ResolutionKind::Review
+                && !item.resolutions[0].recommended
+                && item.resolutions[0].label == "Source schema review required"
+        }));
+        assert!(assessment.nodes[0].requires_action);
+        assert_eq!(assessment.nodes[0].label, "Setup needed");
+    }
+
+    #[test]
+    fn valid_empty_source_parameter_schema_has_no_false_schema_blocker() {
+        let catalog = catalog();
+        let mut source = node(&catalog, "parameterless", "workflow.source");
+        let mut workflow = source_workflow();
+        workflow.parameters.clear();
+        workflow.bindings.clear();
+        workflow.capabilities.exact_execution = true;
+        workflow.capabilities.parameter_edits = true;
+        source.source_workflow = Some(workflow);
+
+        let assessment =
+            assess(&graph(vec![source], Vec::new()), &catalog).expect("source assessment");
+        assert!(assessment.is_ready());
+        assert!(assessment.items.is_empty());
+        assert!(!assessment.nodes[0].requires_action);
+        assert_eq!(assessment.nodes[0].label, "Pinned and ready");
     }
 
     #[test]

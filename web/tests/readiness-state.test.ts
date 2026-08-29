@@ -40,6 +40,11 @@ function snapshot(items: ReadinessItem[] = []): ReadinessSnapshot {
 
 test("readiness summary prioritizes active work, requirements, and current evidence", () => {
   assert.equal(readinessSummary(snapshot([resource]), true, null).label, "Preparing");
+  assert.deepEqual(readinessSummary(null, false, null, "source store is unavailable"), {
+    label: "Readiness unavailable",
+    detail: "source store is unavailable · click to retry",
+    tone: "attention",
+  });
   assert.equal(readinessSummary(snapshot([resource]), false, null).label, "Needs 1 item");
   assert.equal(readinessSummary(snapshot(), false, null).label, "Ready");
   assert.equal(readinessSummary(snapshot(), false, {

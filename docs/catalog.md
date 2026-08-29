@@ -37,6 +37,8 @@ not a promise that Somite manually maintains every bioinformatics package.
 | `qc.fastqc` | FASTQ to HTML plus optional preview |
 | `align.star` | reads plus reference to BAM |
 | `align.bwa` | reads plus reference to BAM |
+| `align.bowtie2_build` | reference FASTA to a reusable Bowtie2 index directory |
+| `align.bowtie2` | reads plus Bowtie2 index to SAM |
 | `quant.salmon` | reads plus index to abundance table |
 | `samtools.index` | BAM to BAI |
 | `class.kraken2` | reads plus a required local Kraken2 database directory to a classification table |
@@ -60,26 +62,33 @@ guess alone never passes step 5.
 ## nf-core Pipeline catalog
 
 The Pipeline panel searches released nf-core workflows. Dropping one resolves
-its selected revision and expands the process graph into movable
-`workflow.reference` Nodes. This provides transparency without claiming every
-process is independently executable.
+its selected revision to an immutable Git commit, verifies the complete tracked
+source tree, and inserts one `workflow.source` Node. The clean outer card opens
+into a nested, source-anchored outline of workflows, subworkflows, processes,
+and invocations.
 
-Every imported graph is normalized at the canvas boundary around the complete
-node footprint, including its title, ID, and exterior port labels. This applies
-to fresh and cached nf-core and Snakemake graphs; opening a saved Somite project
-still preserves the user's deliberate layout.
+The outline is a navigation and editing lens, not a process DAG. Nextflow
+channel transforms, composite values, conditions, and task environments remain
+in the exact source unless Somite has their complete structured contract. DOT
+output is never used as execution truth.
 
-Read-consuming boundary processes may expose separate `r1` and optional `r2`
-ports when the engine graph supports that conclusion. Internal nodes keep
-conservative structural ports; arbitrary wires into the middle of a pipeline
-are not enabled by guesswork.
+The first supported source-backed form is a whole-root workflow with no
+fabricated ports or Edges. Required public parameters come from the workflow's
+own schema and appear as bindings in the inspector. Mixed native/source
+composition waits for a complete callable channel interface.
 
-Compilation fails at references. A node becomes executable only when it is
-replaced by either:
+A catalog-pinned invocation replacement is editable intent inside this Source
+view. Promoting it crosses an explicit boundary into a normal native Graph. The
+promoted Node gets the selected Operator's exact ports, parameters, revision,
+Nextflow compilation, and Pixi requirements; Somite does not infer neighboring
+channels. The original Source Node and invocation mapping remain attached only
+as provenance and never execute underneath the native Graph. Returning to the
+pinned Source view is an explicit restore operation.
 
-- a generic typed Operator compiled into a static Nextflow process; or
-- a future source-backed Adapter that preserves a pinned nf-core module and
-  maps its complete channel Interface.
+Readiness remains blocked until every required binding and the source-defined
+task environment are frozen. Existing DOT-based `workflow.reference` imports
+remain visible and blocked; Somite never silently promotes them because their
+original source cannot be recovered from process labels.
 
 Somite never nests `nextflow run nf-core/<pipeline>` as an opaque canvas node.
 

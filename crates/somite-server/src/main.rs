@@ -1,4 +1,5 @@
 use std::env;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -31,16 +32,12 @@ async fn main() -> Result<()> {
     let root = env::var_os("SOMITE_PROJECT_ROOT")
         .map(PathBuf::from)
         .unwrap_or(env::current_dir().context("current directory")?);
+    let root = root.canonicalize().context("canonical project root")?;
     let graph = match env::var_os("SOMITE_GRAPH") {
         Some(path) => PathBuf::from(path),
         None => {
             let path = root.join(".somite/web.somite.json");
-            if !path.exists() {
-                let parent = path.parent().context("web graph parent")?;
-                std::fs::create_dir_all(parent).context("create .somite directory")?;
-                std::fs::copy(root.join("testdata/fastq_to_fastqc.somite.json"), &path)
-                    .context("initialize web graph")?;
-            }
+            initialize_default_graph(&root, &path)?;
             path
         }
     };
@@ -52,5 +49,66 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     tracing::info!(%address, "Somite web server listening");
     axum::serve(listener, somite_server::app(project)).await?;
+    Ok(())
+}
+
+fn initialize_default_graph(root: &std::path::Path, path: &std::path::Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            anyhow::ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "default web graph must be a regular non-symlink file"
+            );
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect default web graph"),
+    }
+
+    let parent = path.parent().context("web graph parent")?;
+    match std::fs::create_dir(parent) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).context("create .somite directory"),
+    }
+    let parent_metadata = std::fs::symlink_metadata(parent).context("inspect .somite directory")?;
+    anyhow::ensure!(
+        parent_metadata.is_dir() && !parent_metadata.file_type().is_symlink(),
+        ".somite must be a regular non-symlink directory"
+    );
+    let canonical_parent = parent
+        .canonicalize()
+        .context("canonical .somite directory")?;
+    anyhow::ensure!(
+        canonical_parent.parent() == Some(root),
+        ".somite escapes the canonical project root"
+    );
+
+    let source = std::fs::read(root.join("testdata/fastq_to_fastqc.somite.json"))
+        .context("read initial web graph")?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".somite-initial-graph-")
+        .tempfile_in(&canonical_parent)
+        .context("create initial graph temporary file")?;
+    temporary
+        .as_file_mut()
+        .write_all(&source)
+        .context("write initial web graph")?;
+    temporary
+        .as_file_mut()
+        .flush()
+        .context("flush initial web graph")?;
+    temporary
+        .as_file()
+        .sync_all()
+        .context("sync initial web graph")?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| error.error)
+        .context("publish initial web graph")?;
+    #[cfg(unix)]
+    std::fs::File::open(&canonical_parent)
+        .and_then(|directory| directory.sync_all())
+        .context("sync .somite directory")?;
     Ok(())
 }

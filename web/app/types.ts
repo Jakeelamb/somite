@@ -6,10 +6,15 @@ export type PortType =
   | "FastaGz"
   | "Gtf"
   | "GtfGz"
+  | "Gff3"
+  | "Sam"
   | "Bam"
   | "Bai"
   | "Vcf"
   | "VcfGz"
+  | "Bed"
+  | "Agp"
+  | "Chain"
   | "Table"
   | "Json"
   | "Html"
@@ -37,15 +42,115 @@ export type SomitePort = {
   optional?: boolean;
 };
 
+export type SourceProvider = "nf_core" | "local";
+
+export type WorkflowSourcePin = {
+  provider: SourceProvider;
+  repository: string;
+  requested_revision: string;
+  resolved_revision: string;
+  source_digest: string;
+  entrypoint: string;
+  file_count: number;
+  source_bytes: number;
+};
+
+export type WorkflowParameterField = {
+  name: string;
+  label: string;
+  group: string;
+  description?: string;
+  help?: string;
+  type: "string" | "integer" | "number" | "boolean";
+  required?: boolean;
+  hidden?: boolean;
+  managed?: boolean;
+  format?: string;
+  pattern?: string;
+  default?: ParamValue;
+  choices?: ParamValue[];
+  minimum?: number;
+  maximum?: number;
+};
+
+export type WorkflowBinding =
+  | { kind: "project_file"; path: string }
+  | { kind: "project_directory"; path: string }
+  | { kind: "literal"; value: ParamValue };
+
+export type SourceSpan = {
+  path: string;
+  start_line: number;
+  end_line: number;
+};
+
+export type SourceScope = {
+  id: string;
+  title: string;
+  symbol?: string;
+  kind: "entry_workflow" | "workflow" | "process";
+  span: SourceSpan;
+};
+
+export type SourceInvocation = {
+  id: string;
+  caller: string;
+  name: string;
+  callee?: string;
+  span: SourceSpan;
+};
+
+export type SourceInvocationReplacement = {
+  invocation_id: string;
+  operator: string;
+  operator_revision: string;
+  params?: Record<string, ParamValue>;
+};
+
+export type SourceCapabilities = {
+  exact_execution: boolean;
+  parameter_edits: boolean;
+  hierarchy_indexed: boolean;
+  structural_edits: boolean;
+  channel_contracts: boolean;
+  source_edits: boolean;
+};
+
+export type SourceDiagnostic = {
+  code: string;
+  message: string;
+  span?: SourceSpan;
+};
+
+export type SourceWorkflowInstance = {
+  schema_version: number;
+  workflow_revision: string;
+  source: WorkflowSourcePin;
+  profiles?: string[];
+  parameters?: WorkflowParameterField[];
+  bindings?: Record<string, WorkflowBinding>;
+  scopes?: SourceScope[];
+  invocations?: SourceInvocation[];
+  replacements?: SourceInvocationReplacement[];
+  capabilities: SourceCapabilities;
+  diagnostics?: SourceDiagnostic[];
+};
+
 export type SomiteGraphNode = {
   id: string;
   operator: string;
   operator_revision: string;
   ports: SomitePort[];
   params?: Record<string, ParamValue>;
+  source_workflow?: SourceWorkflowInstance;
   layout: { x: number; y: number };
   note?: string;
   color?: CanvasColor;
+};
+
+export type SourceWorkflowVariantOrigin = {
+  source_node: SomiteGraphNode;
+  promoted_invocations?: Record<string, string>;
 };
 
 export type SomiteEdge = {
@@ -62,6 +167,7 @@ export type SomiteGraph = {
   nodes: SomiteGraphNode[];
   edges: SomiteEdge[];
   annotations?: CanvasAnnotation[];
+  variant_origin?: SourceWorkflowVariantOrigin;
 };
 
 export type ParamSpec = {
@@ -106,7 +212,7 @@ export type ReadinessState = "empty" | "building" | "needs_action" | "ready";
 export type RequirementKind = "input" | "parameter" | "managed_resource" | "manual_checkpoint" | "method_details" | "legacy_tool" | "adapter";
 export type ResolutionKind = "connect" | "configure" | "use_existing" | "download" | "build" | "attach" | "review" | "setup" | "add_adapter";
 export type RequirementInputMode = "connection" | "file" | "text" | "choice" | "guide" | "agent";
-export type SupportKind = "input_required" | "managed_tool" | "built_in" | "system_tool" | "manual_checkpoint" | "method_details" | "legacy_source" | "adapter";
+export type SupportKind = "input_required" | "managed_tool" | "source_workflow" | "built_in" | "system_tool" | "manual_checkpoint" | "method_details" | "legacy_source" | "adapter";
 export type ResolutionRecipeKind = "external_checkpoint" | "environment" | "method_selection" | "artifact_preparation" | "adapter_contract";
 
 export type ResolutionRecipe = {
@@ -180,8 +286,10 @@ export type Operator = {
   revision?: string;
   title: string;
   palette: string[];
-  kind: "external" | "inprocess" | "reference";
+  kind: "external" | "inprocess" | "reference" | "source";
   cost: "low" | "high";
+  bin?: string;
+  pixi?: string[];
   params: Record<string, ParamSpec>;
   ports: { in: PortSpec[]; out: PortSpec[] };
   description?: string;
@@ -214,6 +322,18 @@ export type ProjectSession = {
   operators: Operator[];
   recovered_autosave: boolean;
   agent_cursor: number;
+  state_revision: string;
+};
+
+export type GraphWriteResponse = {
+  valid: boolean;
+  state_revision: string;
+};
+
+export type SourceWorkflowEditResponse = {
+  state_revision: string;
+  graph_revision: string;
+  graph: SomiteGraph;
 };
 
 export type AgentPermissionChoice = {
@@ -297,6 +417,7 @@ export type AgentSnapshot = {
   config_options: AgentConfigOption[];
   cursor: number;
   events: AgentEvent[];
+  authoritative_state_revision?: string;
 };
 
 export type RunPhase = "preparing" | "running" | "finalizing" | "completed" | "failed" | "cancelling" | "cancelled";
@@ -349,7 +470,7 @@ export type PaperEvidence = {
   target_id: string;
   status: "explicit" | "inferred" | "needs_adapter";
   detail: string;
-  resolution_kind?: "input_required" | "managed_tool" | "built_in" | "system_tool" | "manual_checkpoint" | "method_details" | "legacy_source" | "adapter";
+  resolution_kind?: "input_required" | "managed_tool" | "source_workflow" | "built_in" | "system_tool" | "manual_checkpoint" | "method_details" | "legacy_source" | "adapter";
   resolution_label?: string;
   resolution_detail?: string;
   resolution_required?: boolean;
@@ -361,7 +482,7 @@ export type ExportTool = {
   title: string;
   binary?: string;
   packages: string[];
-  state: "built_in" | "ready" | "installable" | "system_required" | "manual_checkpoint" | "method_details" | "legacy_source" | "adapter_needed";
+  state: "built_in" | "ready" | "installable" | "system_required" | "source_setup" | "manual_checkpoint" | "method_details" | "legacy_source" | "adapter_needed";
   detail: string;
 };
 
@@ -373,6 +494,7 @@ export type ExportPlan = {
   tools: ExportTool[];
   ready_count: number;
   installable_count: number;
+  source_setup_count: number;
   manual_count: number;
   details_count: number;
   legacy_count: number;

@@ -1,0 +1,8 @@
+{
+  "id": "workflow.source",
+  "title": "Source-backed workflow",
+  "palette": [],
+  "kind": "source",
+  "cost": "high",
+  "ports": { "in": [], "out": [] }
+}

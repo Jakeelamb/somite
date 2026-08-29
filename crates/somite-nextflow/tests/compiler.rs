@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use somite_ir::{Edge, Graph, Layout, Node, ParamValue, SCHEMA_VERSION};
+use somite_ir::{
+    Edge, Graph, Layout, Node, ParamValue, SourceWorkflowInstance, SourceWorkflowVariantOrigin,
+    SCHEMA_VERSION,
+};
 use somite_nextflow::{compile, CompileError, CompileOptions};
 use somite_ops::{Catalog, OpKind, Operator};
 
@@ -23,6 +26,7 @@ fn catalog_node(
         operator_revision: operator.revision().expect("operator revision"),
         ports: operator.ir_ports(),
         params: resolved,
+        source_workflow: None,
         layout: Layout { x: 0.0, y: 0.0 },
         note: None,
         color: None,
@@ -49,6 +53,7 @@ fn paired_fixture() -> (Graph, Catalog) {
         include_str!("../../../spikes/executor-identity/native/operators/files.import_paired.json"),
         include_str!("../../../spikes/executor-identity/native/operators/qc.fastp.json"),
         include_str!("../../../spikes/executor-identity/native/operators/qc.fastqc_paired.json"),
+        include_str!("../../../operators/workflow.source.json"),
     ] {
         let operator: Operator = serde_json::from_str(raw).expect("operator fixture");
         catalog.ops.insert(operator.id.clone(), operator);
@@ -98,6 +103,69 @@ fn compiles_paired_fastp_fastqc_to_the_golden_workflow() {
     let mut graph_edges = graph.edges.clone();
     graph_edges.sort_by(|left, right| left.id.cmp(&right.id));
     assert_eq!(mapped_edges, graph_edges);
+}
+
+#[test]
+fn compiled_node_map_retains_promoted_source_invocation_provenance() {
+    let (mut graph, catalog) = paired_fixture();
+    let fastp_revision = catalog.revision("qc.fastp").expect("fastp revision");
+    let workflow: SourceWorkflowInstance = serde_json::from_value(serde_json::json!({
+        "schema_version": 1,
+        "workflow_revision": format!("blake3:{}", "a".repeat(64)),
+        "source": {
+            "provider": "local",
+            "repository": "local/quality-control",
+            "requested_revision": "v1.0.0",
+            "resolved_revision": "b".repeat(40),
+            "source_digest": format!("blake3:{}", "c".repeat(64)),
+            "entrypoint": "main.nf",
+            "file_count": 1,
+            "source_bytes": 128
+        },
+        "scopes": [{
+            "id": "scope-main",
+            "title": "Entry workflow",
+            "kind": "entry_workflow",
+            "span": {"path": "main.nf", "start_line": 1, "end_line": 20}
+        }],
+        "invocations": [{
+            "id": "call-fastp",
+            "caller": "scope-main",
+            "name": "FASTP",
+            "span": {"path": "main.nf", "start_line": 12, "end_line": 12}
+        }],
+        "replacements": [{
+            "invocation_id": "call-fastp",
+            "operator": "qc.fastp",
+            "operator_revision": fastp_revision,
+            "params": {"threads": 1}
+        }]
+    }))
+    .expect("source workflow provenance");
+    let source_operator = catalog.get("workflow.source").expect("source operator");
+    graph.variant_origin = Some(SourceWorkflowVariantOrigin {
+        source_node: Node {
+            id: "source-quality-control".into(),
+            operator: source_operator.id.clone(),
+            operator_revision: source_operator.revision().expect("source revision"),
+            ports: Vec::new(),
+            params: BTreeMap::new(),
+            source_workflow: Some(workflow),
+            layout: Layout { x: 0.0, y: 0.0 },
+            note: None,
+            color: None,
+        },
+        promoted_invocations: BTreeMap::from([("call-fastp".into(), "fastp".into())]),
+    });
+
+    let compiled = compile(&graph, &catalog, &options()).expect("compile promoted native graph");
+    let node_map: serde_json::Value =
+        serde_json::from_str(&compiled.node_map_json).expect("node map JSON");
+    let source = &node_map["nodes"]["fastp"]["source"];
+    assert_eq!(source["repository"], "local/quality-control");
+    assert_eq!(source["invocation_id"], "call-fastp");
+    assert_eq!(source["invocation_name"], "FASTP");
+    assert_eq!(source["span"]["path"], "main.nf");
 }
 
 #[test]
@@ -292,6 +360,7 @@ fn stdout_and_stable_input_names_compile_legacy_cli_contracts_without_shell_argv
             },
         ],
         annotations: vec![],
+        variant_origin: None,
     };
     let compiled = compile(&graph, &catalog, &options()).expect("compile ALLMAPS graph");
     assert!(compiled.main_nf.contains("name: 'evidence.bed'"));
@@ -346,6 +415,7 @@ fn stdout_and_stable_input_names_compile_legacy_cli_contracts_without_shell_argv
             },
         ],
         annotations: vec![],
+        variant_origin: None,
     };
     let bwa = compile(&bwa_graph, &catalog, &options()).expect("compile BWA graph");
     assert!(bwa

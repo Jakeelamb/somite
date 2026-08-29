@@ -154,6 +154,17 @@ async fn spawned_stdio_server_lists_tools_and_applies_one_atomic_edit() {
     assert!(operator["properties"]["params"].is_object());
     assert!(operator["properties"]["ports"].is_object());
     assert!(operator["properties"]["outputs"].is_object());
+    let workflow_schema = tools
+        .iter()
+        .find(|tool| tool.name == "somite.workflow.get")
+        .and_then(|tool| tool.output_schema.as_ref())
+        .expect("workflow output schema");
+    assert!(workflow_schema["$defs"]["GraphOutput"]["properties"]["variant_origin"].is_object());
+    assert!(
+        workflow_schema["$defs"]["SourceWorkflowVariantOriginOutput"]["properties"]
+            ["promoted_invocations"]
+            .is_object()
+    );
     let names = tools
         .iter()
         .map(|tool| tool.name.to_string())
@@ -169,6 +180,10 @@ async fn spawned_stdio_server_lists_tools_and_applies_one_atomic_edit() {
             "somite.run.start".to_owned(),
             "somite.run.status".to_owned(),
             "somite.source.search".to_owned(),
+            "somite.source_workflow.edit".to_owned(),
+            "somite.source_workflow.promote".to_owned(),
+            "somite.source_workflow.resolve_nfcore".to_owned(),
+            "somite.source_workflow.search_nfcore".to_owned(),
             "somite.validation.start".to_owned(),
             "somite.workflow.compile".to_owned(),
             "somite.workflow.get".to_owned(),

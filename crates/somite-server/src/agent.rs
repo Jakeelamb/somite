@@ -22,18 +22,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use somite_ir::{Edge, Graph, Layout, Node, ParamValue};
 use somite_linker::{graph_state_revision, semantic_graph_revision};
-use somite_ops::Catalog;
+use somite_ops::{Catalog, OpKind};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
 const EVENT_LIMIT: usize = 4_096;
+const TRANSACTION_EVENT_LIMIT: usize = 32;
 const MAX_OPERATIONS: usize = 64;
 const MAX_PROMPT_BYTES: usize = 64 * 1024;
 const WORKFLOW_AGENT_CONTRACT: &str = r#"You are the Workflow Agent embedded in Somite. The current Somite canvas is the work product.
 
 Work through the Somite MCP tools immediately. Do not inspect or modify the Somite repository, run shell commands, read project files directly, or create workflow JSON by hand. Do not use developer tools to discover capabilities that Somite already exposes.
 
-Begin by inspecting the current workflow. Search exact catalog contracts instead of inventing operator ids, ports, parameters, or revisions. Use short single-concept catalog queries; issue independent queries in one parallel batch. When current NCBI or Ensembl data is relevant, use Somite source search before leaving the application. If a source result includes ordered operator_ids, treat them as Somite's native source recipe and search those exact ids. A local file or Directory input is a user/project resource, not an NCBI or Ensembl research query.
+Begin by inspecting the current workflow. Search exact catalog contracts instead of inventing operator ids, ports, parameters, or revisions. Use short single-concept catalog queries; issue independent queries in one parallel batch. Discover exact nf-core repositories and releases through Somite's nf-core source search, then import through its source workflow resolver; never fabricate `nf.*` execution operators or add the bare `workflow.source` infrastructure operator. Edit source-backed intent only through its typed source editor, never normal graph SetParam. If the user wants to rewire a selected invocation replacement, promote that call to the native canvas first; then use ordinary typed graph edits. Promotion retains the exact source as non-executable provenance, never as a hidden second execution layer. When current NCBI or Ensembl data is relevant, use Somite source search before leaving the application. If a source result includes ordered operator_ids, treat them as Somite's native source recipe and search those exact ids. A local file or Directory input is a user/project resource, not an NCBI or Ensembl research query.
 
 Generic web research is allowed only when the request genuinely requires current external evidence that no Somite tool can provide. Prefer authoritative primary sources, state what was learned, and return immediately to the Somite tools. Never use generic web research to inspect Somite's repository or operator contracts.
 
@@ -93,6 +94,18 @@ pub enum AgentError {
     ParameterBounds { operator: String, parameter: String },
     #[error("invalid note")]
     InvalidNote,
+    #[error("operator {0} can only be added through its source workflow resolver")]
+    SourceOperatorRequiresResolver(String),
+    #[error("operator {0} is a resolver-only catalog descriptor and cannot be added directly")]
+    ResolverOnlyOperator(String),
+    #[error("source workflow import requires an empty canvas")]
+    SourceImportRequiresEmptyCanvas,
+    #[error("current canvas does not contain one editable source workflow")]
+    SourceWorkflowNotFound,
+    #[error("source workflow revision {actual} is stale; current workflow revision is {expected}")]
+    StaleSourceWorkflow { actual: String, expected: String },
+    #[error("source workflow transaction must contain between 1 and {MAX_OPERATIONS} edits")]
+    InvalidSourceEditCount,
     #[error("operator catalog: {0}")]
     Catalog(#[from] somite_ops::OpsError),
     #[error("graph: {0}")]
@@ -231,6 +244,9 @@ fn apply_operation(
             note,
         } => {
             valid_identifier(&node_id)?;
+            if operator_id.starts_with("nf.") || operator_id.starts_with("smk.") {
+                return Err(AgentError::ResolverOnlyOperator(operator_id));
+            }
             if !x.is_finite() || !y.is_finite() {
                 return Err(AgentError::InvalidIdentifier(
                     "non-finite layout".to_owned(),
@@ -243,6 +259,9 @@ fn apply_operation(
                 return Err(AgentError::InvalidIdentifier(node_id));
             }
             let operator = catalog.get(&operator_id)?;
+            if operator.kind == OpKind::Source {
+                return Err(AgentError::SourceOperatorRequiresResolver(operator_id));
+            }
             let mut bound = operator
                 .params
                 .iter()
@@ -268,6 +287,7 @@ fn apply_operation(
                 operator_revision: operator.revision()?,
                 ports: operator.ir_ports(),
                 params: bound,
+                source_workflow: None,
                 layout: Layout { x, y },
                 note,
                 color: None,
@@ -388,10 +408,7 @@ fn checked_param(
             .map(|value| ParamValue::String(value.to_owned())),
         "bool" => value.as_bool().map(ParamValue::Bool),
         "int" => value.as_i64().map(ParamValue::Int),
-        "float" => value
-            .as_f64()
-            .filter(|value| value.is_finite())
-            .map(ParamValue::Float),
+        "float" => value.as_f64().and_then(ParamValue::from_f64),
         _ => None,
     }
     .ok_or_else(|| AgentError::ParameterType {
@@ -399,6 +416,13 @@ fn checked_param(
         parameter: parameter.to_owned(),
         expected: spec.ty.clone(),
     })?;
+    if !converted.is_json_transport_stable() {
+        return Err(AgentError::ParameterType {
+            operator: operator.to_owned(),
+            parameter: parameter.to_owned(),
+            expected: spec.ty.clone(),
+        });
+    }
     let outside_bounds = match &converted {
         ParamValue::Int(value) => {
             spec.min.is_some_and(|minimum| *value < minimum)
@@ -495,6 +519,8 @@ pub struct AgentSnapshot {
     pub config_options: Vec<SessionConfigOption>,
     pub cursor: u64,
     pub events: Vec<AgentEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authoritative_state_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -654,6 +680,7 @@ impl AgentBridge {
                 .filter(|event| event.cursor > after)
                 .cloned()
                 .collect(),
+            authoritative_state_revision: None,
         }
     }
 
@@ -790,10 +817,8 @@ impl AgentBridge {
     }
 
     pub async fn prompt(&self, prompt: String) -> Result<(), AgentError> {
+        self.preflight_prompt(&prompt)?;
         let prompt = prompt.trim();
-        if prompt.is_empty() || prompt.len() > MAX_PROMPT_BYTES {
-            return Err(AgentError::InvalidPrompt);
-        }
         {
             let mut state = self.state.lock().expect("agent state");
             if !state.connected {
@@ -825,6 +850,21 @@ impl AgentBridge {
             None,
             Vec::new(),
         );
+        Ok(())
+    }
+
+    pub fn preflight_prompt(&self, prompt: &str) -> Result<(), AgentError> {
+        let prompt = prompt.trim();
+        if prompt.is_empty() || prompt.len() > MAX_PROMPT_BYTES {
+            return Err(AgentError::InvalidPrompt);
+        }
+        let state = self.state.lock().expect("agent state");
+        if !state.connected {
+            return Err(AgentError::NotConnected);
+        }
+        if state.busy {
+            return Err(AgentError::Busy);
+        }
         Ok(())
     }
 
@@ -1524,6 +1564,22 @@ fn push_event_with_tool_call(
         tool_call_id,
         permission_choices,
     });
+    while state
+        .events
+        .iter()
+        .filter(|event| event.transaction.is_some())
+        .count()
+        > TRANSACTION_EVENT_LIMIT
+    {
+        let Some(index) = state
+            .events
+            .iter()
+            .position(|event| event.transaction.is_some())
+        else {
+            break;
+        };
+        state.events.remove(index);
+    }
     while state.events.len() > EVENT_LIMIT {
         state.events.pop_front();
     }
@@ -1759,7 +1815,43 @@ mod tests {
             nodes: Vec::new(),
             edges: Vec::new(),
             annotations: Vec::new(),
+            variant_origin: None,
         }
+    }
+
+    #[test]
+    fn agent_float_parameters_use_browser_stable_numeric_variants() {
+        let spec = somite_ops::ParamSpec {
+            ty: "float".to_owned(),
+            label: None,
+            page: None,
+            default: None,
+            required: false,
+            min: None,
+            max: None,
+        };
+        assert_eq!(
+            checked_param("test.number", "threshold", &spec, serde_json::json!(1.0))
+                .expect("integral float"),
+            ParamValue::Int(1)
+        );
+        assert_eq!(
+            checked_param("test.number", "threshold", &spec, serde_json::json!(-0.0))
+                .expect("negative zero"),
+            ParamValue::Int(0)
+        );
+        assert_eq!(
+            checked_param("test.number", "threshold", &spec, serde_json::json!(0.25))
+                .expect("fractional float"),
+            ParamValue::Float(0.25)
+        );
+        assert!(checked_param(
+            "test.number",
+            "threshold",
+            &spec,
+            serde_json::json!(9_007_199_254_740_992.0_f64)
+        )
+        .is_err());
     }
 
     #[test]
@@ -1849,6 +1941,68 @@ mod tests {
         )
         .expect_err("presentation edits must advance CAS state");
         assert!(matches!(stale_note, AgentError::StaleTransaction { .. }));
+    }
+
+    #[test]
+    fn bare_source_operator_requires_the_canonical_resolver() {
+        let catalog = catalog();
+        let graph = empty_graph();
+        let error = apply_graph_transaction(
+            &graph,
+            &catalog,
+            GraphTransaction {
+                base_state_revision: graph_state_revision(&graph).expect("revision"),
+                idempotency_key: "bare-source-add-1".to_owned(),
+                summary: "Try to add bare source".to_owned(),
+                operations: vec![GraphOperation::AddOperator {
+                    node_id: "source".to_owned(),
+                    operator_id: "workflow.source".to_owned(),
+                    params: BTreeMap::new(),
+                    x: 0.0,
+                    y: 0.0,
+                    note: None,
+                }],
+            },
+            "transaction-source".to_owned(),
+        )
+        .expect_err("bare source operator must fail");
+
+        assert!(matches!(
+            error,
+            AgentError::SourceOperatorRequiresResolver(operator)
+                if operator == "workflow.source"
+        ));
+    }
+
+    #[test]
+    fn dynamic_catalog_descriptors_require_their_resolvers() {
+        let catalog = catalog();
+        let graph = empty_graph();
+        for (index, operator_id) in ["nf.rnaseq", "smk.catalog-demo"].into_iter().enumerate() {
+            let error = apply_graph_transaction(
+                &graph,
+                &catalog,
+                GraphTransaction {
+                    base_state_revision: graph_state_revision(&graph).expect("revision"),
+                    idempotency_key: format!("resolver-only-{index}"),
+                    summary: "Try to add a resolver-only descriptor".to_owned(),
+                    operations: vec![GraphOperation::AddOperator {
+                        node_id: "source".to_owned(),
+                        operator_id: operator_id.to_owned(),
+                        params: BTreeMap::new(),
+                        x: 0.0,
+                        y: 0.0,
+                        note: None,
+                    }],
+                },
+                "transaction-resolver-only".to_owned(),
+            )
+            .expect_err("dynamic descriptor must fail before catalog lookup");
+            assert!(matches!(
+                error,
+                AgentError::ResolverOnlyOperator(ref id) if id == operator_id
+            ));
+        }
     }
 
     #[test]
@@ -2234,6 +2388,7 @@ done
         assert!(delivered.contains("Do not inspect or modify the Somite repository"));
         assert!(delivered.contains("Generic web research is allowed only"));
         assert!(delivered.contains("Use short single-concept catalog queries"));
+        assert!(delivered.contains("promote that call to the native canvas first"));
         assert!(delivered.contains("After editing, call Somite readiness"));
         assert!(delivered.contains("Start validation only when readiness is clear"));
         assert!(delivered.ends_with("Build a tiny workflow"));

@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use somite_ir::{Edge, Graph, ParamValue, Port};
+use somite_ir::{Edge, Graph, ParamValue, Port, WorkflowBinding, WorkflowSourcePin};
 use somite_ops::{Catalog, Operator};
 use thiserror::Error;
 
@@ -332,12 +332,22 @@ pub fn freeze(draft: &RunClosureDraft, pixi_lock: &[u8]) -> Result<RunClosure, L
 
 pub fn semantic_graph_revision(graph: &Graph) -> Result<String, LinkError> {
     #[derive(Serialize)]
+    struct SemanticSourceWorkflow<'a> {
+        schema_version: u32,
+        workflow_revision: &'a str,
+        source: &'a WorkflowSourcePin,
+        profiles: &'a [String],
+        bindings: &'a BTreeMap<String, WorkflowBinding>,
+    }
+
+    #[derive(Serialize)]
     struct SemanticNode<'a> {
         id: &'a str,
         operator: &'a str,
         operator_revision: &'a str,
         ports: &'a [Port],
         params: &'a BTreeMap<String, ParamValue>,
+        source_workflow: Option<SemanticSourceWorkflow<'a>>,
     }
 
     #[derive(Serialize)]
@@ -356,6 +366,16 @@ pub fn semantic_graph_revision(graph: &Graph) -> Result<String, LinkError> {
             operator_revision: &node.operator_revision,
             ports: &node.ports,
             params: &node.params,
+            source_workflow: node
+                .source_workflow
+                .as_ref()
+                .map(|workflow| SemanticSourceWorkflow {
+                    schema_version: workflow.schema_version,
+                    workflow_revision: &workflow.workflow_revision,
+                    source: &workflow.source,
+                    profiles: &workflow.profiles,
+                    bindings: &workflow.bindings,
+                }),
         })
         .collect::<Vec<_>>();
     nodes.sort_by(|left, right| left.id.cmp(right.id));
@@ -382,7 +402,11 @@ fn digest(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use somite_ir::{CanvasAnnotation, CanvasColor, Layout, Node, SCHEMA_VERSION};
+    use somite_ir::{
+        CanvasAnnotation, CanvasColor, Layout, Node, SourceCapabilities, SourceProvider,
+        SourceScope, SourceScopeKind, SourceSpan, SourceWorkflowInstance, WorkflowBinding,
+        WorkflowParameterField, WorkflowParameterType, WorkflowSourcePin, SCHEMA_VERSION,
+    };
 
     fn fixture() -> (Graph, Catalog) {
         let operator: Operator = serde_json::from_str(
@@ -401,12 +425,14 @@ mod tests {
                 operator_revision: revision,
                 ports: Vec::new(),
                 params: BTreeMap::new(),
+                source_workflow: None,
                 layout: Layout { x: 0.0, y: 0.0 },
                 note: None,
                 color: None,
             }],
             edges: Vec::new(),
             annotations: Vec::new(),
+            variant_origin: None,
         };
         (graph, catalog)
     }
@@ -417,6 +443,70 @@ mod tests {
             compiler_identity: "somite-nextflow@0.1.0".into(),
             nextflow_identity: "nextflow@26.04.6".into(),
             openjdk_identity: "openjdk@25.0.2".into(),
+        }
+    }
+
+    fn source_workflow() -> SourceWorkflowInstance {
+        SourceWorkflowInstance {
+            schema_version: 1,
+            workflow_revision: format!("blake3:{}", "a".repeat(64)),
+            source: WorkflowSourcePin {
+                provider: SourceProvider::NfCore,
+                repository: "nf-core/pangenome".into(),
+                requested_revision: "1.1.3".into(),
+                resolved_revision: "3d02bd1df79f48b4bfdb4ad95d4ca0d7f6aeb337".into(),
+                source_digest: format!("blake3:{}", "b".repeat(64)),
+                entrypoint: "main.nf".into(),
+                file_count: 170,
+                source_bytes: 1_286_324,
+            },
+            profiles: vec!["docker".into()],
+            parameters: vec![WorkflowParameterField {
+                name: "input".into(),
+                label: "Input samplesheet".into(),
+                group: "Input/output options".into(),
+                description: String::new(),
+                help: String::new(),
+                ty: WorkflowParameterType::String,
+                required: true,
+                hidden: false,
+                managed: false,
+                format: Some("file-path".into()),
+                pattern: None,
+                default: None,
+                choices: Vec::new(),
+                minimum: None,
+                maximum: None,
+            }],
+            unsupported_required_parameters: Vec::new(),
+            bindings: BTreeMap::from([(
+                "input".into(),
+                WorkflowBinding::ProjectFile {
+                    path: "data/samples.csv".into(),
+                },
+            )]),
+            scopes: vec![SourceScope {
+                id: "scope:main".into(),
+                title: "Pangenome".into(),
+                symbol: None,
+                kind: SourceScopeKind::EntryWorkflow,
+                span: SourceSpan {
+                    path: "main.nf".into(),
+                    start_line: 1,
+                    end_line: 100,
+                },
+            }],
+            invocations: Vec::new(),
+            replacements: Vec::new(),
+            capabilities: SourceCapabilities {
+                exact_execution: true,
+                parameter_edits: true,
+                hierarchy_indexed: true,
+                structural_edits: false,
+                channel_contracts: false,
+                source_edits: false,
+            },
+            diagnostics: Vec::new(),
         }
     }
 
@@ -456,6 +546,62 @@ mod tests {
         assert_ne!(
             semantic_graph_revision(&graph).unwrap(),
             semantic_graph_revision(&changed).unwrap()
+        );
+    }
+
+    #[test]
+    fn source_pin_profiles_and_bindings_are_executable_identity() {
+        let (mut graph, _) = fixture();
+        graph.nodes[0].source_workflow = Some(source_workflow());
+        let base_revision = semantic_graph_revision(&graph).unwrap();
+
+        let mut rebound = graph.clone();
+        rebound.nodes[0]
+            .source_workflow
+            .as_mut()
+            .unwrap()
+            .bindings
+            .insert(
+                "input".into(),
+                WorkflowBinding::ProjectFile {
+                    path: "data/other.csv".into(),
+                },
+            );
+        assert_ne!(base_revision, semantic_graph_revision(&rebound).unwrap());
+
+        let mut reprofiled = graph.clone();
+        reprofiled.nodes[0]
+            .source_workflow
+            .as_mut()
+            .unwrap()
+            .profiles = vec!["singularity".into()];
+        assert_ne!(base_revision, semantic_graph_revision(&reprofiled).unwrap());
+
+        let mut repinned = graph.clone();
+        repinned.nodes[0]
+            .source_workflow
+            .as_mut()
+            .unwrap()
+            .source
+            .resolved_revision = "another-immutable-commit".into();
+        assert_ne!(base_revision, semantic_graph_revision(&repinned).unwrap());
+    }
+
+    #[test]
+    fn source_outline_and_capability_display_do_not_change_executable_identity() {
+        let (mut graph, _) = fixture();
+        graph.nodes[0].source_workflow = Some(source_workflow());
+        let mut reindexed = graph.clone();
+        let workflow = reindexed.nodes[0].source_workflow.as_mut().unwrap();
+        workflow.scopes[0].title = "Human-facing title".into();
+        workflow.capabilities.hierarchy_indexed = false;
+        assert_eq!(
+            semantic_graph_revision(&graph).unwrap(),
+            semantic_graph_revision(&reindexed).unwrap()
+        );
+        assert_ne!(
+            graph_state_revision(&graph).unwrap(),
+            graph_state_revision(&reindexed).unwrap()
         );
     }
 

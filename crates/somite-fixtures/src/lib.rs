@@ -190,12 +190,14 @@ mod tests {
                     ("r1".into(), ParamValue::String(path_one.into())),
                     ("r2".into(), ParamValue::String(path_two.into())),
                 ]),
+                source_workflow: None,
                 layout: Layout { x: 0.0, y: 0.0 },
                 note: None,
                 color: None,
             }],
             edges: Vec::new(),
             annotations: Vec::new(),
+            variant_origin: None,
         }
     }
 

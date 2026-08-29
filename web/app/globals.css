@@ -91,6 +91,12 @@ button:disabled { cursor: default; opacity: .42; }
 .workflow-title-input:hover { border-color: var(--border); }
 .workflow-title-input:focus { border-color: var(--border-strong); background: var(--surface); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 15%, transparent); text-overflow: clip; }
 .workflow-project { flex: none; color: var(--muted); font-size: 9px; white-space: nowrap; }
+.workflow-variant-badge { min-width: 0; height: 30px; padding: 3px 5px 3px 8px; display: flex; align-items: center; gap: 8px; border: 1px solid color-mix(in srgb, var(--accent) 42%, var(--border)); border-radius: 16px; background: color-mix(in srgb, var(--accent) 7%, var(--surface)); }
+.workflow-variant-badge > span { min-width: 0; display: grid; gap: 0; line-height: 1; }
+.workflow-variant-badge strong { color: var(--accent); font: 700 8px var(--font-readout), monospace; text-transform: uppercase; white-space: nowrap; }
+.workflow-variant-badge small { color: var(--muted); font: 7px var(--font-readout), monospace; white-space: nowrap; }
+.workflow-variant-badge button { height: 20px; padding: 0 7px; border: 0; border-radius: 10px; background: var(--surface-raised); color: var(--text); font-size: 8px; font-weight: 650; white-space: nowrap; cursor: pointer; }
+.workflow-variant-badge button:hover { background: var(--surface-hover); color: var(--accent); }
 .unsaved-dot { width: 6px; height: 6px; flex: none; border-radius: 50%; background: var(--warning); }
 .top-actions { display: flex; align-items: center; gap: 5px; }
 .studio-button, .run-button { height: 30px; padding: 0 11px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); color: var(--text); font-size: 10px; font-weight: 500; cursor: pointer; }
@@ -200,6 +206,87 @@ button:disabled { cursor: default; opacity: .42; }
 .node-collapsed-body { min-height: 70px; padding: 15px 14px; display: flex; flex-direction: column; gap: 10px; justify-content: center; }
 .node-collapsed-body strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .node-collapsed-body span { color: var(--muted); font: 9px var(--font-readout), monospace; }
+.somite-node.source-workflow-node, .somite-node.source-workflow-node.viewer-hidden { width: 226px; min-height: 142px; border-color: color-mix(in srgb, var(--accent) 38%, var(--border)); }
+.source-workflow-card { min-height: 140px; padding: 13px 14px; display: grid; align-content: start; gap: 5px; overflow: hidden; border-radius: 11px; background: linear-gradient(145deg, color-mix(in srgb, var(--accent) 8%, var(--surface-sunken)), var(--surface-sunken) 62%); }
+.source-workflow-card header, .source-workflow-card footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.source-workflow-card header span, .source-workflow-card header em { font: 700 7px var(--font-readout), monospace; letter-spacing: .07em; text-transform: uppercase; }
+.source-workflow-card header span { color: var(--accent); }
+.source-workflow-card header em { padding: 3px 5px; border-radius: 8px; background: color-mix(in srgb, var(--accent) 10%, var(--surface)); color: var(--muted); font-style: normal; letter-spacing: 0; text-transform: none; }
+.source-workflow-card > strong { margin-top: 11px; overflow: hidden; font-size: 16px; text-overflow: ellipsis; white-space: nowrap; }
+.source-workflow-card > small { color: var(--muted); font: 8px var(--font-readout), monospace; }
+.source-workflow-card footer { margin-top: auto; padding-top: 10px; border-top: 1px solid var(--border); color: var(--muted); font-size: 8px; }
+.source-workflow-card footer button { padding: 3px 0; display: flex; align-items: center; gap: 3px; border: 0; background: transparent; color: var(--accent); font-size: 8px; font-weight: 650; cursor: pointer; }
+.source-workflow-card footer button:hover { color: var(--text); }
+.nested-source-canvas { position: absolute; inset: 0; z-index: 20; min-width: 0; min-height: 0; display: grid; grid-template-rows: 58px 36px 62px 22px minmax(0, 1fr) 30px; overflow: hidden; background-color: var(--canvas); background-image: linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px); background-size: 20px 20px; }
+.nested-source-head { padding: 0 22px; display: grid; grid-template-columns: minmax(180px, 1fr) auto minmax(180px, 1fr); align-items: center; gap: 18px; border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--surface) 96%, transparent); box-shadow: 0 4px 16px rgb(0 0 0 / 12%); }
+.nested-source-return { justify-self: start; padding: 8px 10px; display: flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-raised); color: var(--text); font-size: 9px; font-weight: 650; cursor: pointer; }
+.nested-source-return:hover { border-color: var(--accent); color: var(--accent); }
+.nested-source-head > div { min-width: 0; display: grid; justify-items: center; gap: 2px; }
+.nested-source-head > div span { color: var(--accent); font: 700 7px var(--font-readout), monospace; letter-spacing: .07em; text-transform: uppercase; }
+.nested-source-head > div strong { max-width: 420px; overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.nested-source-head > em { justify-self: end; padding: 4px 7px; border-radius: 999px; background: var(--surface-raised); color: var(--muted); font: 650 8px var(--font-readout), monospace; font-style: normal; }
+.nested-source-breadcrumbs { padding: 0 22px; display: flex; align-items: center; gap: 4px; overflow: hidden; border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent); background: color-mix(in srgb, var(--canvas) 92%, transparent); }
+.nested-source-breadcrumbs button { min-width: 0; padding: 4px 6px; overflow: hidden; border: 0; border-radius: 5px; background: transparent; color: var(--muted); font: 650 8px var(--font-readout), monospace; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.nested-source-breadcrumbs button:hover, .nested-source-breadcrumbs button[aria-current="page"] { background: color-mix(in srgb, var(--accent) 10%, transparent); color: var(--text); }
+.nested-source-breadcrumbs svg { flex: none; color: var(--muted); }
+.nested-source-title { padding: 10px 28px 6px; display: flex; align-items: end; justify-content: space-between; gap: 20px; }
+.nested-source-title > span { min-width: 0; display: flex; align-items: baseline; gap: 10px; }
+.nested-source-title strong { overflow: hidden; font-size: 24px; letter-spacing: -.025em; text-overflow: ellipsis; white-space: nowrap; }
+.nested-source-title small, .nested-source-title > em { color: var(--muted); font: 9px var(--font-readout), monospace; font-style: normal; text-transform: uppercase; }
+.nested-source-relation { padding: 0 28px; display: flex; align-items: center; gap: 8px; color: var(--muted); font: 7px var(--font-readout), monospace; letter-spacing: .07em; text-transform: uppercase; }
+.nested-source-relation i { width: 32px; border-top: 1px dashed var(--accent); }
+.nested-source-stage { min-width: 0; min-height: 0; padding: 16px 32px 48px; overflow: auto; scrollbar-color: var(--border-strong) transparent; }
+.nested-source-origin { width: min(240px, 70vw); min-height: 64px; margin: 0 auto; padding: 10px 14px; display: grid; place-content: center; gap: 5px; border: 1px solid var(--accent); border-radius: 10px; background: var(--surface); box-shadow: var(--node-shadow-selected); text-align: center; }
+.nested-source-origin span { color: var(--accent); font: 700 7px var(--font-readout), monospace; letter-spacing: .07em; text-transform: uppercase; }
+.nested-source-origin strong { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.nested-source-spine { width: 1px; height: 32px; margin: 0 auto; display: block; border-left: 1px dashed var(--accent); opacity: .7; }
+.nested-source-nodes { position: relative; width: min(1180px, 100%); margin: 0 auto; display: grid; grid-template-columns: repeat(4, minmax(180px, 1fr)); align-items: stretch; gap: 22px; }
+.nested-source-nodes::before { content: ""; position: absolute; top: -1px; right: 10%; left: 10%; border-top: 1px dashed color-mix(in srgb, var(--accent) 65%, var(--border)); }
+.nested-source-node { position: relative; min-width: 0; min-height: 132px; padding: 13px 14px 11px; display: flex; flex-direction: column; gap: 7px; border: 1px solid var(--border); border-radius: 10px; background: var(--node); box-shadow: var(--node-shadow); }
+.nested-source-node::before { content: ""; position: absolute; bottom: 100%; left: 50%; height: 22px; border-left: 1px dashed color-mix(in srgb, var(--accent) 65%, var(--border)); }
+.nested-source-node.can-enter { border-color: color-mix(in srgb, var(--accent) 48%, var(--border)); cursor: pointer; }
+.nested-source-node.can-enter:hover { border-color: var(--accent); box-shadow: var(--node-shadow-selected); }
+.nested-source-node > header { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.nested-source-node > header span, .nested-source-node > header em { color: var(--accent); font: 700 7px var(--font-readout), monospace; letter-spacing: .07em; text-transform: uppercase; }
+.nested-source-node > header em { color: var(--muted); font-style: normal; letter-spacing: 0; }
+.nested-source-node > strong { overflow: hidden; font-size: 13px; text-overflow: ellipsis; white-space: nowrap; }
+.nested-source-node > code { overflow: hidden; color: var(--muted); font: 8px var(--font-readout), monospace; text-overflow: ellipsis; white-space: nowrap; }
+.nested-source-node > small { margin-top: auto; color: var(--muted); font: 8px var(--font-readout), monospace; }
+.nested-source-node.is-replaced { border-color: color-mix(in srgb, var(--warning) 62%, var(--border)); background: linear-gradient(145deg, color-mix(in srgb, var(--warning) 7%, var(--node)), var(--node)); }
+.nested-replacement-origin { margin: 0 !important; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nested-replacement-check { margin: 1px 0 0 !important; display: flex; align-items: center; gap: 4px; color: var(--warning) !important; }
+.nested-source-actions { margin-top: auto; padding-top: 6px; display: flex; align-items: center; gap: 8px; border-top: 1px solid var(--border); }
+.nested-source-actions button { padding: 2px 0; display: flex; align-items: center; gap: 3px; border: 0; background: transparent; color: var(--accent); font-size: 9px; font-weight: 650; cursor: pointer; }
+.nested-source-actions button:last-child:not(:first-child) { margin-left: auto; color: var(--muted); }
+.nested-source-actions button:hover { color: var(--text); }
+.nested-source-actions button:disabled { opacity: .45; cursor: wait; }
+.nested-source-actions .nested-promote-action { padding: 4px 7px; border-radius: 6px; background: var(--accent); color: var(--on-accent); }
+.nested-source-actions .nested-promote-action:hover { background: var(--accent-strong); color: var(--on-accent); }
+.nested-promote-note { margin: 0 !important; color: var(--muted) !important; font-size: 7px !important; line-height: 1.35; }
+.nested-source-node.source-only { border-style: dashed; opacity: .68; }
+.nested-source-node.source-only > header span { color: var(--muted); }
+.nested-source-empty { grid-column: 1 / -1; min-height: 180px; display: grid; place-content: center; gap: 7px; color: var(--muted); text-align: center; }
+.nested-source-empty strong { color: var(--text); font-size: 14px; }
+.nested-source-empty span { font: 9px var(--font-readout), monospace; }
+.nested-source-canvas > footer { padding: 0 22px; display: flex; align-items: center; justify-content: space-between; gap: 20px; border-top: 1px solid var(--border); background: var(--surface); color: var(--muted); font: 8px var(--font-readout), monospace; }
+.nested-replacement-picker { position: absolute; top: 70px; right: 18px; z-index: 30; width: min(390px, calc(100% - 36px)); max-height: calc(100% - 118px); padding: 14px; display: grid; grid-template-rows: auto auto minmax(0, 1fr); gap: 10px; overflow: hidden; border: 1px solid color-mix(in srgb, var(--accent) 48%, var(--border)); border-radius: 12px; background: color-mix(in srgb, var(--surface) 97%, transparent); box-shadow: 0 22px 70px rgb(0 0 0 / 28%); }
+.nested-replacement-picker > header { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
+.nested-replacement-picker > header span { min-width: 0; display: grid; gap: 3px; }
+.nested-replacement-picker > header strong { overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }
+.nested-replacement-picker > header small { color: var(--muted); font-size: 9px; }
+.nested-replacement-picker > header button { padding: 3px; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+.nested-replacement-picker > input { width: 100%; padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; outline: 0; background: var(--surface-sunken); color: var(--text); font-size: 11px; }
+.nested-replacement-picker > input:focus { border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 14%, transparent); }
+.nested-replacement-picker > div { min-height: 0; display: grid; align-content: start; gap: 5px; overflow: auto; }
+.nested-replacement-picker > div > button { width: 100%; padding: 9px 10px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-raised); color: var(--text); text-align: left; cursor: pointer; }
+.nested-replacement-picker > div > button:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 7%, var(--surface-raised)); }
+.nested-replacement-picker > div > button span { min-width: 0; display: grid; gap: 2px; }
+.nested-replacement-picker > div > button strong, .nested-replacement-picker > div > button code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nested-replacement-picker > div > button strong { font-size: 10px; }
+.nested-replacement-picker > div > button code, .nested-replacement-picker > div > button small { color: var(--muted); font: 7px var(--font-readout), monospace; }
+.nested-replacement-picker > div > p { padding: 28px 8px; color: var(--muted); font-size: 10px; text-align: center; }
+@media (max-width: 1050px) { .nested-source-nodes { grid-template-columns: repeat(3, minmax(170px, 1fr)); } }
+@media (max-width: 760px) { .nested-source-head { grid-template-columns: auto 1fr; } .nested-source-head > em { display: none; } .nested-source-nodes { grid-template-columns: repeat(2, minmax(150px, 1fr)); } }
 .viewer-flag { position: absolute; bottom: 2px; left: 2px; width: 8px; height: 8px; border: 1px solid var(--chrome); background: var(--success); }
 .viewer-flag.off { background: var(--border); }
 .node-name { position: absolute; top: calc(100% + 7px); left: 0; width: 100%; overflow: hidden; color: var(--text); font: 10px var(--font-readout), monospace; text-align: center; text-overflow: ellipsis; white-space: nowrap; pointer-events: none; }
@@ -629,6 +716,102 @@ button:disabled { cursor: default; opacity: .42; }
 .port-summary > div small { text-align: right; }
 .migration-note { margin: 10px 12px 12px; padding: 9px; display: grid; grid-template-columns: 16px minmax(0, 1fr); gap: 7px; border-left: 2px solid var(--warning); background: rgb(224 174 79 / 7%); color: var(--muted); font-size: 8px; line-height: 1.5; }
 .migration-note svg { color: var(--warning); }
+.source-workflow-inspector { height: min(720px, 100%); }
+.source-workflow-head { min-height: 70px; }
+.source-workflow-scroll { min-height: 0; flex: 1; overflow-y: auto; padding: 10px; display: grid; align-content: start; gap: 9px; overscroll-behavior: contain; }
+.source-workflow-identity { padding: 11px; display: grid; gap: 5px; border: 1px solid color-mix(in srgb, var(--accent) 36%, var(--border)); border-radius: 8px; background: color-mix(in srgb, var(--accent) 5%, var(--control)); }
+.source-workflow-identity header { display: flex; justify-content: space-between; gap: 8px; color: var(--accent); font: 700 7px var(--font-readout), monospace; text-transform: uppercase; }
+.source-workflow-identity header em { color: var(--warning); font-style: normal; text-transform: none; }
+.source-workflow-identity > strong { margin-top: 4px; overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.source-workflow-identity code, .source-workflow-identity small { overflow: hidden; color: var(--muted); font: 7px var(--font-readout), monospace; text-overflow: ellipsis; white-space: nowrap; }
+.source-outline-open { width: 100%; min-height: 55px; padding: 9px; display: grid; grid-template-columns: 23px minmax(0, 1fr) 16px; align-items: center; gap: 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--control); color: var(--accent); text-align: left; cursor: pointer; }
+.source-outline-open:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 48%, var(--border)); background: var(--surface-hover); }
+.source-outline-open:disabled { opacity: .5; cursor: default; }
+.source-outline-open span { min-width: 0; }
+.source-outline-open strong, .source-outline-open small { display: block; }
+.source-outline-open strong { color: var(--text); font-size: 9px; }
+.source-outline-open small { margin-top: 4px; color: var(--muted); font-size: 7px; }
+.source-capabilities { padding: 9px; display: grid; gap: 8px; border: 1px solid var(--border); border-radius: 7px; background: var(--control); }
+.source-capabilities > header, .source-invocation-list > header, .source-binding-groups > header { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.source-capabilities > header strong, .source-invocation-list > header strong, .source-binding-groups > header strong { font-size: 8px; }
+.source-capabilities > header span, .source-invocation-list > header span, .source-binding-groups > header span { color: var(--muted); font-size: 7px; }
+.source-capabilities > div { display: flex; flex-wrap: wrap; gap: 5px; }
+.source-capabilities > div span { padding: 4px 6px; display: inline-flex; align-items: center; gap: 4px; border-radius: 10px; background: color-mix(in srgb, var(--success) 8%, var(--surface)); color: var(--success); font-size: 7px; }
+.source-capabilities > div span.unavailable { background: var(--surface); color: var(--muted); text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--muted) 55%, transparent); }
+.source-structure-lock { padding: 9px; display: grid; grid-template-columns: 17px minmax(0, 1fr); gap: 7px; border-left: 2px solid var(--warning); background: color-mix(in srgb, var(--warning) 6%, var(--control)); color: var(--warning); }
+.source-structure-lock strong, .source-structure-lock small { display: block; }
+.source-structure-lock strong { color: var(--text); font-size: 8px; }
+.source-structure-lock small { margin-top: 4px; color: var(--muted); font-size: 7px; line-height: 1.45; }
+.source-structure-lock.source-variant-guidance { border-left-color: var(--accent); background: color-mix(in srgb, var(--accent) 7%, var(--control)); color: var(--accent); }
+.source-drop-target { padding: 9px; display: grid; gap: 7px; border: 1px solid color-mix(in srgb, var(--accent) 36%, var(--border)); border-radius: 7px; background: color-mix(in srgb, var(--accent) 6%, var(--control)); }
+.source-drop-target > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.source-drop-target > header span, .source-drop-target > header strong, .source-drop-target > header small { min-width: 0; display: block; }
+.source-drop-target > header strong { font-size: 8px; }
+.source-drop-target > header small { margin-top: 2px; overflow: hidden; color: var(--muted); font: 7px var(--font-readout), monospace; text-overflow: ellipsis; white-space: nowrap; }
+.source-drop-target > header button { padding: 2px; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+.source-drop-target > p { margin: 0; color: var(--muted); font-size: 7px; line-height: 1.4; }
+.source-drop-target > div { display: grid; gap: 5px; }
+.source-drop-target > div > button { padding: 7px; display: grid; gap: 2px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-sunken); color: var(--text); text-align: left; cursor: pointer; }
+.source-drop-target > div > button:hover { border-color: var(--accent); }
+.source-drop-target > div > button:disabled { opacity: .5; cursor: not-allowed; }
+.source-drop-target > div strong { font-size: 8px; }
+.source-drop-target > div small { color: var(--muted); font-size: 7px; }
+.source-binding-groups { display: grid; gap: 6px; }
+.source-binding-groups > details { overflow: hidden; border: 1px solid var(--border); border-radius: 7px; background: var(--control); }
+.source-binding-groups summary { min-height: 33px; padding: 0 8px; display: flex; align-items: center; gap: 7px; color: var(--text); cursor: pointer; list-style: none; }
+.source-binding-groups summary::-webkit-details-marker { display: none; }
+.source-binding-groups summary span { min-width: 0; flex: 1; overflow: hidden; font-size: 8px; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.source-binding-groups summary small { color: var(--muted); font: 7px var(--font-readout), monospace; }
+.source-binding-groups details[open] summary { border-bottom: 1px solid var(--border); }
+.source-binding-groups details[open] summary svg { transform: rotate(180deg); }
+.source-binding-groups details > div { padding: 9px; display: grid; gap: 10px; }
+.source-binding-control { position: relative; display: grid; gap: 5px; }
+.source-binding-control + .source-binding-control { padding-top: 9px; border-top: 1px solid var(--border); }
+.source-binding-control > label:first-child { display: flex; align-items: center; gap: 4px; color: var(--text); font-size: 8px; }
+.source-binding-control.managed { padding: 7px; border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border)); border-radius: 5px; background: color-mix(in srgb, var(--accent) 4%, var(--surface)); }
+.source-binding-control.managed > span { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.source-binding-control.managed strong { font-size: 8px; }
+.source-binding-control.managed em { color: var(--accent); font: normal 7px var(--font-readout), monospace; }
+.source-binding-control sup { color: var(--danger); }
+.source-binding-control label em { margin-left: auto; color: var(--muted); font: normal 6px var(--font-readout), monospace; }
+.source-binding-control > select, .source-binding-input-wrap > input { width: 100%; min-width: 0; height: 29px; padding: 0 7px; border: 1px solid var(--border); border-radius: 5px; outline: 0; background: var(--surface-sunken); color: var(--text); font: 8px var(--font-readout), monospace; }
+.source-binding-control > select:focus, .source-binding-input-wrap > input:focus { border-color: var(--accent); }
+.source-binding-input-wrap { display: flex; }
+.source-binding-input-wrap:has(.browse-button) > input { border-radius: 5px 0 0 5px; }
+.source-binding-input-wrap .browse-button { height: 29px; }
+.source-binding-input-wrap .browse-button.disabled { opacity: .45; pointer-events: none; }
+.source-binding-control > small { color: var(--muted); font-size: 7px; line-height: 1.4; }
+.source-binding-status { color: var(--muted); font: 6px var(--font-readout), monospace; }
+.source-binding-status.saving { color: var(--warning); }
+.source-binding-status.saved { color: var(--success); }
+.source-binding-status.error { color: var(--danger); }
+.source-binding-control > button { justify-self: start; padding: 0; border: 0; background: transparent; color: var(--accent); font-size: 7px; cursor: pointer; }
+.source-binding-toggle { height: 29px; padding: 0 7px; display: flex; align-items: center; gap: 7px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-sunken); color: var(--muted); font-size: 8px; }
+.source-binding-toggle input { accent-color: var(--accent); }
+.source-breadcrumbs { min-height: 29px; display: flex; align-items: center; gap: 3px; overflow-x: auto; }
+.source-breadcrumbs > button, .source-breadcrumbs span button { min-height: 24px; padding: 0 5px; display: inline-flex; align-items: center; gap: 3px; border: 0; border-radius: 4px; background: transparent; color: var(--muted); font-size: 7px; white-space: nowrap; cursor: pointer; }
+.source-breadcrumbs span { display: flex; align-items: center; color: var(--muted); }
+.source-breadcrumbs button:hover, .source-breadcrumbs button[aria-current="page"] { background: var(--surface-hover); color: var(--text); }
+.source-scope-summary { padding: 10px; display: grid; gap: 4px; border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border)); border-radius: 7px; background: color-mix(in srgb, var(--accent) 5%, var(--control)); }
+.source-scope-summary span { color: var(--accent); font: 7px var(--font-readout), monospace; text-transform: uppercase; }
+.source-scope-summary strong { font-size: 11px; }
+.source-scope-summary code { overflow: hidden; color: var(--muted); font: 7px var(--font-readout), monospace; text-overflow: ellipsis; white-space: nowrap; }
+.source-invocation-list { display: grid; gap: 6px; }
+.source-invocation-list > button { min-height: 48px; padding: 7px 8px; display: grid; grid-template-columns: minmax(0, 1fr) auto 14px; align-items: center; gap: 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--control); color: var(--text); text-align: left; cursor: pointer; }
+.source-invocation-list > button:hover:not(:disabled) { border-color: color-mix(in srgb, var(--accent) 46%, var(--border)); background: var(--surface-hover); }
+.source-invocation-list > button:disabled { cursor: default; opacity: .72; }
+.source-invocation-list > button span { min-width: 0; }
+.source-invocation-list > button strong, .source-invocation-list > button code { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.source-invocation-list > button strong { font-size: 8px; }
+.source-invocation-list > button code { margin-top: 4px; color: var(--muted); font: 6px var(--font-readout), monospace; }
+.source-invocation-list > button small { color: var(--accent); font-size: 7px; }
+.source-diagnostics { border: 1px solid var(--border); border-radius: 7px; background: var(--control); }
+.source-diagnostics summary { min-height: 32px; padding: 0 8px; display: flex; align-items: center; gap: 6px; color: var(--warning); cursor: pointer; list-style: none; }
+.source-diagnostics summary span { min-width: 0; flex: 1; color: var(--text); font-size: 8px; }
+.source-diagnostics > div { padding: 0 8px 8px; display: grid; gap: 5px; }
+.source-diagnostics article { padding: 6px; display: grid; gap: 3px; border-radius: 5px; background: var(--surface); }
+.source-diagnostics strong { color: var(--text); font-size: 7px; line-height: 1.4; }
+.source-diagnostics code { color: var(--muted); font: 6px var(--font-readout), monospace; }
 
 .machine-hero { padding: 13px; display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 9px; align-items: center; border-bottom: 1px solid var(--border); }
 .machine-hero svg { color: var(--accent); }
@@ -694,7 +877,7 @@ button:disabled { cursor: default; opacity: .42; }
 .toolchain-summary .attention strong { color: var(--danger); }
 .tool-list { min-height: 0; flex: 1; overflow: auto; padding: 8px; display: grid; align-content: start; gap: 5px; overscroll-behavior: contain; }
 .tool-row { padding: 8px; border: 1px solid var(--border); border-left: 2px solid var(--accent); border-radius: 5px; background: var(--control); }
-.tool-row.state-installable { border-left-color: var(--warning); }
+.tool-row.state-installable, .tool-row.state-source_setup { border-left-color: var(--warning); }
 .tool-row.state-system_required, .tool-row.state-adapter_needed { border-left-color: var(--danger); }
 .tool-row header { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
 .tool-row header > span { min-width: 0; display: grid; gap: 3px; }

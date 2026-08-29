@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
+use std::hash::{Hash, Hasher};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, Request, State};
@@ -14,18 +15,22 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha1::{Digest, Sha1};
 use somite_assessment::{assess, AssessmentState, SupportKind, WorkflowAssessment};
 use somite_bundle::{
     absolutize_import_paths, archive_frozen_package, create_frozen_package_with_pixi,
     pixi_executable, plan_frozen_package, BundlePlan, ExportTarget,
 };
 use somite_fixtures::{bind_representative_fastq, content_digest, FixtureBinding};
-use somite_ir::Graph;
+use somite_ir::{
+    Graph, Layout, Node, SourceCapabilities, SourceProvider as WorkflowSourceProvider,
+    SourceWorkflowInstance, WorkflowBinding, WorkflowSourcePin, MAX_SOURCE_PATH_BYTES,
+};
 use somite_linker::{
     evidence_receipt, graph_state_revision, semantic_graph_revision, EvidenceDraft, EvidenceIndex,
     EvidenceReceipt, EvidenceResult,
 };
-use somite_ops::{current_pixi_platform, Catalog, Operator};
+use somite_ops::{current_pixi_platform, Catalog, OpKind, Operator};
 use somite_ops::{nfcore, snakemake, snakemake_local, workflow};
 use somite_paper::{
     extract_from_path, extract_from_path_with_toolchain, reconstruct, resource_citations, Assay,
@@ -33,12 +38,19 @@ use somite_paper::{
     ExtractionProgress, ExtractionToolchain, MethodSupport, PaperError, ReconstructionOutcome,
     ResourceCitationKind, ResourceRole,
 };
+use somite_source_workflow::workflow_revision as calculate_source_workflow_revision;
+use somite_source_workflow::{
+    apply as apply_source_edit, promote_invocation, restore_source_workflow, EditTransaction,
+    FrozenSourceFile, SemanticEdit, SourceFileManifest, SourceManifest, SOURCE_INDEXER_REVISION,
+};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{watch, Notify, Semaphore};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
+use unicode_casefold::UnicodeCaseFold;
+use unicode_normalization::UnicodeNormalization;
 
 mod agent;
 mod agent_discovery;
@@ -69,6 +81,14 @@ pub enum ServerError {
     InvalidFilename,
     #[error("upload: {0}")]
     Upload(String),
+    #[error("upload store: {0}")]
+    UnsafeUploadStore(String),
+    #[error("upload exceeds the {limit_bytes} byte limit")]
+    UploadTooLarge { limit_bytes: u64 },
+    #[error(
+        "upload would exceed the project upload budget of {limit_bytes} bytes (currently using {used_bytes} bytes)"
+    )]
+    UploadProjectBudgetExceeded { limit_bytes: u64, used_bytes: u64 },
     #[error("paper upload exceeds the {limit_bytes} byte limit")]
     PaperUploadTooLarge { limit_bytes: u64 },
     #[error("unsupported paper upload: {0}")]
@@ -93,10 +113,29 @@ pub enum ServerError {
     Literature(#[from] literature::LiteratureError),
     #[error("project path is not a readable file: {0}")]
     InvalidProjectPath(String),
+    #[error("unsafe graph path: {0}")]
+    UnsafeGraphPath(String),
+    #[error(
+        "serialized graph is {encoded_bytes} bytes and exceeds the {limit_bytes} byte graph limit"
+    )]
+    GraphTooLarge {
+        encoded_bytes: u64,
+        limit_bytes: u64,
+    },
     #[error("nf-core catalog: {0}")]
     CatalogDiscovery(String),
     #[error("workflow import: {0}")]
     WorkflowImport(String),
+    #[error("source workflow: {0}")]
+    SourceWorkflow(String),
+    #[error(
+        "serialized {record} is {encoded_bytes} bytes and exceeds the {limit_bytes} byte source record limit"
+    )]
+    SourceRecordTooLarge {
+        record: String,
+        encoded_bytes: u64,
+        limit_bytes: u64,
+    },
     #[error("source search: {0}")]
     SourceSearch(String),
     #[error("source request: {0}")]
@@ -111,10 +150,24 @@ pub enum ServerError {
     Assessment(#[from] somite_assessment::AssessmentError),
     #[error("workflow is not ready: {0}")]
     NotReady(String),
+    #[error(
+        "graph state conflict: base_state_revision {provided} does not match current state_revision {current}"
+    )]
+    GraphStateConflict { provided: String, current: String },
 }
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
+        if let Self::GraphStateConflict { current, .. } = &self {
+            return (
+                StatusCode::CONFLICT,
+                Json(GraphWriteConflictResponse {
+                    error: self.to_string(),
+                    state_revision: current.clone(),
+                }),
+            )
+                .into_response();
+        }
         let status = match self {
             Self::InvalidGraph(_)
             | Self::Catalog(
@@ -127,13 +180,18 @@ impl IntoResponse for ServerError {
             Self::MissingUpload
             | Self::InvalidFilename
             | Self::InvalidProjectPath(_)
+            | Self::UnsafeGraphPath(_)
             | Self::InvalidSourceRequest(_)
             | Self::InvalidPaperIntake(_)
             | Self::Literature(
                 literature::LiteratureError::InvalidQuery
                 | literature::LiteratureError::InvalidPaperId,
             ) => StatusCode::BAD_REQUEST,
-            Self::PaperUploadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::PaperUploadTooLarge { .. }
+            | Self::UploadTooLarge { .. }
+            | Self::UploadProjectBudgetExceeded { .. }
+            | Self::GraphTooLarge { .. }
+            | Self::SourceRecordTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::UnsupportedPaperUpload(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::PaperIntakeBusy => StatusCode::SERVICE_UNAVAILABLE,
             Self::RunNotFound(_)
@@ -150,7 +208,10 @@ impl IntoResponse for ServerError {
             }
             Self::Link(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Assessment(_) | Self::NotReady(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::Paper(_) | Self::WorkflowImport(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Paper(_) | Self::WorkflowImport(_) | Self::SourceWorkflow(_) => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
+            Self::UnsafeUploadStore(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Literature(
                 literature::LiteratureError::FullTextUnavailable
                 | literature::LiteratureError::NotBiorxiv,
@@ -170,6 +231,12 @@ impl IntoResponse for ServerError {
                 | agent::AgentError::ParameterType { .. }
                 | agent::AgentError::ParameterBounds { .. }
                 | agent::AgentError::InvalidNote
+                | agent::AgentError::SourceOperatorRequiresResolver(_)
+                | agent::AgentError::ResolverOnlyOperator(_)
+                | agent::AgentError::SourceImportRequiresEmptyCanvas
+                | agent::AgentError::SourceWorkflowNotFound
+                | agent::AgentError::StaleSourceWorkflow { .. }
+                | agent::AgentError::InvalidSourceEditCount
                 | agent::AgentError::EmptyCommand
                 | agent::AgentError::InvalidCommand
                 | agent::AgentError::InvalidPrompt
@@ -189,6 +256,7 @@ impl IntoResponse for ServerError {
             ) => StatusCode::UNPROCESSABLE_ENTITY,
             Self::SourceSearch(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::CatalogDiscovery(_) => StatusCode::SERVICE_UNAVAILABLE,
+            Self::GraphStateConflict { .. } => StatusCode::CONFLICT,
         };
         (
             status,
@@ -206,10 +274,17 @@ struct ErrorResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct GraphWriteConflictResponse {
+    error: String,
+    state_revision: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct ProjectSession {
     pub project_name: String,
     pub graph_path: String,
     pub graph: Graph,
+    pub state_revision: String,
     pub operators: Vec<CatalogOperator>,
     pub recovered_autosave: bool,
     pub agent_cursor: u64,
@@ -225,6 +300,18 @@ pub struct CatalogOperator {
 #[derive(Debug, Serialize)]
 pub struct ValidationResponse {
     pub valid: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GraphWriteRequest {
+    pub base_state_revision: String,
+    pub graph: Graph,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GraphWriteResponse {
+    pub valid: bool,
+    pub state_revision: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -447,6 +534,25 @@ const PAPER_MULTIPART_OVERHEAD_BYTES: u64 = 1024 * 1024;
 const MAX_ACTIVE_PAPER_INTAKES: usize = 256;
 const PAPER_EXTRACTOR_REVISION: &str = "somite-paper-extractor-v2";
 const PAPER_RECONSTRUCTOR_REVISION: &str = "somite-paper-reconstructor-v4";
+// Bump this whenever indexing changes can alter the full stored source-workflow
+// instance for the same upstream release. The request cache is deliberately
+// keyed by this presentation/index revision, not only by semantic identity.
+const NFCORE_SOURCE_RESOLVER_REVISION: &str = "nfcore-source-resolver-v3";
+const MAX_NFCORE_TRACKED_FILES: usize = 20_000;
+const MAX_NFCORE_TRACKED_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_NFCORE_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_NFCORE_GIT_METADATA_BYTES: usize = 16 * 1024 * 1024;
+const MAX_NFCORE_GIT_DIAGNOSTIC_BYTES: usize = 1024 * 1024;
+const MAX_SOURCE_RECORD_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_NFCORE_CATALOG_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_GRAPH_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_MAX_GENERIC_UPLOAD_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_GENERIC_UPLOAD_PROJECT_BYTES: u64 = 256 * 1024 * 1024 * 1024;
+const MAX_CONFIGURED_GENERIC_UPLOAD_BYTES: u64 = 8 * 1024 * 1024 * 1024 * 1024;
+const MAX_GRAPH_TRANSACTION_REPLAYS: usize = 64;
+const MAX_VERIFIED_SOURCE_OBJECTS: usize = 128;
+const MAX_VERIFIED_SOURCE_INSTANCES: usize = 512;
+const SOURCE_VERIFICATION_GATE_STRIPES: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
 struct PaperLimits {
@@ -455,6 +561,32 @@ struct PaperLimits {
     max_ocr_pages: usize,
     command_timeout: Duration,
     max_active_executions: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GenericUploadLimits {
+    max_file_bytes: u64,
+    max_project_bytes: u64,
+}
+
+impl GenericUploadLimits {
+    fn from_environment() -> Self {
+        let max_project_bytes = bounded_environment_u64(
+            "SOMITE_UPLOAD_MAX_PROJECT_BYTES",
+            DEFAULT_MAX_GENERIC_UPLOAD_PROJECT_BYTES,
+            MAX_CONFIGURED_GENERIC_UPLOAD_BYTES,
+        );
+        let max_file_bytes = bounded_environment_u64(
+            "SOMITE_UPLOAD_MAX_FILE_BYTES",
+            DEFAULT_MAX_GENERIC_UPLOAD_BYTES,
+            MAX_CONFIGURED_GENERIC_UPLOAD_BYTES,
+        )
+        .min(max_project_bytes);
+        Self {
+            max_file_bytes,
+            max_project_bytes,
+        }
+    }
 }
 
 impl PaperLimits {
@@ -647,6 +779,35 @@ pub struct NfcoreEntry {
 }
 
 #[derive(Debug, Serialize)]
+pub struct NfcoreSourceSearchResponse {
+    pub query: String,
+    pub provenance: String,
+    pub cached: bool,
+    pub total_matches: usize,
+    pub entries: Vec<NfcoreSourceSearchEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NfcoreSourceSearchEntry {
+    pub repository: String,
+    pub title: String,
+    pub description: String,
+    pub topics: Vec<String>,
+    pub revision: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct NfcoreSourceSearchQuery {
+    q: String,
+    #[serde(default = "default_nfcore_source_search_limit")]
+    limit: usize,
+}
+
+fn default_nfcore_source_search_limit() -> usize {
+    12
+}
+
+#[derive(Debug, Serialize)]
 pub struct SnakemakeCatalogResponse {
     pub entries: Vec<SnakemakeEntry>,
     pub cached: bool,
@@ -667,6 +828,145 @@ pub struct WorkflowGraphRequest {
     pub workflow: String,
     pub revision: String,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AgentNfcoreSourceImportRequest {
+    workflow: String,
+    revision: String,
+    base_state_revision: String,
+    idempotency_key: String,
+    summary: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AgentSourceWorkflowEditRequest {
+    base_state_revision: String,
+    workflow_revision: String,
+    idempotency_key: String,
+    summary: String,
+    edits: Vec<SemanticEdit>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AgentSourceWorkflowPromotionRequest {
+    base_state_revision: String,
+    workflow_revision: String,
+    invocation_id: String,
+    idempotency_key: String,
+    summary: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SourceWorkflowEditRequest {
+    pub base_state_revision: String,
+    pub workflow_revision: String,
+    pub edits: Vec<SemanticEdit>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SourceWorkflowPromotionRequest {
+    pub base_state_revision: String,
+    pub workflow_revision: String,
+    pub invocation_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SourceWorkflowRestoreRequest {
+    pub base_state_revision: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SourceWorkflowEditResponse {
+    pub state_revision: String,
+    pub graph_revision: String,
+    pub graph: Graph,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredNfcoreRequest {
+    schema_version: u32,
+    resolver_revision: String,
+    #[serde(default)]
+    indexer_revision: String,
+    workflow: String,
+    requested_revision: String,
+    resolved_revision: String,
+    source_digest: String,
+    workflow_revision: String,
+    instance_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredWorkflowInstanceRecord {
+    schema_version: u32,
+    #[serde(default)]
+    indexer_revision: String,
+    instance_digest: String,
+    source_digest: String,
+    workflow: SourceWorkflowInstance,
+}
+
+type StoredSourceFiles = Vec<(SourceFileManifest, Vec<u8>)>;
+type SourceVerificationKey = (PathBuf, String, String);
+
+#[derive(Debug, Clone, Deserialize)]
+struct LegacyStoredSourceObjectRecord {
+    schema_version: u32,
+    manifest: SourceManifest,
+    #[serde(default)]
+    capabilities: SourceCapabilities,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct StoredSourceInstance {
+    workflow: SourceWorkflowInstance,
+    manifest: SourceManifest,
+    files: StoredSourceFiles,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct StoredSourceInstanceMetadata {
+    workflow: SourceWorkflowInstance,
+    manifest: SourceManifest,
+    source_root: PathBuf,
+    metadata_fingerprint: String,
+}
+
+struct SourceTreeInspection {
+    metadata_fingerprint: String,
+    files: Option<StoredSourceFiles>,
+    #[cfg(test)]
+    metadata_operations: usize,
+    #[cfg(test)]
+    file_metadata_operations: usize,
+}
+
+#[derive(Clone, Copy)]
+enum SourceTreeReadMode {
+    MetadataOnly,
+    Contents,
+}
+
+#[derive(Debug, Clone)]
+struct SourceVerificationToken {
+    metadata_fingerprint: String,
+    derived_projection_digest: String,
+    #[cfg(test)]
+    cold_verification_sequence: u64,
+}
+
+static VERIFIED_SOURCE_OBJECTS: OnceLock<
+    Mutex<BTreeMap<SourceVerificationKey, SourceVerificationToken>>,
+> = OnceLock::new();
+static SOURCE_VERIFICATION_GATES: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
+static VERIFIED_SOURCE_INSTANCES: OnceLock<Mutex<BTreeSet<(PathBuf, String)>>> = OnceLock::new();
+#[cfg(test)]
+static SOURCE_VERIFICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+static SOURCE_COLD_VERIFICATIONS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+static SOURCE_EXACT_CONTENT_READS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Deserialize)]
 pub struct LocalSnakemakeRequest {
@@ -703,6 +1003,7 @@ pub struct WebProject {
     runs: Mutex<BTreeMap<String, Arc<RunJob>>>,
     paper_intakes: Mutex<BTreeMap<String, Arc<PaperIntakeJob>>>,
     paper_execution: Arc<Semaphore>,
+    upload_execution: Arc<Semaphore>,
     graph_lock: Mutex<()>,
     agent: agent::AgentBridge,
     mcp_capability: RuntimeCapability,
@@ -712,6 +1013,7 @@ pub struct WebProject {
     replay_sequence: AtomicU64,
     sequence: AtomicU64,
     paper_limits: PaperLimits,
+    upload_limits: GenericUploadLimits,
     paper_tools: PaperToolchainState,
     source_search_cache: Mutex<BTreeMap<String, (Instant, Vec<source_search::SearchResult>)>>,
     paper_search_cache: Mutex<BTreeMap<String, (Instant, Vec<literature::PaperSearchResult>)>>,
@@ -828,13 +1130,15 @@ impl WebProject {
         root: impl Into<PathBuf>,
         graph_path: impl Into<PathBuf>,
     ) -> Result<Self, ServerError> {
-        let root = root.into();
-        let graph_path = graph_path.into();
-        let graph_path = if graph_path.is_absolute() {
-            graph_path
+        let supplied_root = root.into();
+        let root = supplied_root.canonicalize()?;
+        let supplied_graph_path = graph_path.into();
+        let candidate_graph_path = if supplied_graph_path.is_absolute() {
+            supplied_graph_path
         } else {
-            root.join(graph_path)
+            supplied_root.join(supplied_graph_path)
         };
+        let graph_path = checked_existing_graph_path(&root, &candidate_graph_path)?;
         let catalog = Catalog::load_dir(&root.join("operators"))?;
         let server_url = local_server_url();
         let mcp_command = std::env::current_exe()?;
@@ -848,6 +1152,7 @@ impl WebProject {
         let paper_tools = PaperToolchainState::detect(&root);
         let paper_limits = PaperLimits::from_environment();
         let paper_execution = Arc::new(Semaphore::new(paper_limits.max_active_executions));
+        let upload_limits = GenericUploadLimits::from_environment();
         Ok(Self {
             root,
             graph_path,
@@ -856,6 +1161,7 @@ impl WebProject {
             runs: Mutex::new(BTreeMap::new()),
             paper_intakes: Mutex::new(BTreeMap::new()),
             paper_execution,
+            upload_execution: Arc::new(Semaphore::new(1)),
             graph_lock: Mutex::new(()),
             agent,
             mcp_capability,
@@ -865,6 +1171,7 @@ impl WebProject {
             replay_sequence: AtomicU64::new(0),
             sequence: AtomicU64::new(0),
             paper_limits,
+            upload_limits,
             paper_tools,
             source_search_cache: Mutex::new(BTreeMap::new()),
             paper_search_cache: Mutex::new(BTreeMap::new()),
@@ -877,25 +1184,37 @@ impl WebProject {
     }
 
     pub fn session(&self) -> Result<ProjectSession, ServerError> {
+        // Read the Agent cursor before the graph. The graph snapshot is then
+        // guaranteed to represent every transaction event through that cursor
+        // (and may safely be newer if a transaction has committed but has not
+        // recorded its event yet).
+        let agent_cursor = self.agent.cursor();
+        let _guard = self
+            .graph_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let recovery_path = self.autosave_path();
-        let recovered = read_valid_graph(&recovery_path, &self.catalog);
+        let recovered = read_valid_graph(&self.root, &recovery_path, &self.catalog)?;
         let recovered_autosave = recovered.is_some();
         let mut graph = match recovered {
             Some(graph) => graph,
             None => {
-                let raw = std::fs::read_to_string(&self.graph_path)?;
-                let mut graph: Graph = serde_json::from_str(&raw)?;
+                let raw = read_graph_file(&self.root, &self.graph_path)?;
+                let mut graph: Graph = serde_json::from_slice(&raw)?;
                 self.catalog.pin_graph(&mut graph)?;
                 graph
             }
         };
         workflow::upgrade_reference_ports(&mut graph);
         graph.validate()?;
+        reject_resolver_only_graph(&graph)?;
         self.catalog.verify_graph(&graph)?;
+        verify_graph_source_store(&self.root, &graph)?;
         let operators = self
             .catalog
             .ops
             .values()
+            .filter(|operator| !resolver_only_operator_id(&operator.id))
             .map(|operator| {
                 Ok(CatalogOperator {
                     revision: operator.revision()?,
@@ -903,13 +1222,15 @@ impl WebProject {
                 })
             })
             .collect::<Result<Vec<_>, somite_ops::OpsError>>()?;
+        let state_revision = graph_state_revision(&graph)?;
         Ok(ProjectSession {
             project_name: self.project_name(),
             graph_path: display_path(&self.root, &self.graph_path),
             graph,
+            state_revision,
             operators,
             recovered_autosave,
-            agent_cursor: self.agent.cursor(),
+            agent_cursor,
         })
     }
 
@@ -940,21 +1261,47 @@ impl WebProject {
         format!("{prefix}-{epoch:x}-{sequence:x}")
     }
 
-    pub fn save_graph(&self, graph: &Graph) -> Result<(), ServerError> {
-        let _guard = self
-            .graph_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.save_graph_at(&self.graph_path, graph)?;
-        self.save_graph_at(&self.autosave_path(), graph)
+    pub fn save_graph_cas(
+        &self,
+        base_state_revision: &str,
+        graph: &Graph,
+    ) -> Result<String, ServerError> {
+        self.save_browser_graph_cas(base_state_revision, graph, true)
     }
 
-    pub fn save_autosave(&self, graph: &Graph) -> Result<(), ServerError> {
+    pub fn save_autosave_cas(
+        &self,
+        base_state_revision: &str,
+        graph: &Graph,
+    ) -> Result<String, ServerError> {
+        self.save_browser_graph_cas(base_state_revision, graph, false)
+    }
+
+    fn save_browser_graph_cas(
+        &self,
+        base_state_revision: &str,
+        graph: &Graph,
+        save_project_graph: bool,
+    ) -> Result<String, ServerError> {
         let _guard = self
             .graph_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.save_graph_at(&self.autosave_path(), graph)
+        let current = current_agent_graph(self)?;
+        let current_state_revision = graph_state_revision(&current)?;
+        if base_state_revision != current_state_revision {
+            return Err(ServerError::GraphStateConflict {
+                provided: base_state_revision.to_owned(),
+                current: current_state_revision,
+            });
+        }
+        verify_graph_source_store(&self.root, graph)?;
+        reject_resolver_only_graph(graph)?;
+        if save_project_graph {
+            self.save_graph_at(&self.graph_path, graph)?;
+        }
+        self.save_graph_at(&self.autosave_path(), graph)?;
+        graph_state_revision(graph).map_err(ServerError::from)
     }
 
     fn autosave_path(&self) -> PathBuf {
@@ -967,24 +1314,41 @@ impl WebProject {
     }
 
     fn save_graph_at(&self, path: &Path, graph: &Graph) -> Result<(), ServerError> {
-        Self::write_graph_at(path, graph, &self.catalog)
+        Self::write_graph_at(&self.root, path, graph, &self.catalog)
     }
 
-    fn write_graph_at(path: &Path, graph: &Graph, catalog: &Catalog) -> Result<(), ServerError> {
+    fn write_graph_at(
+        root: &Path,
+        path: &Path,
+        graph: &Graph,
+        catalog: &Catalog,
+    ) -> Result<(), ServerError> {
+        Self::write_graph_at_with_limit(root, path, graph, catalog, MAX_GRAPH_BYTES)
+    }
+
+    fn write_graph_at_with_limit(
+        root: &Path,
+        path: &Path,
+        graph: &Graph,
+        catalog: &Catalog,
+        max_graph_bytes: u64,
+    ) -> Result<(), ServerError> {
         graph.validate()?;
         catalog.verify_graph(graph)?;
-        let encoded = serde_json::to_vec_pretty(graph)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let temporary = path.with_extension("somite.json.tmp");
-        std::fs::write(&temporary, encoded)?;
-        std::fs::rename(temporary, path)?;
+        let encoded = serialize_graph_with_limit(graph, max_graph_bytes)?;
+        let (parent, destination) = checked_graph_write_path(root, path)?;
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".somite-graph-")
+            .tempfile_in(&parent)?;
+        temporary.as_file_mut().write_all(&encoded)?;
+        temporary.as_file_mut().flush()?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(&destination)
+            .map_err(|error| ServerError::Io(error.error))?;
+        #[cfg(unix)]
+        std::fs::File::open(&parent)?.sync_all()?;
         Ok(())
-    }
-
-    fn uploads_dir(&self) -> PathBuf {
-        self.root.join(".somite/uploads")
     }
 
     fn papers_dir(&self) -> PathBuf {
@@ -1179,11 +1543,24 @@ fn local_server_url() -> String {
     format!("http://{address}")
 }
 
-fn read_valid_graph(path: &Path, catalog: &Catalog) -> Option<Graph> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let mut graph = serde_json::from_str::<Graph>(&raw).ok()?;
-    catalog.pin_graph(&mut graph).ok()?;
-    Some(graph)
+fn read_valid_graph(
+    root: &Path,
+    path: &Path,
+    catalog: &Catalog,
+) -> Result<Option<Graph>, ServerError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ServerError::Io(error)),
+    }
+    let raw = read_graph_file(root, path)?;
+    let Ok(mut graph) = serde_json::from_slice::<Graph>(&raw) else {
+        return Ok(None);
+    };
+    if catalog.pin_graph(&mut graph).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(graph))
 }
 
 fn display_path(root: &Path, path: &Path) -> String {
@@ -1195,7 +1572,10 @@ fn display_path(root: &Path, path: &Path) -> String {
 
 pub fn app(project: WebProject) -> Router {
     let cors = CorsLayer::new()
-        .allow_origin(HeaderValue::from_static("http://localhost:3000"))
+        .allow_origin(AllowOrigin::list([
+            HeaderValue::from_static("http://localhost:3000"),
+            HeaderValue::from_static("http://127.0.0.1:3000"),
+        ]))
         .allow_methods([Method::GET, Method::POST, Method::PUT])
         .allow_headers([header::CONTENT_TYPE]);
     let paper_body_limit = project
@@ -1210,6 +1590,20 @@ pub fn app(project: WebProject) -> Router {
         .route("/api/system", get(system_profile))
         .route("/api/catalog/nfcore", get(discover_nfcore))
         .route("/api/catalog/nfcore/expand", post(expand_nfcore))
+        .route("/api/source-workflows/nfcore/resolve", post(expand_nfcore))
+        .route(
+            "/api/source-workflows/nfcore/search",
+            get(search_nfcore_sources),
+        )
+        .route("/api/source-workflows/edit", post(edit_source_workflow))
+        .route(
+            "/api/source-workflows/promote",
+            post(promote_source_workflow),
+        )
+        .route(
+            "/api/source-workflows/restore",
+            post(restore_source_workflow_view),
+        )
         .route("/api/catalog/snakemake", get(discover_snakemake))
         .route("/api/catalog/snakemake/expand", post(expand_snakemake))
         .route(
@@ -1234,6 +1628,18 @@ pub fn app(project: WebProject) -> Router {
         .route("/api/agent/graph", get(agent_graph))
         .route("/api/agent/catalog", get(agent_catalog))
         .route("/api/agent/transactions", post(agent_transaction))
+        .route(
+            "/api/agent/source-workflows/nfcore/resolve",
+            post(agent_import_nfcore_source),
+        )
+        .route(
+            "/api/agent/source-workflows/edit",
+            post(agent_edit_source_workflow),
+        )
+        .route(
+            "/api/agent/source-workflows/promote",
+            post(agent_promote_source_workflow),
+        )
         .route("/api/agent/compile", post(agent_compile))
         .route("/api/agent/evidence", get(agent_evidence))
         .route("/api/agent/discover", get(agent_discover))
@@ -1273,11 +1679,92 @@ pub fn app(project: WebProject) -> Router {
         )
         .layer(cors)
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(reject_cross_origin_mutation))
         .layer(middleware::from_fn_with_state(
             project.clone(),
             record_mcp_activity,
         ))
         .with_state(project)
+}
+
+async fn reject_cross_origin_mutation(request: Request, next: Next) -> Response {
+    let mutating = matches!(
+        *request.method(),
+        Method::POST | Method::PUT | Method::DELETE | Method::PATCH
+    );
+    if mutating && !request_origin_is_allowed(&request) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "cross-origin mutation of the local Somite project is forbidden".to_owned(),
+            }),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+fn request_origin_is_allowed(request: &Request) -> bool {
+    let Some(host) = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        // Hyper supplies Host/:authority for real HTTP requests. Most in-module
+        // Router::oneshot tests use deliberately incomplete relative requests;
+        // keep only those originless fixtures working under cfg(test).
+        return cfg!(test) && request.headers().get(header::ORIGIN).is_none();
+    };
+    if !loopback_authority(host) {
+        return false;
+    }
+    let Some(origin) = request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        // Native clients must opt into a non-CORS-safelisted header. The MCP
+        // bridge already supplies its bearer capability. A browser cannot add
+        // either header through a hostile simple form, and its preflight is
+        // rejected by the CORS policy.
+        return request
+            .headers()
+            .get("x-somite-request")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == "local")
+            || request
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("Bearer "));
+    };
+    if matches!(origin, "http://localhost:3000" | "http://127.0.0.1:3000") {
+        return true;
+    }
+    let Some(authority) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+        .filter(|authority| !authority.is_empty() && !authority.contains('/'))
+    else {
+        return false;
+    };
+    authority.eq_ignore_ascii_case(host)
+}
+
+fn loopback_authority(value: &str) -> bool {
+    let Ok(authority) = value.parse::<axum::http::uri::Authority>() else {
+        return false;
+    };
+    let host = authority.host();
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
 }
 
 async fn agent_discover() -> Json<agent_discovery::AgentDiscoveryResponse> {
@@ -1294,6 +1781,9 @@ async fn record_mcp_activity(
         "/api/agent/graph"
             | "/api/agent/catalog"
             | "/api/agent/transactions"
+            | "/api/agent/source-workflows/nfcore/resolve"
+            | "/api/agent/source-workflows/edit"
+            | "/api/agent/source-workflows/promote"
             | "/api/agent/compile"
             | "/api/agent/evidence"
     );
@@ -1352,10 +1842,22 @@ async fn health() -> &'static str {
     "ok"
 }
 
+async fn run_server_blocking<T, F>(label: &'static str, operation: F) -> Result<T, ServerError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ServerError> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| ServerError::SourceWorkflow(format!("{label} task failed: {error}")))?
+}
+
 async fn session(
     State(project): State<Arc<WebProject>>,
 ) -> Result<Json<ProjectSession>, ServerError> {
-    Ok(Json(project.session()?))
+    Ok(Json(
+        run_server_blocking("project session", move || project.session()).await?,
+    ))
 }
 
 async fn system_profile(State(project): State<Arc<WebProject>>) -> Json<SystemProfile> {
@@ -1547,23 +2049,9 @@ async fn search_papers(
 async fn discover_nfcore(
     State(project): State<Arc<WebProject>>,
 ) -> Result<Json<NfcoreCatalogResponse>, ServerError> {
-    let cache_path = project.root.join(".somite/catalog/nfcore-pipelines.json");
+    let root = project.root.clone();
     let response = tokio::task::spawn_blocking(move || {
-        let (pipelines, cached) = match nfcore::fetch() {
-            Ok((raw, pipelines)) => {
-                if let Some(parent) = cache_path.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::write(&cache_path, raw)?;
-                (pipelines, false)
-            }
-            Err(fetch_error) => {
-                let raw = std::fs::read_to_string(&cache_path)
-                    .map_err(|_| ServerError::CatalogDiscovery(fetch_error))?;
-                let pipelines = nfcore::parse(&raw).map_err(ServerError::CatalogDiscovery)?;
-                (pipelines, true)
-            }
-        };
+        let (pipelines, cached) = load_current_nfcore_catalog(&root)?;
         Ok::<_, ServerError>(NfcoreCatalogResponse {
             entries: pipelines
                 .into_iter()
@@ -1580,6 +2068,150 @@ async fn discover_nfcore(
     .await
     .map_err(|error| ServerError::CatalogDiscovery(error.to_string()))??;
     Ok(Json(response))
+}
+
+fn load_current_nfcore_catalog(root: &Path) -> Result<(Vec<nfcore::Pipeline>, bool), ServerError> {
+    let cache_path = checked_nfcore_catalog_cache_path(root, true)?.ok_or_else(|| {
+        ServerError::CatalogDiscovery("could not initialize nf-core catalog cache".to_owned())
+    })?;
+    match nfcore::fetch() {
+        Ok((raw, pipelines)) => {
+            write_catalog_cache_atomic(&cache_path, raw.as_bytes())?;
+            Ok((pipelines, false))
+        }
+        Err(fetch_error) => {
+            let raw = String::from_utf8(
+                read_regular_file(&cache_path, MAX_NFCORE_CATALOG_BYTES)
+                    .map_err(|_| ServerError::CatalogDiscovery(fetch_error.clone()))?,
+            )
+            .map_err(|_| {
+                ServerError::CatalogDiscovery("nf-core catalog cache is not valid UTF-8".to_owned())
+            })?;
+            let pipelines = nfcore::parse(&raw).map_err(ServerError::CatalogDiscovery)?;
+            Ok((pipelines, true))
+        }
+    }
+}
+
+fn checked_nfcore_catalog_cache_path(
+    root: &Path,
+    create: bool,
+) -> Result<Option<PathBuf>, ServerError> {
+    let canonical_root = root.canonicalize().map_err(|error| {
+        ServerError::CatalogDiscovery(format!("could not resolve project root: {error}"))
+    })?;
+    let somite = canonical_root.join(".somite");
+    if !ensure_or_find_store_directory(&somite, &canonical_root, ".somite", create)? {
+        return Ok(None);
+    }
+    let canonical_somite = somite.canonicalize()?;
+    let catalog = somite.join("catalog");
+    if !ensure_or_find_store_directory(&catalog, &canonical_somite, ".somite/catalog", create)? {
+        return Ok(None);
+    }
+    let cache = catalog.join("nfcore-pipelines.json");
+    match std::fs::symlink_metadata(&cache) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(ServerError::CatalogDiscovery(
+                "nf-core catalog cache must be a regular non-symlink file".to_owned(),
+            ))
+        }
+        Ok(_) => Ok(Some(cache)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => Ok(Some(cache)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ServerError::Io(error)),
+    }
+}
+
+fn write_catalog_cache_atomic(path: &Path, contents: &[u8]) -> Result<(), ServerError> {
+    let parent = path.parent().ok_or_else(|| {
+        ServerError::CatalogDiscovery("nf-core catalog cache has no parent".to_owned())
+    })?;
+    validate_store_directory(
+        parent,
+        &parent
+            .parent()
+            .ok_or_else(|| {
+                ServerError::CatalogDiscovery("nf-core catalog directory has no parent".to_owned())
+            })?
+            .canonicalize()?,
+        ".somite/catalog",
+    )?;
+    if path_entry_exists(path)? {
+        read_regular_file(path, MAX_NFCORE_CATALOG_BYTES)?;
+    }
+    let temporary = tempfile::Builder::new()
+        .prefix(".nfcore-catalog-")
+        .tempfile_in(parent)?;
+    std::fs::write(temporary.path(), contents)?;
+    std::fs::rename(temporary.path(), path)?;
+    Ok(())
+}
+
+async fn search_nfcore_sources(
+    State(project): State<Arc<WebProject>>,
+    Query(request): Query<NfcoreSourceSearchQuery>,
+) -> Result<Json<NfcoreSourceSearchResponse>, ServerError> {
+    let query = request.q.trim();
+    if query.is_empty() || query.len() > 120 || query.chars().any(char::is_control) {
+        return Err(ServerError::InvalidSourceRequest(
+            "nf-core query must contain 1 to 120 printable bytes".to_owned(),
+        ));
+    }
+    let query = query.to_owned();
+    let limit = request.limit.clamp(1, 50);
+    let root = project.root.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        let (pipelines, cached) = load_current_nfcore_catalog(&root)?;
+        Ok::<_, ServerError>(filter_nfcore_source_catalog(
+            &query, limit, pipelines, cached,
+        ))
+    })
+    .await
+    .map_err(|error| ServerError::CatalogDiscovery(error.to_string()))??;
+    Ok(Json(response))
+}
+
+fn filter_nfcore_source_catalog(
+    query: &str,
+    limit: usize,
+    pipelines: Vec<nfcore::Pipeline>,
+    cached: bool,
+) -> NfcoreSourceSearchResponse {
+    let terms = query
+        .split_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let mut matches = pipelines
+        .into_iter()
+        .filter(|pipeline| {
+            let haystack = format!(
+                "{} {} {}",
+                pipeline.name,
+                pipeline.description,
+                pipeline.topics.join(" ")
+            )
+            .to_ascii_lowercase();
+            terms.iter().all(|term| haystack.contains(term))
+        })
+        .map(|pipeline| NfcoreSourceSearchEntry {
+            repository: format!("nf-core/{}", pipeline.name),
+            title: format!("nf-core/{}", pipeline.name),
+            description: pipeline.description,
+            topics: pipeline.topics,
+            revision: pipeline.revision,
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| left.repository.cmp(&right.repository));
+    let total_matches = matches.len();
+    matches.truncate(limit);
+    NfcoreSourceSearchResponse {
+        query: query.to_owned(),
+        provenance: nfcore::CATALOG_URL.to_owned(),
+        cached,
+        total_matches,
+        entries: matches,
+    }
 }
 
 async fn discover_snakemake(
@@ -1711,7 +2343,20 @@ async fn expand_nfcore(
     State(project): State<Arc<WebProject>>,
     Json(request): Json<WorkflowGraphRequest>,
 ) -> Result<Json<WorkflowGraphResponse>, ServerError> {
+    validate_nfcore_workflow_request(&request)?;
+    let root = project.root.clone();
+    let source_operator_revision = project.catalog.revision("workflow.source")?;
+    let response = tokio::task::spawn_blocking(move || {
+        import_nfcore_source(&root, &request, &source_operator_revision, None)
+    })
+    .await
+    .map_err(|error| ServerError::WorkflowImport(error.to_string()))??;
+    Ok(Json(response))
+}
+
+fn validate_nfcore_workflow_request(request: &WorkflowGraphRequest) -> Result<(), ServerError> {
     if !request.workflow.starts_with("nf-core/")
+        || request.workflow.len() == "nf-core/".len()
         || request.workflow["nf-core/".len()..]
             .chars()
             .any(|character| !character.is_ascii_alphanumeric() && !matches!(character, '-' | '_'))
@@ -1724,83 +2369,2674 @@ async fn expand_nfcore(
             "invalid nf-core workflow or revision".to_owned(),
         ));
     }
-    let root = project.root.clone();
-    let reference_operator_revision = project.catalog.revision("workflow.reference")?;
-    let response = tokio::task::spawn_blocking(move || {
-        import_nfcore_graph(&root, &request, &reference_operator_revision)
-    })
-    .await
-    .map_err(|error| ServerError::WorkflowImport(error.to_string()))??;
-    Ok(Json(response))
+    Ok(())
 }
 
-fn import_nfcore_graph(
+fn import_nfcore_source(
     root: &Path,
     request: &WorkflowGraphRequest,
-    reference_operator_revision: &str,
+    source_operator_revision: &str,
+    repository_override: Option<&Path>,
 ) -> Result<WorkflowGraphResponse, ServerError> {
-    let key = format!(
-        "{}-{}",
-        request
-            .workflow
-            .trim_start_matches("nf-core/")
-            .replace('_', "-"),
-        request.revision
-    );
-    let cache_path = root
-        .join(".somite/catalog/graphs")
-        .join(format!("nfcore-v2-{key}.json"));
-    if let Ok(raw) = std::fs::read_to_string(&cache_path) {
-        let mut cached: WorkflowGraphResponse = serde_json::from_str(&raw)?;
-        if cached.graph.schema_version == somite_ir::LEGACY_SCHEMA_VERSION {
-            cached.graph.schema_version = somite_ir::SCHEMA_VERSION;
-            for node in &mut cached.graph.nodes {
-                node.operator_revision = reference_operator_revision.to_owned();
-            }
-        }
-        cached.graph.validate()?;
-        cached.cached = true;
-        return Ok(cached);
+    require_current_nfcore_release(root, request)?;
+    let request_key = nfcore_source_request_key(request);
+    if let Some(workflow) = read_cached_nfcore_source(root, request, &request_key)? {
+        return source_workflow_response(request, source_operator_revision, workflow, true);
     }
-    let nextflow = executable_path("nextflow").ok_or_else(|| {
+
+    let fetched = fetch_nfcore_git_source(root, request, repository_override)?;
+    let reindexed =
+        somite_source_workflow::reindex_frozen(&fetched.manifest, &fetched.files, "main.nf")
+            .map_err(|error| {
+                ServerError::WorkflowImport(format!(
+                    "{}@{} source could not be indexed: {error}",
+                    request.workflow, request.revision
+                ))
+            })?;
+    let file_count = u32::try_from(fetched.manifest.files.len()).map_err(|_| {
+        ServerError::WorkflowImport("nf-core tracked file count exceeds u32".to_owned())
+    })?;
+    let mut workflow = SourceWorkflowInstance {
+        schema_version: 1,
+        workflow_revision: String::new(),
+        source: WorkflowSourcePin {
+            provider: WorkflowSourceProvider::NfCore,
+            repository: format!("https://github.com/{}", request.workflow),
+            requested_revision: request.revision.clone(),
+            resolved_revision: fetched.resolved_revision,
+            source_digest: fetched.manifest.source_digest.clone(),
+            entrypoint: "main.nf".to_owned(),
+            file_count,
+            source_bytes: fetched.manifest.source_bytes,
+        },
+        profiles: Vec::new(),
+        parameters: reindexed.parameters,
+        unsupported_required_parameters: reindexed.unsupported_required_parameters,
+        bindings: BTreeMap::new(),
+        scopes: reindexed.scopes,
+        invocations: reindexed.invocations,
+        replacements: Vec::new(),
+        capabilities: reindexed.capabilities,
+        diagnostics: reindexed.diagnostics,
+    };
+    workflow.workflow_revision = calculate_source_workflow_revision(&workflow)
+        .map_err(|error| ServerError::WorkflowImport(error.to_string()))?;
+    let files = pair_frozen_source_files(fetched.files, &fetched.manifest)?;
+    let stored = StoredSourceInstance {
+        workflow,
+        manifest: fetched.manifest,
+        files,
+    };
+    publish_nfcore_source_import(
+        root,
+        request,
+        source_operator_revision,
+        &request_key,
+        stored,
+        MAX_GRAPH_BYTES,
+    )
+}
+
+fn publish_nfcore_source_import(
+    root: &Path,
+    request: &WorkflowGraphRequest,
+    source_operator_revision: &str,
+    request_key: &str,
+    stored: StoredSourceInstance,
+    max_graph_bytes: u64,
+) -> Result<WorkflowGraphResponse, ServerError> {
+    let response = source_workflow_response_with_limit(
+        request,
+        source_operator_revision,
+        stored.workflow.clone(),
+        false,
+        max_graph_bytes,
+    )?;
+    let prepared_request =
+        prepare_nfcore_request(request, &stored.workflow, MAX_SOURCE_RECORD_BYTES)?;
+    persist_source_instance(root, &stored)?;
+    verify_stored_source_instance_cached(root, &stored.workflow).map_err(|error| {
+        ServerError::WorkflowImport(format!(
+            "{}@{} stored source could not be reindexed exactly: {error}",
+            request.workflow, request.revision
+        ))
+    })?;
+    persist_prepared_nfcore_request(root, request_key, prepared_request)?;
+    Ok(response)
+}
+
+fn require_current_nfcore_release(
+    root: &Path,
+    request: &WorkflowGraphRequest,
+) -> Result<(), ServerError> {
+    let cache_path = checked_nfcore_catalog_cache_path(root, false)?.ok_or_else(|| {
         ServerError::WorkflowImport(
-            "Nextflow is required to resolve this pipeline graph; install it through Somite's Pixi toolchain first".to_owned(),
+            "nf-core catalog cache is not ready; refresh the catalog before importing".to_owned(),
         )
     })?;
-    let work = root.join(".somite/catalog/preview").join(&key);
-    std::fs::create_dir_all(&work)?;
-    let dot_path = work.join("workflow.dot");
-    let output = run_nfcore_preview(&nextflow, &work, request, &dot_path)?;
-    if !output.status.success() || !dot_path.is_file() {
-        let detail = nfcore_preview_failure_detail(&work, &output);
-        return Err(ServerError::WorkflowImport(format!(
-            "{}@{} could not be previewed: {detail}",
+    let raw = String::from_utf8(read_regular_file(&cache_path, MAX_NFCORE_CATALOG_BYTES)?)
+        .map_err(|_| {
+            ServerError::WorkflowImport("nf-core catalog cache is not valid UTF-8".to_owned())
+        })?;
+    let pipelines = nfcore::parse(&raw).map_err(ServerError::WorkflowImport)?;
+    let name = request.workflow.trim_start_matches("nf-core/");
+    if pipelines
+        .iter()
+        .any(|pipeline| pipeline.name == name && pipeline.revision == request.revision)
+    {
+        Ok(())
+    } else {
+        Err(ServerError::WorkflowImport(
+            "workflow release is not in the current nf-core catalog".to_owned(),
+        ))
+    }
+}
+
+fn nfcore_source_request_key(request: &WorkflowGraphRequest) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"somite-nfcore-source-request-v3\0");
+    hasher.update(NFCORE_SOURCE_RESOLVER_REVISION.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(SOURCE_INDEXER_REVISION.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(request.workflow.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(request.revision.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn read_cached_nfcore_source(
+    root: &Path,
+    request: &WorkflowGraphRequest,
+    request_key: &str,
+) -> Result<Option<SourceWorkflowInstance>, ServerError> {
+    let Some(requests) = checked_source_store_subdir(root, "requests", false)? else {
+        return Ok(None);
+    };
+    let path = requests.join(format!("{request_key}.json"));
+    if !path.exists() {
+        return Ok(None);
+    }
+    let record: StoredNfcoreRequest =
+        serde_json::from_slice(&read_regular_file(&path, MAX_SOURCE_RECORD_BYTES)?)?;
+    if record.schema_version != 2
+        || record.resolver_revision != NFCORE_SOURCE_RESOLVER_REVISION
+        || record.indexer_revision != SOURCE_INDEXER_REVISION
+        || record.workflow != request.workflow
+        || record.requested_revision != request.revision
+    {
+        return Err(ServerError::SourceWorkflow(format!(
+            "cached nf-core request {}@{} does not match its immutable request key",
             request.workflow, request.revision
         )));
     }
-    let dot = std::fs::read_to_string(dot_path)?;
-    let graph = workflow::graph_from_dot(
-        workflow::DotFlavor::Nextflow,
-        &request.workflow,
-        &request.revision,
-        reference_operator_revision,
-        &dot,
+    let stored = read_stored_source_instance_record(root, &record.instance_digest)?;
+    let source = &stored.workflow.source;
+    if stored.workflow.workflow_revision != record.workflow_revision
+        || source.provider != WorkflowSourceProvider::NfCore
+        || source.repository != format!("https://github.com/{}", request.workflow)
+        || source.requested_revision != request.revision
+        || source.resolved_revision != record.resolved_revision
+        || source.source_digest != record.source_digest
+    {
+        return Err(ServerError::SourceWorkflow(format!(
+            "cached nf-core source {}@{} does not match its stored source identity",
+            request.workflow, request.revision
+        )));
+    }
+    verify_stored_source_instance_cached(root, &stored.workflow)?;
+    Ok(Some(stored.workflow))
+}
+
+struct FetchedNfcoreSource {
+    resolved_revision: String,
+    manifest: SourceManifest,
+    files: Vec<FrozenSourceFile>,
+}
+
+struct NfcoreGitIsolation {
+    home: PathBuf,
+    xdg_config: PathBuf,
+    global_config: PathBuf,
+    hooks: PathBuf,
+    templates: PathBuf,
+    allow_local_repository: bool,
+}
+
+impl NfcoreGitIsolation {
+    fn new(root: &Path, allow_local_repository: bool) -> Result<Self, ServerError> {
+        let home = root.join("git-home");
+        let xdg_config = root.join("git-xdg-config");
+        let hooks = root.join("git-hooks-disabled");
+        let templates = root.join("git-templates-empty");
+        for directory in [&home, &xdg_config, &hooks, &templates] {
+            std::fs::create_dir(directory)?;
+        }
+        let global_config = root.join("git-global-config-empty");
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&global_config)?
+            .sync_all()?;
+        Ok(Self {
+            home,
+            xdg_config,
+            global_config,
+            hooks,
+            templates,
+            allow_local_repository,
+        })
+    }
+
+    fn apply(&self, command: &mut Command) {
+        for variable in [
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_ALLOW_PROTOCOL",
+            "GIT_ASKPASS",
+            "GIT_ATTR_NOSYSTEM",
+            "GIT_CEILING_DIRECTORIES",
+            "GIT_COMMON_DIR",
+            "GIT_CONFIG",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_SYSTEM",
+            "GIT_DIR",
+            "GIT_EXEC_PATH",
+            "GIT_INDEX_FILE",
+            "GIT_NAMESPACE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_PROTOCOL",
+            "GIT_PROTOCOL_FROM_USER",
+            "GIT_PROXY_COMMAND",
+            "GIT_SSL_NO_VERIFY",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "GIT_TEMPLATE_DIR",
+            "GIT_WORK_TREE",
+            "SSH_ASKPASS",
+            "XDG_CONFIG_HOME",
+        ] {
+            command.env_remove(variable);
+        }
+        command
+            .env("HOME", &self.home)
+            .env("XDG_CONFIG_HOME", &self.xdg_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_ATTR_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", &self.global_config)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_ASKPASS", "/bin/false")
+            .env("SSH_ASKPASS", "/bin/false")
+            .env("GIT_CONFIG_COUNT", "6")
+            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_0", &self.hooks)
+            .env("GIT_CONFIG_KEY_1", "init.templateDir")
+            .env("GIT_CONFIG_VALUE_1", &self.templates)
+            .env("GIT_CONFIG_KEY_2", "protocol.ext.allow")
+            .env("GIT_CONFIG_VALUE_2", "never")
+            .env("GIT_CONFIG_KEY_3", "protocol.file.allow")
+            .env(
+                "GIT_CONFIG_VALUE_3",
+                if self.allow_local_repository {
+                    "user"
+                } else {
+                    "never"
+                },
+            )
+            .env("GIT_CONFIG_KEY_4", "credential.interactive")
+            .env("GIT_CONFIG_VALUE_4", "never")
+            .env("GIT_CONFIG_KEY_5", "core.fsmonitor")
+            .env("GIT_CONFIG_VALUE_5", "false");
+    }
+}
+
+fn fetch_nfcore_git_source(
+    root: &Path,
+    request: &WorkflowGraphRequest,
+    repository_override: Option<&Path>,
+) -> Result<FetchedNfcoreSource, ServerError> {
+    let store = checked_source_workflow_store(root, true)?.ok_or_else(|| {
+        ServerError::SourceWorkflow("could not initialize source workflow store".to_owned())
+    })?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".nfcore-fetch-")
+        .tempdir_in(&store)?;
+    let git_isolation = NfcoreGitIsolation::new(temporary.path(), repository_override.is_some())?;
+    let bare = temporary.path().join("repository.git");
+    run_nfcore_git(
+        Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .arg(&bare),
+        &git_isolation,
+        "initialize an isolated nf-core repository",
+    )?;
+    let repository = repository_override
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(format!("https://github.com/{}.git", request.workflow)));
+    run_nfcore_git(
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(&bare)
+            .args(["remote", "add", "origin"])
+            .arg(&repository),
+        &git_isolation,
+        "configure the catalog-advertised nf-core repository",
+    )?;
+    run_nfcore_git(
+        Command::new("git").arg("--git-dir").arg(&bare).args([
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--depth=1",
+            "origin",
+            &format!("refs/tags/{}", request.revision),
+        ]),
+        &git_isolation,
+        &format!(
+            "fetch catalog release {}@{}",
+            request.workflow, request.revision
+        ),
+    )?;
+    let resolved_revision = git_stdout(
+        Command::new("git").arg("--git-dir").arg(&bare).args([
+            "rev-parse",
+            "--verify",
+            "FETCH_HEAD^{commit}",
+        ]),
+        &git_isolation,
+        "resolve the fetched nf-core tag",
+    )?
+    .trim()
+    .to_ascii_lowercase();
+    if resolved_revision.len() != 40
+        || !resolved_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ServerError::WorkflowImport(
+            "Git did not resolve the nf-core tag to a full 40-character commit".to_owned(),
+        ));
+    }
+
+    let tree = run_nfcore_git(
+        Command::new("git")
+            .arg("--git-dir")
+            .arg(&bare)
+            .args(["ls-tree", "-l", "-r", "-z", "--full-tree"])
+            .arg(&resolved_revision),
+        &git_isolation,
+        "enumerate exact tracked nf-core source files",
+    )?;
+    let mut entrypoint_found = false;
+    let mut paths = BTreeSet::new();
+    let mut portable_paths = PortableSourcePathRegistry::default();
+    let mut source_bytes = 0_u64;
+    let mut files = Vec::new();
+    for raw_entry in tree
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let entry = std::str::from_utf8(raw_entry).map_err(|_| {
+            ServerError::WorkflowImport(
+                "nf-core source tree contains a non-UTF-8 tracked path".to_owned(),
+            )
+        })?;
+        let (header, path) = entry.split_once('\t').ok_or_else(|| {
+            ServerError::WorkflowImport("Git returned a malformed source tree entry".to_owned())
+        })?;
+        let fields = header.split_whitespace().collect::<Vec<_>>();
+        let [mode, kind, object, size] = fields.as_slice() else {
+            return Err(ServerError::WorkflowImport(
+                "Git returned a malformed source tree identity".to_owned(),
+            ));
+        };
+        if *kind != "blob" || !matches!(*mode, "100644" | "100755") {
+            return Err(ServerError::WorkflowImport(format!(
+                "nf-core source contains unsupported tracked entry {path} ({mode} {kind})"
+            )));
+        }
+        if object.len() != 40 || !object.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(ServerError::WorkflowImport(format!(
+                "Git returned an invalid SHA-1 object identity for {path}"
+            )));
+        }
+        if !safe_source_relative_path(path)
+            || reserved_git_metadata_path(path)
+            || !paths.insert(path.to_owned())
+        {
+            return Err(ServerError::WorkflowImport(format!(
+                "nf-core source contains unsafe or duplicate tracked path {path}"
+            )));
+        }
+        portable_paths.insert(path).map_err(|collision| {
+            ServerError::WorkflowImport(format!("nf-core source {collision}"))
+        })?;
+        if paths.len() > MAX_NFCORE_TRACKED_FILES {
+            return Err(ServerError::WorkflowImport(format!(
+                "nf-core source exceeds {MAX_NFCORE_TRACKED_FILES} tracked files"
+            )));
+        }
+        let size = size.parse::<u64>().map_err(|_| {
+            ServerError::WorkflowImport(format!(
+                "Git returned an invalid tracked byte count for {path}"
+            ))
+        })?;
+        if size > MAX_NFCORE_TRACKED_FILE_BYTES {
+            return Err(ServerError::WorkflowImport(format!(
+                "nf-core tracked file {path} exceeds {MAX_NFCORE_TRACKED_FILE_BYTES} bytes"
+            )));
+        }
+        source_bytes = source_bytes.checked_add(size).ok_or_else(|| {
+            ServerError::WorkflowImport("nf-core source byte count overflowed u64".to_owned())
+        })?;
+        if source_bytes > MAX_NFCORE_SOURCE_BYTES {
+            return Err(ServerError::WorkflowImport(format!(
+                "nf-core source exceeds {MAX_NFCORE_SOURCE_BYTES} tracked bytes"
+            )));
+        }
+        let blob = read_nfcore_git_blob(&bare, &git_isolation, object, size, path)?;
+        if blob.len() as u64 != size {
+            return Err(ServerError::WorkflowImport(format!(
+                "Git blob {path} changed size while source was fetched"
+            )));
+        }
+        files.push(FrozenSourceFile {
+            path: path.to_owned(),
+            mode: if *mode == "100755" {
+                0o100755
+            } else {
+                0o100644
+            },
+            bytes: blob,
+        });
+        entrypoint_found |= path == "main.nf";
+    }
+    if !entrypoint_found {
+        return Err(ServerError::WorkflowImport(
+            "nf-core release does not contain a regular tracked main.nf entrypoint".to_owned(),
+        ));
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    let manifest = source_manifest_from_frozen(&files, source_bytes)?;
+    Ok(FetchedNfcoreSource {
+        resolved_revision,
+        manifest,
+        files,
+    })
+}
+
+fn run_nfcore_git(
+    command: &mut Command,
+    isolation: &NfcoreGitIsolation,
+    operation: &str,
+) -> Result<std::process::Output, ServerError> {
+    run_nfcore_git_bounded(command, isolation, operation, MAX_NFCORE_GIT_METADATA_BYTES)
+}
+
+fn run_nfcore_git_bounded(
+    command: &mut Command,
+    isolation: &NfcoreGitIsolation,
+    operation: &str,
+    stdout_limit: usize,
+) -> Result<std::process::Output, ServerError> {
+    isolation.apply(command);
+    let output = capture_nfcore_git_output(command, stdout_limit, MAX_NFCORE_GIT_DIAGNOSTIC_BYTES)
+        .map_err(|error| ServerError::WorkflowImport(format!("could not {operation}: {error}")))?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(ServerError::WorkflowImport(format!(
+            "could not {operation}: {}",
+            command_failure_detail(&output)
+        )))
+    }
+}
+
+fn read_nfcore_git_blob(
+    bare: &Path,
+    isolation: &NfcoreGitIsolation,
+    object: &str,
+    expected_bytes: u64,
+    path: &str,
+) -> Result<Vec<u8>, ServerError> {
+    let mut command = Command::new("git");
+    command
+        .arg("--git-dir")
+        .arg(bare)
+        .args(["cat-file", "blob", object]);
+    isolation.apply(&mut command);
+    let expected_bytes_usize = usize::try_from(expected_bytes).map_err(|_| {
+        ServerError::WorkflowImport(format!(
+            "Git blob {path} declared a byte size unsupported on this platform"
+        ))
+    })?;
+    let output = match capture_nfcore_git_output(
+        &mut command,
+        expected_bytes_usize,
+        MAX_NFCORE_GIT_DIAGNOSTIC_BYTES,
+    ) {
+        Ok(output) => output,
+        Err(BoundedGitOutputError::Limit {
+            stream: "stdout", ..
+        }) => {
+            return Err(ServerError::WorkflowImport(format!(
+                "Git blob {path} exceeded its declared {expected_bytes} byte size"
+            )))
+        }
+        Err(error) => {
+            return Err(ServerError::WorkflowImport(format!(
+                "could not read exact tracked source blob {path}: {error}"
+            )))
+        }
+    };
+    if !output.status.success() {
+        return Err(ServerError::WorkflowImport(format!(
+            "could not read exact tracked source blob {path}: {}",
+            command_failure_detail(&output)
+        )));
+    }
+    let mut hasher = Sha1::new();
+    hasher.update(format!("blob {}\0", output.stdout.len()).as_bytes());
+    hasher.update(&output.stdout);
+    let actual_object = format!("{:x}", hasher.finalize());
+    if !actual_object.eq_ignore_ascii_case(object) {
+        return Err(ServerError::WorkflowImport(format!(
+            "Git blob {path} did not match its advertised object identity {object}; got {actual_object}"
+        )));
+    }
+    Ok(output.stdout)
+}
+
+#[derive(Debug, Error)]
+enum BoundedGitOutputError {
+    #[error("could not spawn Git: {0}")]
+    Spawn(#[source] std::io::Error),
+    #[error("Git did not expose its {0} pipe")]
+    MissingPipe(&'static str),
+    #[error("could not wait for Git: {0}")]
+    Wait(#[source] std::io::Error),
+    #[error("could not read Git {stream}: {source}")]
+    Read {
+        stream: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("Git {stream} reader stopped unexpectedly")]
+    ReaderPanicked { stream: &'static str },
+    #[error("Git {stream} exceeded the {limit}-byte capture limit")]
+    Limit { stream: &'static str, limit: usize },
+}
+
+struct BoundedPipeCapture {
+    bytes: Vec<u8>,
+    exceeded: bool,
+}
+
+fn capture_nfcore_git_output(
+    command: &mut Command,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> Result<std::process::Output, BoundedGitOutputError> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(BoundedGitOutputError::Spawn)?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(BoundedGitOutputError::MissingPipe("stdout"));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(BoundedGitOutputError::MissingPipe("stderr"));
+        }
+    };
+
+    let abort = Arc::new(AtomicBool::new(false));
+    let stdout_abort = abort.clone();
+    let stdout_reader =
+        std::thread::spawn(move || read_bounded_git_pipe(stdout, stdout_limit, stdout_abort));
+    let stderr_abort = abort.clone();
+    let stderr_reader =
+        std::thread::spawn(move || read_bounded_git_pipe(stderr, stderr_limit, stderr_abort));
+
+    let status = loop {
+        if abort.load(Ordering::Acquire) {
+            let _ = child.kill();
+            break child.wait().map_err(BoundedGitOutputError::Wait)?;
+        }
+        match child.try_wait().map_err(BoundedGitOutputError::Wait)? {
+            Some(status) => break status,
+            None => std::thread::sleep(Duration::from_millis(1)),
+        }
+    };
+
+    let stdout_joined = stdout_reader.join();
+    let stderr_joined = stderr_reader.join();
+    let stdout = stdout_joined
+        .map_err(|_| BoundedGitOutputError::ReaderPanicked { stream: "stdout" })?
+        .map_err(|source| BoundedGitOutputError::Read {
+            stream: "stdout",
+            source,
+        })?;
+    let stderr = stderr_joined
+        .map_err(|_| BoundedGitOutputError::ReaderPanicked { stream: "stderr" })?
+        .map_err(|source| BoundedGitOutputError::Read {
+            stream: "stderr",
+            source,
+        })?;
+    if stdout.exceeded {
+        return Err(BoundedGitOutputError::Limit {
+            stream: "stdout",
+            limit: stdout_limit,
+        });
+    }
+    if stderr.exceeded {
+        return Err(BoundedGitOutputError::Limit {
+            stream: "stderr",
+            limit: stderr_limit,
+        });
+    }
+    Ok(std::process::Output {
+        status,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+    })
+}
+
+fn read_bounded_git_pipe(
+    mut pipe: impl Read,
+    limit: usize,
+    abort: Arc<AtomicBool>,
+) -> Result<BoundedPipeCapture, std::io::Error> {
+    let capture_limit = limit.saturating_add(1);
+    let mut bytes = Vec::with_capacity(capture_limit.min(8 * 1024));
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = match pipe.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) => {
+                abort.store(true, Ordering::Release);
+                return Err(error);
+            }
+        };
+        if read == 0 {
+            return Ok(BoundedPipeCapture {
+                bytes,
+                exceeded: false,
+            });
+        }
+        let remaining = capture_limit.saturating_sub(bytes.len());
+        let retained = read.min(remaining);
+        bytes
+            .try_reserve_exact(retained)
+            .map_err(std::io::Error::other)?;
+        bytes.extend_from_slice(&buffer[..retained]);
+        if read > remaining || bytes.len() > limit {
+            abort.store(true, Ordering::Release);
+            return Ok(BoundedPipeCapture {
+                bytes,
+                exceeded: true,
+            });
+        }
+    }
+}
+
+fn git_stdout(
+    command: &mut Command,
+    isolation: &NfcoreGitIsolation,
+    operation: &str,
+) -> Result<String, ServerError> {
+    let output = run_nfcore_git(command, isolation, operation)?;
+    String::from_utf8(output.stdout).map_err(|_| {
+        ServerError::WorkflowImport(format!(
+            "could not {operation}: Git returned non-UTF-8 output"
+        ))
+    })
+}
+
+fn command_failure_detail(output: &std::process::Output) -> String {
+    last_nonempty_output_line(&output.stderr)
+        .or_else(|| last_nonempty_output_line(&output.stdout))
+        .unwrap_or_else(|| output.status.to_string())
+}
+
+fn source_workflow_response(
+    request: &WorkflowGraphRequest,
+    source_operator_revision: &str,
+    workflow: SourceWorkflowInstance,
+    cached: bool,
+) -> Result<WorkflowGraphResponse, ServerError> {
+    source_workflow_response_with_limit(
+        request,
+        source_operator_revision,
+        workflow,
+        cached,
+        MAX_GRAPH_BYTES,
     )
-    .map_err(ServerError::WorkflowImport)?;
-    let response = WorkflowGraphResponse {
+}
+
+fn source_workflow_response_with_limit(
+    request: &WorkflowGraphRequest,
+    source_operator_revision: &str,
+    workflow: SourceWorkflowInstance,
+    cached: bool,
+    max_graph_bytes: u64,
+) -> Result<WorkflowGraphResponse, ServerError> {
+    let resolved_short = workflow
+        .source
+        .resolved_revision
+        .get(..12)
+        .unwrap_or(&workflow.source.resolved_revision)
+        .to_owned();
+    let graph = Graph {
+        schema_version: somite_ir::SCHEMA_VERSION,
+        name: Some(request.workflow.clone()),
+        nodes: vec![Node {
+            id: format!("source-{}", request.workflow.trim_start_matches("nf-core/")),
+            operator: "workflow.source".to_owned(),
+            operator_revision: source_operator_revision.to_owned(),
+            ports: Vec::new(),
+            params: BTreeMap::new(),
+            source_workflow: Some(workflow),
+            layout: Layout { x: 0.0, y: 0.0 },
+            note: Some(format!(
+                "Pinned from {}@{} ({resolved_short})",
+                request.workflow, request.revision
+            )),
+            color: None,
+        }],
+        edges: Vec::new(),
+        annotations: Vec::new(),
+        variant_origin: None,
+    };
+    graph.validate()?;
+    let _ = serialize_graph_with_limit(&graph, max_graph_bytes)?;
+    Ok(WorkflowGraphResponse {
         engine: "nextflow".to_owned(),
         workflow: request.workflow.clone(),
         revision: request.revision.clone(),
         graph,
-        cached: false,
-    };
-    if let Some(parent) = cache_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(cache_path, serde_json::to_vec_pretty(&response)?)?;
-    Ok(response)
+        cached,
+    })
 }
 
+fn serialize_graph_with_limit(graph: &Graph, max_graph_bytes: u64) -> Result<Vec<u8>, ServerError> {
+    let encoded = serde_json::to_vec_pretty(graph)?;
+    let encoded_bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+    if encoded_bytes > max_graph_bytes {
+        return Err(ServerError::GraphTooLarge {
+            encoded_bytes,
+            limit_bytes: max_graph_bytes,
+        });
+    }
+    Ok(encoded)
+}
+
+#[cfg(test)]
+fn source_workflow_store(root: &Path) -> PathBuf {
+    root.join(".somite/source-workflows")
+}
+
+fn checked_source_workflow_store(
+    root: &Path,
+    create: bool,
+) -> Result<Option<PathBuf>, ServerError> {
+    let canonical_root = root.canonicalize().map_err(|error| {
+        ServerError::SourceWorkflow(format!("could not resolve project root: {error}"))
+    })?;
+    let somite = canonical_root.join(".somite");
+    if !ensure_or_find_store_directory(&somite, &canonical_root, ".somite", create)? {
+        return Ok(None);
+    }
+    let canonical_somite = somite.canonicalize().map_err(ServerError::Io)?;
+    let store = somite.join("source-workflows");
+    if !ensure_or_find_store_directory(
+        &store,
+        &canonical_somite,
+        ".somite/source-workflows",
+        create,
+    )? {
+        return Ok(None);
+    }
+    let canonical_store = store.canonicalize().map_err(ServerError::Io)?;
+    for name in ["objects", "instances", "revisions", "requests"] {
+        let child = store.join(name);
+        match std::fs::symlink_metadata(&child) {
+            Ok(_) => {
+                validate_store_directory(&child, &canonical_store, name)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ServerError::Io(error)),
+        }
+    }
+    Ok(Some(store))
+}
+
+fn checked_source_store_subdir(
+    root: &Path,
+    name: &str,
+    create: bool,
+) -> Result<Option<PathBuf>, ServerError> {
+    let Some(store) = checked_source_workflow_store(root, create)? else {
+        return Ok(None);
+    };
+    let canonical_store = store.canonicalize().map_err(ServerError::Io)?;
+    let directory = store.join(name);
+    if !ensure_or_find_store_directory(&directory, &canonical_store, name, create)? {
+        return Ok(None);
+    }
+    Ok(Some(directory))
+}
+
+fn ensure_or_find_store_directory(
+    path: &Path,
+    canonical_parent: &Path,
+    label: &str,
+    create: bool,
+) -> Result<bool, ServerError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {
+            validate_store_directory(path, canonical_parent, label)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+            match std::fs::create_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(ServerError::Io(error)),
+            }
+            validate_store_directory(path, canonical_parent, label)?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(ServerError::Io(error)),
+    }
+}
+
+fn validate_store_directory(
+    path: &Path,
+    canonical_parent: &Path,
+    label: &str,
+) -> Result<(), ServerError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ServerError::SourceWorkflow(format!(
+            "source workflow store path {label} must be a regular non-symlink directory"
+        )));
+    }
+    let canonical = path.canonicalize()?;
+    if canonical.parent() != Some(canonical_parent) {
+        return Err(ServerError::SourceWorkflow(format!(
+            "source workflow store path {label} escapes its canonical parent"
+        )));
+    }
+    Ok(())
+}
+
+fn source_instance_digest(workflow: &SourceWorkflowInstance) -> Result<String, ServerError> {
+    let encoded = serde_json::to_vec(workflow)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"somite-source-workflow-instance-v2\0");
+    hasher.update(SOURCE_INDEXER_REVISION.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(&encoded);
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+fn verify_source_workflow_revision_cached(
+    root: &Path,
+    workflow: &SourceWorkflowInstance,
+    instance_digest: &str,
+) -> Result<(), ServerError> {
+    let key = (root.canonicalize()?, instance_digest.to_owned());
+    let verified = VERIFIED_SOURCE_INSTANCES.get_or_init(|| Mutex::new(BTreeSet::new()));
+    {
+        let verified = verified
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if verified.contains(&key) {
+            return Ok(());
+        }
+    }
+    let expected = calculate_source_workflow_revision(workflow)
+        .map_err(|error| ServerError::SourceWorkflow(error.to_string()))?;
+    if expected != workflow.workflow_revision {
+        return Err(ServerError::SourceWorkflow(format!(
+            "source workflow instance {instance_digest} has stale semantic revision {}; expected {expected}",
+            workflow.workflow_revision
+        )));
+    }
+    let mut verified = verified
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if verified.len() >= MAX_VERIFIED_SOURCE_INSTANCES && !verified.contains(&key) {
+        if let Some(oldest) = verified.first().cloned() {
+            verified.remove(&oldest);
+        }
+    }
+    verified.insert(key);
+    Ok(())
+}
+
+fn source_instance_digest_hex(digest: &str) -> Result<String, ServerError> {
+    blake3_identity_hex(digest, "source workflow instance digest")
+}
+
+fn source_digest_hex(digest: &str) -> Result<String, ServerError> {
+    blake3_identity_hex(digest, "source digest")
+}
+
+fn blake3_identity_hex(identity: &str, kind: &str) -> Result<String, ServerError> {
+    let Some(hex) = identity.strip_prefix("blake3:") else {
+        return Err(ServerError::SourceWorkflow(format!(
+            "{kind} {identity} is not a blake3 identity"
+        )));
+    };
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ServerError::SourceWorkflow(format!(
+            "{kind} {identity} is malformed"
+        )));
+    }
+    Ok(hex.to_ascii_lowercase())
+}
+
+fn safe_source_relative_path(value: &str) -> bool {
+    let path = Path::new(value);
+    !value.trim().is_empty()
+        && value.len() <= MAX_SOURCE_PATH_BYTES
+        && !value.contains('\\')
+        && !value.chars().any(char::is_control)
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+#[derive(Debug)]
+enum PortableSourcePathError {
+    Collision { first: String, second: String },
+    InvalidComponent { path: String, component: String },
+}
+
+impl std::fmt::Display for PortableSourcePathError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Collision { first, second } => write!(
+                formatter,
+                "paths {first} and {second} collide on a portable filesystem"
+            ),
+            Self::InvalidComponent { path, component } => write!(
+                formatter,
+                "path {path} contains component {component:?}, which is not portable across supported filesystems"
+            ),
+        }
+    }
+}
+
+#[derive(Default)]
+struct PortableSourcePathRegistry {
+    // Track every prefix, not only complete file names. This rejects cases
+    // such as `A/file.nf` plus `a/other.nf`, whose distinct directory
+    // spellings collapse on a case-insensitive filesystem and make exact
+    // manifest enumeration ambiguous.
+    prefixes: BTreeMap<Vec<String>, String>,
+    directories: BTreeMap<Vec<String>, String>,
+    files: BTreeMap<Vec<String>, String>,
+}
+
+impl PortableSourcePathRegistry {
+    fn insert(&mut self, path: &str) -> Result<(), PortableSourcePathError> {
+        let components = Path::new(path)
+            .components()
+            .map(|component| {
+                let std::path::Component::Normal(component) = component else {
+                    return Err(PortableSourcePathError::InvalidComponent {
+                        path: path.to_owned(),
+                        component: component.as_os_str().to_string_lossy().into_owned(),
+                    });
+                };
+                component
+                    .to_str()
+                    .ok_or_else(|| PortableSourcePathError::InvalidComponent {
+                        path: path.to_owned(),
+                        component: component.to_string_lossy().into_owned(),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut portable_prefix = Vec::new();
+        let mut source_prefix = Vec::new();
+        for (index, &component) in components.iter().enumerate() {
+            let portable_component = portable_source_component_key(path, component)?;
+            portable_prefix.push(portable_component);
+            source_prefix.push(component);
+            let source_prefix = source_prefix.join("/");
+            if let Some(first) = self.prefixes.get(&portable_prefix) {
+                if first != &source_prefix {
+                    return Err(PortableSourcePathError::Collision {
+                        first: first.clone(),
+                        second: source_prefix,
+                    });
+                }
+            } else {
+                let _ = self
+                    .prefixes
+                    .insert(portable_prefix.clone(), source_prefix.clone());
+            }
+
+            let final_component = index + 1 == components.len();
+            if final_component {
+                if let Some(first) = self.directories.get(&portable_prefix) {
+                    return Err(PortableSourcePathError::Collision {
+                        first: first.clone(),
+                        second: source_prefix,
+                    });
+                }
+                let _ = self.files.insert(portable_prefix.clone(), source_prefix);
+            } else {
+                if let Some(first) = self.files.get(&portable_prefix) {
+                    return Err(PortableSourcePathError::Collision {
+                        first: first.clone(),
+                        second: source_prefix,
+                    });
+                }
+                let _ = self
+                    .directories
+                    .insert(portable_prefix.clone(), source_prefix);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn portable_source_component_key(
+    path: &str,
+    component: &str,
+) -> Result<String, PortableSourcePathError> {
+    let portable_component = component.nfkc().case_fold().nfkc().collect::<String>();
+    let invalid_character = portable_component.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            )
+    });
+    let trailing_dot_or_space = portable_component.ends_with(['.', ' ']);
+    let stem = portable_component.split('.').next().unwrap_or_default();
+    let reserved_device = matches!(stem, "con" | "prn" | "aux" | "nul")
+        || stem.strip_prefix("com").is_some_and(|number| {
+            matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+        })
+        || stem.strip_prefix("lpt").is_some_and(|number| {
+            matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+        });
+    if portable_component.is_empty()
+        || invalid_character
+        || trailing_dot_or_space
+        || reserved_device
+    {
+        return Err(PortableSourcePathError::InvalidComponent {
+            path: path.to_owned(),
+            component: component.to_owned(),
+        });
+    }
+    Ok(portable_component)
+}
+
+fn reserved_git_metadata_path(value: &str) -> bool {
+    Path::new(value).components().any(|component| {
+        let std::path::Component::Normal(component) = component else {
+            return false;
+        };
+        component.to_str().is_some_and(|component| {
+            let component = component
+                .split(':')
+                .next()
+                .unwrap_or(component)
+                .trim_end_matches(['.', ' ']);
+            // Git protects both the NTFS 8.3 alias and HFS spellings that
+            // differ from `.git` only by filesystem-ignorable Unicode. The
+            // resolver never materializes beside Git metadata, but reject the
+            // aliases before they enter Somite's cross-platform source CAS as
+            // defense in depth.
+            let ascii_projection = component.chars().filter(char::is_ascii).collect::<String>();
+            ascii_projection.eq_ignore_ascii_case(".git")
+                || ascii_projection.eq_ignore_ascii_case("git~1")
+        })
+    })
+}
+
+fn source_manifest_from_frozen(
+    files: &[FrozenSourceFile],
+    expected_source_bytes: u64,
+) -> Result<SourceManifest, ServerError> {
+    if files.is_empty() || files.len() > MAX_NFCORE_TRACKED_FILES {
+        return Err(ServerError::WorkflowImport(format!(
+            "nf-core source must contain between 1 and {MAX_NFCORE_TRACKED_FILES} tracked files"
+        )));
+    }
+    let mut manifest_files = Vec::with_capacity(files.len());
+    let mut source_bytes = 0_u64;
+    let mut source_hasher = blake3::Hasher::new();
+    source_hasher.update(b"somite-source-manifest-v1\0");
+    let mut previous_path: Option<&str> = None;
+    let mut portable_paths = PortableSourcePathRegistry::default();
+    for file in files {
+        if !safe_source_relative_path(&file.path)
+            || reserved_git_metadata_path(&file.path)
+            || previous_path.is_some_and(|previous| previous >= file.path.as_str())
+            || !matches!(file.mode, 0o100644 | 0o100755)
+        {
+            return Err(ServerError::WorkflowImport(format!(
+                "nf-core source contains an invalid frozen file {}",
+                file.path
+            )));
+        }
+        portable_paths.insert(&file.path).map_err(|collision| {
+            ServerError::WorkflowImport(format!("nf-core source {collision}"))
+        })?;
+        previous_path = Some(&file.path);
+        let bytes = u64::try_from(file.bytes.len()).map_err(|_| {
+            ServerError::WorkflowImport(format!("nf-core tracked file {} exceeds u64", file.path))
+        })?;
+        if bytes > MAX_NFCORE_TRACKED_FILE_BYTES {
+            return Err(ServerError::WorkflowImport(format!(
+                "nf-core tracked file {} exceeds {MAX_NFCORE_TRACKED_FILE_BYTES} bytes",
+                file.path
+            )));
+        }
+        source_bytes = source_bytes.checked_add(bytes).ok_or_else(|| {
+            ServerError::WorkflowImport("nf-core source byte count overflowed u64".to_owned())
+        })?;
+        if source_bytes > MAX_NFCORE_SOURCE_BYTES {
+            return Err(ServerError::WorkflowImport(format!(
+                "nf-core source exceeds {MAX_NFCORE_SOURCE_BYTES} tracked bytes"
+            )));
+        }
+        update_source_digest_frame(&mut source_hasher, file.path.as_bytes());
+        source_hasher.update(&file.mode.to_le_bytes());
+        source_hasher.update(&bytes.to_le_bytes());
+        update_source_digest_frame(&mut source_hasher, &file.bytes);
+        manifest_files.push(SourceFileManifest {
+            path: file.path.clone(),
+            mode: file.mode,
+            bytes,
+            digest: format!("blake3:{}", blake3::hash(&file.bytes).to_hex()),
+        });
+    }
+    if source_bytes != expected_source_bytes {
+        return Err(ServerError::WorkflowImport(format!(
+            "nf-core source declared {expected_source_bytes} bytes but fetched {source_bytes}"
+        )));
+    }
+    Ok(SourceManifest {
+        schema_version: 1,
+        source_digest: format!("blake3:{}", source_hasher.finalize().to_hex()),
+        source_bytes,
+        files: manifest_files,
+    })
+}
+
+fn pair_frozen_source_files(
+    frozen: Vec<FrozenSourceFile>,
+    manifest: &SourceManifest,
+) -> Result<Vec<(SourceFileManifest, Vec<u8>)>, ServerError> {
+    if frozen.len() != manifest.files.len() {
+        return Err(ServerError::SourceWorkflow(
+            "frozen source file count does not match its manifest".to_owned(),
+        ));
+    }
+    manifest
+        .files
+        .iter()
+        .cloned()
+        .zip(frozen)
+        .map(|(entry, file)| {
+            if file.mode != entry.mode
+                || file.path != entry.path
+                || file.bytes.len() as u64 != entry.bytes
+                || format!("blake3:{}", blake3::hash(&file.bytes).to_hex()) != entry.digest
+            {
+                return Err(ServerError::SourceWorkflow(format!(
+                    "frozen source file {} does not match its manifest",
+                    entry.path
+                )));
+            }
+            Ok((entry, file.bytes))
+        })
+        .collect()
+}
+
+fn verify_source_instance_contents(stored: &StoredSourceInstance) -> Result<(), ServerError> {
+    verify_source_instance_metadata(&stored.workflow, &stored.manifest)?;
+    if stored.files.len() != stored.manifest.files.len() {
+        return Err(ServerError::SourceWorkflow(format!(
+            "stored source workflow {} does not match its source manifest",
+            stored.workflow.workflow_revision
+        )));
+    }
+
+    let mut source_bytes = 0_u64;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"somite-source-manifest-v1\0");
+    let mut previous_path: Option<&str> = None;
+    let mut entrypoint_found = false;
+    for (index, (entry, bytes)) in stored.files.iter().enumerate() {
+        if stored.manifest.files.get(index) != Some(entry)
+            || !safe_source_relative_path(&entry.path)
+            || previous_path.is_some_and(|previous| previous >= entry.path.as_str())
+            || !matches!(entry.mode, 0o100644 | 0o100755)
+            || entry.bytes != bytes.len() as u64
+            || entry.digest != format!("blake3:{}", blake3::hash(bytes).to_hex())
+        {
+            return Err(ServerError::SourceWorkflow(format!(
+                "stored source file {} does not match its immutable manifest entry",
+                entry.path
+            )));
+        }
+        previous_path = Some(&entry.path);
+        entrypoint_found |= entry.path == stored.workflow.source.entrypoint;
+        source_bytes = source_bytes.checked_add(entry.bytes).ok_or_else(|| {
+            ServerError::SourceWorkflow("stored source byte count overflowed u64".to_owned())
+        })?;
+        update_source_digest_frame(&mut hasher, entry.path.as_bytes());
+        hasher.update(&entry.mode.to_le_bytes());
+        hasher.update(&entry.bytes.to_le_bytes());
+        update_source_digest_frame(&mut hasher, bytes);
+    }
+    let source_digest = format!("blake3:{}", hasher.finalize().to_hex());
+    if source_bytes != stored.manifest.source_bytes
+        || source_digest != stored.manifest.source_digest
+        || !entrypoint_found
+    {
+        return Err(ServerError::SourceWorkflow(format!(
+            "stored source workflow {} failed exact source identity verification",
+            stored.workflow.workflow_revision
+        )));
+    }
+    Ok(())
+}
+
+fn verify_source_instance_metadata(
+    workflow: &SourceWorkflowInstance,
+    manifest: &SourceManifest,
+) -> Result<(), ServerError> {
+    validate_stored_source_manifest(manifest)?;
+    if workflow.capabilities.exact_execution {
+        return Err(ServerError::SourceWorkflow(
+            "source workflow exact_execution must remain false until an execution environment is frozen"
+                .to_owned(),
+        ));
+    }
+    if workflow.capabilities.structural_edits
+        || workflow.capabilities.channel_contracts
+        || workflow.capabilities.source_edits
+    {
+        return Err(ServerError::SourceWorkflow(format!(
+            "source workflow {} capabilities violate the source-backed workflow invariants",
+            workflow.workflow_revision
+        )));
+    }
+    if manifest.schema_version != 1
+        || manifest.source_digest != workflow.source.source_digest
+        || manifest.source_bytes != workflow.source.source_bytes
+        || manifest.files.len() != workflow.source.file_count as usize
+    {
+        return Err(ServerError::SourceWorkflow(format!(
+            "stored source workflow {} does not match its source manifest",
+            workflow.workflow_revision
+        )));
+    }
+    Ok(())
+}
+
+fn update_source_digest_frame(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn persist_source_instance(root: &Path, stored: &StoredSourceInstance) -> Result<(), ServerError> {
+    persist_source_instance_with_limit(root, stored, MAX_SOURCE_RECORD_BYTES)
+}
+
+fn persist_source_instance_with_limit(
+    root: &Path,
+    stored: &StoredSourceInstance,
+    max_record_bytes: u64,
+) -> Result<(), ServerError> {
+    verify_source_instance_contents(stored)?;
+    let prepared = prepare_workflow_instance_record(root, &stored.workflow, max_record_bytes)?;
+    persist_prepared_source_instance(root, stored, prepared)
+}
+
+fn persist_prepared_source_instance(
+    root: &Path,
+    stored: &StoredSourceInstance,
+    prepared: PreparedWorkflowInstanceRecord,
+) -> Result<(), ServerError> {
+    persist_source_object(root, &stored.manifest, &stored.files)?;
+    persist_prepared_workflow_instance_record(root, prepared)
+}
+
+fn persist_source_instance_metadata(
+    root: &Path,
+    stored: &StoredSourceInstanceMetadata,
+) -> Result<(), ServerError> {
+    verify_source_instance_metadata(&stored.workflow, &stored.manifest)?;
+    let prepared =
+        prepare_workflow_instance_record(root, &stored.workflow, MAX_SOURCE_RECORD_BYTES)?;
+    let (canonical_source_root, canonical_manifest, canonical_fingerprint) =
+        read_stored_source_object_manifest(root, &stored.workflow.source.source_digest)?;
+    if canonical_manifest != stored.manifest
+        || canonical_source_root != stored.source_root
+        || canonical_fingerprint != stored.metadata_fingerprint
+    {
+        return Err(ServerError::SourceWorkflow(format!(
+            "source workflow {} does not match its immutable source object",
+            stored.workflow.workflow_revision
+        )));
+    }
+    persist_prepared_workflow_instance_record(root, prepared)
+}
+
+fn persist_source_object(
+    root: &Path,
+    manifest: &SourceManifest,
+    files: &[(SourceFileManifest, Vec<u8>)],
+) -> Result<(), ServerError> {
+    validate_stored_source_manifest(manifest)?;
+    let manifest_identity = format!("source object {} manifest", manifest.source_digest);
+    let encoded_manifest = pretty_json_line(manifest)?;
+    ensure_source_record_size(
+        &encoded_manifest,
+        &manifest_identity,
+        MAX_SOURCE_RECORD_BYTES,
+    )?;
+    let store = checked_source_workflow_store(root, true)?.ok_or_else(|| {
+        ServerError::SourceWorkflow("could not initialize source workflow store".to_owned())
+    })?;
+    let objects = checked_source_store_subdir(root, "objects", true)?.ok_or_else(|| {
+        ServerError::SourceWorkflow("could not initialize source object store".to_owned())
+    })?;
+    let destination = objects.join(source_digest_hex(&manifest.source_digest)?);
+    if path_entry_exists(&destination)? {
+        let (existing_manifest, existing_files) =
+            read_stored_source_object(root, &manifest.source_digest)?;
+        return if existing_manifest == *manifest && existing_files == files {
+            Ok(())
+        } else {
+            Err(ServerError::SourceWorkflow(format!(
+                "source object {} conflicts with its existing immutable store",
+                manifest.source_digest
+            )))
+        };
+    }
+
+    let stage = tempfile::Builder::new()
+        .prefix(".source-object-")
+        .tempdir_in(&store)?;
+    let source = stage.path().join("source");
+    std::fs::create_dir(&source)?;
+    for (entry, bytes) in files {
+        let destination = source.join(&entry.path);
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&destination, bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = if entry.mode == 0o100755 { 0o755 } else { 0o644 };
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(permissions))?;
+        }
+    }
+    std::fs::write(stage.path().join("source-manifest.json"), encoded_manifest)?;
+    verify_staged_source_object(stage.path(), manifest, files)?;
+    match std::fs::rename(stage.path(), &destination) {
+        Ok(()) => Ok(()),
+        Err(_) if path_entry_exists(&destination)? => {
+            let (existing_manifest, existing_files) =
+                read_stored_source_object(root, &manifest.source_digest)?;
+            if existing_manifest == *manifest && existing_files == files {
+                Ok(())
+            } else {
+                Err(ServerError::SourceWorkflow(format!(
+                    "source object {} raced with different stored content",
+                    manifest.source_digest
+                )))
+            }
+        }
+        Err(error) => Err(ServerError::Io(error)),
+    }
+}
+
+fn verify_staged_source_object(
+    directory: &Path,
+    expected_manifest: &SourceManifest,
+    expected_files: &[(SourceFileManifest, Vec<u8>)],
+) -> Result<(), ServerError> {
+    verify_source_object_root_entries(directory, &expected_manifest.source_digest)?;
+    let encoded_manifest = read_regular_file(
+        &directory.join("source-manifest.json"),
+        MAX_SOURCE_RECORD_BYTES,
+    )?;
+    let manifest: SourceManifest = serde_json::from_slice(&encoded_manifest)?;
+    if manifest != *expected_manifest {
+        return Err(ServerError::SourceWorkflow(format!(
+            "staged source object {} does not contain its exact manifest",
+            expected_manifest.source_digest
+        )));
+    }
+    validate_stored_source_manifest(&manifest)?;
+
+    let canonical_directory = directory.canonicalize()?;
+    let source_root = directory.join("source");
+    validate_store_directory(&source_root, &canonical_directory, "staged source")?;
+    let inspection =
+        inspect_stored_source_tree(&source_root, &manifest, SourceTreeReadMode::Contents)?;
+    let files = inspection.files.ok_or_else(|| {
+        ServerError::SourceWorkflow(format!(
+            "staged source object {} was not read with its exact contents",
+            expected_manifest.source_digest
+        ))
+    })?;
+    if files != expected_files {
+        return Err(ServerError::SourceWorkflow(format!(
+            "staged source object {} does not contain its exact source bytes",
+            expected_manifest.source_digest
+        )));
+    }
+    Ok(())
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool, ServerError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(ServerError::Io(error)),
+    }
+}
+
+#[cfg(test)]
+fn persist_workflow_instance_record_with_limit(
+    root: &Path,
+    workflow: &SourceWorkflowInstance,
+    max_record_bytes: u64,
+) -> Result<(), ServerError> {
+    let prepared = prepare_workflow_instance_record(root, workflow, max_record_bytes)?;
+    persist_prepared_workflow_instance_record(root, prepared)
+}
+
+struct PreparedWorkflowInstanceRecord {
+    instance_digest: String,
+    identity: String,
+    encoded: Vec<u8>,
+}
+
+fn prepare_workflow_instance_record(
+    root: &Path,
+    workflow: &SourceWorkflowInstance,
+    max_record_bytes: u64,
+) -> Result<PreparedWorkflowInstanceRecord, ServerError> {
+    let instance_digest = source_instance_digest(workflow)?;
+    verify_source_workflow_revision_cached(root, workflow, &instance_digest)?;
+    let record = StoredWorkflowInstanceRecord {
+        schema_version: 2,
+        indexer_revision: SOURCE_INDEXER_REVISION.to_owned(),
+        instance_digest: instance_digest.clone(),
+        source_digest: workflow.source.source_digest.clone(),
+        workflow: workflow.clone(),
+    };
+    let encoded = pretty_json_line(&record)?;
+    let identity = format!("source workflow instance {instance_digest}");
+    ensure_source_record_size(&encoded, &identity, max_record_bytes)?;
+    Ok(PreparedWorkflowInstanceRecord {
+        instance_digest,
+        identity,
+        encoded,
+    })
+}
+
+fn persist_prepared_workflow_instance_record(
+    root: &Path,
+    prepared: PreparedWorkflowInstanceRecord,
+) -> Result<(), ServerError> {
+    let instances = checked_source_store_subdir(root, "instances", true)?.ok_or_else(|| {
+        ServerError::SourceWorkflow("could not initialize source instance store".to_owned())
+    })?;
+    let destination = instances.join(format!(
+        "{}.json",
+        source_instance_digest_hex(&prepared.instance_digest)?
+    ));
+    persist_immutable_json_file(
+        &instances,
+        &destination,
+        &prepared.encoded,
+        &prepared.identity,
+    )
+}
+
+fn pretty_json_line(value: &impl Serialize) -> Result<Vec<u8>, ServerError> {
+    let mut encoded = serde_json::to_vec_pretty(value)?;
+    encoded.push(b'\n');
+    Ok(encoded)
+}
+
+fn ensure_source_record_size(
+    encoded: &[u8],
+    record: &str,
+    max_record_bytes: u64,
+) -> Result<(), ServerError> {
+    let encoded_bytes = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+    if encoded_bytes > max_record_bytes {
+        return Err(ServerError::SourceRecordTooLarge {
+            record: record.to_owned(),
+            encoded_bytes,
+            limit_bytes: max_record_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn persist_immutable_json_file(
+    directory: &Path,
+    destination: &Path,
+    encoded: &[u8],
+    identity: &str,
+) -> Result<(), ServerError> {
+    let temporary = tempfile::Builder::new()
+        .prefix(".source-record-")
+        .tempfile_in(directory)?;
+    std::fs::write(temporary.path(), encoded)?;
+    match std::fs::hard_link(temporary.path(), destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if read_regular_file(destination, encoded.len() as u64 + 1)? == encoded {
+                Ok(())
+            } else {
+                Err(ServerError::SourceWorkflow(format!(
+                    "{identity} conflicts with its existing immutable record"
+                )))
+            }
+        }
+        Err(error) => Err(ServerError::Io(error)),
+    }
+}
+
+struct PreparedNfcoreRequestRecord {
+    identity: String,
+    encoded: Vec<u8>,
+}
+
+fn prepare_nfcore_request(
+    request: &WorkflowGraphRequest,
+    workflow: &SourceWorkflowInstance,
+    max_record_bytes: u64,
+) -> Result<PreparedNfcoreRequestRecord, ServerError> {
+    let record = StoredNfcoreRequest {
+        schema_version: 2,
+        resolver_revision: NFCORE_SOURCE_RESOLVER_REVISION.to_owned(),
+        indexer_revision: SOURCE_INDEXER_REVISION.to_owned(),
+        workflow: request.workflow.clone(),
+        requested_revision: request.revision.clone(),
+        resolved_revision: workflow.source.resolved_revision.clone(),
+        source_digest: workflow.source.source_digest.clone(),
+        workflow_revision: workflow.workflow_revision.clone(),
+        instance_digest: source_instance_digest(workflow)?,
+    };
+    let encoded = pretty_json_line(&record)?;
+    let identity = format!("nf-core request {}@{}", request.workflow, request.revision);
+    ensure_source_record_size(&encoded, &identity, max_record_bytes)?;
+    Ok(PreparedNfcoreRequestRecord { identity, encoded })
+}
+
+fn persist_prepared_nfcore_request(
+    root: &Path,
+    request_key: &str,
+    prepared: PreparedNfcoreRequestRecord,
+) -> Result<(), ServerError> {
+    let requests = checked_source_store_subdir(root, "requests", true)?.ok_or_else(|| {
+        ServerError::SourceWorkflow("could not initialize source request store".to_owned())
+    })?;
+    let destination = requests.join(format!("{request_key}.json"));
+    persist_immutable_json_file(
+        &requests,
+        &destination,
+        &prepared.encoded,
+        &prepared.identity,
+    )
+}
+
+fn read_stored_source_instance(
+    root: &Path,
+    expected: &SourceWorkflowInstance,
+) -> Result<StoredSourceInstance, ServerError> {
+    #[cfg(test)]
+    SOURCE_EXACT_CONTENT_READS.fetch_add(1, Ordering::Relaxed);
+    let digest = source_instance_digest(expected)?;
+    let stored = read_stored_source_instance_digest(root, &digest)?;
+    if stored.workflow != *expected {
+        return Err(ServerError::SourceWorkflow(format!(
+            "source workflow instance {digest} does not match its canonical stored instance"
+        )));
+    }
+    Ok(stored)
+}
+
+fn read_stored_source_instance_metadata(
+    root: &Path,
+    expected: &SourceWorkflowInstance,
+) -> Result<StoredSourceInstanceMetadata, ServerError> {
+    let digest = source_instance_digest(expected)?;
+    let record = read_stored_source_instance_record(root, &digest)?;
+    if record.workflow != *expected {
+        return Err(ServerError::SourceWorkflow(format!(
+            "source workflow instance {digest} does not match its canonical stored instance"
+        )));
+    }
+    let (source_root, manifest, metadata_fingerprint) =
+        read_stored_source_object_manifest(root, &record.source_digest)?;
+    verify_source_instance_metadata(&record.workflow, &manifest)?;
+    Ok(StoredSourceInstanceMetadata {
+        workflow: record.workflow,
+        manifest,
+        source_root,
+        metadata_fingerprint,
+    })
+}
+
+fn read_stored_source_instance_digest(
+    root: &Path,
+    instance_digest: &str,
+) -> Result<StoredSourceInstance, ServerError> {
+    let record = read_stored_source_instance_record(root, instance_digest)?;
+    let (manifest, files) = read_stored_source_object(root, &record.source_digest)?;
+    let stored = StoredSourceInstance {
+        workflow: record.workflow,
+        manifest,
+        files,
+    };
+    verify_source_instance_contents(&stored)?;
+    Ok(stored)
+}
+
+fn read_stored_source_instance_record(
+    root: &Path,
+    instance_digest: &str,
+) -> Result<StoredWorkflowInstanceRecord, ServerError> {
+    let instances = checked_source_store_subdir(root, "instances", false)?.ok_or_else(|| {
+        ServerError::SourceWorkflow(format!(
+            "source workflow instance {instance_digest} is not stored under .somite/source-workflows"
+        ))
+    })?;
+    let path = instances.join(format!(
+        "{}.json",
+        source_instance_digest_hex(instance_digest)?
+    ));
+    let record: StoredWorkflowInstanceRecord =
+        serde_json::from_slice(&read_regular_file(&path, MAX_SOURCE_RECORD_BYTES).map_err(|_| {
+            ServerError::SourceWorkflow(format!(
+                "source workflow instance {instance_digest} is not stored under .somite/source-workflows"
+            ))
+        })?)?;
+    if record.schema_version == 1 {
+        return Err(ServerError::SourceWorkflow(format!(
+            "stored source workflow instance {instance_digest} predates explicit indexer identity; re-import the source workflow"
+        )));
+    }
+    if record.schema_version != 2 {
+        return Err(ServerError::SourceWorkflow(format!(
+            "stored source workflow instance {instance_digest} uses unsupported record schema {}; re-import the source workflow",
+            record.schema_version
+        )));
+    }
+    if record.indexer_revision != SOURCE_INDEXER_REVISION {
+        return Err(ServerError::SourceWorkflow(format!(
+            "stored source workflow instance {instance_digest} was indexed under {}; this server requires {SOURCE_INDEXER_REVISION}; re-import the source workflow",
+            record.indexer_revision
+        )));
+    }
+    if record.instance_digest != instance_digest
+        || source_instance_digest(&record.workflow)? != instance_digest
+        || record.source_digest != record.workflow.source.source_digest
+    {
+        return Err(ServerError::SourceWorkflow(format!(
+            "stored source workflow instance {instance_digest} has an invalid identity record"
+        )));
+    }
+    verify_source_workflow_revision_cached(root, &record.workflow, instance_digest)?;
+    Ok(record)
+}
+
+fn read_stored_source_object(
+    root: &Path,
+    source_digest: &str,
+) -> Result<(SourceManifest, StoredSourceFiles), ServerError> {
+    let (_, manifest, inspection) =
+        read_stored_source_object_inspected(root, source_digest, SourceTreeReadMode::Contents)?;
+    let files = inspection.files.ok_or_else(|| {
+        ServerError::SourceWorkflow(format!(
+            "source object {source_digest} was not read with its exact contents"
+        ))
+    })?;
+    Ok((manifest, files))
+}
+
+fn read_stored_source_object_manifest(
+    root: &Path,
+    source_digest: &str,
+) -> Result<(PathBuf, SourceManifest, String), ServerError> {
+    let (source_root, manifest, inspection) =
+        read_stored_source_object_inspected(root, source_digest, SourceTreeReadMode::MetadataOnly)?;
+    Ok((source_root, manifest, inspection.metadata_fingerprint))
+}
+
+fn read_stored_source_object_inspected(
+    root: &Path,
+    source_digest: &str,
+    read_mode: SourceTreeReadMode,
+) -> Result<(PathBuf, SourceManifest, SourceTreeInspection), ServerError> {
+    let objects = checked_source_store_subdir(root, "objects", false)?.ok_or_else(|| {
+        ServerError::SourceWorkflow(format!(
+            "source object {source_digest} is not stored under .somite/source-workflows"
+        ))
+    })?;
+    let canonical_objects = objects.canonicalize()?;
+    let directory = objects.join(source_digest_hex(source_digest)?);
+    std::fs::symlink_metadata(&directory).map_err(|_| {
+        ServerError::SourceWorkflow(format!(
+            "source object {source_digest} is not stored under .somite/source-workflows"
+        ))
+    })?;
+    validate_store_directory(&directory, &canonical_objects, source_digest)?;
+    verify_source_object_root_entries(&directory, source_digest)?;
+    let manifest_bytes = read_regular_file(
+        &directory.join("source-manifest.json"),
+        MAX_SOURCE_RECORD_BYTES,
+    )?;
+    let manifest = match serde_json::from_slice::<SourceManifest>(&manifest_bytes) {
+        Ok(manifest) => manifest,
+        Err(_) => {
+            let legacy: LegacyStoredSourceObjectRecord = serde_json::from_slice(&manifest_bytes)?;
+            if legacy.schema_version != 1 {
+                return Err(ServerError::SourceWorkflow(format!(
+                    "stored source object {source_digest} has an unsupported record schema"
+                )));
+            }
+            let _legacy_capabilities = legacy.capabilities;
+            legacy.manifest
+        }
+    };
+    if manifest.source_digest != source_digest {
+        return Err(ServerError::SourceWorkflow(format!(
+            "stored source object {source_digest} contains manifest {}",
+            manifest.source_digest
+        )));
+    }
+    validate_stored_source_manifest(&manifest)?;
+    let source_root = directory.join("source");
+    let canonical_directory = directory.canonicalize()?;
+    validate_store_directory(&source_root, &canonical_directory, "source")?;
+    let inspection = inspect_stored_source_tree(&source_root, &manifest, read_mode)?;
+    Ok((source_root, manifest, inspection))
+}
+
+fn validate_stored_source_manifest(manifest: &SourceManifest) -> Result<(), ServerError> {
+    if manifest.schema_version != 1 || manifest.files.len() > MAX_NFCORE_TRACKED_FILES {
+        return Err(ServerError::SourceWorkflow(
+            "stored source manifest has an unsupported schema or file count".to_owned(),
+        ));
+    }
+    if manifest.source_bytes > MAX_NFCORE_SOURCE_BYTES {
+        return Err(ServerError::SourceWorkflow(format!(
+            "stored source manifest exceeds {MAX_NFCORE_SOURCE_BYTES} bytes"
+        )));
+    }
+    let mut total = 0_u64;
+    let mut previous: Option<&str> = None;
+    let mut portable_paths = PortableSourcePathRegistry::default();
+    for file in &manifest.files {
+        if !safe_source_relative_path(&file.path)
+            || reserved_git_metadata_path(&file.path)
+            || previous.is_some_and(|path| path >= file.path.as_str())
+            || !matches!(file.mode, 0o100644 | 0o100755)
+            || file.bytes > MAX_NFCORE_TRACKED_FILE_BYTES
+        {
+            return Err(ServerError::SourceWorkflow(format!(
+                "stored source manifest contains invalid entry {}",
+                file.path
+            )));
+        }
+        portable_paths.insert(&file.path).map_err(|collision| {
+            ServerError::SourceWorkflow(format!("stored source manifest {collision}"))
+        })?;
+        total = total.checked_add(file.bytes).ok_or_else(|| {
+            ServerError::SourceWorkflow("stored source byte count overflowed u64".to_owned())
+        })?;
+        previous = Some(&file.path);
+    }
+    if total != manifest.source_bytes {
+        return Err(ServerError::SourceWorkflow(
+            "stored source manifest byte total does not match its source identity".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn verify_source_object_root_entries(
+    directory: &Path,
+    source_digest: &str,
+) -> Result<(), ServerError> {
+    let mut source_found = false;
+    let mut manifest_found = false;
+    let mut entry_count = 0_usize;
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            ServerError::SourceWorkflow(format!(
+                "source object {source_digest} contains a non-UTF-8 entry"
+            ))
+        })?;
+        if !matches!(name.as_str(), "source" | "source-manifest.json") {
+            return Err(ServerError::SourceWorkflow(format!(
+                "source object {source_digest} contains unmanifested entry {name}"
+            )));
+        }
+        source_found |= name == "source";
+        manifest_found |= name == "source-manifest.json";
+        entry_count += 1;
+    }
+    if !source_found || !manifest_found || entry_count != 2 {
+        return Err(ServerError::SourceWorkflow(format!(
+            "source object {source_digest} is missing its exact source tree or manifest"
+        )));
+    }
+    Ok(())
+}
+
+struct SourceTreeExpectations<'a> {
+    files: BTreeMap<&'a str, (usize, &'a SourceFileManifest)>,
+    directories: BTreeSet<&'a str>,
+}
+
+impl<'a> SourceTreeExpectations<'a> {
+    fn from_manifest(manifest: &'a SourceManifest) -> Self {
+        let mut files = BTreeMap::new();
+        let mut directories = BTreeSet::new();
+        for (index, file) in manifest.files.iter().enumerate() {
+            let _ = files.insert(file.path.as_str(), (index, file));
+            for (separator, _) in file.path.match_indices('/') {
+                let _ = directories.insert(&file.path[..separator]);
+            }
+        }
+        Self { files, directories }
+    }
+}
+
+fn inspect_stored_source_tree(
+    source_root: &Path,
+    manifest: &SourceManifest,
+    read_mode: SourceTreeReadMode,
+) -> Result<SourceTreeInspection, ServerError> {
+    let expected = SourceTreeExpectations::from_manifest(manifest);
+    let root_metadata = std::fs::symlink_metadata(source_root)?;
+    #[cfg(test)]
+    let mut metadata_operations = 1_usize;
+    #[cfg(test)]
+    let mut file_metadata_operations = 0_usize;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(ServerError::SourceWorkflow(
+            "stored source root is not a regular non-symlink directory".to_owned(),
+        ));
+    }
+    let mut found_files = 0_usize;
+    let mut found_directories = 0_usize;
+    let mut pending = vec![(source_root.to_path_buf(), String::new())];
+    let mut metadata_by_path = BTreeMap::new();
+    let mut file_bytes = matches!(read_mode, SourceTreeReadMode::Contents).then(|| {
+        std::iter::repeat_with(|| None)
+            .take(manifest.files.len())
+            .collect::<Vec<Option<Vec<u8>>>>()
+    });
+    while let Some((directory, prefix)) = pending.pop() {
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                ServerError::SourceWorkflow(
+                    "stored source tree contains a non-UTF-8 entry".to_owned(),
+                )
+            })?;
+            let relative = if prefix.is_empty() {
+                name
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let metadata = std::fs::symlink_metadata(entry.path())?;
+            #[cfg(test)]
+            {
+                metadata_operations += 1;
+            }
+            if metadata.file_type().is_symlink() {
+                return Err(ServerError::SourceWorkflow(format!(
+                    "stored source tree contains symlink {relative}"
+                )));
+            }
+            if metadata.is_dir() {
+                if !expected.directories.contains(relative.as_str()) {
+                    return Err(ServerError::SourceWorkflow(format!(
+                        "stored source tree contains unmanifested directory {relative}"
+                    )));
+                }
+                found_directories += 1;
+                pending.push((entry.path(), relative.clone()));
+            } else if metadata.is_file() {
+                let Some(&(file_index, expected_file)) = expected.files.get(relative.as_str())
+                else {
+                    return Err(ServerError::SourceWorkflow(format!(
+                        "stored source tree contains unmanifested file {relative}"
+                    )));
+                };
+                if metadata.len() != expected_file.bytes {
+                    return Err(ServerError::SourceWorkflow(format!(
+                        "stored source file {relative} does not match its manifest byte count"
+                    )));
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let executable = metadata.permissions().mode() & 0o111 != 0;
+                    if executable != (expected_file.mode == 0o100755) {
+                        return Err(ServerError::SourceWorkflow(format!(
+                            "stored source file {relative} does not match its manifest mode"
+                        )));
+                    }
+                }
+                if let Some(file_bytes) = &mut file_bytes {
+                    let bytes = read_inspected_source_file(
+                        &entry.path(),
+                        &relative,
+                        expected_file.bytes,
+                        &metadata,
+                    )?;
+                    #[cfg(test)]
+                    {
+                        file_metadata_operations += 2;
+                    }
+                    if file_bytes[file_index].replace(bytes).is_some() {
+                        return Err(ServerError::SourceWorkflow(format!(
+                            "stored source tree contains duplicate file {relative}"
+                        )));
+                    }
+                }
+                found_files += 1;
+            } else {
+                return Err(ServerError::SourceWorkflow(format!(
+                    "stored source tree contains unsupported entry {relative}"
+                )));
+            }
+            if metadata_by_path
+                .insert(relative.clone(), metadata)
+                .is_some()
+            {
+                return Err(ServerError::SourceWorkflow(format!(
+                    "stored source tree contains duplicate entry {relative}"
+                )));
+            }
+        }
+    }
+    if found_files != expected.files.len() || found_directories != expected.directories.len() {
+        return Err(ServerError::SourceWorkflow(
+            "stored source tree does not exactly match its manifest".to_owned(),
+        ));
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"somite-source-object-metadata-v2\0");
+    update_source_digest_frame(&mut hasher, &serde_json::to_vec(manifest)?);
+    update_source_metadata_frame(&mut hasher, &root_metadata)?;
+    for (relative, metadata) in &metadata_by_path {
+        update_source_digest_frame(&mut hasher, relative.as_bytes());
+        update_source_metadata_frame(&mut hasher, metadata)?;
+    }
+    let files = file_bytes
+        .map(|file_bytes| {
+            manifest
+                .files
+                .iter()
+                .zip(file_bytes)
+                .map(|(entry, bytes)| {
+                    bytes.map(|bytes| (entry.clone(), bytes)).ok_or_else(|| {
+                        ServerError::SourceWorkflow(format!(
+                            "stored source tree is missing file {} after inspection",
+                            entry.path
+                        ))
+                    })
+                })
+                .collect::<Result<StoredSourceFiles, ServerError>>()
+        })
+        .transpose()?;
+    Ok(SourceTreeInspection {
+        metadata_fingerprint: format!("blake3:{}", hasher.finalize().to_hex()),
+        files,
+        #[cfg(test)]
+        metadata_operations,
+        #[cfg(test)]
+        file_metadata_operations,
+    })
+}
+
+fn read_inspected_source_file(
+    path: &Path,
+    relative: &str,
+    expected_bytes: u64,
+    inspected_metadata: &std::fs::Metadata,
+) -> Result<Vec<u8>, ServerError> {
+    if expected_bytes > MAX_NFCORE_TRACKED_FILE_BYTES {
+        return Err(ServerError::SourceWorkflow(format!(
+            "stored source file {relative} exceeds the source file read limit"
+        )));
+    }
+    let inspected_identity = source_metadata_identity(inspected_metadata)?;
+    let mut file = std::fs::File::open(path)?;
+    let opened_metadata = file.metadata()?;
+    if !opened_metadata.is_file()
+        || source_metadata_identity(&opened_metadata)? != inspected_identity
+    {
+        return Err(ServerError::SourceWorkflow(format!(
+            "stored source file {relative} changed between inspection and open"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(expected_bytes).unwrap_or_default());
+    (&mut file)
+        .take(expected_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    let confirmed_metadata = file.metadata()?;
+    if source_metadata_identity(&confirmed_metadata)? != inspected_identity
+        || bytes.len() as u64 != expected_bytes
+    {
+        return Err(ServerError::SourceWorkflow(format!(
+            "stored source file {relative} changed while it was read"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn source_metadata_identity(metadata: &std::fs::Metadata) -> Result<blake3::Hash, ServerError> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"somite-source-metadata-identity-v1\0");
+    update_source_metadata_frame(&mut hasher, metadata)?;
+    Ok(hasher.finalize())
+}
+
+fn read_regular_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, ServerError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        ServerError::SourceWorkflow(format!("stored source file {}: {error}", path.display()))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ServerError::SourceWorkflow(format!(
+            "stored source file {} is not a regular non-symlink file",
+            path.display()
+        )));
+    }
+    if metadata.len() > max_bytes {
+        return Err(ServerError::SourceWorkflow(format!(
+            "stored source file {} exceeds the {max_bytes} byte read limit",
+            path.display()
+        )));
+    }
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or_default());
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(ServerError::SourceWorkflow(format!(
+            "stored source file {} changed beyond the {max_bytes} byte read limit",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn update_source_metadata_frame(
+    hasher: &mut blake3::Hasher,
+    metadata: &std::fs::Metadata,
+) -> Result<(), ServerError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        hasher.update(&metadata.dev().to_le_bytes());
+        hasher.update(&metadata.ino().to_le_bytes());
+        hasher.update(&metadata.mode().to_le_bytes());
+        hasher.update(&metadata.nlink().to_le_bytes());
+        hasher.update(&metadata.size().to_le_bytes());
+        hasher.update(&metadata.mtime().to_le_bytes());
+        hasher.update(&metadata.mtime_nsec().to_le_bytes());
+        hasher.update(&metadata.ctime().to_le_bytes());
+        hasher.update(&metadata.ctime_nsec().to_le_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        update_portable_source_metadata_frame(
+            hasher,
+            metadata.len(),
+            metadata.modified(),
+            metadata.is_file(),
+            metadata.is_dir(),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(any(not(unix), test))]
+fn update_portable_source_metadata_frame(
+    hasher: &mut blake3::Hasher,
+    len: u64,
+    modified: std::io::Result<SystemTime>,
+    is_file: bool,
+    is_dir: bool,
+) -> Result<(), ServerError> {
+    hasher.update(&len.to_le_bytes());
+    let modified = modified?.duration_since(UNIX_EPOCH).unwrap_or_default();
+    hasher.update(&modified.as_secs().to_le_bytes());
+    hasher.update(&modified.subsec_nanos().to_le_bytes());
+    hasher.update(&[u8::from(is_file), u8::from(is_dir)]);
+    Ok(())
+}
+
+fn source_derived_projection_digest(
+    workflow: &SourceWorkflowInstance,
+) -> Result<String, ServerError> {
+    let encoded = serde_json::to_vec(&(
+        &workflow.parameters,
+        &workflow.unsupported_required_parameters,
+        &workflow.scopes,
+        &workflow.invocations,
+        &workflow.capabilities,
+        &workflow.diagnostics,
+    ))?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"somite-source-derived-projection-v1\0");
+    hasher.update(&encoded);
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
+}
+
+// The verified-object fast path is sound only when the metadata frame carries
+// Unix device/inode/mode/link-count/size/mtime/ctime change tokens. Portable
+// std metadata permits a same-length replacement with a restored modification
+// time, so non-Unix builds deliberately cold-read/reindex on every check and
+// then content-verify a second read instead of trusting a weak post-read frame.
+const fn source_verification_metadata_cache_enabled() -> bool {
+    cfg!(unix)
+}
+
+fn source_verification_gate(key: &SourceVerificationKey) -> &'static Mutex<()> {
+    let gates = SOURCE_VERIFICATION_GATES.get_or_init(|| {
+        (0..SOURCE_VERIFICATION_GATE_STRIPES)
+            .map(|_| Mutex::new(()))
+            .collect()
+    });
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    let stripe_count = u64::try_from(gates.len()).unwrap_or(1);
+    let index = usize::try_from(hasher.finish() % stripe_count).unwrap_or_default();
+    &gates[index]
+}
+
+fn verify_stored_source_instance_cached(
+    root: &Path,
+    workflow: &SourceWorkflowInstance,
+) -> Result<(), ServerError> {
+    let canonical_project_root = root.canonicalize()?;
+    let key = (
+        canonical_project_root,
+        workflow.source.source_digest.clone(),
+        SOURCE_INDEXER_REVISION.to_owned(),
+    );
+    let _verification_guard = source_verification_gate(&key)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let stored = read_stored_source_instance_metadata(root, workflow)?;
+    let canonical_source_root = stored.source_root.canonicalize()?;
+    let metadata_fingerprint = stored.metadata_fingerprint;
+    let derived_projection_digest = source_derived_projection_digest(workflow)?;
+    if source_verification_metadata_cache_enabled() {
+        let cache = VERIFIED_SOURCE_OBJECTS.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let verified = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if verified.get(&key).is_some_and(|token| {
+            token.metadata_fingerprint == metadata_fingerprint
+                && token.derived_projection_digest == derived_projection_digest
+        }) {
+            return Ok(());
+        }
+    }
+
+    #[cfg(test)]
+    SOURCE_COLD_VERIFICATIONS.fetch_add(1, Ordering::Relaxed);
+    {
+        let exact = read_stored_source_instance(root, workflow)?;
+        verify_source_instance_derivation(exact)?;
+    }
+    let confirmed = read_stored_source_instance_metadata(root, workflow)?;
+    let confirmed_root = confirmed.source_root.canonicalize()?;
+    let confirmed_fingerprint = confirmed.metadata_fingerprint;
+    if confirmed_root != canonical_source_root || confirmed_fingerprint != metadata_fingerprint {
+        return Err(ServerError::SourceWorkflow(format!(
+            "source workflow {} immutable source object changed during verification",
+            workflow.workflow_revision
+        )));
+    }
+    #[cfg(not(unix))]
+    {
+        // The second bounded read revalidates every per-file and aggregate
+        // digest after the weak portable metadata confirmation above.
+        let _confirmed_exact = read_stored_source_instance(root, workflow)?;
+    }
+
+    if source_verification_metadata_cache_enabled() {
+        let cache = VERIFIED_SOURCE_OBJECTS.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let mut verified = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if verified.len() >= MAX_VERIFIED_SOURCE_OBJECTS && !verified.contains_key(&key) {
+            if let Some(oldest_key) = verified.keys().next().cloned() {
+                verified.remove(&oldest_key);
+            }
+        }
+        verified.insert(
+            key,
+            SourceVerificationToken {
+                metadata_fingerprint,
+                derived_projection_digest,
+                #[cfg(test)]
+                cold_verification_sequence: SOURCE_VERIFICATION_SEQUENCE
+                    .fetch_add(1, Ordering::Relaxed),
+            },
+        );
+    }
+    Ok(())
+}
+
+fn verify_source_instance_derivation(stored: StoredSourceInstance) -> Result<(), ServerError> {
+    let StoredSourceInstance {
+        workflow,
+        manifest,
+        files,
+    } = stored;
+    let frozen = into_frozen_source_files(files);
+    let reindexed =
+        somite_source_workflow::reindex_frozen(&manifest, &frozen, &workflow.source.entrypoint)
+            .map_err(|error| ServerError::SourceWorkflow(error.to_string()))?;
+    if reindexed.parameters != workflow.parameters
+        || reindexed.unsupported_required_parameters != workflow.unsupported_required_parameters
+        || reindexed.scopes != workflow.scopes
+        || reindexed.invocations != workflow.invocations
+        || reindexed.capabilities != workflow.capabilities
+        || reindexed.diagnostics != workflow.diagnostics
+    {
+        return Err(ServerError::SourceWorkflow(format!(
+            "source workflow {} derived index does not match its exact stored source bytes under {SOURCE_INDEXER_REVISION}; re-import the source workflow",
+            workflow.workflow_revision
+        )));
+    }
+    Ok(())
+}
+
+fn into_frozen_source_files(files: StoredSourceFiles) -> Vec<FrozenSourceFile> {
+    files
+        .into_iter()
+        .map(|(entry, bytes)| FrozenSourceFile {
+            path: entry.path,
+            mode: entry.mode,
+            bytes,
+        })
+        .collect()
+}
+
+fn verify_graph_source_store(root: &Path, graph: &Graph) -> Result<(), ServerError> {
+    for node in graph.nodes.iter().chain(
+        graph
+            .variant_origin
+            .iter()
+            .map(|origin| &origin.source_node),
+    ) {
+        let Some(workflow) = &node.source_workflow else {
+            continue;
+        };
+        verify_stored_source_instance_cached(root, workflow).map_err(|error| {
+            ServerError::SourceWorkflow(format!(
+                "source node {} failed stored identity verification: {error}",
+                node.id
+            ))
+        })?;
+        verify_source_project_bindings(root, workflow)?;
+    }
+    Ok(())
+}
+
+fn verify_source_project_bindings(
+    root: &Path,
+    workflow: &SourceWorkflowInstance,
+) -> Result<(), ServerError> {
+    let project_root = root.canonicalize().map_err(|error| {
+        ServerError::SourceWorkflow(format!(
+            "could not resolve the project root for source bindings: {error}"
+        ))
+    })?;
+    for (parameter, binding) in &workflow.bindings {
+        match binding {
+            WorkflowBinding::ProjectFile { path } => verify_project_binding_path(
+                &project_root,
+                parameter,
+                path,
+                ProjectBindingKind::File,
+            )?,
+            WorkflowBinding::ProjectDirectory { path } => verify_project_binding_path(
+                &project_root,
+                parameter,
+                path,
+                ProjectBindingKind::Directory,
+            )?,
+            WorkflowBinding::Literal { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ProjectBindingKind {
+    File,
+    Directory,
+}
+
+impl ProjectBindingKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Directory => "directory",
+        }
+    }
+}
+
+fn verify_project_binding_path(
+    project_root: &Path,
+    parameter: &str,
+    relative: &str,
+    kind: ProjectBindingKind,
+) -> Result<(), ServerError> {
+    if !safe_source_relative_path(relative) {
+        return Err(ServerError::SourceWorkflow(format!(
+            "source parameter {parameter} project {} path must be safe and relative",
+            kind.label()
+        )));
+    }
+    let components = Path::new(relative).components().collect::<Vec<_>>();
+    let mut path = project_root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(ServerError::SourceWorkflow(format!(
+                "source parameter {parameter} project {} path must be safe and relative",
+                kind.label()
+            )));
+        };
+        path.push(component);
+        let final_component = index + 1 == components.len();
+        let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+            ServerError::SourceWorkflow(format!(
+                "source parameter {parameter} project {} {relative} is not available: {error}",
+                kind.label()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(ServerError::SourceWorkflow(format!(
+                "source parameter {parameter} project {} {relative} crosses a symlink",
+                kind.label()
+            )));
+        }
+        if !final_component && !metadata.is_dir() {
+            return Err(ServerError::SourceWorkflow(format!(
+                "source parameter {parameter} project {} {relative} crosses a non-directory component",
+                kind.label()
+            )));
+        }
+        if final_component {
+            let expected_type = match kind {
+                ProjectBindingKind::File => metadata.is_file(),
+                ProjectBindingKind::Directory => metadata.is_dir(),
+            };
+            if !expected_type {
+                return Err(ServerError::SourceWorkflow(format!(
+                    "source parameter {parameter} project {} {relative} has the wrong file type",
+                    kind.label()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn edit_source_workflow(
+    State(project): State<Arc<WebProject>>,
+    Json(request): Json<SourceWorkflowEditRequest>,
+) -> Result<Json<SourceWorkflowEditResponse>, ServerError> {
+    Ok(Json(
+        run_server_blocking("source workflow edit", move || {
+            edit_source_workflow_locked(&project, request)
+        })
+        .await?,
+    ))
+}
+
+fn edit_source_workflow_locked(
+    project: &WebProject,
+    request: SourceWorkflowEditRequest,
+) -> Result<SourceWorkflowEditResponse, ServerError> {
+    if !(1..=64).contains(&request.edits.len()) {
+        return Err(ServerError::SourceWorkflow(
+            "source workflow transaction must contain between 1 and 64 edits".to_owned(),
+        ));
+    }
+    let _guard = project
+        .graph_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut graph = current_agent_graph(project)?;
+    let current_state_revision = graph_state_revision(&graph)?;
+    if request.base_state_revision != current_state_revision {
+        return Err(ServerError::GraphStateConflict {
+            provided: request.base_state_revision,
+            current: current_state_revision,
+        });
+    }
+    let base_workflow = graph_source_workflow(&graph)?.clone();
+    if request.workflow_revision != base_workflow.workflow_revision {
+        return Err(ServerError::SourceWorkflow(format!(
+            "source workflow revision {} is stale; current workflow revision is {}",
+            request.workflow_revision, base_workflow.workflow_revision
+        )));
+    }
+    let stored = read_stored_source_instance_metadata(&project.root, &base_workflow)?;
+    let edited = apply_checked_source_edit(
+        &stored.workflow,
+        &EditTransaction {
+            base_workflow_revision: request.workflow_revision,
+            edits: request.edits,
+        },
+    )?;
+    verify_source_project_bindings(&project.root, &edited)?;
+    let edited_metadata = StoredSourceInstanceMetadata {
+        workflow: edited.clone(),
+        manifest: stored.manifest,
+        source_root: stored.source_root,
+        metadata_fingerprint: stored.metadata_fingerprint,
+    };
+    graph.nodes[0].source_workflow = Some(edited);
+    graph.validate()?;
+    project.catalog.verify_graph(&graph)?;
+    let _ = serialize_graph_with_limit(&graph, MAX_GRAPH_BYTES)?;
+    let state_revision = graph_state_revision(&graph)?;
+    let graph_revision = semantic_graph_revision(&graph)?;
+    persist_source_instance_metadata(&project.root, &edited_metadata)?;
+    verify_graph_source_store(&project.root, &graph)?;
+    WebProject::write_graph_at(
+        &project.root,
+        &project.autosave_path(),
+        &graph,
+        &project.catalog,
+    )?;
+    Ok(SourceWorkflowEditResponse {
+        state_revision,
+        graph_revision,
+        graph,
+    })
+}
+
+fn apply_checked_source_edit(
+    workflow: &SourceWorkflowInstance,
+    transaction: &EditTransaction,
+) -> Result<SourceWorkflowInstance, ServerError> {
+    if transaction.edits.iter().any(|edit| {
+        matches!(
+            edit,
+            SemanticEdit::SetParameter { .. } | SemanticEdit::ResetParameter { .. }
+        )
+    }) && !workflow.capabilities.parameter_edits
+    {
+        return Err(ServerError::SourceWorkflow(format!(
+            "source workflow {} does not permit parameter edits",
+            workflow.workflow_revision
+        )));
+    }
+    apply_source_edit(workflow, transaction)
+        .map_err(|error| ServerError::SourceWorkflow(error.to_string()))
+}
+
+async fn promote_source_workflow(
+    State(project): State<Arc<WebProject>>,
+    Json(request): Json<SourceWorkflowPromotionRequest>,
+) -> Result<Json<SourceWorkflowEditResponse>, ServerError> {
+    Ok(Json(
+        run_server_blocking("source workflow promotion", move || {
+            promote_source_workflow_locked(&project, request)
+        })
+        .await?,
+    ))
+}
+
+fn promote_source_workflow_locked(
+    project: &WebProject,
+    request: SourceWorkflowPromotionRequest,
+) -> Result<SourceWorkflowEditResponse, ServerError> {
+    let _guard = project
+        .graph_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let graph = current_agent_graph(project)?;
+    let current_state_revision = graph_state_revision(&graph)?;
+    if request.base_state_revision != current_state_revision {
+        return Err(ServerError::GraphStateConflict {
+            provided: request.base_state_revision,
+            current: current_state_revision,
+        });
+    }
+    let promoted = build_promoted_source_graph(
+        project,
+        &graph,
+        &request.workflow_revision,
+        &request.invocation_id,
+    )?;
+    WebProject::write_graph_at(
+        &project.root,
+        &project.autosave_path(),
+        &promoted,
+        &project.catalog,
+    )?;
+    Ok(SourceWorkflowEditResponse {
+        state_revision: graph_state_revision(&promoted)?,
+        graph_revision: semantic_graph_revision(&promoted)?,
+        graph: promoted,
+    })
+}
+
+fn build_promoted_source_graph(
+    project: &WebProject,
+    graph: &Graph,
+    workflow_revision: &str,
+    invocation_id: &str,
+) -> Result<Graph, ServerError> {
+    verify_graph_source_store(&project.root, graph)?;
+    let workflow = graph_source_workflow(graph)?;
+    if workflow_revision != workflow.workflow_revision {
+        return Err(ServerError::SourceWorkflow(format!(
+            "source workflow revision {} is stale; current workflow revision is {}",
+            workflow_revision, workflow.workflow_revision
+        )));
+    }
+    let replacement = workflow
+        .replacements
+        .iter()
+        .find(|replacement| replacement.invocation_id == invocation_id)
+        .ok_or_else(|| {
+            ServerError::SourceWorkflow(format!(
+                "source invocation {} has no selected replacement to promote",
+                invocation_id
+            ))
+        })?;
+    let operator = project.catalog.get(&replacement.operator)?;
+    let node_id = promoted_node_id(&operator.id, invocation_id);
+    let promoted_node = Node {
+        id: node_id,
+        operator: operator.id.clone(),
+        operator_revision: operator.revision()?,
+        ports: operator.ir_ports(),
+        params: replacement.params.clone(),
+        source_workflow: None,
+        layout: graph.nodes[0].layout.clone(),
+        note: None,
+        color: graph.nodes[0].color,
+    };
+    let promoted = promote_invocation(graph, workflow_revision, invocation_id, promoted_node)
+        .map_err(|error| ServerError::SourceWorkflow(error.to_string()))?;
+    promoted.validate()?;
+    project.catalog.verify_graph(&promoted)?;
+    let _ = serialize_graph_with_limit(&promoted, MAX_GRAPH_BYTES)?;
+    verify_graph_source_store(&project.root, &promoted)?;
+    Ok(promoted)
+}
+
+fn promoted_node_id(operator: &str, invocation_id: &str) -> String {
+    let base = operator
+        .rsplit('.')
+        .next()
+        .unwrap_or("promoted")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let suffix = blake3::hash(invocation_id.as_bytes()).to_hex();
+    format!("{}-{}", base.trim_matches('-'), &suffix[..8])
+}
+
+async fn restore_source_workflow_view(
+    State(project): State<Arc<WebProject>>,
+    Json(request): Json<SourceWorkflowRestoreRequest>,
+) -> Result<Json<SourceWorkflowEditResponse>, ServerError> {
+    Ok(Json(
+        run_server_blocking("source workflow restore", move || {
+            restore_source_workflow_view_locked(&project, request)
+        })
+        .await?,
+    ))
+}
+
+fn restore_source_workflow_view_locked(
+    project: &WebProject,
+    request: SourceWorkflowRestoreRequest,
+) -> Result<SourceWorkflowEditResponse, ServerError> {
+    let _guard = project
+        .graph_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let graph = current_agent_graph(project)?;
+    let current_state_revision = graph_state_revision(&graph)?;
+    if request.base_state_revision != current_state_revision {
+        return Err(ServerError::GraphStateConflict {
+            provided: request.base_state_revision,
+            current: current_state_revision,
+        });
+    }
+    verify_graph_source_store(&project.root, &graph)?;
+    let restored = restore_source_workflow(&graph)
+        .map_err(|error| ServerError::SourceWorkflow(error.to_string()))?;
+    project.catalog.verify_graph(&restored)?;
+    let _ = serialize_graph_with_limit(&restored, MAX_GRAPH_BYTES)?;
+    verify_graph_source_store(&project.root, &restored)?;
+    WebProject::write_graph_at(
+        &project.root,
+        &project.autosave_path(),
+        &restored,
+        &project.catalog,
+    )?;
+    Ok(SourceWorkflowEditResponse {
+        state_revision: graph_state_revision(&restored)?,
+        graph_revision: semantic_graph_revision(&restored)?,
+        graph: restored,
+    })
+}
+
+#[cfg(test)]
 fn run_nfcore_preview(
     nextflow: &Path,
     work: &Path,
@@ -1816,6 +5052,7 @@ fn run_nfcore_preview(
     run_nfcore_preview_attempt(nextflow, work, request, dot_path, Some("v1"))
 }
 
+#[cfg(test)]
 fn run_nfcore_preview_attempt(
     nextflow: &Path,
     work: &Path,
@@ -1849,6 +5086,7 @@ fn run_nfcore_preview_attempt(
     command.output()
 }
 
+#[cfg(test)]
 fn remove_preview_artifact(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -1857,6 +5095,7 @@ fn remove_preview_artifact(path: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(test)]
 fn nfcore_preview_needs_legacy_parser(work: &Path, output: &std::process::Output) -> bool {
     if output.status.code() == Some(124) {
         return false;
@@ -1871,6 +5110,7 @@ fn nfcore_preview_needs_legacy_parser(work: &Path, output: &std::process::Output
             && evidence.contains("multiplecompilationerrorsexception")
 }
 
+#[cfg(test)]
 fn nfcore_preview_failure_evidence(work: &Path, output: &std::process::Output) -> String {
     let log = std::fs::read_to_string(work.join(".nextflow.log")).unwrap_or_default();
     format!(
@@ -1880,6 +5120,7 @@ fn nfcore_preview_failure_evidence(work: &Path, output: &std::process::Output) -
     )
 }
 
+#[cfg(test)]
 fn nfcore_preview_failure_detail(work: &Path, output: &std::process::Output) -> String {
     let log = std::fs::read_to_string(work.join(".nextflow.log")).unwrap_or_default();
     if let Some(detail) = concise_nextflow_log_failure(&log) {
@@ -1893,6 +5134,7 @@ fn nfcore_preview_failure_detail(work: &Path, output: &std::process::Output) -> 
         .unwrap_or_else(|| "Nextflow did not produce a DAG".to_owned())
 }
 
+#[cfg(test)]
 fn concise_nextflow_log_failure(log: &str) -> Option<String> {
     let headline = log.lines().rev().find_map(|line| {
         let error = line
@@ -1935,38 +5177,73 @@ fn last_nonempty_output_line(output: &[u8]) -> Option<String> {
 
 async fn validate_graph(
     State(project): State<Arc<WebProject>>,
-    Json(mut graph): Json<Graph>,
+    Json(graph): Json<Graph>,
 ) -> Result<Json<ValidationResponse>, ServerError> {
-    project.catalog.pin_graph(&mut graph)?;
-    Ok(Json(ValidationResponse { valid: true }))
+    Ok(Json(
+        run_server_blocking("workflow validation", move || {
+            let mut graph = graph;
+            project.catalog.pin_graph(&mut graph)?;
+            reject_resolver_only_graph(&graph)?;
+            verify_graph_source_store(&project.root, &graph)?;
+            Ok(ValidationResponse { valid: true })
+        })
+        .await?,
+    ))
 }
 
 async fn readiness_snapshot(
     State(project): State<Arc<WebProject>>,
-    Json(mut graph): Json<Graph>,
+    Json(graph): Json<Graph>,
 ) -> Result<Json<WorkflowAssessment>, ServerError> {
-    let mut catalog = project.catalog.clone();
-    install_cached_nfcore(&project.root, &mut catalog);
-    catalog.pin_graph(&mut graph)?;
-    Ok(Json(assess(&graph, &catalog)?))
+    Ok(Json(
+        run_server_blocking("workflow readiness", move || {
+            let catalog = project.catalog.clone();
+            let mut graph = graph;
+            catalog.pin_graph(&mut graph)?;
+            reject_resolver_only_graph(&graph)?;
+            verify_graph_source_store(&project.root, &graph)?;
+            assess(&graph, &catalog).map_err(ServerError::from)
+        })
+        .await?,
+    ))
 }
 
 async fn save_graph(
     State(project): State<Arc<WebProject>>,
-    Json(mut graph): Json<Graph>,
-) -> Result<Json<ValidationResponse>, ServerError> {
-    project.catalog.pin_graph(&mut graph)?;
-    project.save_graph(&graph)?;
-    Ok(Json(ValidationResponse { valid: true }))
+    Json(request): Json<GraphWriteRequest>,
+) -> Result<Json<GraphWriteResponse>, ServerError> {
+    Ok(Json(
+        run_server_blocking("graph save", move || {
+            let mut request = request;
+            project.catalog.pin_graph(&mut request.graph)?;
+            let state_revision =
+                project.save_graph_cas(&request.base_state_revision, &request.graph)?;
+            Ok(GraphWriteResponse {
+                valid: true,
+                state_revision,
+            })
+        })
+        .await?,
+    ))
 }
 
 async fn autosave_graph(
     State(project): State<Arc<WebProject>>,
-    Json(mut graph): Json<Graph>,
-) -> Result<Json<ValidationResponse>, ServerError> {
-    project.catalog.pin_graph(&mut graph)?;
-    project.save_autosave(&graph)?;
-    Ok(Json(ValidationResponse { valid: true }))
+    Json(request): Json<GraphWriteRequest>,
+) -> Result<Json<GraphWriteResponse>, ServerError> {
+    Ok(Json(
+        run_server_blocking("graph autosave", move || {
+            let mut request = request;
+            project.catalog.pin_graph(&mut request.graph)?;
+            let state_revision =
+                project.save_autosave_cas(&request.base_state_revision, &request.graph)?;
+            Ok(GraphWriteResponse {
+                valid: true,
+                state_revision,
+            })
+        })
+        .await?,
+    ))
 }
 
 #[derive(Debug, Serialize)]
@@ -1979,14 +5256,19 @@ struct AgentGraphResponse {
 async fn agent_graph(
     State(project): State<Arc<WebProject>>,
 ) -> Result<Json<AgentGraphResponse>, ServerError> {
-    let graph = current_agent_graph(&project)?;
-    let state_revision = graph_state_revision(&graph)?;
-    let graph_revision = semantic_graph_revision(&graph)?;
-    Ok(Json(AgentGraphResponse {
-        state_revision,
-        graph_revision,
-        graph,
-    }))
+    Ok(Json(
+        run_server_blocking("agent graph read", move || {
+            let graph = current_agent_graph(&project)?;
+            let state_revision = graph_state_revision(&graph)?;
+            let graph_revision = semantic_graph_revision(&graph)?;
+            Ok(AgentGraphResponse {
+                state_revision,
+                graph_revision,
+                graph,
+            })
+        })
+        .await?,
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2142,6 +5424,24 @@ fn catalog_cursor(catalog_revision: &str, offset: usize) -> String {
     )
 }
 
+fn resolver_only_operator_id(operator_id: &str) -> bool {
+    operator_id.starts_with("nf.") || operator_id.starts_with("smk.")
+}
+
+fn reject_resolver_only_graph(graph: &Graph) -> Result<(), ServerError> {
+    if let Some(node) = graph
+        .nodes
+        .iter()
+        .find(|node| resolver_only_operator_id(&node.operator))
+    {
+        return Err(ServerError::SourceWorkflow(format!(
+            "node {} uses resolver-only operator {}; import its canonical workflow instead",
+            node.id, node.operator
+        )));
+    }
+    Ok(())
+}
+
 fn catalog_cursor_offset(
     cursor: Option<&str>,
     catalog_revision: &str,
@@ -2172,13 +5472,15 @@ async fn agent_catalog(
     let mut query_terms = BTreeSet::new();
     add_catalog_terms(&mut query_terms, query);
     let query_terms = query_terms.into_iter().collect::<Vec<_>>();
-    let mut catalog = project.catalog.clone();
-    install_cached_nfcore(&project.root, &mut catalog);
+    let catalog = project.catalog.clone();
     let catalog_revision = catalog.catalog_revision()?;
     let offset = catalog_cursor_offset(request.cursor.as_deref(), &catalog_revision)?;
     let mut matches = catalog
         .ops
         .values()
+        .filter(|operator| {
+            operator.kind != OpKind::Source && !resolver_only_operator_id(&operator.id)
+        })
         .filter_map(|operator| {
             catalog_search_score(operator, &query_terms).map(|(score, matched_terms)| {
                 (
@@ -2254,16 +5556,21 @@ async fn agent_transaction(
             (replay.result.clone(), true)
         } else {
             let graph = current_agent_graph(&project)?;
-            let mut catalog = project.catalog.clone();
-            install_cached_nfcore(&project.root, &mut catalog);
+            let catalog = project.catalog.clone();
             let result = agent::apply_graph_transaction(
                 &graph,
                 &catalog,
                 request,
                 project.next_id("transaction"),
             )?;
-            WebProject::write_graph_at(&project.autosave_path(), &result.graph, &catalog)?;
-            if replays.len() >= 1_024 {
+            verify_graph_source_store(&project.root, &result.graph)?;
+            WebProject::write_graph_at(
+                &project.root,
+                &project.autosave_path(),
+                &result.graph,
+                &catalog,
+            )?;
+            if replays.len() >= MAX_GRAPH_TRANSACTION_REPLAYS {
                 if let Some(oldest_key) = replays
                     .iter()
                     .min_by_key(|(_, replay)| replay.sequence)
@@ -2287,6 +5594,425 @@ async fn agent_transaction(
         project.agent.record_transaction(result.clone());
     }
     Ok(Json(AgentTransactionResponse { result, replayed }))
+}
+
+async fn agent_import_nfcore_source(
+    State(project): State<Arc<WebProject>>,
+    Json(request): Json<AgentNfcoreSourceImportRequest>,
+) -> Result<Json<AgentTransactionResponse>, ServerError> {
+    if !agent::valid_idempotency_key(&request.idempotency_key) {
+        return Err(ServerError::Agent(agent::AgentError::InvalidIdempotencyKey));
+    }
+    let summary = request.summary.trim();
+    if summary.is_empty() || summary.chars().count() > 240 || summary.chars().any(char::is_control)
+    {
+        return Err(ServerError::Agent(agent::AgentError::InvalidSummary));
+    }
+    let workflow_request = WorkflowGraphRequest {
+        workflow: request.workflow.clone(),
+        revision: request.revision.clone(),
+    };
+    validate_nfcore_workflow_request(&workflow_request)?;
+    let request_digest = content_digest(&serde_json::to_vec(&request)?);
+
+    {
+        let _guard = project
+            .graph_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let replays = project
+            .transaction_replays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(replay) = replays.get(&request.idempotency_key) {
+            if replay.request_digest != request_digest {
+                return Err(ServerError::Agent(agent::AgentError::IdempotencyConflict));
+            }
+            return Ok(Json(AgentTransactionResponse {
+                result: replay.result.clone(),
+                replayed: true,
+            }));
+        }
+        let current = current_agent_graph(&project)?;
+        let current_revision = graph_state_revision(&current)?;
+        if request.base_state_revision != current_revision {
+            return Err(ServerError::Agent(agent::AgentError::StaleTransaction {
+                actual: request.base_state_revision,
+                expected: current_revision,
+            }));
+        }
+        if !current.nodes.is_empty() || !current.edges.is_empty() {
+            return Err(ServerError::Agent(
+                agent::AgentError::SourceImportRequiresEmptyCanvas,
+            ));
+        }
+    }
+
+    let root = project.root.clone();
+    let source_operator_revision = project.catalog.revision("workflow.source")?;
+    let resolved = tokio::task::spawn_blocking(move || {
+        import_nfcore_source(&root, &workflow_request, &source_operator_revision, None)
+    })
+    .await
+    .map_err(|error| ServerError::WorkflowImport(error.to_string()))??;
+
+    let result = {
+        let _guard = project
+            .graph_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut replays = project
+            .transaction_replays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(replay) = replays.get(&request.idempotency_key) {
+            if replay.request_digest != request_digest {
+                return Err(ServerError::Agent(agent::AgentError::IdempotencyConflict));
+            }
+            return Ok(Json(AgentTransactionResponse {
+                result: replay.result.clone(),
+                replayed: true,
+            }));
+        }
+
+        let current = current_agent_graph(&project)?;
+        let previous_state_revision = graph_state_revision(&current)?;
+        if request.base_state_revision != previous_state_revision {
+            return Err(ServerError::Agent(agent::AgentError::StaleTransaction {
+                actual: request.base_state_revision,
+                expected: previous_state_revision,
+            }));
+        }
+        if !current.nodes.is_empty() || !current.edges.is_empty() {
+            return Err(ServerError::Agent(
+                agent::AgentError::SourceImportRequiresEmptyCanvas,
+            ));
+        }
+
+        let mut graph = resolved.graph;
+        graph.annotations = current.annotations;
+        if current.name.is_some() {
+            graph.name = current.name;
+        }
+        project.catalog.verify_graph(&graph)?;
+        verify_graph_source_store(&project.root, &graph)?;
+        let result = TransactionResult {
+            transaction_id: project.next_id("transaction"),
+            previous_state_revision,
+            state_revision: graph_state_revision(&graph)?,
+            graph_revision: semantic_graph_revision(&graph)?,
+            summary: summary.to_owned(),
+            graph,
+        };
+        WebProject::write_graph_at(
+            &project.root,
+            &project.autosave_path(),
+            &result.graph,
+            &project.catalog,
+        )?;
+        if replays.len() >= MAX_GRAPH_TRANSACTION_REPLAYS {
+            if let Some(oldest_key) = replays
+                .iter()
+                .min_by_key(|(_, replay)| replay.sequence)
+                .map(|(key, _)| key.clone())
+            {
+                replays.remove(&oldest_key);
+            }
+        }
+        replays.insert(
+            request.idempotency_key,
+            TransactionReplay {
+                request_digest,
+                result: result.clone(),
+                sequence: project.replay_sequence.fetch_add(1, Ordering::Relaxed),
+            },
+        );
+        result
+    };
+    project.agent.record_transaction(result.clone());
+    Ok(Json(AgentTransactionResponse {
+        result,
+        replayed: false,
+    }))
+}
+
+async fn agent_edit_source_workflow(
+    State(project): State<Arc<WebProject>>,
+    Json(request): Json<AgentSourceWorkflowEditRequest>,
+) -> Result<Json<AgentTransactionResponse>, ServerError> {
+    agent_edit_source_workflow_with_phase_two_hook(project, request, |_| {})
+}
+
+fn agent_edit_source_workflow_with_phase_two_hook(
+    project: Arc<WebProject>,
+    request: AgentSourceWorkflowEditRequest,
+    before_phase_two: impl FnOnce(&WebProject),
+) -> Result<Json<AgentTransactionResponse>, ServerError> {
+    if !agent::valid_idempotency_key(&request.idempotency_key) {
+        return Err(ServerError::Agent(agent::AgentError::InvalidIdempotencyKey));
+    }
+    let summary = request.summary.trim();
+    if summary.is_empty() || summary.chars().count() > 240 || summary.chars().any(char::is_control)
+    {
+        return Err(ServerError::Agent(agent::AgentError::InvalidSummary));
+    }
+    if !(1..=64).contains(&request.edits.len()) {
+        return Err(ServerError::Agent(
+            agent::AgentError::InvalidSourceEditCount,
+        ));
+    }
+    let request_digest = content_digest(&serde_json::to_vec(&request)?);
+
+    let base_workflow = {
+        let _guard = project
+            .graph_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let replays = project
+            .transaction_replays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(replay) = replays.get(&request.idempotency_key) {
+            if replay.request_digest != request_digest {
+                return Err(ServerError::Agent(agent::AgentError::IdempotencyConflict));
+            }
+            return Ok(Json(AgentTransactionResponse {
+                result: replay.result.clone(),
+                replayed: true,
+            }));
+        }
+        let current = current_agent_graph(&project)?;
+        let current_state_revision = graph_state_revision(&current)?;
+        if request.base_state_revision != current_state_revision {
+            return Err(ServerError::Agent(agent::AgentError::StaleTransaction {
+                actual: request.base_state_revision,
+                expected: current_state_revision,
+            }));
+        }
+        let workflow = graph_source_workflow(&current)?;
+        if request.workflow_revision != workflow.workflow_revision {
+            return Err(ServerError::Agent(agent::AgentError::StaleSourceWorkflow {
+                actual: request.workflow_revision,
+                expected: workflow.workflow_revision.clone(),
+            }));
+        }
+        workflow.clone()
+    };
+
+    let stored = read_stored_source_instance_metadata(&project.root, &base_workflow)?;
+    let edited = apply_checked_source_edit(
+        &stored.workflow,
+        &EditTransaction {
+            base_workflow_revision: request.workflow_revision.clone(),
+            edits: request.edits.clone(),
+        },
+    )?;
+    verify_source_project_bindings(&project.root, &edited)?;
+    let edited_metadata = StoredSourceInstanceMetadata {
+        workflow: edited.clone(),
+        manifest: stored.manifest,
+        source_root: stored.source_root,
+        metadata_fingerprint: stored.metadata_fingerprint,
+    };
+    before_phase_two(&project);
+
+    let result = {
+        let _guard = project
+            .graph_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut replays = project
+            .transaction_replays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(replay) = replays.get(&request.idempotency_key) {
+            if replay.request_digest != request_digest {
+                return Err(ServerError::Agent(agent::AgentError::IdempotencyConflict));
+            }
+            return Ok(Json(AgentTransactionResponse {
+                result: replay.result.clone(),
+                replayed: true,
+            }));
+        }
+        let mut graph = current_agent_graph(&project)?;
+        let previous_state_revision = graph_state_revision(&graph)?;
+        if request.base_state_revision != previous_state_revision {
+            return Err(ServerError::Agent(agent::AgentError::StaleTransaction {
+                actual: request.base_state_revision,
+                expected: previous_state_revision,
+            }));
+        }
+        let current_workflow_revision = graph_source_workflow(&graph)?.workflow_revision.clone();
+        if request.workflow_revision != current_workflow_revision {
+            return Err(ServerError::Agent(agent::AgentError::StaleSourceWorkflow {
+                actual: request.workflow_revision,
+                expected: current_workflow_revision,
+            }));
+        }
+        let node = graph.nodes.first_mut().ok_or(ServerError::Agent(
+            agent::AgentError::SourceWorkflowNotFound,
+        ))?;
+        node.source_workflow = Some(edited);
+        graph.validate()?;
+        project.catalog.verify_graph(&graph)?;
+        let _ = serialize_graph_with_limit(&graph, MAX_GRAPH_BYTES)?;
+        let state_revision = graph_state_revision(&graph)?;
+        let graph_revision = semantic_graph_revision(&graph)?;
+        persist_source_instance_metadata(&project.root, &edited_metadata)?;
+        verify_graph_source_store(&project.root, &graph)?;
+        let result = TransactionResult {
+            transaction_id: project.next_id("transaction"),
+            previous_state_revision,
+            state_revision,
+            graph_revision,
+            summary: summary.to_owned(),
+            graph,
+        };
+        WebProject::write_graph_at(
+            &project.root,
+            &project.autosave_path(),
+            &result.graph,
+            &project.catalog,
+        )?;
+        if replays.len() >= MAX_GRAPH_TRANSACTION_REPLAYS {
+            if let Some(oldest_key) = replays
+                .iter()
+                .min_by_key(|(_, replay)| replay.sequence)
+                .map(|(key, _)| key.clone())
+            {
+                replays.remove(&oldest_key);
+            }
+        }
+        replays.insert(
+            request.idempotency_key,
+            TransactionReplay {
+                request_digest,
+                result: result.clone(),
+                sequence: project.replay_sequence.fetch_add(1, Ordering::Relaxed),
+            },
+        );
+        result
+    };
+    project.agent.record_transaction(result.clone());
+    Ok(Json(AgentTransactionResponse {
+        result,
+        replayed: false,
+    }))
+}
+
+async fn agent_promote_source_workflow(
+    State(project): State<Arc<WebProject>>,
+    Json(request): Json<AgentSourceWorkflowPromotionRequest>,
+) -> Result<Json<AgentTransactionResponse>, ServerError> {
+    if !agent::valid_idempotency_key(&request.idempotency_key) {
+        return Err(ServerError::Agent(agent::AgentError::InvalidIdempotencyKey));
+    }
+    let summary = request.summary.trim();
+    if summary.is_empty() || summary.chars().count() > 240 || summary.chars().any(char::is_control)
+    {
+        return Err(ServerError::Agent(agent::AgentError::InvalidSummary));
+    }
+    if request.invocation_id.is_empty()
+        || request.invocation_id.len() > 512
+        || request.invocation_id.chars().any(char::is_control)
+    {
+        return Err(ServerError::SourceWorkflow(
+            "source invocation id must contain 1 to 512 printable bytes".to_owned(),
+        ));
+    }
+    let request_digest = content_digest(&serde_json::to_vec(&request)?);
+    let result = {
+        let _guard = project
+            .graph_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut replays = project
+            .transaction_replays
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(replay) = replays.get(&request.idempotency_key) {
+            if replay.request_digest != request_digest {
+                return Err(ServerError::Agent(agent::AgentError::IdempotencyConflict));
+            }
+            return Ok(Json(AgentTransactionResponse {
+                result: replay.result.clone(),
+                replayed: true,
+            }));
+        }
+
+        let graph = current_agent_graph(&project)?;
+        let previous_state_revision = graph_state_revision(&graph)?;
+        if request.base_state_revision != previous_state_revision {
+            return Err(ServerError::Agent(agent::AgentError::StaleTransaction {
+                actual: request.base_state_revision,
+                expected: previous_state_revision,
+            }));
+        }
+        let workflow = graph_source_workflow(&graph)?;
+        if request.workflow_revision != workflow.workflow_revision {
+            return Err(ServerError::Agent(agent::AgentError::StaleSourceWorkflow {
+                actual: request.workflow_revision,
+                expected: workflow.workflow_revision.clone(),
+            }));
+        }
+        let promoted = build_promoted_source_graph(
+            &project,
+            &graph,
+            &workflow.workflow_revision,
+            &request.invocation_id,
+        )?;
+        let result = TransactionResult {
+            transaction_id: project.next_id("transaction"),
+            previous_state_revision,
+            state_revision: graph_state_revision(&promoted)?,
+            graph_revision: semantic_graph_revision(&promoted)?,
+            summary: summary.to_owned(),
+            graph: promoted,
+        };
+        WebProject::write_graph_at(
+            &project.root,
+            &project.autosave_path(),
+            &result.graph,
+            &project.catalog,
+        )?;
+        if replays.len() >= MAX_GRAPH_TRANSACTION_REPLAYS {
+            if let Some(oldest_key) = replays
+                .iter()
+                .min_by_key(|(_, replay)| replay.sequence)
+                .map(|(key, _)| key.clone())
+            {
+                replays.remove(&oldest_key);
+            }
+        }
+        replays.insert(
+            request.idempotency_key,
+            TransactionReplay {
+                request_digest,
+                result: result.clone(),
+                sequence: project.replay_sequence.fetch_add(1, Ordering::Relaxed),
+            },
+        );
+        result
+    };
+    project.agent.record_transaction(result.clone());
+    Ok(Json(AgentTransactionResponse {
+        result,
+        replayed: false,
+    }))
+}
+
+fn graph_source_workflow(graph: &Graph) -> Result<&SourceWorkflowInstance, ServerError> {
+    if graph.nodes.len() != 1 || !graph.edges.is_empty() {
+        return Err(ServerError::Agent(
+            agent::AgentError::SourceWorkflowNotFound,
+        ));
+    }
+    graph.nodes[0]
+        .source_workflow
+        .as_ref()
+        .ok_or(ServerError::Agent(
+            agent::AgentError::SourceWorkflowNotFound,
+        ))
 }
 
 #[derive(Debug, Serialize)]
@@ -2444,25 +6170,33 @@ async fn agent_set_config(
 #[derive(Debug, Deserialize)]
 struct AgentPromptRequest {
     message: String,
+    base_state_revision: String,
     graph: Graph,
 }
 
 async fn agent_prompt(
     State(project): State<Arc<WebProject>>,
-    Json(mut request): Json<AgentPromptRequest>,
-) -> Result<StatusCode, ServerError> {
-    let mut catalog = project.catalog.clone();
-    install_cached_nfcore(&project.root, &mut catalog);
-    catalog.pin_graph(&mut request.graph)?;
-    {
-        let _guard = project
-            .graph_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        WebProject::write_graph_at(&project.autosave_path(), &request.graph, &catalog)?;
-    }
-    project.agent.prompt(request.message).await?;
-    Ok(StatusCode::ACCEPTED)
+    Json(request): Json<AgentPromptRequest>,
+) -> Result<(StatusCode, Json<GraphWriteResponse>), ServerError> {
+    let message = request.message;
+    project.agent.preflight_prompt(&message)?;
+    let state_revision = run_server_blocking("agent prompt graph commit", {
+        let project = project.clone();
+        move || {
+            let mut graph = request.graph;
+            project.catalog.pin_graph(&mut graph)?;
+            project.save_autosave_cas(&request.base_state_revision, &graph)
+        }
+    })
+    .await?;
+    project.agent.prompt(message).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(GraphWriteResponse {
+            valid: true,
+            state_revision,
+        }),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -2474,8 +6208,22 @@ struct AgentEventsQuery {
 async fn agent_events(
     State(project): State<Arc<WebProject>>,
     Query(request): Query<AgentEventsQuery>,
-) -> Json<AgentSnapshot> {
-    Json(project.agent.snapshot_after(request.after))
+) -> Result<Json<AgentSnapshot>, ServerError> {
+    let snapshot = run_server_blocking("authoritative agent event snapshot", move || {
+        // Capture the event batch first. The graph revision is then read under
+        // the same lock used by every server mutation, so it represents this
+        // complete batch or a state that superseded it.
+        let mut snapshot = project.agent.snapshot_after(request.after);
+        let _guard = project
+            .graph_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let graph = current_agent_graph(&project)?;
+        snapshot.authoritative_state_revision = Some(graph_state_revision(&graph)?);
+        Ok(snapshot)
+    })
+    .await?;
+    Ok(Json(snapshot))
 }
 
 async fn agent_transcript(State(project): State<Arc<WebProject>>) -> Json<AgentTranscript> {
@@ -2511,20 +6259,132 @@ async fn agent_permission(
     Ok(StatusCode::ACCEPTED)
 }
 
+fn checked_existing_graph_path(root: &Path, path: &Path) -> Result<PathBuf, ServerError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        ServerError::UnsafeGraphPath(format!(
+            "{} is not a readable regular file: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ServerError::UnsafeGraphPath(format!(
+            "{} must be a regular non-symlink file",
+            path.display()
+        )));
+    }
+    let canonical = path.canonicalize()?;
+    let canonical_root = root.canonicalize()?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(ServerError::UnsafeGraphPath(format!(
+            "{} escapes the canonical project root {}",
+            path.display(),
+            canonical_root.display()
+        )));
+    }
+    checked_graph_write_path(&canonical_root, &canonical)?;
+    Ok(canonical)
+}
+
+fn checked_graph_write_path(root: &Path, path: &Path) -> Result<(PathBuf, PathBuf), ServerError> {
+    let canonical_root = root.canonicalize()?;
+    let parent = path.parent().ok_or_else(|| {
+        ServerError::UnsafeGraphPath(format!("{} has no parent directory", path.display()))
+    })?;
+    let parent_metadata = std::fs::symlink_metadata(parent).map_err(|error| {
+        ServerError::UnsafeGraphPath(format!(
+            "graph parent {} is not available: {error}",
+            parent.display()
+        ))
+    })?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        return Err(ServerError::UnsafeGraphPath(format!(
+            "graph parent {} must be a regular non-symlink directory",
+            parent.display()
+        )));
+    }
+    let canonical_parent = parent.canonicalize()?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        return Err(ServerError::UnsafeGraphPath(format!(
+            "graph parent {} escapes the canonical project root {}",
+            parent.display(),
+            canonical_root.display()
+        )));
+    }
+    let filename = path.file_name().ok_or_else(|| {
+        ServerError::UnsafeGraphPath(format!("{} has no filename", path.display()))
+    })?;
+    let destination = canonical_parent.join(filename);
+    if destination != path {
+        return Err(ServerError::UnsafeGraphPath(format!(
+            "graph path {} is not canonical within its project parent",
+            path.display()
+        )));
+    }
+    match std::fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(ServerError::UnsafeGraphPath(format!(
+                "{} must be a regular non-symlink file",
+                destination.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(ServerError::Io(error)),
+    }
+    Ok((canonical_parent, destination))
+}
+
+fn read_graph_file(root: &Path, path: &Path) -> Result<Vec<u8>, ServerError> {
+    let (_, destination) = checked_graph_write_path(root, path)?;
+    let before_open = std::fs::symlink_metadata(&destination)?;
+    if before_open.file_type().is_symlink() || !before_open.is_file() {
+        return Err(ServerError::UnsafeGraphPath(format!(
+            "{} must be a regular non-symlink file",
+            destination.display()
+        )));
+    }
+    let file = std::fs::File::open(&destination)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || !same_file_identity(&before_open, &opened) {
+        return Err(ServerError::UnsafeGraphPath(format!(
+            "{} changed while it was being opened",
+            destination.display()
+        )));
+    }
+    if opened.len() > MAX_GRAPH_BYTES {
+        return Err(ServerError::UnsafeGraphPath(format!(
+            "{} exceeds the {MAX_GRAPH_BYTES} byte graph limit",
+            destination.display()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(opened.len() as usize);
+    file.take(MAX_GRAPH_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_GRAPH_BYTES {
+        return Err(ServerError::UnsafeGraphPath(format!(
+            "{} exceeds the {MAX_GRAPH_BYTES} byte graph limit",
+            destination.display()
+        )));
+    }
+    Ok(bytes)
+}
+
 fn current_agent_graph(project: &WebProject) -> Result<Graph, ServerError> {
     let recovery_path = project.autosave_path();
-    let mut catalog = project.catalog.clone();
-    install_cached_nfcore(&project.root, &mut catalog);
-    let mut graph = if let Some(graph) = read_valid_graph(&recovery_path, &catalog) {
+    let catalog = project.catalog.clone();
+    let mut graph = if let Some(graph) = read_valid_graph(&project.root, &recovery_path, &catalog)?
+    {
         graph
     } else {
-        let raw = std::fs::read_to_string(&project.graph_path)?;
-        serde_json::from_str::<Graph>(&raw)?
+        let raw = read_graph_file(&project.root, &project.graph_path)?;
+        serde_json::from_slice::<Graph>(&raw)?
     };
     catalog.pin_graph(&mut graph)?;
     workflow::upgrade_reference_ports(&mut graph);
     graph.validate()?;
+    reject_resolver_only_graph(&graph)?;
     catalog.verify_graph(&graph)?;
+    verify_graph_source_store(&project.root, &graph)?;
     Ok(graph)
 }
 
@@ -2534,8 +6394,15 @@ async fn start_run(
     Json(graph): Json<Graph>,
 ) -> Result<(StatusCode, Json<RunStartResponse>), ServerError> {
     let request_digest = content_digest(&serde_json::to_vec(&("run", &graph))?);
-    let (graph, catalog, target) = production_inputs(&project, &graph)?;
-    require_ready(&graph, &catalog)?;
+    let (graph, catalog, target) = run_server_blocking("run readiness", {
+        let project = project.clone();
+        move || {
+            let inputs = production_inputs(&project, &graph)?;
+            require_ready(&inputs.0, &inputs.1)?;
+            Ok(inputs)
+        }
+    })
+    .await?;
     queue_run(
         &project,
         graph,
@@ -2553,12 +6420,18 @@ async fn start_validation(
     Json(graph): Json<Graph>,
 ) -> Result<(StatusCode, Json<RunStartResponse>), ServerError> {
     let request_digest = content_digest(&serde_json::to_vec(&("validation", &graph))?);
-    let mut readiness_catalog = project.catalog.clone();
-    install_cached_nfcore(&project.root, &mut readiness_catalog);
-    let mut readiness_graph = graph.clone();
-    readiness_catalog.pin_graph(&mut readiness_graph)?;
-    require_ready(&readiness_graph, &readiness_catalog)?;
-    let (graph, catalog, target, validation) = validation_inputs(&project, &graph)?;
+    let (graph, catalog, target, validation) = run_server_blocking("validation readiness", {
+        let project = project.clone();
+        move || {
+            let readiness_catalog = project.catalog.clone();
+            let mut readiness_graph = graph.clone();
+            readiness_catalog.pin_graph(&mut readiness_graph)?;
+            verify_graph_source_store(&project.root, &readiness_graph)?;
+            require_ready(&readiness_graph, &readiness_catalog)?;
+            validation_inputs(&project, &graph)
+        }
+    })
+    .await?;
     queue_run(
         &project,
         graph,
@@ -2577,15 +6450,23 @@ fn require_ready(graph: &Graph, catalog: &Catalog) -> Result<(), ServerError> {
     }
     let detail = match snapshot.state {
         AssessmentState::Empty => "add at least one operator".to_owned(),
-        _ => format!(
-            "resolve {} required item{}; inspect /api/readiness or somite.readiness.get",
-            snapshot.required_count,
-            if snapshot.required_count == 1 {
-                ""
-            } else {
-                "s"
-            }
-        ),
+        _ => {
+            let requirements = snapshot
+                .items
+                .iter()
+                .map(|item| format!("{}: {}", item.title, item.detail))
+                .collect::<Vec<_>>()
+                .join("; ");
+            format!(
+                "resolve {} required item{}: {requirements}",
+                snapshot.required_count,
+                if snapshot.required_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+        }
     };
     Err(ServerError::NotReady(detail))
 }
@@ -3236,17 +7117,28 @@ async fn export_plan(
     State(project): State<Arc<WebProject>>,
     Json(graph): Json<Graph>,
 ) -> Result<Json<BundlePlan>, ServerError> {
-    let (graph, catalog, target) = production_inputs(&project, &graph)?;
-    Ok(Json(plan_frozen_package(
-        &graph, &catalog, &target, executable,
-    )?))
+    Ok(Json(
+        run_server_blocking("export planning", move || {
+            let (graph, catalog, target) = production_inputs(&project, &graph)?;
+            plan_frozen_package(&graph, &catalog, &target, executable).map_err(ServerError::from)
+        })
+        .await?,
+    ))
 }
 
 async fn export_bundle(
     State(project): State<Arc<WebProject>>,
     Json(graph): Json<Graph>,
 ) -> Result<Response, ServerError> {
-    let (graph, catalog, target) = production_inputs(&project, &graph)?;
+    let (graph, catalog, target) = run_server_blocking("export readiness", {
+        let project = project.clone();
+        move || {
+            let inputs = production_inputs(&project, &graph)?;
+            require_ready(&inputs.0, &inputs.1)?;
+            Ok(inputs)
+        }
+    })
+    .await?;
     let pixi = project
         .pixi
         .clone()
@@ -3292,9 +7184,13 @@ fn production_inputs(
     graph: &Graph,
 ) -> Result<(Graph, Catalog, ExportTarget), ServerError> {
     let mut catalog = project.catalog.clone();
-    install_cached_nfcore(&project.root, &mut catalog);
+    catalog
+        .ops
+        .retain(|operator_id, _| !resolver_only_operator_id(operator_id));
     let mut graph = graph.clone();
+    reject_resolver_only_graph(&graph)?;
     catalog.pin_graph(&mut graph)?;
+    verify_graph_source_store(&project.root, &graph)?;
     let graph_base = project.graph_path.parent().unwrap_or(&project.root);
     absolutize_import_paths(&mut graph, &project.root, graph_base);
     let target = ExportTarget::new(project.workflow_name(&graph), current_pixi_platform());
@@ -3306,9 +7202,13 @@ fn validation_inputs(
     graph: &Graph,
 ) -> Result<(Graph, Catalog, ExportTarget, ValidationContext), ServerError> {
     let mut catalog = project.catalog.clone();
-    install_cached_nfcore(&project.root, &mut catalog);
+    catalog
+        .ops
+        .retain(|operator_id, _| !resolver_only_operator_id(operator_id));
     let mut source_graph = graph.clone();
+    reject_resolver_only_graph(&source_graph)?;
     catalog.pin_graph(&mut source_graph)?;
+    verify_graph_source_store(&project.root, &source_graph)?;
     let subject_digest = semantic_graph_revision(&source_graph)
         .map_err(|error| ServerError::Validation(error.to_string()))?;
     let root = project
@@ -3370,22 +7270,6 @@ async fn validation_status(
         fixture_pack: validation.fixture_pack,
         receipt,
     }))
-}
-
-fn install_cached_nfcore(root: &Path, catalog: &mut Catalog) {
-    let cache_path = root.join(".somite/catalog/nfcore-pipelines.json");
-    let Some(pipelines) = std::fs::read_to_string(cache_path)
-        .ok()
-        .and_then(|raw| nfcore::parse(&raw).ok())
-    else {
-        return;
-    };
-    for pipeline in pipelines {
-        catalog
-            .ops
-            .entry(pipeline.operator_id())
-            .or_insert_with(|| pipeline.operator());
-    }
 }
 
 fn paper_progress(phase: PaperIntakePhase) -> PaperIntakeProgress {
@@ -4248,6 +8132,7 @@ fn support_kind_label(kind: SupportKind) -> &'static str {
     match kind {
         SupportKind::InputRequired => "input_required",
         SupportKind::ManagedTool => "managed_tool",
+        SupportKind::SourceWorkflow => "source_workflow",
         SupportKind::BuiltIn => "built_in",
         SupportKind::SystemTool => "system_tool",
         SupportKind::ManualCheckpoint => "manual_checkpoint",
@@ -4616,6 +8501,11 @@ async fn upload_file(
     State(project): State<Arc<WebProject>>,
     mut multipart: Multipart,
 ) -> Result<Json<UploadResponse>, ServerError> {
+    let _upload_permit = project
+        .upload_execution
+        .acquire()
+        .await
+        .map_err(|_| ServerError::Upload("upload coordinator is unavailable".to_owned()))?;
     while let Some(mut field) = multipart
         .next_field()
         .await
@@ -4628,24 +8518,58 @@ async fn upload_file(
         let filename = Path::new(supplied)
             .file_name()
             .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
+            .filter(|name| {
+                !name.is_empty()
+                    && *name != "."
+                    && *name != ".."
+                    && name.len() <= 255
+                    && !name.chars().any(char::is_control)
+            })
             .ok_or(ServerError::InvalidFilename)?
             .to_owned();
-        let uploads = project.uploads_dir();
-        tokio::fs::create_dir_all(&uploads).await?;
-        let destination = available_destination(&uploads, &filename).await?;
-        let temporary = destination.with_extension("somite-upload-part");
-        let mut output = tokio::fs::File::create(&temporary).await?;
+        let uploads = checked_uploads_directory(&project.root)?;
+        let existing_bytes = generic_upload_store_bytes(&uploads)?;
+        if existing_bytes >= project.upload_limits.max_project_bytes {
+            return Err(ServerError::UploadProjectBudgetExceeded {
+                limit_bytes: project.upload_limits.max_project_bytes,
+                used_bytes: existing_bytes,
+            });
+        }
+        let temporary = tempfile::Builder::new()
+            .prefix(".upload-")
+            .tempfile_in(&uploads)?;
+        let mut output = tokio::fs::File::from_std(temporary.as_file().try_clone()?);
+        let mut size_bytes = 0_u64;
         while let Some(chunk) = field
             .chunk()
             .await
             .map_err(|error| ServerError::Upload(error.to_string()))?
         {
+            size_bytes =
+                size_bytes
+                    .checked_add(chunk.len() as u64)
+                    .ok_or(ServerError::UploadTooLarge {
+                        limit_bytes: project.upload_limits.max_file_bytes,
+                    })?;
+            if size_bytes > project.upload_limits.max_file_bytes {
+                return Err(ServerError::UploadTooLarge {
+                    limit_bytes: project.upload_limits.max_file_bytes,
+                });
+            }
+            if existing_bytes.saturating_add(size_bytes) > project.upload_limits.max_project_bytes {
+                return Err(ServerError::UploadProjectBudgetExceeded {
+                    limit_bytes: project.upload_limits.max_project_bytes,
+                    used_bytes: existing_bytes,
+                });
+            }
             output.write_all(&chunk).await?;
         }
         output.flush().await?;
+        output.sync_all().await?;
         drop(output);
-        tokio::fs::rename(&temporary, &destination).await?;
+        let destination = publish_uploaded_file(&uploads, &filename, temporary.path()).await?;
+        #[cfg(unix)]
+        std::fs::File::open(&uploads)?.sync_all()?;
         return Ok(Json(UploadResponse {
             path: display_path(&project.root, &destination),
             filename: destination
@@ -4656,6 +8580,106 @@ async fn upload_file(
         }));
     }
     Err(ServerError::MissingUpload)
+}
+
+fn generic_upload_store_bytes(uploads: &Path) -> Result<u64, ServerError> {
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(uploads)? {
+        let entry = entry?;
+        let metadata = std::fs::symlink_metadata(entry.path())?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(ServerError::UnsafeUploadStore(format!(
+                ".somite/uploads contains a non-regular entry: {}",
+                entry.file_name().to_string_lossy()
+            )));
+        }
+        total = total.checked_add(metadata.len()).ok_or_else(|| {
+            ServerError::UnsafeUploadStore("upload store byte count overflowed".to_owned())
+        })?;
+    }
+    Ok(total)
+}
+
+fn checked_uploads_directory(root: &Path) -> Result<PathBuf, ServerError> {
+    let canonical_root = root.canonicalize().map_err(|error| {
+        ServerError::UnsafeUploadStore(format!("could not resolve project root: {error}"))
+    })?;
+    let somite = canonical_root.join(".somite");
+    ensure_upload_directory(&somite, &canonical_root, ".somite")?;
+    let canonical_somite = somite.canonicalize()?;
+    let uploads = somite.join("uploads");
+    ensure_upload_directory(&uploads, &canonical_somite, ".somite/uploads")?;
+    Ok(uploads)
+}
+
+fn ensure_upload_directory(
+    path: &Path,
+    canonical_parent: &Path,
+    label: &str,
+) -> Result<(), ServerError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::create_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(ServerError::Io(error)),
+            }
+        }
+        Err(error) => return Err(ServerError::Io(error)),
+    }
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ServerError::UnsafeUploadStore(format!(
+            "{label} must be a regular non-symlink directory"
+        )));
+    }
+    let canonical = path.canonicalize()?;
+    if canonical.parent() != Some(canonical_parent) {
+        return Err(ServerError::UnsafeUploadStore(format!(
+            "{label} escapes its canonical project parent"
+        )));
+    }
+    Ok(())
+}
+
+async fn publish_uploaded_file(
+    uploads: &Path,
+    filename: &str,
+    temporary: &Path,
+) -> Result<PathBuf, ServerError> {
+    let path = Path::new(filename);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("upload");
+    let extension = path.extension().and_then(|value| value.to_str());
+    for index in 1..=10_000 {
+        let candidate = if index == 1 {
+            uploads.join(filename)
+        } else {
+            match extension {
+                Some(extension) => uploads.join(format!("{stem}-{index}.{extension}")),
+                None => uploads.join(format!("{stem}-{index}")),
+            }
+        };
+        let canonical_parent = uploads.parent().ok_or_else(|| {
+            ServerError::UnsafeUploadStore("uploads directory has no parent".to_owned())
+        })?;
+        ensure_upload_directory(
+            uploads,
+            &canonical_parent.canonicalize()?,
+            ".somite/uploads",
+        )?;
+        match tokio::fs::hard_link(temporary, &candidate).await {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(ServerError::Io(error)),
+        }
+    }
+    Err(ServerError::Upload(format!(
+        "could not allocate a unique name for {filename}"
+    )))
 }
 
 struct IncomingPaperFile {
@@ -4960,31 +8984,6 @@ async fn upload_paper(
     Err(ServerError::MissingUpload)
 }
 
-async fn available_destination(directory: &Path, filename: &str) -> Result<PathBuf, ServerError> {
-    let initial = directory.join(filename);
-    if !tokio::fs::try_exists(&initial).await? {
-        return Ok(initial);
-    }
-    let path = Path::new(filename);
-    let stem = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("upload");
-    let extension = path.extension().and_then(|value| value.to_str());
-    for index in 2..=10_000 {
-        let candidate = match extension {
-            Some(extension) => directory.join(format!("{stem}-{index}.{extension}")),
-            None => directory.join(format!("{stem}-{index}")),
-        };
-        if !tokio::fs::try_exists(&candidate).await? {
-            return Ok(candidate);
-        }
-    }
-    Err(ServerError::Upload(format!(
-        "could not allocate a unique name for {filename}"
-    )))
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
@@ -5134,6 +9133,8 @@ mod tests {
         Request::builder()
             .method(Method::POST)
             .uri(uri)
+            .header(header::HOST, "127.0.0.1:7310")
+            .header("x-somite-request", "local")
             .header(
                 header::CONTENT_TYPE,
                 format!("multipart/form-data; boundary={boundary}"),
@@ -5216,6 +9217,2152 @@ mod tests {
             permissions.set_mode(0o755);
             std::fs::set_permissions(path, permissions).expect("test executable permissions");
         }
+    }
+
+    struct NfcoreSourceFixture {
+        temp: TempDir,
+        request: WorkflowGraphRequest,
+        repository: PathBuf,
+        resolved_revision: String,
+        source_operator_revision: String,
+    }
+
+    impl NfcoreSourceFixture {
+        fn root(&self) -> &Path {
+            self.temp.path()
+        }
+    }
+
+    fn nfcore_source_fixture() -> NfcoreSourceFixture {
+        nfcore_source_fixture_with_parameter_schema(true)
+    }
+
+    fn nfcore_source_fixture_with_parameter_schema(
+        include_parameter_schema: bool,
+    ) -> NfcoreSourceFixture {
+        let schema = include_parameter_schema.then_some(
+            r#"{
+  "type": "object",
+  "properties": {
+    "label": {"type": "string", "title": "Label"},
+    "input_file": {"type": "string", "format": "file-path", "title": "Input file"},
+    "input_dir": {"type": "string", "format": "directory-path", "title": "Input directory"}
+  }
+}
+"#,
+        );
+        nfcore_source_fixture_with_schema(schema)
+    }
+
+    fn nfcore_source_fixture_with_schema(schema: Option<&str>) -> NfcoreSourceFixture {
+        let temp = TempDir::new().expect("temporary nf-core source project");
+        let root = temp.path();
+        let seed = root.join("seed");
+        run_test_command(
+            Command::new("git").args(["init", "--quiet"]).arg(&seed),
+            "initialize source repository",
+        );
+        run_test_command(
+            Command::new("git")
+                .arg("-C")
+                .arg(&seed)
+                .args(["config", "user.name", "Somite Test"]),
+            "configure Git user",
+        );
+        run_test_command(
+            Command::new("git").arg("-C").arg(&seed).args([
+                "config",
+                "user.email",
+                "somite@example.invalid",
+            ]),
+            "configure Git email",
+        );
+        std::fs::write(
+            seed.join("main.nf"),
+            r#"nextflow.enable.dsl=2
+process DEMO {
+  output:
+  path 'done.txt'
+  script:
+  """
+  touch done.txt
+  """
+}
+workflow { DEMO() }
+"#,
+        )
+        .expect("workflow source");
+        std::fs::write(
+            seed.join("nextflow.config"),
+            format!(
+                "new File('{}').text = 'remote config was interpreted'\n",
+                root.join("remote-config-ran").display()
+            ),
+        )
+        .expect("non-executed workflow configuration fixture");
+        if let Some(schema) = schema {
+            std::fs::write(seed.join("nextflow_schema.json"), schema).expect("parameter schema");
+        }
+        run_test_command(
+            Command::new("git").arg("-C").arg(&seed).args(["add", "."]),
+            "stage source",
+        );
+        run_test_command(
+            Command::new("git")
+                .arg("-C")
+                .arg(&seed)
+                .args(["commit", "--quiet", "-m", "fixture"]),
+            "commit source",
+        );
+        run_test_command(
+            Command::new("git")
+                .arg("-C")
+                .arg(&seed)
+                .args(["tag", "1.2.3"]),
+            "tag source",
+        );
+        let resolved_revision = run_test_command(
+            Command::new("git")
+                .arg("-C")
+                .arg(&seed)
+                .args(["rev-parse", "HEAD"]),
+            "resolve fixture revision",
+        )
+        .trim()
+        .to_owned();
+
+        let asset_root = root.join("assets/.repos/nf-core/demo");
+        std::fs::create_dir_all(&asset_root).expect("asset root");
+        run_test_command(
+            Command::new("git")
+                .args(["clone", "--quiet", "--bare"])
+                .arg(&seed)
+                .arg(asset_root.join("bare")),
+            "clone bare asset",
+        );
+
+        let catalog = root.join(".somite/catalog");
+        std::fs::create_dir_all(&catalog).expect("catalog directory");
+        std::fs::write(
+            catalog.join("nfcore-pipelines.json"),
+            r#"{"remote_workflows":[{"name":"demo","description":"Demo pipeline","topics":["testing"],"archived":false,"releases":[{"tag_name":"1.2.3"}]}]}"#,
+        )
+        .expect("nf-core catalog");
+
+        let operators = root.join("operators");
+        std::fs::create_dir(&operators).expect("operator directory");
+        std::fs::write(
+            operators.join("workflow.source.json"),
+            r#"{"id":"workflow.source","title":"Source-backed workflow","palette":[],"kind":"source","cost":"high","ports":{"in":[],"out":[]}}"#,
+        )
+        .expect("source operator");
+        let source_operator_revision = Catalog::load_dir(&operators)
+            .expect("source catalog")
+            .revision("workflow.source")
+            .expect("source operator revision");
+
+        NfcoreSourceFixture {
+            temp,
+            request: WorkflowGraphRequest {
+                workflow: "nf-core/demo".to_owned(),
+                revision: "1.2.3".to_owned(),
+            },
+            repository: asset_root.join("bare"),
+            resolved_revision,
+            source_operator_revision,
+        }
+    }
+
+    fn run_test_command(command: &mut Command, operation: &str) -> String {
+        let output = command.output().expect(operation);
+        assert!(
+            output.status.success(),
+            "{operation}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("UTF-8 command output")
+    }
+
+    fn run_test_command_with_stdin(command: &mut Command, input: &[u8], operation: &str) -> String {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect(operation);
+        child
+            .stdin
+            .take()
+            .expect("test command stdin")
+            .write_all(input)
+            .expect("write test command stdin");
+        let output = child.wait_with_output().expect(operation);
+        assert!(
+            output.status.success(),
+            "{operation}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).expect("UTF-8 command output")
+    }
+
+    #[cfg(unix)]
+    fn inject_reserved_git_hook_tree(fixture: &NfcoreSourceFixture, marker: &Path) {
+        let hook = fixture.root().join("remote-hook-payload");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\nprintf executed > '{}'\n", marker.display()),
+        )
+        .expect("remote hook payload");
+        let blob = run_test_command(
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&fixture.repository)
+                .args(["hash-object", "-w"])
+                .arg(&hook),
+            "write malicious hook blob",
+        );
+        let hooks_tree = run_test_command_with_stdin(
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&fixture.repository)
+                .arg("mktree"),
+            format!(
+                "100755 blob {}\tpost-index-change\n100755 blob {}\treference-transaction\n",
+                blob.trim(),
+                blob.trim()
+            )
+            .as_bytes(),
+            "write malicious hooks tree",
+        );
+        let dot_git_tree = run_test_command_with_stdin(
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&fixture.repository)
+                .arg("mktree"),
+            format!("040000 tree {}\thooks\n", hooks_tree.trim()).as_bytes(),
+            "write malicious .git tree",
+        );
+        let base_tree = run_test_command(
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&fixture.repository)
+                .args(["ls-tree", &fixture.resolved_revision]),
+            "read base source tree",
+        );
+        let root_tree = run_test_command_with_stdin(
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&fixture.repository)
+                .arg("mktree"),
+            format!("040000 tree {}\t.git\n{base_tree}", dot_git_tree.trim()).as_bytes(),
+            "write malicious root tree",
+        );
+        let commit = run_test_command(
+            Command::new("git")
+                .env("GIT_AUTHOR_NAME", "Somite Test")
+                .env("GIT_AUTHOR_EMAIL", "somite@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Somite Test")
+                .env("GIT_COMMITTER_EMAIL", "somite@example.invalid")
+                .arg("--git-dir")
+                .arg(&fixture.repository)
+                .args([
+                    "commit-tree",
+                    root_tree.trim(),
+                    "-p",
+                    &fixture.resolved_revision,
+                    "-m",
+                    "malicious reserved metadata tree",
+                ]),
+            "commit malicious tree",
+        );
+        run_test_command(
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&fixture.repository)
+                .args(["tag", "--force", "1.2.3", commit.trim()]),
+            "retag malicious tree",
+        );
+    }
+
+    fn directory_entry_count(path: &Path) -> usize {
+        std::fs::read_dir(path)
+            .expect("stored directory")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("stored entries")
+            .len()
+    }
+
+    fn browser_parse_stringify_numbers(value: &mut Value) {
+        match value {
+            Value::Number(number) => {
+                let Some(number) = number.as_f64() else {
+                    return;
+                };
+                if !number.is_finite() || number.fract() != 0.0 {
+                    return;
+                }
+                let integer = number as i64;
+                if (somite_ir::MIN_EXACT_JSON_INTEGER..=somite_ir::MAX_EXACT_JSON_INTEGER)
+                    .contains(&integer)
+                    && integer as f64 == number
+                {
+                    *value = Value::from(integer);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    browser_parse_stringify_numbers(value);
+                }
+            }
+            Value::Object(fields) => {
+                for value in fields.values_mut() {
+                    browser_parse_stringify_numbers(value);
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::String(_) => {}
+        }
+    }
+
+    #[test]
+    fn nfcore_source_resolver_enforces_the_cached_catalog_before_fetch() {
+        let fixture = nfcore_source_fixture();
+        let request = WorkflowGraphRequest {
+            workflow: fixture.request.workflow.clone(),
+            revision: "9.9.9".to_owned(),
+        };
+
+        let error = import_nfcore_source(
+            fixture.root(),
+            &request,
+            &fixture.source_operator_revision,
+            Some(&fixture.repository),
+        )
+        .expect_err("uncatalogued release must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("workflow release is not in the current nf-core catalog"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn nfcore_git_metadata_rejects_oversized_tree_output() {
+        let fixture = nfcore_source_fixture();
+        let isolation_root = TempDir::new().expect("temporary Git isolation root");
+        let isolation = NfcoreGitIsolation::new(isolation_root.path(), true)
+            .expect("bounded-output Git isolation");
+        let error = run_nfcore_git_bounded(
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&fixture.repository)
+                .args(["ls-tree", "-l", "-r", "-z", "--full-tree"])
+                .arg(&fixture.resolved_revision),
+            &isolation,
+            "enumerate exact tracked nf-core source files",
+            64,
+        )
+        .expect_err("tree metadata beyond the fixed capture bound must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Git stdout exceeded the 64-byte capture limit"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn nfcore_git_capture_rejects_oversized_stderr_without_deadlock() {
+        const CHILD: &str = "SOMITE_TEST_OVERSIZED_GIT_STDERR_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let chunk = [b'x'; 8 * 1024];
+            let mut stderr = std::io::stderr().lock();
+            for _ in 0..=(MAX_NFCORE_GIT_DIAGNOSTIC_BYTES / chunk.len()) {
+                if stderr.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+            let _ = stderr.flush();
+            return;
+        }
+
+        let isolation_root = TempDir::new().expect("temporary Git isolation root");
+        let isolation = NfcoreGitIsolation::new(isolation_root.path(), false)
+            .expect("bounded-output Git isolation");
+        let error = run_nfcore_git_bounded(
+            Command::new(std::env::current_exe().expect("server test executable"))
+                .args([
+                    "--exact",
+                    "tests::nfcore_git_capture_rejects_oversized_stderr_without_deadlock",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1"),
+            &isolation,
+            "capture Git diagnostics",
+            MAX_NFCORE_GIT_METADATA_BYTES,
+        )
+        .expect_err("diagnostics beyond the fixed capture bound must fail");
+
+        assert!(
+            error.to_string().contains(&format!(
+                "Git stderr exceeded the {MAX_NFCORE_GIT_DIAGNOSTIC_BYTES}-byte capture limit"
+            )),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn nfcore_blob_read_verifies_bytes_against_the_advertised_git_object() {
+        let repository_root = TempDir::new().expect("temporary bare repository root");
+        let bare = repository_root.path().join("repository.git");
+        run_test_command(
+            Command::new("git")
+                .args(["init", "--bare", "--quiet"])
+                .arg(&bare),
+            "initialize corrupt-object fixture",
+        );
+        let original = b"safe\n";
+        let substitute = b"evil\n";
+        let original_object = run_test_command_with_stdin(
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&bare)
+                .args(["hash-object", "-w", "--stdin"]),
+            original,
+            "write original loose blob",
+        )
+        .trim()
+        .to_owned();
+        let substitute_object = run_test_command_with_stdin(
+            Command::new("git")
+                .arg("--git-dir")
+                .arg(&bare)
+                .args(["hash-object", "-w", "--stdin"]),
+            substitute,
+            "write substitute loose blob",
+        )
+        .trim()
+        .to_owned();
+        assert_ne!(original_object, substitute_object);
+        let loose_object =
+            |object: &str| bare.join("objects").join(&object[..2]).join(&object[2..]);
+        let original_path = loose_object(&original_object);
+        std::fs::remove_file(&original_path).expect("remove original loose object bytes");
+        std::fs::copy(loose_object(&substitute_object), &original_path)
+            .expect("replace original object bytes without changing its advertised name");
+
+        let isolation_root = TempDir::new().expect("temporary Git isolation root");
+        let isolation = NfcoreGitIsolation::new(isolation_root.path(), true)
+            .expect("corrupt-object Git isolation");
+        let error = read_nfcore_git_blob(
+            &bare,
+            &isolation,
+            &original_object,
+            original.len() as u64,
+            "main.nf",
+        )
+        .expect_err("substituted bytes must not inherit the advertised object identity");
+
+        assert!(
+            error
+                .to_string()
+                .contains("did not match its advertised object identity"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nfcore_source_resolver_rejects_reserved_git_hooks_without_executing_them() {
+        let fixture = nfcore_source_fixture();
+        let marker = fixture.root().join("remote-hook-executed");
+        inject_reserved_git_hook_tree(&fixture, &marker);
+
+        let error = import_nfcore_source(
+            fixture.root(),
+            &fixture.request,
+            &fixture.source_operator_revision,
+            Some(&fixture.repository),
+        )
+        .expect_err("reserved .git hook tree must fail before extraction");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsafe or duplicate tracked path .git/hooks/"),
+            "{error}"
+        );
+        assert!(!marker.exists(), "remote Git hook payload was executed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nfcore_source_resolver_ignores_hostile_global_git_fsmonitor() {
+        const CHILD: &str = "SOMITE_TEST_HOSTILE_GIT_CHILD";
+        const ROOT: &str = "SOMITE_TEST_HOSTILE_GIT_ROOT";
+        const REPOSITORY: &str = "SOMITE_TEST_HOSTILE_GIT_REPOSITORY";
+        const OPERATOR_REVISION: &str = "SOMITE_TEST_HOSTILE_GIT_OPERATOR_REVISION";
+        const MARKER: &str = "SOMITE_TEST_HOSTILE_GIT_MARKER";
+
+        if std::env::var_os(CHILD).is_some() {
+            let root = PathBuf::from(std::env::var_os(ROOT).expect("child project root"));
+            let repository = PathBuf::from(std::env::var_os(REPOSITORY).expect("child repository"));
+            let source_operator_revision =
+                std::env::var(OPERATOR_REVISION).expect("child source operator revision");
+            let marker = PathBuf::from(std::env::var_os(MARKER).expect("child marker"));
+            import_nfcore_source(
+                &root,
+                &WorkflowGraphRequest {
+                    workflow: "nf-core/demo".to_owned(),
+                    revision: "1.2.3".to_owned(),
+                },
+                &source_operator_revision,
+                Some(&repository),
+            )
+            .expect("source resolution under hostile global Git configuration");
+            assert!(
+                !marker.exists(),
+                "untrusted global core.fsmonitor was executed"
+            );
+            return;
+        }
+
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = nfcore_source_fixture();
+        let marker = fixture.root().join("hostile-global-fsmonitor-ran");
+        let fsmonitor = fixture.root().join("hostile-global-fsmonitor");
+        std::fs::write(
+            &fsmonitor,
+            format!(
+                "#!/bin/sh\nprintf executed > '{}'\nprintf 'somite-test-token\\n'\n",
+                marker.display()
+            ),
+        )
+        .expect("hostile fsmonitor fixture");
+        std::fs::set_permissions(&fsmonitor, std::fs::Permissions::from_mode(0o755))
+            .expect("executable hostile fsmonitor fixture");
+        let hostile_global = fixture.root().join("hostile-global-git-config");
+        std::fs::write(
+            &hostile_global,
+            format!(
+                "[core]\n\tfsmonitor = {}\n\tfsmonitorHookVersion = 2\n",
+                fsmonitor.display()
+            ),
+        )
+        .expect("hostile global Git configuration");
+
+        let output = Command::new(std::env::current_exe().expect("server test executable"))
+            .args([
+                "--exact",
+                "tests::nfcore_source_resolver_ignores_hostile_global_git_fsmonitor",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(ROOT, fixture.root())
+            .env(REPOSITORY, &fixture.repository)
+            .env(OPERATOR_REVISION, &fixture.source_operator_revision)
+            .env(MARKER, &marker)
+            .env("GIT_CONFIG_GLOBAL", &hostile_global)
+            .output()
+            .expect("run isolated source resolver child test");
+        assert!(
+            output.status.success(),
+            "resolver child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !marker.exists(),
+            "untrusted global core.fsmonitor was executed"
+        );
+    }
+
+    #[test]
+    fn source_paths_reserve_git_metadata_across_platform_spellings() {
+        for reserved in [
+            ".git/hooks/pre-commit",
+            ".GIT/config",
+            ".git./hooks/post-index-change",
+            ".git /config",
+            ".git::$INDEX_ALLOCATION/hooks/reference-transaction",
+            "nested/.Git/hooks/pre-push",
+            "git~1/config",
+            "nested/GIT~1./config",
+            ".g\u{200c}it/config",
+        ] {
+            assert!(
+                reserved_git_metadata_path(reserved),
+                "expected {reserved} to be reserved"
+            );
+        }
+        for ordinary in [".gitignore", ".gitattributes", "git/hooks.txt"] {
+            assert!(
+                !reserved_git_metadata_path(ordinary),
+                "expected {ordinary} to remain a source path"
+            );
+        }
+    }
+
+    #[test]
+    fn portable_source_path_aliases_are_rejected_before_cas_materialization() {
+        for aliases in [
+            ["A.nf", "a.nf"],
+            ["caf\u{e9}.nf", "cafe\u{301}.nf"],
+            ["Stra\u{df}e.nf", "STRASSE.nf"],
+            ["A/first.nf", "a/second.nf"],
+            ["dir", "dir/file.nf"],
+        ] {
+            let mut files = aliases
+                .into_iter()
+                .map(|path| FrozenSourceFile {
+                    path: path.to_owned(),
+                    mode: 0o100644,
+                    bytes: b"x".to_vec(),
+                })
+                .collect::<Vec<_>>();
+            files.sort_by(|left, right| left.path.cmp(&right.path));
+            let error = source_manifest_from_frozen(&files, files.len() as u64)
+                .expect_err("portable source path aliases must be rejected");
+            assert!(error.to_string().contains("portable filesystem"), "{error}");
+
+            let manifest = SourceManifest {
+                schema_version: 1,
+                source_digest: format!("blake3:{}", "0".repeat(64)),
+                source_bytes: files.len() as u64,
+                files: files
+                    .iter()
+                    .map(|file| SourceFileManifest {
+                        path: file.path.clone(),
+                        mode: file.mode,
+                        bytes: file.bytes.len() as u64,
+                        digest: format!("blake3:{}", blake3::hash(&file.bytes).to_hex()),
+                    })
+                    .collect(),
+            };
+            let paired = manifest
+                .files
+                .iter()
+                .cloned()
+                .zip(files.iter().map(|file| file.bytes.clone()))
+                .collect::<Vec<_>>();
+            let target = TempDir::new().expect("portable collision target");
+            let error = persist_source_object(target.path(), &manifest, &paired)
+                .expect_err("portable aliases must fail before source CAS creation");
+            assert!(error.to_string().contains("portable filesystem"), "{error}");
+            assert!(!source_workflow_store(target.path()).exists());
+        }
+    }
+
+    #[test]
+    fn windows_invalid_source_components_are_rejected_before_cas_materialization() {
+        for invalid in [
+            "CON",
+            "con.nf",
+            "PrN.json",
+            "AUX",
+            "nul.txt",
+            "COM1.nf",
+            "com9",
+            "LPT1.txt",
+            "lpt9",
+            "bad:name.nf",
+            "bad<name.nf",
+            "bad>name.nf",
+            "bad\"name.nf",
+            "bad\\name.nf",
+            "bad|name.nf",
+            "bad?name.nf",
+            "bad*name.nf",
+            "trailing-dot.",
+            "trailing-space ",
+            "control-\u{1f}.nf",
+        ] {
+            let error = PortableSourcePathRegistry::default()
+                .insert(invalid)
+                .expect_err("Windows-invalid source component must be rejected");
+            assert!(
+                error.to_string().contains("not portable"),
+                "{invalid}: {error}"
+            );
+        }
+        let mut registry = PortableSourcePathRegistry::default();
+        for portable in [
+            "console.nf",
+            "printer.nf",
+            "auxiliary.nf",
+            "null.nf",
+            "com0.nf",
+            "com10.nf",
+            "lpt0.nf",
+            "lpt10.nf",
+        ] {
+            registry
+                .insert(portable)
+                .unwrap_or_else(|error| panic!("{portable} should remain portable: {error}"));
+        }
+
+        let manifest = SourceManifest {
+            schema_version: 1,
+            source_digest: format!("blake3:{}", "0".repeat(64)),
+            source_bytes: 1,
+            files: vec![SourceFileManifest {
+                path: "CON.nf".to_owned(),
+                mode: 0o100644,
+                bytes: 1,
+                digest: format!("blake3:{}", blake3::hash(b"x").to_hex()),
+            }],
+        };
+        let files = vec![(manifest.files[0].clone(), b"x".to_vec())];
+        let target = TempDir::new().expect("Windows-invalid source target");
+        let error = persist_source_object(target.path(), &manifest, &files)
+            .expect_err("Windows-invalid source must fail before CAS creation");
+        assert!(error.to_string().contains("not portable"), "{error}");
+        assert!(!source_workflow_store(target.path()).exists());
+    }
+
+    #[test]
+    fn server_source_paths_match_shared_blank_and_byte_limits() {
+        assert!(safe_source_relative_path("data/input file.fa"));
+        assert!(safe_source_relative_path(
+            &"a".repeat(MAX_SOURCE_PATH_BYTES)
+        ));
+        for invalid in [
+            "".to_owned(),
+            " \t\n".to_owned(),
+            "\u{2003}".to_owned(),
+            "a".repeat(MAX_SOURCE_PATH_BYTES + 1),
+            "\u{e9}".repeat(MAX_SOURCE_PATH_BYTES / 2 + 1),
+        ] {
+            assert!(
+                !safe_source_relative_path(&invalid),
+                "source path should be rejected: {invalid:?}"
+            );
+        }
+
+        let oversized_path = "a".repeat(MAX_SOURCE_PATH_BYTES + 1);
+        let manifest = SourceManifest {
+            schema_version: 1,
+            source_digest: format!("blake3:{}", "0".repeat(64)),
+            source_bytes: 1,
+            files: vec![SourceFileManifest {
+                path: oversized_path,
+                mode: 0o100644,
+                bytes: 1,
+                digest: format!("blake3:{}", blake3::hash(b"x").to_hex()),
+            }],
+        };
+        let files = vec![(manifest.files[0].clone(), b"x".to_vec())];
+        let target = TempDir::new().expect("oversized source-path target");
+        let error = persist_source_object(target.path(), &manifest, &files)
+            .expect_err("oversized source path must fail before CAS materialization");
+        assert!(error.to_string().contains("invalid entry"), "{error}");
+        assert!(!source_workflow_store(target.path()).exists());
+    }
+
+    #[test]
+    fn portable_metadata_frame_propagates_modified_time_errors() {
+        let mut hasher = blake3::Hasher::new();
+        let error = update_portable_source_metadata_frame(
+            &mut hasher,
+            1,
+            Err(std::io::Error::other("modified time unavailable")),
+            true,
+            false,
+        )
+        .expect_err("portable metadata failures must not be ignored");
+        assert!(error.to_string().contains("modified time unavailable"));
+
+        let mut hasher = blake3::Hasher::new();
+        update_portable_source_metadata_frame(
+            &mut hasher,
+            1,
+            Ok(UNIX_EPOCH + Duration::from_secs(1)),
+            true,
+            false,
+        )
+        .expect("portable metadata frame");
+        assert_ne!(hasher.finalize(), blake3::hash(&[]));
+    }
+
+    #[test]
+    fn staged_source_object_verifier_rejects_changed_or_extra_bytes() {
+        let frozen = vec![FrozenSourceFile {
+            path: "main.nf".to_owned(),
+            mode: 0o100644,
+            bytes: b"ok\n".to_vec(),
+        }];
+        let manifest = source_manifest_from_frozen(&frozen, 3).expect("source manifest");
+        let files = pair_frozen_source_files(frozen, &manifest).expect("paired source files");
+        let stage = TempDir::new().expect("staged source object");
+        let source = stage.path().join("source");
+        std::fs::create_dir(&source).expect("staged source directory");
+        std::fs::write(source.join("main.nf"), b"ok\n").expect("staged source file");
+        std::fs::write(
+            stage.path().join("source-manifest.json"),
+            pretty_json_line(&manifest).expect("encoded source manifest"),
+        )
+        .expect("staged source manifest");
+        verify_staged_source_object(stage.path(), &manifest, &files)
+            .expect("exact staged source object");
+
+        std::fs::write(source.join("main.nf"), b"no\n").expect("mutated staged source file");
+        let error = verify_staged_source_object(stage.path(), &manifest, &files)
+            .expect_err("changed staged bytes must fail before publish");
+        assert!(error.to_string().contains("exact source bytes"), "{error}");
+
+        std::fs::write(source.join("main.nf"), b"ok\n").expect("restored staged source file");
+        std::fs::write(source.join("extra.nf"), b"extra\n").expect("extra staged source file");
+        let error = verify_staged_source_object(stage.path(), &manifest, &files)
+            .expect_err("extra staged entry must fail before publish");
+        assert!(error.to_string().contains("unmanifested file"), "{error}");
+    }
+
+    #[test]
+    fn full_cold_source_read_stats_each_deep_shared_entry_once() {
+        const DEPTH: usize = 24;
+        const FILES: usize = 256;
+
+        let shared_prefix = (0..DEPTH)
+            .map(|depth| format!("d{depth:02}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let mut frozen = Vec::with_capacity(FILES);
+        let mut source_bytes = 0_u64;
+        for index in 0..FILES {
+            let relative = format!("{shared_prefix}/file-{index:03}.nf");
+            let bytes = format!("workflow {{ VALUE_{index}() }}\n").into_bytes();
+            source_bytes += bytes.len() as u64;
+            frozen.push(FrozenSourceFile {
+                path: relative,
+                mode: 0o100644,
+                bytes,
+            });
+        }
+        let manifest = source_manifest_from_frozen(&frozen, source_bytes)
+            .expect("deep shared source manifest");
+        let files = pair_frozen_source_files(frozen, &manifest).expect("deep shared source files");
+        let project = TempDir::new().expect("deep shared source project");
+        persist_source_object(project.path(), &manifest, &files)
+            .expect("persist deep shared source object");
+        let (_, stored_manifest, inspection) = read_stored_source_object_inspected(
+            project.path(),
+            &manifest.source_digest,
+            SourceTreeReadMode::Contents,
+        )
+        .expect("linear full cold source read");
+        assert_eq!(stored_manifest, manifest);
+        assert_eq!(inspection.files.as_ref(), Some(&files));
+        assert_eq!(
+            inspection.metadata_operations,
+            1 + DEPTH + FILES,
+            "the root, each shared directory, and each file must be lstat'd exactly once"
+        );
+        assert!(
+            inspection.metadata_operations < FILES * DEPTH,
+            "inspection must not re-stat the shared directory chain for every file"
+        );
+        assert_eq!(
+            inspection.file_metadata_operations,
+            FILES * 2,
+            "each opened file must be fstat'd once before and once after its bounded read"
+        );
+        let (wrapper_manifest, wrapper_files) =
+            read_stored_source_object(project.path(), &manifest.source_digest)
+                .expect("production cold source-object read");
+        assert_eq!(wrapper_manifest, manifest);
+        assert_eq!(wrapper_files, files);
+        let (_, _, repeated) = read_stored_source_object_inspected(
+            project.path(),
+            &manifest.source_digest,
+            SourceTreeReadMode::MetadataOnly,
+        )
+        .expect("repeat deep source metadata inspection");
+        assert_eq!(
+            repeated.metadata_fingerprint, inspection.metadata_fingerprint,
+            "single-pass metadata fingerprints must be deterministic"
+        );
+    }
+
+    #[test]
+    fn source_derivation_reuses_cold_read_byte_allocations() {
+        let files = ["main.nf", "nextflow.config"]
+            .into_iter()
+            .map(|path| {
+                let bytes = format!("content for {path}\n").into_bytes();
+                (
+                    SourceFileManifest {
+                        path: path.to_owned(),
+                        mode: 0o100644,
+                        bytes: bytes.len() as u64,
+                        digest: format!("blake3:{}", blake3::hash(&bytes).to_hex()),
+                    },
+                    bytes,
+                )
+            })
+            .collect::<StoredSourceFiles>();
+        let allocations = files
+            .iter()
+            .map(|(_, bytes)| (bytes.as_ptr(), bytes.capacity()))
+            .collect::<Vec<_>>();
+        let frozen = into_frozen_source_files(files);
+        assert_eq!(frozen.len(), allocations.len());
+        for (file, (pointer, capacity)) in frozen.iter().zip(allocations) {
+            assert_eq!(file.bytes.as_ptr(), pointer);
+            assert_eq!(file.bytes.capacity(), capacity);
+        }
+    }
+
+    #[test]
+    fn source_verification_gates_remain_fixed_under_many_distinct_keys() {
+        let mut gate_addresses = BTreeSet::new();
+        for index in 0..4_096 {
+            let key = (
+                PathBuf::from(format!("/synthetic-project-{index}")),
+                format!("blake3:{index:064x}"),
+                format!("synthetic-indexer-{index}"),
+            );
+            let gate = source_verification_gate(&key);
+            let _ = gate_addresses.insert(std::ptr::from_ref(gate).addr());
+        }
+        let gates = SOURCE_VERIFICATION_GATES
+            .get()
+            .expect("fixed source verification gates");
+        assert_eq!(gates.len(), SOURCE_VERIFICATION_GATE_STRIPES);
+        assert!(gate_addresses.len() > 1);
+        assert!(gate_addresses.len() <= SOURCE_VERIFICATION_GATE_STRIPES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nfcore_source_resolver_rejects_a_symlinked_store_parent_before_fetch() {
+        let fixture = nfcore_source_fixture();
+        let somite = fixture.root().join(".somite");
+        let actual = fixture.root().join(".somite-actual");
+        std::fs::rename(&somite, &actual).expect("move Somite fixture state");
+        std::os::unix::fs::symlink(".somite-actual", &somite)
+            .expect("symlink Somite fixture state");
+
+        let error = import_nfcore_source(
+            fixture.root(),
+            &fixture.request,
+            &fixture.source_operator_revision,
+            Some(&fixture.repository),
+        )
+        .expect_err("symlinked .somite parent must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains(".somite must be a regular non-symlink directory"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_store_rejects_symlinked_internal_directories() {
+        for name in ["objects", "instances", "revisions", "requests"] {
+            let project = TempDir::new().expect("temporary source store project");
+            let store = project.path().join(".somite/source-workflows");
+            std::fs::create_dir_all(&store).expect("source store");
+            let outside = project.path().join(format!("outside-{name}"));
+            std::fs::create_dir(&outside).expect("symlink target");
+            std::os::unix::fs::symlink(&outside, store.join(name)).expect("source store symlink");
+
+            let error = checked_source_workflow_store(project.path(), false)
+                .expect_err("symlinked store child must fail");
+            assert!(
+                error
+                    .to_string()
+                    .contains("must be a regular non-symlink directory"),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_store_allows_concurrent_first_writers() {
+        let project = TempDir::new().expect("temporary concurrent source store project");
+        let root = project.path().to_path_buf();
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let writers = (0..16)
+            .map(|_| {
+                let root = root.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    checked_source_store_subdir(&root, "objects", true)
+                        .expect("concurrent source store initialization")
+                        .expect("created objects directory")
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let paths = writers
+            .into_iter()
+            .map(|writer| writer.join().expect("source store writer"))
+            .collect::<Vec<_>>();
+        assert!(paths.iter().all(|path| path == &paths[0]));
+        assert!(paths[0].is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nfcore_catalog_cache_rejects_a_symlinked_file() {
+        let project = TempDir::new().expect("temporary nf-core catalog project");
+        let cache = checked_nfcore_catalog_cache_path(project.path(), true)
+            .expect("initialize catalog cache")
+            .expect("catalog cache path");
+        let outside = project.path().join("outside-catalog.json");
+        std::fs::write(&outside, b"{}\n").expect("outside catalog");
+        std::os::unix::fs::symlink(&outside, &cache).expect("catalog cache symlink");
+
+        let error = checked_nfcore_catalog_cache_path(project.path(), false)
+            .expect_err("symlinked catalog cache must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("catalog cache must be a regular non-symlink file"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn nfcore_catalog_cache_concurrent_writes_remain_whole() {
+        let project = TempDir::new().expect("temporary nf-core catalog project");
+        let cache = checked_nfcore_catalog_cache_path(project.path(), true)
+            .expect("initialize catalog cache")
+            .expect("catalog cache path");
+        let first =
+            br#"{"remote_workflows":[{"name":"first","releases":[{"tag_name":"1"}]}]}"#.to_vec();
+        let second =
+            br#"{"remote_workflows":[{"name":"second","releases":[{"tag_name":"2"}]}]}"#.to_vec();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let writers = [first.clone(), second.clone()]
+            .into_iter()
+            .map(|contents| {
+                let cache = cache.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    write_catalog_cache_atomic(&cache, &contents)
+                        .expect("atomic catalog cache write");
+                })
+            })
+            .collect::<Vec<_>>();
+        for writer in writers {
+            writer.join().expect("catalog cache writer");
+        }
+        let stored =
+            read_regular_file(&cache, MAX_NFCORE_CATALOG_BYTES).expect("whole catalog cache");
+        assert!(stored == first || stored == second);
+        let text = String::from_utf8(stored).expect("UTF-8 catalog cache");
+        nfcore::parse(&text).expect("complete catalog cache JSON");
+    }
+
+    #[test]
+    fn nfcore_source_resolver_returns_one_cached_source_node_without_ports() {
+        let fixture = nfcore_source_fixture();
+        let first = import_nfcore_source(
+            fixture.root(),
+            &fixture.request,
+            &fixture.source_operator_revision,
+            Some(&fixture.repository),
+        )
+        .expect("first source resolution");
+
+        assert!(!first.cached);
+        assert!(
+            !fixture.root().join("remote-config-ran").exists(),
+            "source resolution must never interpret remote Nextflow configuration"
+        );
+        assert_eq!(first.graph.schema_version, somite_ir::SCHEMA_VERSION);
+        assert_eq!(first.graph.nodes.len(), 1);
+        assert!(first.graph.edges.is_empty());
+        let node = &first.graph.nodes[0];
+        assert_eq!(node.operator, "workflow.source");
+        assert!(node.ports.is_empty());
+        assert!(node.params.is_empty());
+        let workflow = node.source_workflow.as_ref().expect("source instance");
+        assert_eq!(workflow.source.resolved_revision, fixture.resolved_revision);
+        assert!(!workflow.capabilities.exact_execution);
+        verify_graph_source_store(fixture.root(), &first.graph).expect("stored identity");
+        #[cfg(unix)]
+        let verification_sequence = VERIFIED_SOURCE_OBJECTS
+            .get()
+            .expect("source verification cache")
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|((_, digest, revision), _)| {
+                digest == &workflow.source.source_digest && revision == SOURCE_INDEXER_REVISION
+            })
+            .map(|(_, token)| token.cold_verification_sequence)
+            .expect("cold verification token");
+        #[cfg(not(unix))]
+        let cold_verifications_before = SOURCE_COLD_VERIFICATIONS.load(Ordering::Relaxed);
+        #[cfg(not(unix))]
+        let exact_content_reads_before = SOURCE_EXACT_CONTENT_READS.load(Ordering::Relaxed);
+        let warm_started = Instant::now();
+        for _ in 0..32 {
+            verify_graph_source_store(fixture.root(), &first.graph)
+                .expect("warm source identity verification");
+        }
+        let warm_elapsed = warm_started.elapsed();
+        #[cfg(unix)]
+        let warm_sequence = VERIFIED_SOURCE_OBJECTS
+            .get()
+            .expect("source verification cache")
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .find(|((_, digest, revision), _)| {
+                digest == &workflow.source.source_digest && revision == SOURCE_INDEXER_REVISION
+            })
+            .map(|(_, token)| token.cold_verification_sequence)
+            .expect("warm verification token");
+        #[cfg(unix)]
+        assert_eq!(warm_sequence, verification_sequence);
+        #[cfg(not(unix))]
+        assert!(
+            SOURCE_COLD_VERIFICATIONS.load(Ordering::Relaxed)
+                >= cold_verifications_before.saturating_add(32),
+            "non-Unix verification must cold-read and reindex every round"
+        );
+        #[cfg(not(unix))]
+        assert!(
+            SOURCE_EXACT_CONTENT_READS.load(Ordering::Relaxed)
+                >= exact_content_reads_before.saturating_add(64),
+            "non-Unix verification must content-verify both sides of its weak metadata frame"
+        );
+        assert_eq!(source_verification_metadata_cache_enabled(), cfg!(unix));
+        eprintln!(
+            "warm source-store verification: 32 rounds in {} microseconds",
+            warm_elapsed.as_micros()
+        );
+        let catalog =
+            Catalog::load_dir(&fixture.root().join("operators")).expect("source operator catalog");
+        let readiness = assess(&first.graph, &catalog).expect("source readiness");
+        assert!(readiness
+            .items
+            .iter()
+            .any(|item| item.field == "execution_environment"));
+
+        let objects = source_workflow_store(fixture.root()).join("objects");
+        let instances = source_workflow_store(fixture.root()).join("instances");
+        assert_eq!(directory_entry_count(&objects), 1);
+        assert_eq!(directory_entry_count(&instances), 1);
+        assert!(std::fs::read_dir(&instances)
+            .expect("instance records")
+            .all(|entry| entry.expect("instance record").path().is_file()));
+
+        let second = import_nfcore_source(
+            fixture.root(),
+            &fixture.request,
+            &fixture.source_operator_revision,
+            None,
+        )
+        .expect("cached source resolution without another Git fetch");
+        assert!(second.cached);
+        assert_eq!(second.graph, first.graph);
+        assert_eq!(directory_entry_count(&objects), 1);
+
+        let object = std::fs::read_dir(&objects)
+            .expect("source objects")
+            .next()
+            .expect("source object")
+            .expect("source object entry")
+            .path();
+        let extra = object.join("source/unmanifested.txt");
+        std::fs::write(&extra, b"not in the source manifest\n")
+            .expect("unmanifested source fixture");
+        let error = verify_graph_source_store(fixture.root(), &first.graph)
+            .expect_err("unmanifested stored source file must fail verification");
+        assert!(error.to_string().contains("unmanifested file"), "{error}");
+        std::fs::remove_file(extra).expect("remove unmanifested source fixture");
+
+        #[cfg(unix)]
+        {
+            let source = object.join("source");
+            let actual_source = fixture.root().join("stored-source-actual");
+            std::fs::rename(&source, &actual_source).expect("move stored source tree");
+            std::os::unix::fs::symlink(&actual_source, &source)
+                .expect("symlink stored source tree");
+            let error = verify_graph_source_store(fixture.root(), &first.graph)
+                .expect_err("symlinked stored source root must fail verification");
+            assert!(
+                error
+                    .to_string()
+                    .contains("source must be a regular non-symlink directory"),
+                "{error}"
+            );
+            std::fs::remove_file(&source).expect("remove stored source symlink");
+            std::fs::rename(&actual_source, &source).expect("restore stored source tree");
+        }
+
+        let stored =
+            read_stored_source_instance(fixture.root(), workflow).expect("original exact instance");
+        let mut reindexed = workflow.clone();
+        reindexed
+            .scopes
+            .first_mut()
+            .expect("indexed source scope")
+            .title
+            .push_str(" (reindexed)");
+        assert_eq!(
+            calculate_source_workflow_revision(&reindexed).expect("semantic revision"),
+            workflow.workflow_revision
+        );
+        assert_ne!(
+            source_instance_digest(&reindexed).expect("reindexed instance digest"),
+            source_instance_digest(workflow).expect("original instance digest")
+        );
+        persist_source_instance(
+            fixture.root(),
+            &StoredSourceInstance {
+                workflow: reindexed.clone(),
+                manifest: stored.manifest,
+                files: stored.files,
+            },
+        )
+        .expect("coexisting reindexed source instance");
+        read_stored_source_instance(fixture.root(), workflow).expect("original remains exact");
+        read_stored_source_instance(fixture.root(), &reindexed).expect("reindex remains exact");
+        assert_eq!(directory_entry_count(&objects), 1);
+        assert_eq!(directory_entry_count(&instances), 2);
+        let mut reindexed_graph = first.graph.clone();
+        reindexed_graph.nodes[0].source_workflow = Some(reindexed);
+        let error = verify_graph_source_store(fixture.root(), &reindexed_graph)
+            .expect_err("unproven derived presentation must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("derived index does not match its exact stored source bytes"),
+            "{error}"
+        );
+        verify_graph_source_store(fixture.root(), &first.graph)
+            .expect("the original canonical presentation remains exact");
+
+        std::fs::write(object.join("source/main.nf"), b"workflow { MUTATED() }\n")
+            .expect("mutate stored source fixture");
+        let error = verify_graph_source_store(fixture.root(), &first.graph)
+            .expect_err("mutated stored source must fail readiness/save verification");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its manifest byte count"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn source_number_identity_survives_browser_json_and_autosave_cas() {
+        let fixture = nfcore_source_fixture_with_schema(Some(
+            r#"{
+  "type": "object",
+  "properties": {
+    "threshold": {
+      "type": "number",
+      "minimum": -0.0,
+      "enum": [1.0, -0.0],
+      "default": 1.0
+    }
+  }
+}
+"#,
+        ));
+        let imported = import_nfcore_source(
+            fixture.root(),
+            &fixture.request,
+            &fixture.source_operator_revision,
+            Some(&fixture.repository),
+        )
+        .expect("source workflow with numeric schema");
+        let workflow = imported.graph.nodes[0]
+            .source_workflow
+            .as_ref()
+            .expect("numeric source workflow");
+        let threshold = workflow
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == "threshold")
+            .expect("threshold contract");
+        assert_eq!(threshold.default, Some(somite_ir::ParamValue::Int(1)));
+        assert_eq!(
+            threshold.choices,
+            vec![somite_ir::ParamValue::Int(1), somite_ir::ParamValue::Int(0)]
+        );
+        let minimum = threshold.minimum.expect("threshold minimum");
+        assert_eq!(minimum, 0.0);
+        assert!(!minimum.is_sign_negative());
+
+        let workflow_revision = workflow.workflow_revision.clone();
+        let instance_digest = source_instance_digest(workflow).expect("source instance digest");
+        let state_revision =
+            graph_state_revision(&imported.graph).expect("source graph state revision");
+        let mut browser_json =
+            serde_json::to_value(&imported.graph).expect("browser source graph JSON");
+        browser_parse_stringify_numbers(&mut browser_json);
+        let browser_graph: Graph =
+            serde_json::from_value(browser_json).expect("browser-round-tripped source graph");
+        let browser_workflow = browser_graph.nodes[0]
+            .source_workflow
+            .as_ref()
+            .expect("browser source workflow");
+        assert_eq!(browser_workflow.workflow_revision, workflow_revision);
+        assert_eq!(
+            source_instance_digest(browser_workflow).expect("browser instance digest"),
+            instance_digest
+        );
+        assert_eq!(
+            graph_state_revision(&browser_graph).expect("browser state revision"),
+            state_revision
+        );
+        verify_graph_source_store(fixture.root(), &browser_graph)
+            .expect("browser graph retains exact stored source identity");
+
+        let graph_path = fixture.root().join("graph.somite.json");
+        std::fs::write(
+            &graph_path,
+            pretty_json_line(&imported.graph).expect("source graph JSON"),
+        )
+        .expect("source graph");
+        let project =
+            WebProject::open(fixture.root(), &graph_path).expect("numeric source project");
+        let saved_revision = project
+            .save_autosave_cas(&state_revision, &browser_graph)
+            .expect("browser autosave CAS");
+        assert_eq!(saved_revision, state_revision);
+        verify_graph_source_store(fixture.root(), &browser_graph)
+            .expect("saved browser graph retains its exact source instance");
+    }
+
+    #[test]
+    fn oversized_source_instance_record_leaves_existing_records_unchanged() {
+        let fixture = nfcore_source_fixture();
+        let imported = import_nfcore_source(
+            fixture.root(),
+            &fixture.request,
+            &fixture.source_operator_revision,
+            Some(&fixture.repository),
+        )
+        .expect("stored source instance fixture");
+        let workflow = imported.graph.nodes[0]
+            .source_workflow
+            .clone()
+            .expect("source workflow instance");
+        let mut stored =
+            read_stored_source_instance(fixture.root(), &workflow).expect("stored source instance");
+        let mut oversized = workflow;
+        oversized.diagnostics.push(somite_ir::SourceDiagnostic {
+            code: "oversized_record_fixture".to_owned(),
+            message: "x".repeat(4 * 1024),
+            span: None,
+        });
+
+        let instances = source_workflow_store(fixture.root()).join("instances");
+        let read_records = || {
+            std::fs::read_dir(&instances)
+                .expect("source instance directory")
+                .map(|entry| {
+                    let entry = entry.expect("source instance entry");
+                    (
+                        entry.file_name(),
+                        std::fs::read(entry.path()).expect("source instance record"),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let before = read_records();
+        assert_eq!(before.len(), 1);
+        let oversized_digest = source_instance_digest(&oversized).expect("oversized digest");
+        let destination = instances.join(format!(
+            "{}.json",
+            source_instance_digest_hex(&oversized_digest).expect("oversized digest hex")
+        ));
+        assert!(!destination.exists());
+
+        let error = persist_workflow_instance_record_with_limit(fixture.root(), &oversized, 1024)
+            .expect_err("oversized source instance record must fail before persistence");
+        assert!(
+            matches!(
+                error,
+                ServerError::SourceRecordTooLarge {
+                    limit_bytes: 1024,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(!destination.exists());
+        assert_eq!(read_records(), before);
+
+        let empty_target = TempDir::new().expect("empty oversized-import target");
+        stored.workflow = oversized;
+        let error = persist_source_instance_with_limit(empty_target.path(), &stored, 1024)
+            .expect_err("oversized import must fail before source CAS publication");
+        assert!(matches!(error, ServerError::SourceRecordTooLarge { .. }));
+        assert!(
+            !source_workflow_store(empty_target.path()).exists(),
+            "oversized import must leave neither source object nor instance record"
+        );
+    }
+
+    #[test]
+    fn source_import_graph_size_preflight_precedes_cas_publication() {
+        let fixture = nfcore_source_fixture();
+        let imported = import_nfcore_source(
+            fixture.root(),
+            &fixture.request,
+            &fixture.source_operator_revision,
+            Some(&fixture.repository),
+        )
+        .expect("source import fixture");
+        let workflow = imported.graph.nodes[0]
+            .source_workflow
+            .as_ref()
+            .expect("source workflow");
+        let stored =
+            read_stored_source_instance(fixture.root(), workflow).expect("stored source instance");
+        let empty_target = TempDir::new().expect("empty graph-preflight target");
+        let prepared = prepare_workflow_instance_record(
+            empty_target.path(),
+            &stored.workflow,
+            MAX_SOURCE_RECORD_BYTES,
+        )
+        .expect("bounded source instance record");
+        let preview = source_workflow_response_with_limit(
+            &fixture.request,
+            &fixture.source_operator_revision,
+            stored.workflow.clone(),
+            false,
+            u64::MAX,
+        )
+        .expect("unbounded response preview");
+        let graph_bytes = serde_json::to_vec_pretty(&preview.graph)
+            .expect("source graph JSON")
+            .len();
+        assert!(graph_bytes > prepared.encoded.len());
+        let graph_limit = u64::try_from(graph_bytes - 1).expect("near-boundary graph limit");
+        assert!(prepared.encoded.len() as u64 <= graph_limit);
+
+        let request_key = nfcore_source_request_key(&fixture.request);
+        let error = publish_nfcore_source_import(
+            empty_target.path(),
+            &fixture.request,
+            &fixture.source_operator_revision,
+            &request_key,
+            stored,
+            graph_limit,
+        )
+        .expect_err("source graph beyond the save cap must fail before publication");
+        assert!(
+            matches!(
+                error,
+                ServerError::GraphTooLarge {
+                    encoded_bytes,
+                    limit_bytes,
+                } if encoded_bytes == graph_bytes as u64 && limit_bytes == graph_limit
+            ),
+            "{error}"
+        );
+        assert!(
+            !source_workflow_store(empty_target.path()).exists(),
+            "unsavable source import must leave neither CAS object nor instance"
+        );
+    }
+
+    #[test]
+    #[ignore = "networked production-workload profile; run explicitly"]
+    fn profile_live_nfcore_pangenome_source_store_warm_path() {
+        const EXPECTED_RESOLVED_REVISION: &str = "3d02bd1df79f48b4bfdb4ad95d4ca0d7f6aeb337";
+        const EXPECTED_SOURCE_DIGEST: &str =
+            "blake3:4b8e157a3fbd3009095b60e4d857fba2af999ffe29c21bd01bd8304aaa427442";
+        let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let catalog_source = repository_root.join(".somite/catalog/nfcore-pipelines.json");
+        assert!(
+            catalog_source.is_file(),
+            "refresh the nf-core catalog before running the live profile"
+        );
+        let project = TempDir::new().expect("temporary live pangenome project");
+        std::fs::create_dir(project.path().join("operators")).expect("operator directory");
+        std::fs::copy(
+            repository_root.join("operators/workflow.source.json"),
+            project.path().join("operators/workflow.source.json"),
+        )
+        .expect("source operator");
+        std::fs::create_dir_all(project.path().join(".somite/catalog")).expect("catalog directory");
+        std::fs::copy(
+            catalog_source,
+            project.path().join(".somite/catalog/nfcore-pipelines.json"),
+        )
+        .expect("nf-core catalog");
+        let catalog =
+            Catalog::load_dir(&project.path().join("operators")).expect("source operator catalog");
+        let request = WorkflowGraphRequest {
+            workflow: "nf-core/pangenome".to_owned(),
+            revision: "1.1.3".to_owned(),
+        };
+
+        let cold_started = Instant::now();
+        let imported = import_nfcore_source(
+            project.path(),
+            &request,
+            &catalog
+                .revision("workflow.source")
+                .expect("source revision"),
+            None,
+        )
+        .expect("live pangenome source import");
+        let cold_elapsed = cold_started.elapsed();
+        let workflow = imported.graph.nodes[0]
+            .source_workflow
+            .as_ref()
+            .expect("pangenome source workflow");
+        assert_eq!(
+            workflow.source.resolved_revision, EXPECTED_RESOLVED_REVISION,
+            "catalog tag must still resolve to the profiled immutable commit"
+        );
+        assert_eq!(
+            workflow.source.source_digest, EXPECTED_SOURCE_DIGEST,
+            "profiled immutable source bytes must retain their aggregate digest"
+        );
+        assert!(
+            workflow.capabilities.parameter_edits,
+            "pinned pangenome source must permit supported parameter edits"
+        );
+        assert!(
+            workflow
+                .parameters
+                .iter()
+                .any(|parameter| parameter.name == "input"),
+            "pinned pangenome source must expose its input parameter"
+        );
+        assert!(
+            !workflow.bindings.contains_key("input"),
+            "fresh pangenome import must leave input unbound"
+        );
+        let profile_input = "inputs/reference.fasta.gz";
+        std::fs::create_dir(project.path().join("inputs")).expect("profile input directory");
+        std::fs::write(
+            project.path().join(profile_input),
+            b"somite source-workflow profile input\n",
+        )
+        .expect("regular profile input file");
+
+        let warm_started = Instant::now();
+        for _ in 0..100 {
+            verify_graph_source_store(project.path(), &imported.graph)
+                .expect("warm exact source verification");
+            assess(&imported.graph, &catalog).expect("warm pangenome readiness assessment");
+        }
+        let warm_elapsed = warm_started.elapsed();
+
+        let stored = read_stored_source_instance_metadata(project.path(), workflow)
+            .expect("pangenome source metadata");
+        let mut current = workflow.clone();
+        let edit_started = Instant::now();
+        for round in 0..100 {
+            let previous_revision = current.workflow_revision.clone();
+            let edit = if round % 2 == 0 {
+                SemanticEdit::SetParameter {
+                    name: "input".to_owned(),
+                    binding: WorkflowBinding::ProjectFile {
+                        path: profile_input.to_owned(),
+                    },
+                }
+            } else {
+                SemanticEdit::ResetParameter {
+                    name: "input".to_owned(),
+                }
+            };
+            let edited = apply_checked_source_edit(
+                &current,
+                &EditTransaction {
+                    base_workflow_revision: previous_revision.clone(),
+                    edits: vec![edit],
+                },
+            )
+            .expect("alternating pangenome input edit");
+            assert_ne!(
+                edited.workflow_revision, previous_revision,
+                "each alternating edit must change semantic workflow state"
+            );
+            verify_source_project_bindings(project.path(), &edited)
+                .expect("edited pangenome project binding");
+            persist_source_instance_metadata(
+                project.path(),
+                &StoredSourceInstanceMetadata {
+                    workflow: edited.clone(),
+                    manifest: stored.manifest.clone(),
+                    source_root: stored.source_root.clone(),
+                    metadata_fingerprint: stored.metadata_fingerprint.clone(),
+                },
+            )
+            .expect("metadata-only pangenome edit persistence");
+            current = edited;
+        }
+        let edit_elapsed = edit_started.elapsed();
+        assert_eq!(
+            current.bindings, workflow.bindings,
+            "100 alternating set/reset rounds must end at the imported binding state"
+        );
+        eprintln!(
+            "pangenome source profile: resolved_revision={} source_digest={} files={} bytes={} cold_ms={} warm_100_ms={} alternating_set_reset_100_ms={}",
+            workflow.source.resolved_revision,
+            workflow.source.source_digest,
+            workflow.source.file_count,
+            workflow.source.source_bytes,
+            cold_elapsed.as_millis(),
+            warm_elapsed.as_millis(),
+            edit_elapsed.as_millis()
+        );
+        assert_eq!(
+            directory_entry_count(&source_workflow_store(project.path()).join("objects")),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_nfcore_resolution_is_an_empty_canvas_transaction_and_replays() {
+        let fixture = nfcore_source_fixture();
+        import_nfcore_source(
+            fixture.root(),
+            &fixture.request,
+            &fixture.source_operator_revision,
+            Some(&fixture.repository),
+        )
+        .expect("prime exact source cache");
+        let graph_path = fixture.root().join("graph.somite.json");
+        let empty = Graph {
+            schema_version: somite_ir::SCHEMA_VERSION,
+            name: None,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            annotations: Vec::new(),
+            variant_origin: None,
+        };
+        std::fs::write(
+            &graph_path,
+            pretty_json_line(&empty).expect("empty graph JSON"),
+        )
+        .expect("empty graph");
+        let project = Arc::new(
+            WebProject::open(fixture.root(), &graph_path).expect("source workflow project"),
+        );
+        let request = AgentNfcoreSourceImportRequest {
+            workflow: fixture.request.workflow.clone(),
+            revision: fixture.request.revision.clone(),
+            base_state_revision: graph_state_revision(&empty).expect("empty state revision"),
+            idempotency_key: "nfcore-source-import-1".to_owned(),
+            summary: "Import nf-core demo source".to_owned(),
+        };
+
+        let first = agent_import_nfcore_source(State(project.clone()), Json(request.clone()))
+            .await
+            .expect("agent source import")
+            .0;
+        assert!(!first.replayed);
+        assert_eq!(first.result.graph.nodes.len(), 1);
+        assert!(first.result.graph.nodes[0].ports.is_empty());
+        let saved: Graph = serde_json::from_slice(
+            &std::fs::read(project.autosave_path()).expect("agent autosave"),
+        )
+        .expect("agent autosave JSON");
+        assert_eq!(saved, first.result.graph);
+        assert!(project
+            .agent
+            .snapshot_after(0)
+            .events
+            .iter()
+            .any(|event| event.transaction.is_some()));
+
+        let replay = agent_import_nfcore_source(State(project.clone()), Json(request))
+            .await
+            .expect("idempotent source import replay")
+            .0;
+        assert!(replay.replayed);
+        assert_eq!(replay.result.transaction_id, first.result.transaction_id);
+
+        let nonempty_request = AgentNfcoreSourceImportRequest {
+            workflow: fixture.request.workflow,
+            revision: fixture.request.revision,
+            base_state_revision: first.result.state_revision,
+            idempotency_key: "nfcore-source-import-2".to_owned(),
+            summary: "Import another source".to_owned(),
+        };
+        let error = agent_import_nfcore_source(State(project), Json(nonempty_request))
+            .await
+            .expect_err("nonempty canvas must reject source import");
+        assert!(error.to_string().contains("requires an empty canvas"));
+    }
+
+    #[tokio::test]
+    async fn source_edits_validate_project_paths_and_reuse_one_source_object() {
+        let fixture = nfcore_source_fixture();
+        let imported = import_nfcore_source(
+            fixture.root(),
+            &fixture.request,
+            &fixture.source_operator_revision,
+            Some(&fixture.repository),
+        )
+        .expect("source resolution");
+        let base_workflow = imported.graph.nodes[0]
+            .source_workflow
+            .clone()
+            .expect("source workflow");
+        let graph_path = fixture.root().join("graph.somite.json");
+        std::fs::write(
+            &graph_path,
+            pretty_json_line(&imported.graph).expect("source graph JSON"),
+        )
+        .expect("source graph");
+        let project = Arc::new(
+            WebProject::open(fixture.root(), &graph_path).expect("source workflow project"),
+        );
+
+        let missing = SourceWorkflowEditRequest {
+            base_state_revision: graph_state_revision(&imported.graph)
+                .expect("source graph state revision"),
+            workflow_revision: base_workflow.workflow_revision.clone(),
+            edits: vec![SemanticEdit::SetParameter {
+                name: "input_file".to_owned(),
+                binding: WorkflowBinding::ProjectFile {
+                    path: "missing.fastq".to_owned(),
+                },
+            }],
+        };
+        let error = edit_source_workflow(State(project.clone()), Json(missing))
+            .await
+            .expect_err("missing project file must fail");
+        assert!(
+            error.to_string().contains("missing.fastq is not available"),
+            "{error}"
+        );
+        assert_eq!(
+            directory_entry_count(&source_workflow_store(fixture.root()).join("instances")),
+            1
+        );
+
+        std::fs::write(fixture.root().join("reads.fastq"), b"@r\nAC\n+\n!!\n")
+            .expect("project input");
+        let edit_request = AgentSourceWorkflowEditRequest {
+            base_state_revision: graph_state_revision(&imported.graph)
+                .expect("source graph state revision"),
+            workflow_revision: base_workflow.workflow_revision.clone(),
+            idempotency_key: "source-parameter-edit-1".to_owned(),
+            summary: "Bind source workflow reads".to_owned(),
+            edits: vec![SemanticEdit::SetParameter {
+                name: "input_file".to_owned(),
+                binding: WorkflowBinding::ProjectFile {
+                    path: "reads.fastq".to_owned(),
+                },
+            }],
+        };
+        let edited = agent_edit_source_workflow(State(project.clone()), Json(edit_request.clone()))
+            .await
+            .expect("agent source edit")
+            .0;
+        assert!(!edited.replayed);
+        let edited_workflow = edited.result.graph.nodes[0]
+            .source_workflow
+            .as_ref()
+            .expect("edited source workflow");
+        assert_eq!(
+            edited_workflow.bindings.get("input_file"),
+            Some(&WorkflowBinding::ProjectFile {
+                path: "reads.fastq".to_owned()
+            })
+        );
+        let store = source_workflow_store(fixture.root());
+        assert_eq!(directory_entry_count(&store.join("objects")), 1);
+        assert_eq!(directory_entry_count(&store.join("instances")), 2);
+        assert!(std::fs::read_dir(store.join("instances"))
+            .expect("instance records")
+            .all(|entry| entry.expect("instance record").path().is_file()));
+
+        let replay = agent_edit_source_workflow(State(project.clone()), Json(edit_request))
+            .await
+            .expect("source edit replay")
+            .0;
+        assert!(replay.replayed);
+        assert_eq!(replay.result.transaction_id, edited.result.transaction_id);
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("reads.fastq", fixture.root().join("linked.fastq"))
+                .expect("project symlink");
+            let symlink_edit = SourceWorkflowEditRequest {
+                base_state_revision: edited.result.state_revision.clone(),
+                workflow_revision: edited_workflow.workflow_revision.clone(),
+                edits: vec![SemanticEdit::SetParameter {
+                    name: "input_file".to_owned(),
+                    binding: WorkflowBinding::ProjectFile {
+                        path: "linked.fastq".to_owned(),
+                    },
+                }],
+            };
+            let error = edit_source_workflow(State(project), Json(symlink_edit))
+                .await
+                .expect_err("project symlink must fail");
+            assert!(error.to_string().contains("crosses a symlink"), "{error}");
+            assert_eq!(directory_entry_count(&store.join("objects")), 1);
+            assert_eq!(directory_entry_count(&store.join("instances")), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn source_invocation_replacement_persists_a_catalog_pinned_variant() {
+        let fixture = nfcore_source_fixture_with_parameter_schema(false);
+        let imported = import_nfcore_source(
+            fixture.root(),
+            &fixture.request,
+            &fixture.source_operator_revision,
+            Some(&fixture.repository),
+        )
+        .expect("source resolution");
+        let workflow = imported.graph.nodes[0]
+            .source_workflow
+            .as_ref()
+            .expect("source workflow");
+        let invocation = workflow
+            .invocations
+            .iter()
+            .find(|invocation| invocation.name == "DEMO")
+            .expect("DEMO invocation");
+        let graph_path = fixture.root().join("graph.somite.json");
+        std::fs::write(
+            &graph_path,
+            pretty_json_line(&imported.graph).expect("source graph JSON"),
+        )
+        .expect("source graph");
+        std::fs::write(
+            fixture.root().join("operators/align.bowtie2.json"),
+            include_str!("../../../operators/align.bowtie2.json"),
+        )
+        .expect("Bowtie2 operator fixture");
+        let project = Arc::new(
+            WebProject::open(fixture.root(), &graph_path).expect("source workflow project"),
+        );
+        let bowtie2_revision = project
+            .catalog
+            .revision("align.bowtie2")
+            .expect("Bowtie2 catalog revision");
+
+        let edited = edit_source_workflow(
+            State(project.clone()),
+            Json(SourceWorkflowEditRequest {
+                base_state_revision: graph_state_revision(&imported.graph)
+                    .expect("source graph state revision"),
+                workflow_revision: workflow.workflow_revision.clone(),
+                edits: vec![SemanticEdit::ReplaceInvocation {
+                    invocation_id: invocation.id.clone(),
+                    operator: "align.bowtie2".to_owned(),
+                    operator_revision: bowtie2_revision.clone(),
+                    params: BTreeMap::from([("threads".to_owned(), somite_ir::ParamValue::Int(8))]),
+                }],
+            }),
+        )
+        .await
+        .expect("persist source replacement")
+        .0;
+
+        let variant = edited.graph.nodes[0]
+            .source_workflow
+            .as_ref()
+            .expect("variant workflow");
+        assert_eq!(variant.invocations, workflow.invocations);
+        assert_eq!(variant.replacements.len(), 1);
+        assert_eq!(variant.replacements[0].invocation_id, invocation.id);
+        assert_eq!(variant.replacements[0].operator, "align.bowtie2");
+        assert_eq!(variant.replacements[0].operator_revision, bowtie2_revision);
+
+        let promoted = promote_source_workflow(
+            State(project.clone()),
+            Json(SourceWorkflowPromotionRequest {
+                base_state_revision: edited.state_revision.clone(),
+                workflow_revision: variant.workflow_revision.clone(),
+                invocation_id: invocation.id.clone(),
+            }),
+        )
+        .await
+        .expect("promote replacement into native graph")
+        .0;
+        assert_eq!(promoted.graph.nodes.len(), 1);
+        assert_eq!(promoted.graph.nodes[0].operator, "align.bowtie2");
+        assert!(promoted.graph.nodes[0].source_workflow.is_none());
+        let origin = promoted
+            .graph
+            .variant_origin
+            .as_ref()
+            .expect("source provenance");
+        assert_eq!(
+            origin.promoted_invocations.get(&invocation.id),
+            Some(&promoted.graph.nodes[0].id)
+        );
+        let saved: Graph = serde_json::from_slice(
+            &std::fs::read(project.autosave_path()).expect("promoted autosave"),
+        )
+        .expect("promoted autosave JSON");
+        assert_eq!(saved, promoted.graph);
+
+        let restored = restore_source_workflow_view(
+            State(project.clone()),
+            Json(SourceWorkflowRestoreRequest {
+                base_state_revision: promoted.state_revision,
+            }),
+        )
+        .await
+        .expect("restore retained source workflow")
+        .0;
+        assert_eq!(restored.graph.nodes.len(), 1);
+        assert!(restored.graph.nodes[0].source_workflow.is_some());
+        assert!(restored.graph.variant_origin.is_none());
+
+        let agent_request = AgentSourceWorkflowPromotionRequest {
+            base_state_revision: restored.state_revision,
+            workflow_revision: restored.graph.nodes[0]
+                .source_workflow
+                .as_ref()
+                .expect("restored source workflow")
+                .workflow_revision
+                .clone(),
+            invocation_id: invocation.id.clone(),
+            idempotency_key: "promote-demo-invocation".to_owned(),
+            summary: "Promote DEMO to editable Bowtie2".to_owned(),
+        };
+        let agent_promoted =
+            agent_promote_source_workflow(State(project.clone()), Json(agent_request.clone()))
+                .await
+                .expect("agent source promotion")
+                .0;
+        assert!(!agent_promoted.replayed);
+        assert_eq!(
+            agent_promoted.result.graph.nodes[0].operator,
+            "align.bowtie2"
+        );
+        assert!(agent_promoted.result.graph.variant_origin.is_some());
+        let replay = agent_promote_source_workflow(State(project), Json(agent_request))
+            .await
+            .expect("agent source promotion replay")
+            .0;
+        assert!(replay.replayed);
+        assert_eq!(
+            replay.result.transaction_id,
+            agent_promoted.result.transaction_id
+        );
+    }
+
+    #[test]
+    fn stale_agent_source_edit_phase_two_does_not_publish_an_instance() {
+        let fixture = nfcore_source_fixture();
+        let imported = import_nfcore_source(
+            fixture.root(),
+            &fixture.request,
+            &fixture.source_operator_revision,
+            Some(&fixture.repository),
+        )
+        .expect("source resolution");
+        let workflow = imported.graph.nodes[0]
+            .source_workflow
+            .as_ref()
+            .expect("source workflow");
+        let graph_path = fixture.root().join("graph.somite.json");
+        std::fs::write(
+            &graph_path,
+            pretty_json_line(&imported.graph).expect("source graph JSON"),
+        )
+        .expect("source graph");
+        let project = Arc::new(
+            WebProject::open(fixture.root(), &graph_path).expect("source workflow project"),
+        );
+        let instances = source_workflow_store(fixture.root()).join("instances");
+        let before_instances = directory_entry_count(&instances);
+        assert_eq!(before_instances, 1);
+
+        let request = AgentSourceWorkflowEditRequest {
+            base_state_revision: graph_state_revision(&imported.graph)
+                .expect("source graph state revision"),
+            workflow_revision: workflow.workflow_revision.clone(),
+            idempotency_key: "stale-source-edit-phase-two".to_owned(),
+            summary: "Edit a stale source workflow".to_owned(),
+            edits: vec![SemanticEdit::SetParameter {
+                name: "label".to_owned(),
+                binding: WorkflowBinding::Literal {
+                    value: somite_ir::ParamValue::String("stale".to_owned()),
+                },
+            }],
+        };
+        let error =
+            agent_edit_source_workflow_with_phase_two_hook(project.clone(), request, |project| {
+                let mut concurrent = current_agent_graph(project).expect("current source graph");
+                let base = graph_state_revision(&concurrent).expect("concurrent base revision");
+                concurrent.name = Some("Concurrent graph update".to_owned());
+                project
+                    .save_autosave_cas(&base, &concurrent)
+                    .expect("concurrent autosave update");
+            })
+            .expect_err("phase-two state mismatch must reject the source edit");
+        assert!(
+            matches!(
+                error,
+                ServerError::Agent(agent::AgentError::StaleTransaction { .. })
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            directory_entry_count(&instances),
+            before_instances,
+            "a phase-two conflict must not orphan an immutable source instance"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_edits_reject_instances_without_parameter_edit_capability() {
+        let fixture = nfcore_source_fixture_with_parameter_schema(false);
+        let imported = import_nfcore_source(
+            fixture.root(),
+            &fixture.request,
+            &fixture.source_operator_revision,
+            Some(&fixture.repository),
+        )
+        .expect("source resolution without parameter schema");
+        let workflow = imported.graph.nodes[0]
+            .source_workflow
+            .clone()
+            .expect("source workflow");
+        assert!(!workflow.capabilities.parameter_edits);
+        let graph_path = fixture.root().join("graph.somite.json");
+        std::fs::write(
+            &graph_path,
+            pretty_json_line(&imported.graph).expect("source graph JSON"),
+        )
+        .expect("source graph");
+        let project = Arc::new(
+            WebProject::open(fixture.root(), &graph_path).expect("source workflow project"),
+        );
+        let edit = SemanticEdit::SetParameter {
+            name: "label".to_owned(),
+            binding: WorkflowBinding::Literal {
+                value: somite_ir::ParamValue::String("blocked".to_owned()),
+            },
+        };
+
+        let error = edit_source_workflow(
+            State(project.clone()),
+            Json(SourceWorkflowEditRequest {
+                base_state_revision: graph_state_revision(&imported.graph)
+                    .expect("source graph state revision"),
+                workflow_revision: workflow.workflow_revision.clone(),
+                edits: vec![edit.clone()],
+            }),
+        )
+        .await
+        .expect_err("browser source edit must honor capabilities");
+        assert!(
+            error
+                .to_string()
+                .contains("does not permit parameter edits"),
+            "{error}"
+        );
+
+        let error = agent_edit_source_workflow(
+            State(project),
+            Json(AgentSourceWorkflowEditRequest {
+                base_state_revision: graph_state_revision(&imported.graph)
+                    .expect("source graph state revision"),
+                workflow_revision: workflow.workflow_revision,
+                idempotency_key: "disabled-source-parameter-edit".to_owned(),
+                summary: "Try a disabled parameter edit".to_owned(),
+                edits: vec![edit],
+            }),
+        )
+        .await
+        .expect_err("agent source edit must honor capabilities");
+        assert!(
+            error
+                .to_string()
+                .contains("does not permit parameter edits"),
+            "{error}"
+        );
+        assert_eq!(
+            directory_entry_count(&source_workflow_store(fixture.root()).join("instances")),
+            1
+        );
+    }
+
+    #[test]
+    fn browser_save_rejects_exact_execution_capability_tampering() {
+        let fixture = nfcore_source_fixture();
+        let imported = import_nfcore_source(
+            fixture.root(),
+            &fixture.request,
+            &fixture.source_operator_revision,
+            Some(&fixture.repository),
+        )
+        .expect("source resolution");
+        let graph_path = fixture.root().join("graph.somite.json");
+        std::fs::write(
+            &graph_path,
+            pretty_json_line(&imported.graph).expect("source graph JSON"),
+        )
+        .expect("source graph");
+        let project =
+            WebProject::open(fixture.root(), &graph_path).expect("source workflow project");
+        let base_state_revision =
+            graph_state_revision(&imported.graph).expect("source graph state revision");
+        let base_graph_revision =
+            semantic_graph_revision(&imported.graph).expect("source semantic graph revision");
+        let mut tampered = imported.graph.clone();
+        tampered.nodes[0]
+            .source_workflow
+            .as_mut()
+            .expect("source workflow")
+            .capabilities
+            .exact_execution = true;
+        assert_eq!(
+            semantic_graph_revision(&tampered).expect("tampered semantic graph revision"),
+            base_graph_revision,
+            "capabilities are presentation metadata in the current semantic revision"
+        );
+
+        let error = project
+            .save_autosave_cas(&base_state_revision, &tampered)
+            .expect_err("browser capability tampering must not persist");
+        assert!(
+            error.to_string().contains("source workflow instance")
+                && error.to_string().contains("is not stored"),
+            "{error}"
+        );
+        let saved: Graph =
+            serde_json::from_slice(&std::fs::read(&graph_path).expect("unchanged source graph"))
+                .expect("unchanged source graph JSON");
+        assert!(
+            !saved.nodes[0]
+                .source_workflow
+                .as_ref()
+                .expect("saved source workflow")
+                .capabilities
+                .exact_execution
+        );
+    }
+
+    #[test]
+    fn nfcore_source_search_returns_exact_release_without_operator_descriptors() {
+        let pipelines = nfcore::parse(
+            r#"{"remote_workflows":[{"name":"rnaseq","description":"RNA sequencing","topics":["transcriptomics"],"archived":false,"releases":[{"tag_name":"3.21.0"}]},{"name":"ampliseq","description":"Amplicon sequencing","topics":[],"archived":false,"releases":[{"tag_name":"2.14.0"}]}]}"#,
+        )
+        .expect("nf-core fixture");
+
+        let response = filter_nfcore_source_catalog("RNA sequencing", 12, pipelines, true);
+
+        assert!(response.cached);
+        assert_eq!(response.provenance, nfcore::CATALOG_URL);
+        assert_eq!(response.total_matches, 1);
+        assert_eq!(response.entries[0].repository, "nf-core/rnaseq");
+        assert_eq!(response.entries[0].revision, "3.21.0");
     }
 
     #[test]
@@ -5483,7 +11630,10 @@ exit 1
             .expect("body")
             .to_bytes();
         let session: serde_json::Value = serde_json::from_slice(&body).expect("session json");
-        assert_eq!(session["graph"]["schema_version"], 2);
+        assert_eq!(
+            session["graph"]["schema_version"],
+            somite_ir::SCHEMA_VERSION
+        );
         assert_eq!(session["graph_path"], "graph.somite.json");
         assert_eq!(session["recovered_autosave"], false);
     }
@@ -5740,6 +11890,10 @@ exit 1
             .expect("events body")
             .to_bytes();
         let events: serde_json::Value = serde_json::from_slice(&events_body).expect("events json");
+        assert_eq!(
+            events["authoritative_state_revision"], edit["state_revision"],
+            "event polling must identify the graph state captured after its event batch"
+        );
         let event_list = events["events"].as_array().expect("agent event list");
         assert!(event_list.iter().any(|event| {
             event["kind"] == "tool"
@@ -6324,7 +12478,7 @@ exit 1
     #[tokio::test]
     async fn export_endpoints_return_a_plan_and_downloadable_zip() {
         let (temp, project) = fixture_project();
-        let graph = r#"{"schema_version":1,"name":"RNA seq review","nodes":[],"edges":[]}"#;
+        let graph = r#"{"schema_version":1,"name":"RNA seq review","nodes":[{"id":"noop","operator":"test.noop","ports":[],"layout":{"x":0.0,"y":0.0}}],"edges":[]}"#;
         let router = app(project);
         let plan_response = router
             .clone()
@@ -6348,7 +12502,8 @@ exit 1
         let plan: serde_json::Value = serde_json::from_slice(&plan_body).expect("plan json");
         assert_eq!(plan["filename"], "RNA-seq-review.somite-run.zip");
         assert_eq!(plan["platform"], current_pixi_platform());
-        assert_eq!(plan["tools"], serde_json::json!([]));
+        assert_eq!(plan["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(plan["tools"][0]["operator_id"], "test.noop");
 
         let zip_response = router
             .clone()
@@ -6401,6 +12556,61 @@ exit 1
             .join(".somite/exports")
             .read_dir()
             .is_ok_and(|mut entries| entries.next().is_some()));
+    }
+
+    #[tokio::test]
+    async fn source_export_plan_is_inspectable_but_bundle_requires_the_execution_environment() {
+        let fixture = nfcore_source_fixture();
+        let imported = import_nfcore_source(
+            fixture.root(),
+            &fixture.request,
+            &fixture.source_operator_revision,
+            Some(&fixture.repository),
+        )
+        .expect("source resolution");
+        let graph_path = fixture.root().join("graph.somite.json");
+        std::fs::write(
+            &graph_path,
+            pretty_json_line(&imported.graph).expect("source graph JSON"),
+        )
+        .expect("source graph");
+        let router =
+            app(WebProject::open(fixture.root(), &graph_path).expect("source workflow project"));
+        let body = serde_json::to_vec(&imported.graph).expect("source graph request");
+
+        let plan = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/export/plan")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.clone()))
+                    .expect("source export plan request"),
+            )
+            .await
+            .expect("source export plan response");
+        assert_eq!(plan.status(), StatusCode::OK);
+
+        let bundle = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/export")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("source export request"),
+            )
+            .await
+            .expect("source export response");
+        assert_eq!(bundle.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let error = response_json(bundle).await;
+        assert!(
+            error["error"].as_str().is_some_and(|message| message
+                .contains("Finish the execution environment")
+                && message.contains("task containers or Conda environments are not frozen")),
+            "{error}"
+        );
     }
 
     #[tokio::test]
@@ -6587,19 +12797,138 @@ exit 1
         let (temp, project) = fixture_project();
         let graph_path = temp.path().join("graph.somite.json");
         let before = std::fs::read_to_string(&graph_path).expect("before");
+        let base_graph = project.session().expect("project session").graph;
+        let body = serde_json::json!({
+            "base_state_revision": graph_state_revision(&base_graph).expect("base revision"),
+            "graph": {"schema_version": 99, "nodes": [], "edges": []}
+        });
         let response = app(project)
             .oneshot(
                 Request::builder()
                     .method(Method::PUT)
                     .uri("/api/graph")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"schema_version":99,"nodes":[],"edges":[]}"#))
+                    .body(Body::from(body.to_string()))
                     .expect("request"),
             )
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(std::fs::read_to_string(graph_path).expect("after"), before);
+    }
+
+    #[test]
+    fn oversized_encoded_graph_preserves_existing_graph_and_creates_no_autosave() {
+        let (temp, project) = fixture_project();
+        let graph_path = temp.path().join("graph.somite.json");
+        let before = std::fs::read(&graph_path).expect("valid graph before oversized save");
+        let mut graph = project.session().expect("project session").graph;
+        graph.name = Some("x".repeat(somite_ir::MAX_GRAPH_NAME_CHARS));
+        let test_limit = 128;
+        assert!(
+            serde_json::to_vec_pretty(&graph)
+                .expect("encoded graph")
+                .len()
+                > test_limit as usize
+        );
+
+        let error = WebProject::write_graph_at_with_limit(
+            temp.path(),
+            &graph_path,
+            &graph,
+            &project.catalog,
+            test_limit,
+        )
+        .expect_err("oversized project graph must fail before replacement");
+        assert!(
+            matches!(
+                error,
+                ServerError::GraphTooLarge {
+                    limit_bytes: 128,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(&graph_path).expect("valid graph after rejected save"),
+            before
+        );
+
+        let autosave = project.autosave_path();
+        assert!(!autosave.exists());
+        let error = WebProject::write_graph_at_with_limit(
+            temp.path(),
+            &autosave,
+            &graph,
+            &project.catalog,
+            test_limit,
+        )
+        .expect_err("oversized autosave must fail before destination creation");
+        assert!(matches!(error, ServerError::GraphTooLarge { .. }));
+        assert!(!autosave.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graph_write_ignores_a_malicious_legacy_temporary_symlink() {
+        let (temp, project) = fixture_project();
+        let graph_path = temp.path().join("graph.somite.json");
+        let outside = TempDir::new().expect("outside directory");
+        let outside_file = outside.path().join("do-not-truncate.txt");
+        std::fs::write(&outside_file, b"preserve me\n").expect("outside file");
+        let predictable_temporary = graph_path.with_extension("somite.json.tmp");
+        std::os::unix::fs::symlink(&outside_file, &predictable_temporary)
+            .expect("malicious legacy temporary symlink");
+
+        let mut graph = project.session().expect("project session").graph;
+        graph.name = Some("Safely saved".to_owned());
+        project
+            .save_graph_at(&graph_path, &graph)
+            .expect("atomic graph write");
+
+        assert_eq!(
+            std::fs::read(&outside_file).expect("outside file after save"),
+            b"preserve me\n"
+        );
+        assert!(std::fs::symlink_metadata(&predictable_temporary)
+            .expect("legacy symlink remains untouched")
+            .file_type()
+            .is_symlink());
+        let saved: Graph =
+            serde_json::from_slice(&std::fs::read(&graph_path).expect("saved canonical graph"))
+                .expect("saved graph JSON");
+        assert_eq!(saved.name.as_deref(), Some("Safely saved"));
+    }
+
+    #[test]
+    fn project_open_rejects_a_graph_path_outside_the_project_root() {
+        let (temp, _project) = fixture_project();
+        let outside = TempDir::new().expect("outside directory");
+        let outside_graph = outside.path().join("outside.somite.json");
+        let original = br#"{"schema_version":1,"nodes":[],"edges":[]}"#;
+        std::fs::write(&outside_graph, original).expect("outside graph");
+
+        let error = WebProject::open(temp.path(), &outside_graph)
+            .expect_err("outside graph path must be rejected");
+        assert!(matches!(error, ServerError::UnsafeGraphPath(_)), "{error}");
+        assert_eq!(
+            std::fs::read(&outside_graph).expect("unchanged outside graph"),
+            original
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_open_rejects_a_symlink_graph_target() {
+        let (temp, _project) = fixture_project();
+        let real_graph = temp.path().join("graph.somite.json");
+        let alias_graph = temp.path().join("alias.somite.json");
+        std::os::unix::fs::symlink(&real_graph, &alias_graph).expect("graph symlink");
+
+        let error = WebProject::open(temp.path(), &alias_graph)
+            .expect_err("symlink graph path must be rejected");
+        assert!(matches!(error, ServerError::UnsafeGraphPath(_)), "{error}");
     }
 
     #[tokio::test]
@@ -6614,6 +12943,8 @@ exit 1
                 Request::builder()
                     .method(Method::POST)
                     .uri("/api/files")
+                    .header(header::HOST, "127.0.0.1:7310")
+                    .header(header::ORIGIN, "http://localhost:3000")
                     .header(
                         header::CONTENT_TYPE,
                         format!("multipart/form-data; boundary={boundary}"),
@@ -6639,6 +12970,371 @@ exit 1
                 .expect("uploaded file"),
             "@read-1\nACGT\n+\n!!!!\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_session_rejects_a_symlink_autosave_target() {
+        let (_temp, project) = fixture_project();
+        let outside = TempDir::new().expect("outside directory");
+        let outside_graph = outside.path().join("outside.somite.json");
+        std::fs::write(
+            &outside_graph,
+            br#"{"schema_version":1,"nodes":[],"edges":[]}"#,
+        )
+        .expect("outside graph");
+        std::os::unix::fs::symlink(&outside_graph, project.autosave_path())
+            .expect("autosave symlink");
+
+        let error = project
+            .session()
+            .expect_err("symlink autosave must be rejected");
+        assert!(matches!(error, ServerError::UnsafeGraphPath(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn cross_origin_upload_is_rejected_before_creating_the_upload_store() {
+        let (temp, project) = fixture_project();
+        let mut request = multipart_upload_request(
+            "/api/files",
+            "hostile-origin-upload",
+            "reads.fastq",
+            "application/octet-stream",
+            b"hostile\n",
+        );
+        request.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://attacker.example"),
+        );
+        let response = app(project)
+            .oneshot(request)
+            .await
+            .expect("hostile upload response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!temp.path().join(".somite/uploads").exists());
+    }
+
+    #[tokio::test]
+    async fn dns_rebinding_origin_and_host_cannot_mutate_the_project() {
+        let (temp, project) = fixture_project();
+        let mut request = multipart_upload_request(
+            "/api/files",
+            "dns-rebinding-upload",
+            "reads.fastq",
+            "application/octet-stream",
+            b"rebound\n",
+        );
+        request.headers_mut().insert(
+            header::HOST,
+            HeaderValue::from_static("attacker.example:7310"),
+        );
+        request.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://attacker.example:7310"),
+        );
+        let response = app(project)
+            .oneshot(request)
+            .await
+            .expect("DNS-rebinding upload response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!temp.path().join(".somite/uploads").exists());
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_allows_both_explicit_local_web_origins_only() {
+        let (_temp, project) = fixture_project();
+        let router = app(project);
+        for origin in ["http://localhost:3000", "http://127.0.0.1:3000"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::OPTIONS)
+                        .uri("/api/graph")
+                        .header(header::HOST, "127.0.0.1:7310")
+                        .header(header::ORIGIN, origin)
+                        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "PUT")
+                        .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+                        .body(Body::empty())
+                        .expect("local preflight request"),
+                )
+                .await
+                .expect("local preflight response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .and_then(|value| value.to_str().ok()),
+                Some(origin)
+            );
+        }
+
+        let hostile = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/api/graph")
+                    .header(header::HOST, "attacker.example:7310")
+                    .header(header::ORIGIN, "http://attacker.example:3000")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "PUT")
+                    .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+                    .body(Body::empty())
+                    .expect("hostile preflight request"),
+            )
+            .await
+            .expect("hostile preflight response");
+        assert!(hostile
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none());
+    }
+
+    #[test]
+    fn mutation_host_allowlist_accepts_only_loopback_authorities() {
+        for allowed in [
+            "localhost",
+            "localhost:7310",
+            "127.0.0.1",
+            "127.0.0.1:7310",
+            "[::1]",
+            "[::1]:7310",
+        ] {
+            assert!(loopback_authority(allowed), "expected {allowed} to pass");
+        }
+        for rejected in [
+            "attacker.example",
+            "attacker.example:7310",
+            "localhost.attacker.example:7310",
+            "0.0.0.0:7310",
+            "192.168.1.2:7310",
+        ] {
+            assert!(!loopback_authority(rejected), "expected {rejected} to fail");
+        }
+    }
+
+    #[tokio::test]
+    async fn originless_upload_requires_the_local_request_header() {
+        let (temp, project) = fixture_project();
+        let mut request = multipart_upload_request(
+            "/api/files",
+            "missing-origin-upload",
+            "reads.fastq",
+            "application/octet-stream",
+            b"missing origin\n",
+        );
+        request.headers_mut().remove("x-somite-request");
+        let response = app(project)
+            .oneshot(request)
+            .await
+            .expect("originless upload response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!temp.path().join(".somite/uploads").exists());
+    }
+
+    #[tokio::test]
+    async fn generic_upload_enforces_file_and_project_byte_limits() {
+        let (temp, mut project) = fixture_project();
+        project.upload_limits = GenericUploadLimits {
+            max_file_bytes: 8,
+            max_project_bytes: 12,
+        };
+        let router = app(project);
+
+        let oversized = router
+            .clone()
+            .oneshot(multipart_upload_request(
+                "/api/files",
+                "oversized-upload",
+                "oversized.fastq",
+                "application/octet-stream",
+                b"123456789",
+            ))
+            .await
+            .expect("oversized upload response");
+        assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!temp.path().join(".somite/uploads/oversized.fastq").exists());
+
+        let accepted = router
+            .clone()
+            .oneshot(multipart_upload_request(
+                "/api/files",
+                "accepted-upload",
+                "accepted.fastq",
+                "application/octet-stream",
+                b"12345678",
+            ))
+            .await
+            .expect("accepted upload response");
+        assert_eq!(accepted.status(), StatusCode::OK);
+
+        let over_budget = router
+            .oneshot(multipart_upload_request(
+                "/api/files",
+                "budget-upload",
+                "budget.fastq",
+                "application/octet-stream",
+                b"12345",
+            ))
+            .await
+            .expect("project budget upload response");
+        assert_eq!(over_budget.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!temp.path().join(".somite/uploads/budget.fastq").exists());
+        assert_eq!(
+            std::fs::read(temp.path().join(".somite/uploads/accepted.fastq"))
+                .expect("accepted upload"),
+            b"12345678"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_opened_project_upload_binds_through_source_edit() {
+        let fixture = nfcore_source_fixture();
+        let imported = import_nfcore_source(
+            fixture.root(),
+            &fixture.request,
+            &fixture.source_operator_revision,
+            Some(&fixture.repository),
+        )
+        .expect("source resolution");
+        let workflow = imported.graph.nodes[0]
+            .source_workflow
+            .as_ref()
+            .expect("source workflow");
+        let graph_path = fixture.root().join("graph.somite.json");
+        std::fs::write(
+            &graph_path,
+            pretty_json_line(&imported.graph).expect("source graph JSON"),
+        )
+        .expect("source graph");
+        let alias_parent = TempDir::new().expect("project alias parent");
+        let alias = alias_parent.path().join("project-alias");
+        std::os::unix::fs::symlink(fixture.root(), &alias).expect("project root alias");
+        let project = WebProject::open(&alias, alias.join("graph.somite.json"))
+            .expect("symlink-opened project");
+        assert_eq!(
+            project.root,
+            fixture.root().canonicalize().expect("real root")
+        );
+        let router = app(project);
+
+        let upload = router
+            .clone()
+            .oneshot(multipart_upload_request(
+                "/api/files",
+                "symlink-root-upload",
+                "reads.fastq",
+                "application/octet-stream",
+                b"@read\nAC\n+\n!!\n",
+            ))
+            .await
+            .expect("upload response");
+        assert_eq!(upload.status(), StatusCode::OK);
+        let upload = response_json(upload).await;
+        assert_eq!(upload["path"], ".somite/uploads/reads.fastq");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/source-workflows/edit")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "base_state_revision": graph_state_revision(&imported.graph)
+                                .expect("source state revision"),
+                            "workflow_revision": workflow.workflow_revision,
+                            "edits": [{
+                                "kind": "set_parameter",
+                                "name": "input_file",
+                                "binding": {
+                                    "kind": "project_file",
+                                    "path": upload["path"]
+                                }
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("source edit request"),
+            )
+            .await
+            .expect("source edit response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        assert_eq!(
+            response["graph"]["nodes"][0]["source_workflow"]["bindings"]["input_file"]["path"],
+            ".somite/uploads/reads.fastq"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn generic_upload_rejects_a_symlinked_upload_directory() {
+        let (temp, project) = fixture_project();
+        let somite = temp.path().join(".somite");
+        std::fs::create_dir_all(&somite).expect("Somite state directory");
+        let outside = temp.path().join("outside-uploads");
+        std::fs::create_dir(&outside).expect("outside upload directory");
+        std::os::unix::fs::symlink(&outside, somite.join("uploads"))
+            .expect("symlinked upload directory");
+
+        let response = app(project)
+            .oneshot(multipart_upload_request(
+                "/api/files",
+                "symlinked-generic-upload",
+                "reads.fastq",
+                "application/octet-stream",
+                b"@read\nAC\n+\n!!\n",
+            ))
+            .await
+            .expect("symlinked upload response");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            std::fs::read_dir(outside)
+                .expect("outside upload directory")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn simultaneous_same_name_generic_uploads_publish_without_clobbering() {
+        let (temp, project) = fixture_project();
+        let router = app(project);
+        let first = router.clone().oneshot(multipart_upload_request(
+            "/api/files",
+            "generic-upload-one",
+            "reads.fastq",
+            "application/octet-stream",
+            b"first\n",
+        ));
+        let second = router.clone().oneshot(multipart_upload_request(
+            "/api/files",
+            "generic-upload-two",
+            "reads.fastq",
+            "application/octet-stream",
+            b"second\n",
+        ));
+        let (first, second) = tokio::join!(first, second);
+        let first = first.expect("first concurrent upload");
+        let second = second.expect("second concurrent upload");
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+        let first = response_json(first).await;
+        let second = response_json(second).await;
+        assert_ne!(first["path"], second["path"]);
+
+        let mut contents = std::fs::read_dir(temp.path().join(".somite/uploads"))
+            .expect("upload directory")
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                (!path.file_name()?.to_string_lossy().starts_with(".upload-"))
+                    .then(|| std::fs::read(path).expect("published upload"))
+            })
+            .collect::<Vec<_>>();
+        contents.sort();
+        assert_eq!(contents, [b"first\n".to_vec(), b"second\n".to_vec()]);
     }
 
     #[tokio::test]
@@ -7764,23 +14460,169 @@ exit 1
     #[tokio::test]
     async fn autosave_validates_and_writes_a_recovery_graph() {
         let (temp, project) = fixture_project();
+        let graph = project.session().expect("project session").graph;
+        let base_state_revision = graph_state_revision(&graph).expect("base state revision");
+        let body = serde_json::json!({
+            "base_state_revision": base_state_revision,
+            "graph": graph,
+        });
         let response = app(project)
             .oneshot(
                 Request::builder()
                     .method(Method::PUT)
                     .uri("/api/graph/autosave")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"schema_version":1,"nodes":[],"edges":[]}"#))
+                    .body(Body::from(body.to_string()))
                     .expect("request"),
             )
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
+        let response = response_json(response).await;
+        assert_eq!(response["valid"], true);
+        assert_eq!(response["state_revision"], base_state_revision);
         let recovery =
             std::fs::read_to_string(temp.path().join("graph.somite.autosave.somite.json"))
                 .expect("recovery graph");
         let graph: Graph = serde_json::from_str(&recovery).expect("recovery json");
-        assert_eq!(graph.schema_version, 2);
+        assert_eq!(graph.schema_version, somite_ir::SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    async fn agent_prompt_preflight_does_not_commit_when_agent_is_unavailable() {
+        let (temp, project) = fixture_project();
+        let mut graph = project.session().expect("project session").graph;
+        let base_state_revision = graph_state_revision(&graph).expect("base state revision");
+        graph.name = Some("must not be committed".to_owned());
+        let graph_path = project.graph_path.clone();
+        let autosave_path = project.autosave_path();
+        let before = std::fs::read(&graph_path).expect("project graph before prompt");
+
+        let response = app(project)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/agent/prompt")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "message": "Inspect this graph",
+                            "base_state_revision": base_state_revision,
+                            "graph": graph,
+                        })
+                        .to_string(),
+                    ))
+                    .expect("agent prompt request"),
+            )
+            .await
+            .expect("agent prompt response");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            std::fs::read(graph_path).expect("project graph after prompt"),
+            before
+        );
+        assert!(!autosave_path.exists());
+        drop(temp);
+    }
+
+    #[tokio::test]
+    async fn stale_browser_saves_cannot_overwrite_an_agent_source_import() {
+        let fixture = nfcore_source_fixture();
+        import_nfcore_source(
+            fixture.root(),
+            &fixture.request,
+            &fixture.source_operator_revision,
+            Some(&fixture.repository),
+        )
+        .expect("prime exact source cache");
+        let empty = Graph {
+            schema_version: somite_ir::SCHEMA_VERSION,
+            name: None,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            annotations: Vec::new(),
+            variant_origin: None,
+        };
+        let empty_revision = graph_state_revision(&empty).expect("empty state revision");
+        let graph_path = fixture.root().join("graph.somite.json");
+        std::fs::write(
+            &graph_path,
+            pretty_json_line(&empty).expect("empty graph JSON"),
+        )
+        .expect("empty graph");
+        let project =
+            WebProject::open(fixture.root(), &graph_path).expect("source workflow project");
+        let authorization = format!("Bearer {}", project.mcp_runtime_capability());
+        let router = app(project);
+
+        let imported = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/agent/source-workflows/nfcore/resolve")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, authorization)
+                    .body(Body::from(
+                        serde_json::json!({
+                            "workflow": fixture.request.workflow,
+                            "revision": fixture.request.revision,
+                            "base_state_revision": empty_revision,
+                            "idempotency_key": "browser-cas-source-import",
+                            "summary": "Import the exact source workflow"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("agent source import request"),
+            )
+            .await
+            .expect("agent source import response");
+        assert_eq!(imported.status(), StatusCode::OK);
+        let imported = response_json(imported).await;
+        let imported_revision = imported["state_revision"]
+            .as_str()
+            .expect("imported state revision")
+            .to_owned();
+
+        let stale_request = serde_json::json!({
+            "base_state_revision": empty_revision,
+            "graph": empty,
+        })
+        .to_string();
+        for route in ["/api/graph/autosave", "/api/graph"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::PUT)
+                        .uri(route)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(stale_request.clone()))
+                        .expect("stale browser graph request"),
+                )
+                .await
+                .expect("stale browser graph response");
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{route}");
+            let conflict = response_json(response).await;
+            assert_eq!(conflict["state_revision"], imported_revision, "{route}");
+            assert!(
+                conflict["error"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("graph state conflict")),
+                "{route}: {conflict}"
+            );
+        }
+
+        let saved: Graph = serde_json::from_slice(
+            &std::fs::read(graph_path.with_extension("autosave.somite.json"))
+                .expect("agent autosave"),
+        )
+        .expect("agent autosave graph");
+        assert_eq!(
+            graph_state_revision(&saved).expect("saved state revision"),
+            imported_revision
+        );
+        assert_eq!(saved.nodes[0].operator, "workflow.source");
     }
 
     #[test]
@@ -7825,8 +14667,8 @@ exit 1
     }
 
     #[test]
-    fn cached_nfcore_operators_join_the_production_compile_catalog() {
-        let temp = TempDir::new().expect("temporary project");
+    fn cached_nfcore_operators_do_not_join_the_production_compile_catalog() {
+        let (temp, project) = fixture_project();
         let cache = temp.path().join(".somite/catalog");
         std::fs::create_dir_all(&cache).expect("catalog cache");
         std::fs::write(
@@ -7834,10 +14676,15 @@ exit 1
             r#"{"remote_workflows":[{"name":"demo","description":"Demo","topics":[],"archived":false,"releases":[{"tag_name":"1.2.3"}]}]}"#,
         )
         .expect("catalog fixture");
-        let mut catalog = Catalog::default();
-        install_cached_nfcore(temp.path(), &mut catalog);
-        let operator = catalog.get("nf.demo").expect("generated operator");
-        assert_eq!(operator.argv[2], "nf-core/demo");
-        assert_eq!(operator.argv[4], "{param.revision}");
+        let graph = Graph {
+            schema_version: somite_ir::SCHEMA_VERSION,
+            name: None,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            annotations: Vec::new(),
+            variant_origin: None,
+        };
+        let (_, catalog, _) = production_inputs(&project, &graph).expect("production inputs");
+        assert!(catalog.get("nf.demo").is_err());
     }
 }

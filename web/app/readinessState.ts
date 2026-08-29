@@ -6,8 +6,10 @@ export function readinessSummary(
   snapshot: ReadinessSnapshot | null,
   running: boolean,
   evidence: ValidationEvidenceResponse | null,
+  error?: string | null,
 ) {
   if (running) return { label: "Preparing", detail: "Execution is active", tone: "checking" as const };
+  if (error) return { label: "Readiness unavailable", detail: `${error} · click to retry`, tone: "attention" as const };
   if (!snapshot) return { label: "Checking readiness…", detail: "Inspecting this graph", tone: "checking" as const };
   if (snapshot.state === "empty") return { label: "Start building", detail: "Add a tool or input", tone: "building" as const };
   if (snapshot.required_count > 0) {

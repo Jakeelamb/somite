@@ -299,6 +299,7 @@ fn build_graph(
                 ),
                 ("component".to_owned(), ParamValue::String(label.clone())),
             ]),
+            source_workflow: None,
             layout: Layout {
                 x: rank as f32 * 280.0,
                 y: *row as f32 * 150.0,
@@ -336,6 +337,7 @@ fn build_graph(
         nodes,
         edges,
         annotations: vec![],
+        variant_origin: None,
     };
     graph.validate().map_err(|error| error.to_string())?;
     Ok(graph)

@@ -39,7 +39,7 @@ function readyReview(name: string): PaperReview {
       warnings: [],
       evidence: [],
       graph: {
-        schema_version: 2,
+        schema_version: 3,
         nodes: [{ id: "step", operator: "test.step", operator_revision: "r1", ports: [], layout: { x: 0, y: 0 } }],
         edges: [],
       },
@@ -107,7 +107,7 @@ test("retry reuses a successful upload after reconstruction fails", async () => 
 
 test("an empty legacy candidate is never ready or safe to apply", async () => {
   const falseReady = readyReview("Empty workflow");
-  falseReady.candidates[0] = { ...falseReady.candidates[0], graph: { schema_version: 2, nodes: [], edges: [] } };
+  falseReady.candidates[0] = { ...falseReady.candidates[0], graph: { schema_version: 3, nodes: [], edges: [] } };
   falseReady.mentions = [{
     display_name: "UnsupportedTool",
     normalized_name: "unsupportedtool",

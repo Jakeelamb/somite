@@ -55,12 +55,14 @@ fn import_then_skip() {
                 m.insert("path".into(), ParamValue::String("testdata/t.fastq".into()));
                 m
             },
+            source_workflow: None,
             layout: Layout { x: 0.0, y: 0.0 },
             note: None,
             color: None,
         }],
         edges: vec![],
         annotations: vec![],
+        variant_origin: None,
     };
     g.validate().unwrap();
     let proj = Project::open(dir.path()).unwrap();
@@ -99,12 +101,14 @@ fn paired_import_keeps_mates_as_two_artifacts() {
                     ParamValue::String("reads/sample_R2.fastq".into()),
                 ),
             ]),
+            source_workflow: None,
             layout: Layout { x: 0.0, y: 0.0 },
             note: None,
             color: None,
         }],
         edges: vec![],
         annotations: vec![],
+        variant_origin: None,
     };
 
     let project = Project::open(dir.path()).unwrap();
@@ -131,12 +135,14 @@ fn unbound_required_input_is_skipped() {
             operator_revision: op.revision().unwrap(),
             ports: op.ir_ports(),
             params: BTreeMap::new(),
+            source_workflow: None,
             layout: Layout { x: 0.0, y: 0.0 },
             note: None,
             color: None,
         }],
         edges: vec![],
         annotations: vec![],
+        variant_origin: None,
     };
     g.validate().unwrap();
     let proj = Project::open(dir.path()).unwrap();
@@ -170,6 +176,7 @@ fn import_then_rnaseq_sheet() {
                     m.insert("path".into(), ParamValue::String("testdata/t.fastq".into()));
                     m
                 },
+                source_workflow: None,
                 layout: Layout { x: 0.0, y: 0.0 },
                 note: None,
                 color: None,
@@ -180,6 +187,7 @@ fn import_then_rnaseq_sheet() {
                 operator_revision: sh.revision().unwrap(),
                 ports: sh.ir_ports(),
                 params: BTreeMap::new(),
+                source_workflow: None,
                 layout: Layout { x: 200.0, y: 0.0 },
                 note: None,
                 color: None,
@@ -193,6 +201,7 @@ fn import_then_rnaseq_sheet() {
             to_port: "r1".into(),
         }],
         annotations: vec![],
+        variant_origin: None,
     };
     g.validate().unwrap();
     let proj = Project::open(dir.path()).unwrap();
@@ -244,12 +253,14 @@ fn imports_a_workflow_directory_as_a_typed_artifact() {
                 "path".into(),
                 ParamValue::String(workflow.display().to_string()),
             )]),
+            source_workflow: None,
             layout: Layout { x: 0.0, y: 0.0 },
             note: None,
             color: None,
         }],
         edges: vec![],
         annotations: vec![],
+        variant_origin: None,
     };
 
     let project = Project::open(dir.path()).unwrap();

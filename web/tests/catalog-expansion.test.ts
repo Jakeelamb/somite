@@ -9,13 +9,13 @@ test("catalog expansion reports visible progress for the selected workflow", () 
     phase: "resolving",
   }), {
     tone: "working",
-    headline: "Building process graph…",
-    summary: "Reading nf-core/pangenome at its pinned release.",
+    headline: "Resolving and pinning source…",
+    summary: "Fetching the exact nf-core/pangenome release.",
     detail: null,
   });
 });
 
-test("a missing Nextflow DAG explains that the canvas is unchanged and keeps the diagnostic", () => {
+test("an nf-core source resolution failure leaves the canvas unchanged and keeps the diagnostic", () => {
   const detail = "workflow import: nf-core/pangenome@1.1.3 could not be previewed: Nextflow did not produce a DAG";
   assert.deepEqual(catalogExpansionPresentation({
     operatorId: "nf.pangenome",
@@ -25,7 +25,7 @@ test("a missing Nextflow DAG explains that the canvas is unchanged and keeps the
   }), {
     tone: "error",
     headline: "Couldn’t add nf-core/pangenome",
-    summary: "Nextflow did not return a process graph, so your canvas was left unchanged.",
+    summary: "Somite could not resolve and pin this workflow’s source, so your canvas was left unchanged.",
     detail,
   });
 });

@@ -26,6 +26,44 @@ content digest. Source identity alone is not executable identity.
 **Node** — one placed instance of an operator, including parameter values and
 canvas layout.
 
+**Source-backed workflow** — one exact engine-authored workflow retained as a
+pinned commit tree and represented by one outer Node. The Node is a collapsed
+canvas view; opening it shows the source-anchored Workflow outline. Somite does
+not translate that outline into native Nodes or execute it as a nested engine.
+
+**Native workflow variant** — an ordinary executable Graph created by promoting
+Source invocations. Its typed Nodes and Edges are executable truth, while its
+exact original Source-backed workflow and invocation-to-Node mappings remain
+attached as non-executable provenance.
+
+**Invocation promotion** — the atomic transition from one selected Source
+invocation to one native catalog-pinned Node. Promotion never guesses adjacent
+channels; missing connections become ordinary Requirements on the resulting
+native Graph.
+
+**Workflow source pin** — the provider, repository, requested release, resolved
+immutable revision, entrypoint, and complete tracked-file content digest for a
+Source-backed workflow. Bytes come from raw blobs in that exact commit, never
+from the mutable worktree, Git status, or checkout filters.
+
+**Workflow outline** — a nested, source-anchored read model of workflow,
+subworkflow, process, and invocation scopes. It supports navigation and honest
+capability reporting. It is not a fabricated Port/Edge execution graph.
+
+**Workflow binding** — one explicit parameter value or project file/directory
+bound to a Source-backed workflow instance. Bindings and execution profiles are
+part of executable identity; outline labels and diagnostics are not.
+
+**Unsupported required workflow parameter** — a required upstream schema
+property that Somite cannot faithfully express as a typed binding. It is
+retained by name, group, description, and reason as a deterministic Readiness
+blocker. The property itself remains source-only, but does not disable edits to
+independently proven fields. Root/group ambiguity or cross-field assertions
+still make the whole parameter schema read-only. The pinned source digest
+already commits to its schema bytes,
+so this derived read-model record does not independently change workflow
+identity.
+
 **Port** — a named, typed input or output on an operator.
 
 **Edge** — an IR connection from an output port to a compatible input port.
@@ -64,7 +102,8 @@ workflow package. Generated engine syntax is an artifact, never a second
 source of truth.
 
 **Graph revision** — the semantic digest of Node identities, pinned Operator
-revisions, ports, parameters, and Edges. Layout and human notes are excluded.
+revisions, ports, parameters, Edges, Workflow source pins, profiles, and
+bindings. Layout, human notes, and Workflow-outline presentation are excluded.
 
 **Graph state revision** — the full editable-document digest used only for
 compare-and-swap writes. It includes the Workflow name, layout, and notes so
@@ -162,9 +201,15 @@ such as NCBI, SRA, or Ensembl.
 **Native operator** — an independently executable operator with a reviewed
 Somite contract.
 
-**Structural workflow reference** — a node reconstructed from an engine-authored
-workflow such as nf-core or Snakemake. It makes the imported DAG transparent
-but is not independently executable until promoted to a native operator.
+**Structural workflow reference** — a legacy, non-executable Node reconstructed
+from engine visualization output. It retains visible historical structure but
+cannot recover the original program and remains blocked pending explicit
+reimport or a reviewed Adapter.
+
+**Source-only region** — exact retained workflow source for which Somite cannot
+yet offer structured visual editing. It remains inspectable and executable only
+when its complete task environment is supported; Somite never guesses Nodes,
+Ports, or channel transformations for it.
 
 **Source-backed module** — a pinned upstream module with a reviewed Adapter
 that maps its complete Interface into visible Somite ports and parameters.
@@ -253,6 +298,12 @@ downloadable run or silently chooses the first member of a collection.
 
 - Node IDs are unique and edges reference existing nodes and ports.
 - Every Node pins the exact execution-semantic revision of its Operator.
+- A Graph containing a Source-backed workflow currently contains exactly one
+  source Node and no Edges; mixed native/source composition waits for complete
+  channel contracts.
+- A Source-backed workflow pins exact source bytes and never runs by repository
+  name or mutable release tag.
+- DOT and other engine visualizations are never execution truth.
 - Every edge passes port-type validation and the graph remains acyclic.
 - Scientific bytes live in artifacts, never inside graph JSON.
 - Pixi environments contain executable dependencies, not Managed resource

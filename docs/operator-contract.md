@@ -165,20 +165,91 @@ Containers and per-node environments are intentionally deferred. An Operator
 must not invoke Conda, Pixi, Docker, Apptainer, Nextflow, Snakemake, or another
 workflow/package engine itself.
 
-## nf-core modules
+## nf-core source-backed workflows and modules
 
-Exact nf-core source reuse is a separate Adapter Implementation, not a generic
-external Operator. A future source-backed Adapter must:
+Exact nf-core source reuse is a Source-backed workflow, not a generic external
+Operator. A whole-root import must:
 
-1. pin the upstream module source and revision;
-2. preserve the module script rather than translating it;
-3. map the complete channel Interface, including metadata values;
-4. map every generated process alias back to one visible Somite Node;
-5. pass the upstream nf-test fixture and a Somite composition fixture; and
-6. emit provenance for the pinned source.
+1. resolve a release to an immutable upstream commit;
+2. read raw blobs from that exact commit tree and retain them by content digest,
+   without consulting mutable worktree bytes, status, or checkout filters;
+3. preserve source rather than translating DOT or launching by repository name;
+4. expose workflow-schema parameters as typed bindings;
+5. index nested scopes and invocations with exact source locations; and
+6. freeze source-defined task environments before claiming Readiness.
 
-The initial compiler does not yet expose this Adapter kind. Imported nf-core
-processes therefore remain references until promoted.
+Module-level structured editing additionally requires the complete callable
+channel Interface, including metadata values and transforms, plus a source map
+from runtime aliases to visible scopes. Until those contracts exist, regions
+remain exact Source-only regions and expose no fabricated ports.
+
+An invocation may cross from Source-only intent into native execution only by
+explicit promotion to one catalog-pinned Operator. Promotion creates an ordinary
+Node with that Operator's exact Ports and parameters; it does not infer adjacent
+channels or keep the original source workflow running beneath it. The native
+Graph retains the complete original Source Node and invocation-to-Node mapping
+as non-executable provenance. From that point, normal graph validation,
+Readiness, Nextflow compilation, and Pixi freezing apply without a separate
+source execution path.
+
+JSON Schema `pattern` bindings fail closed across regex engines. Somite accepts
+only printable-ASCII patterns and values from a deliberately shared ECMA-262 / Rust
+`regex` subset: ordinary and non-capturing groups, alternation, anchors, `.`,
+ASCII classes and ranges, common class/boundary escapes, and `*`, `+`, or `?`
+quantifiers. Lookarounds, inline modes, backreferences, Unicode or hex escapes,
+counted quantifiers, POSIX classes, and class set operations remain Source-only.
+An unsupported required patterned parameter is retained as a Readiness blocker,
+while an unsupported optional patterned parameter remains diagnostic. Neither
+disables edits to independently proven properties.
+
+The source editor recognizes only primitive `type`, `enum`, inclusive `minimum`
+and `maximum`, the pattern subset above, and the `file-path`, `directory-path`,
+or `path` formats as editable constraints. A non-null `default` must satisfy
+that complete contract before it is retained. Display annotations such as
+`title`, `description`, `help_text`, `help`, `fa_icon`, `examples`, `hidden`,
+`mimetype`, `errorMessage`, `readOnly`, `writeOnly`, and `$comment` do not
+constrain values. The property contract is an allowlist: unknown/custom
+keywords and nf-schema validators such as `exists`, referenced sample-sheet
+`schema`, and `deprecated` remain Source-only until their validation behavior
+is implemented with parity.
+Integer values, defaults, enum choices, and bindings are limited to JavaScript's
+exact integer domain, `[-(2^53-1), 2^53-1]`; the browser rejects rather than
+rounds entries outside it. Persisted numeric `minimum` and `maximum` constraints
+use the deliberately narrower `[-(2^53-2), 2^53-2]` domain because the IR stores
+bounds as binary64 values and the outer safe-integer boundary does not survive
+this project's decimal `f64` JSON round trip unchanged. Integer bounds must also
+be integral. A property with a bound, default, or enum outside its applicable
+domain remains Source-only.
+For fractional numeric bounds, defaults, and enum choices, Somite compares the
+original JSON decimal with the canonical decimal of its persisted binary64
+value. If those numbers differ (for example `0.10000000000000001` becoming
+`0.1`), that property remains Source-only. Path formats are editable only on
+string properties; applying them to numbers, integers, or booleans is likewise
+Source-only.
+Other JSON Schema assertions—including `exclusiveMinimum`,
+`exclusiveMaximum`, `multipleOf`, `const`, length/item/property bounds,
+conditionals, composition, references, object/array subschemas, and
+unevaluated/additional-property rules—remain Source-only rather than being
+silently ignored. On a required property they are retained as an explicit
+non-actionable Readiness blocker. Optional unsupported properties remain visible
+through source diagnostics. In both cases, only the affected property is omitted
+from the editable contract, so the public edit API accepts proven emitted fields
+and rejects omitted fields without locking unrelated controls.
+
+At the container level, Somite supports an object root with either direct
+`properties` or `$defs`/`definitions` groups, direct `required`, and root
+`allOf` clauses containing exactly one known local group `$ref` or exactly one
+`required` array. Groups support object `properties` plus `required` and display
+annotations; unreferenced definitions are inert and never become phantom
+parameters. Malformed `required` refuses that contract while retaining any
+valid string names it contains. Other root/group assertions, mixed `allOf`
+clauses, unknown or remote references, and conditional/dependent contracts
+disable editing globally and remain explicit schema-review work because their
+meaning can couple otherwise independent properties. A valid complete empty
+object schema remains editable and produces no false schema-review blocker.
+Duplicate JSON object members anywhere in the schema also disable editing
+globally: last-member-wins behavior is parser-dependent and therefore cannot be
+part of a proven source-editor contract.
 
 ## Snakemake workflows
 

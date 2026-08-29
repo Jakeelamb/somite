@@ -51,6 +51,8 @@ import type {
   ExportPlan,
   SystemProfile,
   ValidationEvidenceResponse,
+  WorkflowBinding,
+  WorkflowParameterField,
 } from "./types";
 import { OperatorGlyph, portColor } from "./visual";
 import { jsonRequest } from "./api";
@@ -59,6 +61,27 @@ import { nextPaperReadSlot, paperAttentionItems, paperParameterValue, paperResou
 import { formatPaperElapsed, paperCandidateCanApply, paperIntakeIsBusy, paperIntakePresentation, paperUnsupportedMentions, type PaperIntakeState } from "./paperIntake";
 import { paperReadingPresentation } from "./paperReading";
 import { catalogExpansionPresentation, type CatalogExpansionActivity } from "./catalogExpansion";
+import {
+  groupedWorkflowParameters,
+  hiddenRequiredWorkflowParameters,
+  opaqueNfcoreFallback,
+  sourceCapabilityRows,
+  sourceBindingResetLabel,
+  sourceBindingStatus,
+  sourceBooleanNeedsExplicitChoice,
+  sourceSpanLabel,
+  sourceWorkflowProvider,
+  sourceWorkflowRevision,
+  sourceWorkflowRoot,
+  sourceWorkflowSetupLabel,
+  sourceWorkflowTitle,
+  parseSourceNumericDraft,
+  workflowBinding,
+  workflowChoiceBinding,
+  workflowChoiceLabel,
+  workflowChoiceSelection,
+  workflowBindingValue,
+} from "./sourceWorkflowPresentation";
 
 function groupedAgentEvents(events: AgentEvent[]) {
   return events.reduce<AgentEvent[]>((grouped, event) => {
@@ -303,6 +326,7 @@ export function ReadinessPanel({ snapshot, evidence, onResolve, onFocus, onAttac
     .map((resolution) => ({ item, resolution })));
   const receipt = evidence?.receipt;
   const evidenceLabel = receipt?.result === "passed" ? "Validated" : receipt?.result === "failed" ? "Failed" : receipt ? "Inconclusive" : "Not validated";
+  const sourceBlocker = current?.operator_id === "workflow.source" && current.fields.length === 0;
   return (
     <section className="floating-panel readiness-window" aria-label="Workflow Readiness">
       <header className="floating-panel-head">
@@ -347,7 +371,8 @@ export function ReadinessPanel({ snapshot, evidence, onResolve, onFocus, onAttac
               {recipe.source_url && <a href={recipe.source_url} target="_blank" rel="noreferrer"><ExternalLink size={11} />Open recipe source</a>}
             </details>)}
             <div className="requirement-actions">
-              {!current.fields.some((field) => field.input_mode === "file") && <button type="button" onClick={() => onResolve(current)}>{current.resolutions[0]?.label ?? (current.kind === "parameter" ? "Configure" : current.kind === "managed_resource" ? "Connect existing" : "Connect input")}</button>}
+              {sourceBlocker && <small>This is an explicit source limitation, not an action Somite can complete silently.</small>}
+              {!sourceBlocker && !current.fields.some((field) => field.input_mode === "file") && <button type="button" onClick={() => onResolve(current)}>{current.resolutions[0]?.label ?? (current.kind === "parameter" ? "Configure" : current.kind === "managed_resource" ? "Connect existing" : "Connect input")}</button>}
               {current.escalatable && <button type="button" className="secondary" onClick={() => onAskAssistant(current)}><MessageSquare size={12} />Ask Agent</button>}
             </div>
           </article>
@@ -407,7 +432,7 @@ function buildSections(
   continuation?: PendingConnection | null,
 ): LibrarySection[] {
   const normalized = query.trim().toLowerCase();
-  const matches = operators.filter((operator) => !isSource(operator)).filter((operator) => {
+  const matches = operators.filter((operator) => !isSource(operator)).filter((operator) => operator.kind !== "source" && !opaqueNfcoreFallback(operator)).filter((operator) => {
     if (continuation && !operatorContinues(operator, continuation)) return false;
     if (normalized) {
       return `${operator.title} ${operator.id} ${operator.palette.join(" ")} ${operator.description ?? ""} ${(operator.topics ?? []).join(" ")}`
@@ -485,7 +510,8 @@ export function LibraryPanel({
   onDismissCatalogExpansion: () => void;
 }) {
   const request = classifySource(query);
-  const nextflowCount = operators.filter((operator) => operator.id.startsWith("nf.")).length;
+  const libraryOperatorCount = operators.filter((operator) => operator.kind !== "source" && !opaqueNfcoreFallback(operator)).length;
+  const nextflowCount = operators.filter((operator) => operator.id.startsWith("nf.") && !opaqueNfcoreFallback(operator)).length;
   const [sourceResults, setSourceResults] = useState<SourceSearchResult[]>([]);
   const [sourceSearching, setSourceSearching] = useState(false);
   const [sourceSearched, setSourceSearched] = useState(false);
@@ -549,7 +575,7 @@ export function LibraryPanel({
   return (
     <section className="floating-panel library-window" aria-label="Operator Library">
       <header className="floating-panel-head">
-        <div><strong>Add to canvas</strong><span>{operators.length} available</span></div>
+        <div><strong>Add to canvas</strong><span>{libraryOperatorCount} available</span></div>
         <button type="button" aria-label="Close Library" onClick={onClose}><X size={15} aria-hidden="true" /></button>
       </header>
       <div className="library-toolbar">
@@ -752,6 +778,7 @@ function toolStateLabel(state: ExportPlan["tools"][number]["state"]) {
     ready: "Ready",
     installable: "Installable",
     system_required: "System tool",
+    source_setup: "Execution setup",
     manual_checkpoint: "Manual checkpoint",
     method_details: "Details needed",
     legacy_source: "Legacy setup",
@@ -777,7 +804,7 @@ export function ToolchainPanel({ plan, pixiReady, loading, downloading, onDownlo
       {loading && <div className="toolchain-loading"><span className="loader-mark" />Reading operator requirements…</div>}
       {plan && <>
         <div className={`export-assessment state-${plan.assessment.state}`}>{plan.assessment.required_count > 0 ? <CircleAlert size={14} /> : <CheckCircle2 size={14} />}<span><strong>{plan.assessment.required_count > 0 ? `${plan.assessment.required_count} setup step${plan.assessment.required_count === 1 ? "" : "s"} remain` : "Workflow setup is complete"}</strong><small>{plan.assessment.items[0]?.title ?? "The same assessment has cleared Paper, Readiness, and Export."}</small></span></div>
-        <div className="toolchain-summary"><span><strong>{plan.ready_count}</strong>ready</span><span><strong>{plan.installable_count}</strong>managed</span><span className={plan.manual_count ? "attention" : ""}><strong>{plan.manual_count}</strong>manual</span><span className={plan.details_count ? "attention" : ""}><strong>{plan.details_count}</strong>need details</span><span className={plan.legacy_count ? "attention" : ""}><strong>{plan.legacy_count}</strong>legacy</span>{plan.adapter_count > 0 && <span className="attention"><strong>{plan.adapter_count}</strong>need adapters</span>}</div>
+        <div className="toolchain-summary"><span><strong>{plan.ready_count}</strong>ready</span><span><strong>{plan.installable_count}</strong>managed</span>{plan.source_setup_count > 0 && <span className="attention"><strong>{plan.source_setup_count}</strong>execution setup</span>}<span className={plan.manual_count ? "attention" : ""}><strong>{plan.manual_count}</strong>manual</span><span className={plan.details_count ? "attention" : ""}><strong>{plan.details_count}</strong>need details</span><span className={plan.legacy_count ? "attention" : ""}><strong>{plan.legacy_count}</strong>legacy</span>{plan.adapter_count > 0 && <span className="attention"><strong>{plan.adapter_count}</strong>need adapters</span>}</div>
         <div className="tool-list">
           {plan.tools.map((tool) => <article key={tool.operator_id} className={`tool-row state-${tool.state}`}><header><span><strong>{tool.title}</strong><code>{tool.operator_id}</code></span><em>{toolStateLabel(tool.state)}</em></header><p>{tool.packages.join(" · ") || tool.binary || tool.detail}</p></article>)}
           {!plan.tools.length && <p className="panel-empty">This graph has no tool requirements yet.</p>}
@@ -1133,7 +1160,169 @@ export function PaperPanel({ intake, active, applied, preparingField, onFile, on
   );
 }
 
-export function InspectorPanel({
+type InspectorPanelProps = {
+  node: SomiteGraphNode;
+  selectedCount: number;
+  operator: Operator;
+  hiddenViewerCount: number;
+  setupCount: number;
+  updateParam: (key: string, value: ParamValue) => void;
+  updateSourceBinding: (key: string, binding: WorkflowBinding | undefined) => Promise<void>;
+  browseSourceBinding: (key: string, file: File) => Promise<void>;
+  pendingSourceFile?: { file: File; parameterNames: string[] };
+  bindPendingSourceFile: (key: string) => Promise<void>;
+  dismissPendingSourceFile: () => void;
+  beginParamEdit: (key: string) => void;
+  browseParam: (key: string, file: File) => Promise<void>;
+  rename: (next: string) => void;
+  toggleViewers: () => void;
+  exploreSource: () => void;
+  close: () => void;
+};
+
+export function InspectorPanel(props: InspectorPanelProps) {
+  if (props.node.source_workflow) return <SourceWorkflowInspector {...props} />;
+  return <OperatorInspectorPanel {...props} />;
+}
+
+function SourceWorkflowInspector({ node, setupCount, updateSourceBinding, browseSourceBinding, pendingSourceFile, bindPendingSourceFile, dismissPendingSourceFile, beginParamEdit, exploreSource, close }: InspectorPanelProps) {
+  const workflow = node.source_workflow;
+  const root = workflow ? sourceWorkflowRoot(workflow) : undefined;
+  if (!workflow) return null;
+
+  const parameterGroups = groupedWorkflowParameters(workflow);
+  const parameterEditingAvailable = workflow.capabilities.parameter_edits;
+  const hiddenRequired = hiddenRequiredWorkflowParameters(workflow);
+  const pendingTargets = (workflow.parameters ?? []).filter((parameter) => pendingSourceFile?.parameterNames.includes(parameter.name));
+
+  return (
+    <section className="floating-panel inspector-window source-workflow-inspector" aria-label="Source Workflow">
+      <header className="inspector-studio-head source-workflow-head">
+        <i />
+        <div><strong>{sourceWorkflowTitle(workflow)}</strong><code>{sourceWorkflowProvider(workflow)} · {sourceWorkflowRevision(workflow)}</code><span>Source-backed · pinned base{workflow.replacements?.length ? ` · ${workflow.replacements.length} variant edit${workflow.replacements.length === 1 ? "" : "s"}` : ""}</span></div>
+        <button type="button" aria-label="Close Source Workflow" onClick={close}><X size={15} /></button>
+      </header>
+      <div className="source-workflow-scroll">
+          <section className="source-workflow-identity">
+            <header><span>{sourceWorkflowProvider(workflow)}</span><em>{sourceWorkflowSetupLabel(workflow, setupCount)}</em></header>
+            <strong>{workflow.source.repository}</strong>
+            <code>{workflow.source.entrypoint} · {workflow.source.resolved_revision.slice(0, 12)}</code>
+            <small>{workflow.source.file_count.toLocaleString()} pinned files · {(workflow.source.source_bytes / 1_000_000).toLocaleString(undefined, { maximumFractionDigits: 1 })} MB</small>
+          </section>
+          <button className="source-outline-open" type="button" disabled={!root} onClick={exploreSource}><FileSearch size={15} aria-hidden="true" /><span><strong>Open editable nested canvas</strong><small>{root ? `${(workflow.scopes ?? []).length} source-anchored scopes · replace tools and explore one layer at a time` : "No source scopes available"}</small></span><ChevronRight size={14} aria-hidden="true" /></button>
+          <section className="source-capabilities">
+            <header><strong>What you can do</strong><span>Current source contract</span></header>
+            <div>{sourceCapabilityRows(workflow.capabilities).map((capability) => <span className={capability.available ? "available" : "unavailable"} key={capability.key}>{capability.available ? <CheckCircle2 size={11} aria-hidden="true" /> : <CircleStop size={11} aria-hidden="true" />}{capability.label}</span>)}</div>
+          </section>
+          {!parameterEditingAvailable && <section className="source-structure-lock"><CircleStop size={15} aria-hidden="true" /><span><strong>Parameter editing is read-only</strong><small>This source schema contains a constraint Somite cannot evaluate safely. Review the source notes below; no parameter changes will be guessed.</small></span></section>}
+          {hiddenRequired.length > 0 && <section className="source-structure-lock"><CircleStop size={15} aria-hidden="true" /><span><strong>Hidden source setup is required</strong><small>{hiddenRequired.map((parameter) => parameter.name).join(", ")} {hiddenRequired.length === 1 ? "is" : "are"} required by the pinned source but intentionally hidden by its schema. Somite keeps the requirement visible without inventing a value.</small></span></section>}
+          <section className="source-structure-lock source-variant-guidance"><CircleAlert size={15} aria-hidden="true" /><span><strong>Creative variants are available</strong><small>Replace any source invocation on the nested canvas. Somite preserves uncertain connections as Logic checks, locks chosen tools with Pixi, and uses validation—not contracts—as proof.</small></span></section>
+          {pendingSourceFile && <section className="source-drop-target">
+            <header><span><strong>Choose this file&apos;s input</strong><small>{pendingSourceFile.file.name}</small></span><button type="button" aria-label="Dismiss dropped file" onClick={dismissPendingSourceFile}><X size={12} /></button></header>
+            <p>Somite found several required file inputs, so it will not guess the biological role.</p>
+            <div>{pendingTargets.map((parameter) => <button type="button" key={parameter.name} disabled={!parameterEditingAvailable} onClick={() => void bindPendingSourceFile(parameter.name)}><strong>{parameter.label || parameter.name}</strong><small>{parameter.description || parameter.help || parameter.name}</small></button>)}</div>
+          </section>}
+          <section className="source-binding-groups">
+            <header><strong>Pipeline setup</strong><span>{Object.keys(workflow.bindings ?? {}).length} bound</span></header>
+            {parameterGroups.map(({ group, parameters }) => <details key={group} open={parameterGroups.length === 1 ? true : undefined}><summary><span>{group}</span><small>{parameters.filter((parameter) => workflow.bindings?.[parameter.name]).length}/{parameters.length}</small><ChevronDown size={12} aria-hidden="true" /></summary><div>{parameters.map((parameter) => <SourceBindingControl key={`${parameter.name}:${workflow.workflow_revision}`} nodeId={node.id} parameter={parameter} binding={workflow.bindings?.[parameter.name]} disabled={!parameterEditingAvailable} beginEdit={() => beginParamEdit(`source:${parameter.name}`)} update={(binding) => updateSourceBinding(parameter.name, binding)} browseFile={(file) => browseSourceBinding(parameter.name, file)} />)}</div></details>)}
+            {!parameterGroups.length && <p className="panel-empty">This source exposes no user-bindable parameters.</p>}
+          </section>
+          {Boolean(workflow.diagnostics?.length) && <details className="source-diagnostics"><summary><CircleAlert size={12} aria-hidden="true" /><span>{workflow.diagnostics?.length} source note{workflow.diagnostics?.length === 1 ? "" : "s"}</span><ChevronDown size={12} aria-hidden="true" /></summary><div>{workflow.diagnostics?.map((diagnostic, index) => <article key={`${diagnostic.code}-${diagnostic.span ? sourceSpanLabel(diagnostic.span) : "workflow"}-${index}`}><strong>{diagnostic.message}</strong><code>{diagnostic.span ? sourceSpanLabel(diagnostic.span) : diagnostic.code}</code></article>)}</div></details>}
+      </div>
+    </section>
+  );
+}
+
+function SourceBindingControl({ nodeId, parameter, binding, disabled, beginEdit, update, browseFile }: {
+  nodeId: string;
+  parameter: WorkflowParameterField;
+  binding: WorkflowBinding | undefined;
+  disabled: boolean;
+  beginEdit: () => void;
+  update: (binding: WorkflowBinding | undefined) => Promise<void>;
+  browseFile: (file: File) => Promise<void>;
+}) {
+  const id = `source-parameter-${nodeId}-${parameter.name}`;
+  const fallback = parameter.default ?? (parameter.type === "boolean" ? false : "");
+  const value = workflowBindingValue(binding, fallback);
+  const [draft, setDraft] = useState(String(value));
+  const ambiguousPath = parameter.format?.toLowerCase() === "path";
+  const [pathKind, setPathKind] = useState<"" | "project_file" | "project_directory">(
+    binding?.kind === "project_file" || binding?.kind === "project_directory" ? binding.kind : "",
+  );
+  const [activity, setActivity] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const save = async (next: WorkflowBinding | undefined) => {
+    if (disabled) return;
+    setActivity("saving");
+    try {
+      await update(next);
+      setActivity("saved");
+    } catch {
+      setActivity("error");
+    }
+  };
+  const bind = (next: ParamValue) => save(workflowBinding(parameter, next, pathKind || undefined));
+  const choices = parameter.choices ?? [];
+  const fileParameter = parameter.format?.toLowerCase() === "file-path" || (ambiguousPath && pathKind === "project_file");
+  const unboundBoolean = sourceBooleanNeedsExplicitChoice(parameter, binding);
+  const chooseFile = async (file: File) => {
+    setActivity("saving");
+    try {
+      await browseFile(file);
+      setActivity("saved");
+    } catch {
+      setActivity("error");
+    }
+  };
+  if (parameter.managed) {
+    return <div className="source-binding-control managed"><span><strong>{parameter.label || parameter.name}</strong><em>Somite-managed</em></span><small>{parameter.description || parameter.help || "Somite binds this value when the frozen run is prepared."}</small></div>;
+  }
+  return (
+    <div className="source-binding-control">
+      <label htmlFor={id}>{parameter.label || parameter.name}{parameter.required && <sup>*</sup>}{parameter.format && <em>{parameter.format.replaceAll("_", " ")}</em>}</label>
+      {ambiguousPath && <select aria-label={`Path kind for ${parameter.label || parameter.name}`} disabled={disabled || activity === "saving"} value={pathKind} onFocus={beginEdit} onChange={(event) => {
+        const next = event.target.value as "" | "project_file" | "project_directory";
+        setPathKind(next);
+        if (!next && binding) void save(undefined);
+        else if (next && binding && draft) void save({ kind: next, path: draft });
+      }}><option value="">Choose file or directory…</option><option value="project_file">File in this project</option><option value="project_directory">Directory in this project</option></select>}
+      {choices.length ? (
+        <select id={id} disabled={disabled || activity === "saving" || (ambiguousPath && !pathKind)} value={workflowChoiceSelection(choices, binding)} onFocus={beginEdit} onChange={(event) => {
+          void save(workflowChoiceBinding(parameter, choices, event.target.value, pathKind || undefined));
+        }}><option value="unset">{ambiguousPath && !pathKind ? "Choose file or directory first…" : parameter.default === undefined ? "Choose…" : `Default · ${String(parameter.default)}`}</option>{choices.map((choice, index) => <option key={`${index}:${String(choice)}`} value={`choice:${index}`}>{workflowChoiceLabel(choice)}</option>)}</select>
+      ) : unboundBoolean ? (
+        <select id={id} disabled={disabled || activity === "saving"} value="" onFocus={beginEdit} onChange={(event) => {
+          if (event.target.value) void bind(event.target.value === "true");
+        }}><option value="">{parameter.required ? "Choose…" : "Not set"}</option><option value="true">Enabled</option><option value="false">Disabled</option></select>
+      ) : parameter.type === "boolean" ? (
+        <label className="source-binding-toggle" htmlFor={id}><input id={id} type="checkbox" disabled={disabled || activity === "saving"} checked={value === true} onFocus={beginEdit} onChange={(event) => { void bind(event.target.checked); }} /><span>{value === true ? "Enabled" : "Disabled"}</span></label>
+      ) : (
+        <>
+          <div className="source-binding-input-wrap"><input id={id} type={parameter.type === "integer" || parameter.type === "number" ? "number" : "text"} step={parameter.type === "integer" ? 1 : undefined} disabled={disabled || activity === "saving" || (ambiguousPath && !pathKind)} value={draft} min={parameter.minimum} max={parameter.maximum} pattern={parameter.pattern} spellCheck={false} onFocus={beginEdit} onChange={(event) => { setDraft(event.target.value); setActivity("idle"); }} onBlur={() => {
+              if (draft === String(value)) return;
+              if (draft === "") { void save(undefined); return; }
+              const next = parameter.type === "integer" || parameter.type === "number" ? parseSourceNumericDraft(parameter, draft) : draft;
+              if (next === undefined) { setActivity("error"); return; }
+              void save(workflowBinding(parameter, next, pathKind || undefined));
+            }} onKeyDown={(event) => {
+              if (event.key === "Enter") event.currentTarget.blur();
+              if (event.key === "Escape") { setDraft(String(value)); event.currentTarget.blur(); }
+            }} />{fileParameter && <label className={`browse-button ${disabled ? "disabled" : ""}`} title={`Choose ${parameter.label || parameter.name}`}><FolderOpen size={12} aria-hidden="true" /><span>Choose</span><input type="file" aria-label={`Choose file for ${parameter.label || parameter.name}`} disabled={disabled || activity === "saving"} onChange={(event) => {
+              const file = event.target.files?.[0];
+              event.target.value = "";
+              if (file) { beginEdit(); void chooseFile(file); }
+            }} /></label>}</div>
+        </>
+      )}
+      {(parameter.description || parameter.help) && <small>{parameter.description || parameter.help}</small>}
+      <span className={`source-binding-status ${activity}`}>{disabled ? "Read-only source parameter" : activity === "saving" ? "Saving…" : activity === "saved" ? "Saved" : activity === "error" ? "Could not save" : sourceBindingStatus(parameter, binding)}</span>
+      {!binding && parameter.type === "string" && !parameter.format && !choices.length && <button type="button" disabled={disabled || activity === "saving"} onClick={() => { beginEdit(); void save({ kind: "literal", value: "" }); }}>Set empty value</button>}
+      {binding && <button type="button" disabled={disabled || activity === "saving"} onClick={() => { beginEdit(); void save(undefined); }}>{sourceBindingResetLabel(parameter)}</button>}
+    </div>
+  );
+}
+
+function OperatorInspectorPanel({
   node,
   selectedCount,
   operator,
@@ -1144,18 +1333,7 @@ export function InspectorPanel({
   rename,
   toggleViewers,
   close,
-}: {
-  node: SomiteGraphNode;
-  selectedCount: number;
-  operator: Operator;
-  hiddenViewerCount: number;
-  updateParam: (key: string, value: ParamValue) => void;
-  beginParamEdit: (key: string) => void;
-  browseParam: (key: string, file: File) => Promise<void>;
-  rename: (next: string) => void;
-  toggleViewers: () => void;
-  close: () => void;
-}) {
+}: InspectorPanelProps) {
   const pages = useMemo(() => {
     const found = [...new Set(Object.values(operator.params).map((spec) => spec.page ?? operator.title))];
     return [...found, "Common"];

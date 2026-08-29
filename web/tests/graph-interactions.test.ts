@@ -118,7 +118,7 @@ test("validation edges expose progress and terminal evidence without color-only 
 });
 
 test("validation identity ignores layout but invalidates parameter changes", () => {
-  const graph = { schema_version: 2, nodes: [{ ...node, params: { threads: 2 } }], edges: [] };
+  const graph = { schema_version: 3, nodes: [{ ...node, params: { threads: 2 } }], edges: [] };
   const renamed = { ...graph, name: "RNA-seq review" };
   const moved = {
     ...graph,
@@ -129,4 +129,28 @@ test("validation identity ignores layout but invalidates parameter changes", () 
   assert.equal(semanticGraphKey(graph), semanticGraphKey(renamed));
   assert.equal(semanticGraphKey(graph), semanticGraphKey(moved));
   assert.notEqual(semanticGraphKey(graph), semanticGraphKey(changed));
+});
+
+test("native variant provenance survives in the graph without becoming execution identity", () => {
+  const graph = { schema_version: 3, nodes: [{ ...node, params: { threads: 2 } }], edges: [] };
+  const first = {
+    ...graph,
+    variant_origin: {
+      source_node: { ...node, id: "source-workflow-a" },
+      promoted_invocations: { "call-fastp": node.id },
+    },
+  };
+  const renamedSource = {
+    ...first,
+    variant_origin: {
+      source_node: { ...first.variant_origin.source_node, id: "source-workflow-b", note: "Original source" },
+      promoted_invocations: { "renamed-source-call": node.id },
+    },
+  };
+
+  assert.equal(semanticGraphKey(first), semanticGraphKey(renamedSource));
+  assert.notEqual(
+    semanticGraphKey(first),
+    semanticGraphKey({ ...first, nodes: [{ ...first.nodes[0], params: { threads: 4 } }] }),
+  );
 });

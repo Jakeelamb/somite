@@ -42,6 +42,8 @@ pub enum CompileError {
     UnknownOperator { node: String, operator: String },
     #[error("node {node} is a structural reference and cannot be executed")]
     ReferenceNode { node: String },
+    #[error("node {node} is a source-backed workflow and must be frozen through the source workflow compiler")]
+    SourceWorkflowNode { node: String },
     #[error("node {node} uses unsupported in-process operator {operator}")]
     UnsupportedInprocess { node: String, operator: String },
     #[error("node {node} attempts to nest workflow engine {binary}")]
@@ -132,10 +134,16 @@ pub fn compile(
                     node: node.id.clone(),
                 })
             }
+            OpKind::Source => {
+                return Err(CompileError::SourceWorkflowNode {
+                    node: node.id.clone(),
+                })
+            }
             OpKind::Inprocess => {
                 compile_import(
                     node,
                     operator,
+                    promoted_source_entry(graph, node),
                     &mut params_inputs,
                     &mut channels,
                     &mut workflow_lines,
@@ -166,6 +174,7 @@ pub fn compile(
                         operator_revision: node.operator_revision.clone(),
                         process: Some(compiled.process_name),
                         kind: "process",
+                        source: promoted_source_entry(graph, node),
                     },
                 );
             }
@@ -207,6 +216,19 @@ struct NodeMapEntry {
     operator_revision: String,
     process: Option<String>,
     kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<PromotedSourceMapEntry>,
+}
+
+#[derive(Serialize)]
+struct PromotedSourceMapEntry {
+    repository: String,
+    requested_revision: String,
+    resolved_revision: String,
+    source_digest: String,
+    invocation_id: String,
+    invocation_name: String,
+    span: somite_ir::SourceSpan,
 }
 
 struct ExternalCompilation {
@@ -254,6 +276,7 @@ fn validate_options(options: &CompileOptions) -> Result<(), CompileError> {
 fn compile_import(
     node: &Node,
     operator: &Operator,
+    source: Option<PromotedSourceMapEntry>,
     params_inputs: &mut Map<String, Value>,
     channels: &mut BTreeMap<(String, String), String>,
     workflow_lines: &mut Vec<String>,
@@ -318,9 +341,32 @@ fn compile_import(
             operator_revision: node.operator_revision.clone(),
             process: None,
             kind: "input",
+            source,
         },
     );
     Ok(())
+}
+
+fn promoted_source_entry(graph: &Graph, node: &Node) -> Option<PromotedSourceMapEntry> {
+    let origin = graph.variant_origin.as_ref()?;
+    let (invocation_id, _) = origin
+        .promoted_invocations
+        .iter()
+        .find(|(_, node_id)| node_id.as_str() == node.id)?;
+    let workflow = origin.source_node.source_workflow.as_ref()?;
+    let invocation = workflow
+        .invocations
+        .iter()
+        .find(|invocation| invocation.id == *invocation_id)?;
+    Some(PromotedSourceMapEntry {
+        repository: workflow.source.repository.clone(),
+        requested_revision: workflow.source.requested_revision.clone(),
+        resolved_revision: workflow.source.resolved_revision.clone(),
+        source_digest: workflow.source.source_digest.clone(),
+        invocation_id: invocation.id.clone(),
+        invocation_name: invocation.name.clone(),
+        span: invocation.span.clone(),
+    })
 }
 
 fn compile_external(

@@ -64,6 +64,7 @@ pub enum ToolState {
     Ready,
     Installable,
     SystemRequired,
+    SourceSetup,
     ManualCheckpoint,
     MethodDetails,
     LegacySource,
@@ -89,6 +90,7 @@ pub struct BundlePlan {
     pub tools: Vec<ToolRequirement>,
     pub ready_count: usize,
     pub installable_count: usize,
+    pub source_setup_count: usize,
     pub manual_count: usize,
     pub details_count: usize,
     pub legacy_count: usize,
@@ -380,11 +382,19 @@ fn used_operators<'a>(
     graph: &Graph,
     catalog: &'a Catalog,
 ) -> Result<Vec<&'a Operator>, BundleError> {
-    let ids = graph
+    let mut ids = graph
         .nodes
         .iter()
         .map(|node| node.operator.as_str())
         .collect::<BTreeSet<_>>();
+    for replacement in graph
+        .nodes
+        .iter()
+        .filter_map(|node| node.source_workflow.as_ref())
+        .flat_map(|workflow| workflow.replacements.iter())
+    {
+        ids.insert(replacement.operator.as_str());
+    }
     ids.into_iter()
         .map(|id| catalog.get(id).map_err(BundleError::from))
         .collect()
@@ -415,6 +425,10 @@ fn build_plan(
         .iter()
         .filter(|tool| tool.state == ToolState::AdapterNeeded)
         .count();
+    let source_setup_count = tools
+        .iter()
+        .filter(|tool| tool.state == ToolState::SourceSetup)
+        .count();
     let manual_count = tools
         .iter()
         .filter(|tool| tool.state == ToolState::ManualCheckpoint)
@@ -435,6 +449,7 @@ fn build_plan(
         tools,
         ready_count,
         installable_count,
+        source_setup_count,
         manual_count,
         details_count,
         legacy_count,
@@ -464,6 +479,7 @@ fn tool_requirement(
     let requires_action = supports.iter().any(|support| support.requires_action);
     if let Some(support) = support {
         let blocked = match support.kind {
+            SupportKind::SourceWorkflow => Some(ToolState::SourceSetup),
             SupportKind::ManualCheckpoint => Some(ToolState::ManualCheckpoint),
             SupportKind::MethodDetails => Some(ToolState::MethodDetails),
             SupportKind::LegacySource => Some(ToolState::LegacySource),
@@ -570,7 +586,9 @@ fn write_zip(files: BTreeMap<String, Vec<u8>>) -> Result<Vec<u8>, BundleError> {
 
 #[cfg(test)]
 mod tests {
-    use somite_ir::{Layout, Node, SCHEMA_VERSION};
+    use somite_ir::{
+        Edge, Layout, Node, SourceWorkflowInstance, SourceWorkflowVariantOrigin, SCHEMA_VERSION,
+    };
     use somite_ops::Operator;
     use zip::ZipArchive;
 
@@ -587,6 +605,7 @@ mod tests {
             operator_revision: op.revision().expect("operator revision"),
             ports: op.ir_ports(),
             params: BTreeMap::new(),
+            source_workflow: None,
             layout: Layout { x: 0.0, y: 0.0 },
             note: None,
             color: None,
@@ -606,6 +625,7 @@ mod tests {
             nodes: vec![node("echo1", &echo)],
             edges: Vec::new(),
             annotations: Vec::new(),
+            variant_origin: None,
         };
         let temporary = tempfile::tempdir().expect("temporary directory");
         let destination = temporary.path().join("frozen");
@@ -678,6 +698,151 @@ mod tests {
     }
 
     #[test]
+    fn promoted_source_call_rewires_and_freezes_as_a_native_nextflow_pixi_package() {
+        let source = operator(include_str!("../../../operators/workflow.source.json"));
+        let reads = operator(include_str!("../../../operators/files.import_paired.json"));
+        let reference = operator(include_str!("../../../operators/files.import_fasta.json"));
+        let build = operator(include_str!("../../../operators/align.bowtie2_build.json"));
+        let align = operator(include_str!("../../../operators/align.bowtie2.json"));
+        let mut catalog = Catalog::default();
+        for operator in [&source, &reads, &reference, &build, &align] {
+            catalog.ops.insert(operator.id.clone(), operator.clone());
+        }
+
+        let mut reads_node = node("reads", &reads);
+        reads_node.params = BTreeMap::from([
+            (
+                "r1".to_owned(),
+                ParamValue::String("inputs/R1.fastq".to_owned()),
+            ),
+            (
+                "r2".to_owned(),
+                ParamValue::String("inputs/R2.fastq".to_owned()),
+            ),
+        ]);
+        let mut reference_node = node("reference", &reference);
+        reference_node.params.insert(
+            "path".to_owned(),
+            ParamValue::String("inputs/reference.fa".to_owned()),
+        );
+        let mut build_node = node("bowtie2-build", &build);
+        build_node
+            .params
+            .insert("threads".to_owned(), ParamValue::Int(8));
+        let mut align_node = node("bowtie2", &align);
+        align_node
+            .params
+            .insert("threads".to_owned(), ParamValue::Int(8));
+
+        let workflow: SourceWorkflowInstance = serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "workflow_revision": format!("blake3:{}", "a".repeat(64)),
+            "source": {
+                "provider": "local",
+                "repository": "local/example",
+                "requested_revision": "v1.0.0",
+                "resolved_revision": "b".repeat(40),
+                "source_digest": format!("blake3:{}", "c".repeat(64)),
+                "entrypoint": "main.nf",
+                "file_count": 1,
+                "source_bytes": 128
+            },
+            "scopes": [{
+                "id": "main", "title": "Main", "kind": "entry_workflow",
+                "span": {"path": "main.nf", "start_line": 1, "end_line": 20}
+            }],
+            "invocations": [{
+                "id": "call-align", "caller": "main", "name": "BWAMEM2",
+                "span": {"path": "main.nf", "start_line": 10, "end_line": 10}
+            }],
+            "replacements": [{
+                "invocation_id": "call-align",
+                "operator": "align.bowtie2",
+                "operator_revision": align.revision().expect("Bowtie2 revision"),
+                "params": {"threads": 8}
+            }]
+        }))
+        .expect("source workflow provenance");
+        let mut source_node = node("source-workflow", &source);
+        source_node.source_workflow = Some(workflow);
+        let graph = Graph {
+            schema_version: SCHEMA_VERSION,
+            name: Some("Editable source variant".into()),
+            nodes: vec![reads_node, reference_node, build_node, align_node],
+            edges: vec![
+                Edge {
+                    id: "reads-r1".into(),
+                    from_node: "reads".into(),
+                    from_port: "r1".into(),
+                    to_node: "bowtie2".into(),
+                    to_port: "r1".into(),
+                },
+                Edge {
+                    id: "reads-r2".into(),
+                    from_node: "reads".into(),
+                    from_port: "r2".into(),
+                    to_node: "bowtie2".into(),
+                    to_port: "r2".into(),
+                },
+                Edge {
+                    id: "reference-ref".into(),
+                    from_node: "reference".into(),
+                    from_port: "assembly".into(),
+                    to_node: "bowtie2-build".into(),
+                    to_port: "ref".into(),
+                },
+                Edge {
+                    id: "index-align".into(),
+                    from_node: "bowtie2-build".into(),
+                    from_port: "index".into(),
+                    to_node: "bowtie2".into(),
+                    to_port: "index".into(),
+                },
+            ],
+            annotations: Vec::new(),
+            variant_origin: Some(SourceWorkflowVariantOrigin {
+                source_node,
+                promoted_invocations: BTreeMap::from([("call-align".into(), "bowtie2".into())]),
+            }),
+        };
+
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let destination = temporary.path().join("promoted-source-variant");
+        let package = create_frozen_package_with_lock(
+            &graph,
+            &catalog,
+            &ExportTarget::new("Editable source variant", "linux-64"),
+            &destination,
+            |_| false,
+            |_| Ok(b"version: 6\n".to_vec()),
+        )
+        .expect("promoted native package");
+
+        assert!(package.plan.assessment.is_ready());
+        assert!(package
+            .plan
+            .packages
+            .contains(&"bioconda::bowtie2".to_owned()));
+        let main = fs::read_to_string(destination.join("main.nf")).expect("Nextflow source");
+        assert!(main.contains("bowtie2-build"));
+        assert!(main.contains("bowtie2"));
+        let pixi = fs::read_to_string(destination.join("pixi.toml")).expect("Pixi manifest");
+        assert!(pixi.contains("\"bowtie2\" = { version = \"*\", channel = \"bioconda\" }"));
+        let node_map: serde_json::Value =
+            serde_json::from_slice(&fs::read(destination.join("node-map.json")).expect("node map"))
+                .expect("node map JSON");
+        assert_eq!(
+            node_map["nodes"]["bowtie2"]["source"]["invocation_id"],
+            "call-align"
+        );
+        let frozen_graph: Graph = serde_json::from_slice(
+            &fs::read(destination.join("workflow.somite.json")).expect("frozen graph"),
+        )
+        .expect("frozen graph JSON");
+        assert_eq!(frozen_graph.variant_origin, graph.variant_origin);
+    }
+
+    #[test]
     fn paper_gap_is_an_adapter_requirement_not_an_install_claim() {
         let gap = operator(
             r#"{"id":"gap.missing","title":"Needs tool adapter","palette":[],"kind":"inprocess","ports":{"out":[{"name":"out","type":"Directory","optional":true}]},"params":{"tool":{"type":"string"}}}"#,
@@ -695,6 +860,7 @@ mod tests {
             nodes: vec![gap_node],
             edges: Vec::new(),
             annotations: Vec::new(),
+            variant_origin: None,
         };
         let plan = plan_frozen_package(
             &graph,
@@ -706,5 +872,132 @@ mod tests {
         assert_eq!(plan.adapter_count, 1);
         assert_eq!(plan.tools[0].state, ToolState::AdapterNeeded);
         assert_eq!(plan.tools[0].title, "Trimmomatic");
+    }
+
+    #[test]
+    fn pinned_source_reports_execution_setup_not_a_missing_system_binary() {
+        let source = operator(
+            r#"{"id":"workflow.source","title":"Pinned workflow","palette":[],"kind":"source","ports":{}}"#,
+        );
+        let mut catalog = Catalog::default();
+        catalog.ops.insert(source.id.clone(), source.clone());
+        let mut source_node = node("source-pangenome", &source);
+        source_node.source_workflow = Some(
+            serde_json::from_value::<SourceWorkflowInstance>(serde_json::json!({
+                "schema_version": 1,
+                "workflow_revision": format!("blake3:{}", "a".repeat(64)),
+                "source": {
+                    "provider": "nf_core",
+                    "repository": "https://github.com/nf-core/pangenome",
+                    "requested_revision": "1.1.3",
+                    "resolved_revision": "3d02bd1df79f48b4bfdb4ad95d4ca0d7f6aeb337",
+                    "source_digest": format!("blake3:{}", "b".repeat(64)),
+                    "entrypoint": "main.nf",
+                    "file_count": 1,
+                    "source_bytes": 1
+                },
+                "capabilities": {
+                    "exact_execution": false,
+                    "parameter_edits": false,
+                    "hierarchy_indexed": false,
+                    "structural_edits": false,
+                    "channel_contracts": false,
+                    "source_edits": false
+                }
+            }))
+            .expect("source workflow fixture"),
+        );
+        let graph = Graph {
+            schema_version: SCHEMA_VERSION,
+            name: None,
+            nodes: vec![source_node],
+            edges: Vec::new(),
+            annotations: Vec::new(),
+            variant_origin: None,
+        };
+
+        let plan = plan_frozen_package(
+            &graph,
+            &catalog,
+            &ExportTarget::new("pangenome", "linux-64"),
+            |_| false,
+        )
+        .expect("source plan");
+
+        assert_eq!(plan.source_setup_count, 1);
+        assert_eq!(plan.tools[0].state, ToolState::SourceSetup);
+        assert_eq!(plan.tools[0].binary, None);
+        assert_eq!(plan.tools[0].detail, "https://github.com/nf-core/pangenome is retained at immutable revision 1.1.3 with its source-backed outline.");
+    }
+
+    #[test]
+    fn source_variant_includes_replacement_packages_in_the_pixi_plan() {
+        let source = operator(
+            r#"{"id":"workflow.source","title":"Pinned workflow","palette":[],"kind":"source","ports":{}}"#,
+        );
+        let bowtie2 = operator(include_str!("../../../operators/align.bowtie2.json"));
+        let mut catalog = Catalog::default();
+        catalog.ops.insert(source.id.clone(), source.clone());
+        catalog.ops.insert(bowtie2.id.clone(), bowtie2.clone());
+        let mut source_node = node("source", &source);
+        source_node.source_workflow = Some(
+            serde_json::from_value::<SourceWorkflowInstance>(serde_json::json!({
+                "schema_version": 1,
+                "workflow_revision": format!("blake3:{}", "a".repeat(64)),
+                "source": {
+                    "provider": "nf_core",
+                    "repository": "nf-core/example",
+                    "requested_revision": "1.0.0",
+                    "resolved_revision": "3d02bd1df79f48b4bfdb4ad95d4ca0d7f6aeb337",
+                    "source_digest": format!("blake3:{}", "b".repeat(64)),
+                    "entrypoint": "main.nf",
+                    "file_count": 1,
+                    "source_bytes": 1
+                },
+                "scopes": [{
+                    "id": "main", "title": "Main", "kind": "entry_workflow",
+                    "span": {"path": "main.nf", "start_line": 1, "end_line": 20}
+                }],
+                "invocations": [{
+                    "id": "call-align", "caller": "main", "name": "BWAMEM2",
+                    "span": {"path": "main.nf", "start_line": 10, "end_line": 10}
+                }],
+                "replacements": [{
+                    "invocation_id": "call-align",
+                    "operator": "align.bowtie2",
+                    "operator_revision": bowtie2.revision().expect("Bowtie2 revision"),
+                    "params": {"threads": 8}
+                }],
+                "capabilities": {
+                    "exact_execution": false,
+                    "parameter_edits": false,
+                    "hierarchy_indexed": true,
+                    "structural_edits": false,
+                    "channel_contracts": false,
+                    "source_edits": false
+                }
+            }))
+            .expect("variant workflow"),
+        );
+        let graph = Graph {
+            schema_version: SCHEMA_VERSION,
+            name: Some("Variant".into()),
+            nodes: vec![source_node],
+            edges: Vec::new(),
+            annotations: Vec::new(),
+            variant_origin: None,
+        };
+
+        let plan = plan_frozen_package(
+            &graph,
+            &catalog,
+            &ExportTarget::new("variant", "linux-64"),
+            |_| false,
+        )
+        .expect("variant plan");
+        assert!(plan.packages.contains(&"bioconda::bowtie2".to_owned()));
+        assert!(plan.tools.iter().any(
+            |tool| tool.operator_id == "align.bowtie2" && tool.state == ToolState::Installable
+        ));
     }
 }

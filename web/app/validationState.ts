@@ -3,7 +3,21 @@ import type { EvidenceResult, RunNodeState, SomiteEdge, SomiteGraph } from "./ty
 export function semanticGraphKey(graph: SomiteGraph) {
   return JSON.stringify({
     schema_version: graph.schema_version,
-    nodes: graph.nodes.map((node) => ({ id: node.id, operator: node.operator, operator_revision: node.operator_revision, ports: node.ports, params: node.params })).sort((left, right) => left.id.localeCompare(right.id)),
+    nodes: graph.nodes.map((node) => ({
+      id: node.id,
+      operator: node.operator,
+      operator_revision: node.operator_revision,
+      ports: node.ports,
+      params: node.params,
+      source_workflow: node.source_workflow ? {
+        schema_version: node.source_workflow.schema_version,
+        workflow_revision: node.source_workflow.workflow_revision,
+        source: node.source_workflow.source,
+        profiles: node.source_workflow.profiles ?? [],
+        parameters: node.source_workflow.parameters ?? [],
+        bindings: Object.fromEntries(Object.entries(node.source_workflow.bindings ?? {}).sort(([left], [right]) => left.localeCompare(right))),
+      } : undefined,
+    })).sort((left, right) => left.id.localeCompare(right.id)),
     edges: [...graph.edges].sort((left, right) => left.id.localeCompare(right.id)),
   });
 }

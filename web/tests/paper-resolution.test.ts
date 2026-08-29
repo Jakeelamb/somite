@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { nextPaperReadSlot, paperAttentionItems, paperCanvasUpdate, paperResolutionAgentPrompt, paperResourceApplied, paperSupportedCount, replacePaperReadSlot } from "../app/paperResolution.ts";
-import type { PaperCandidate } from "../app/types.ts";
+import { nextPaperReadSlot, paperAttentionItems, paperCanvasOwnsCandidate, paperCanvasUpdate, paperResolutionAgentPrompt, paperResourceApplied, paperSupportedCount, replacePaperReadSlot } from "../app/paperResolution.ts";
+import type { PaperCandidate, SomiteGraph } from "../app/types.ts";
 
 const candidate: PaperCandidate = {
   name: "Linkage workflow",
   role: "primary",
   assay: "assembly",
-  graph: { schema_version: 2, nodes: [], edges: [] },
+  graph: { schema_version: 3, nodes: [], edges: [] },
   warnings: [],
   evidence: [{
     target_kind: "node",
@@ -58,7 +58,7 @@ test("paper escalation carries exact evidence, location, choices, and recipes", 
 
 test("a cited run replaces the next local read placeholder without disturbing its consumers", () => {
   const graph = {
-    schema_version: 2,
+    schema_version: 3,
     nodes: [
       { id: "reads", operator: "files.import_paired", operator_revision: "r1", ports: [{ name: "r1", dir: "out" as const, ty: "Fastq" as const }, { name: "r2", dir: "out" as const, ty: "Fastq" as const }], params: {}, layout: { x: 20, y: 40 } },
       { id: "fastp", operator: "qc.fastp", operator_revision: "r2", ports: [], params: {}, layout: { x: 300, y: 40 } },
@@ -96,4 +96,21 @@ test("a cited run replaces the next local read placeholder without disturbing it
   assert.equal(synced.nodes.some((node) => node.id === "notes-export"), true, "unrelated canvas nodes survive");
   assert.equal(synced.edges.some((edge) => edge.id === "user-edge"), true, "unrelated canvas edges survive");
   assert.equal(paperCanvasUpdate(null, 0, graph, replaced, canvas), null, "an off-canvas draft must remain off canvas");
+
+  const deletedCanvas: SomiteGraph = { schema_version: 3, nodes: [], edges: [] };
+  assert.equal(paperCanvasOwnsCandidate(graph, deletedCanvas), false);
+  assert.equal(paperCanvasUpdate(0, 0, graph, replaced, deletedCanvas), null, "a deleted candidate slice loses canvas ownership");
+
+  const sourceCanvas: SomiteGraph = {
+    schema_version: 3,
+    nodes: [{
+      ...graph.nodes[0],
+      id: "pangenome",
+      operator: "workflow.source",
+      source_workflow: {} as never,
+    }],
+    edges: [],
+  };
+  assert.equal(paperCanvasOwnsCandidate(graph, sourceCanvas), false);
+  assert.equal(paperCanvasUpdate(0, 0, graph, replaced, sourceCanvas), null, "a stale paper action cannot mix native nodes into a source-owned canvas");
 });

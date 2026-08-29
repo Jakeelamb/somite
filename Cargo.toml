@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/somite-ir",
+    "crates/somite-source-workflow",
     "crates/somite-assessment",
     "crates/somite-ops",
     "crates/somite-nextflow",

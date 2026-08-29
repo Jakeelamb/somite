@@ -1,0 +1,25 @@
+{
+  "id": "align.bowtie2_build",
+  "title": "Build Bowtie2 index",
+  "palette": ["Alignment"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "bowtie2-build",
+  "pixi": ["bioconda::bowtie2"],
+  "params": {
+    "threads": { "type": "int", "label": "Threads", "page": "Bowtie2 index", "default": 8, "min": 1, "max": 64 }
+  },
+  "ports": {
+    "in": [{ "name": "ref", "type": "Fasta", "union": ["Fasta", "FastaGz"] }],
+    "out": [{ "name": "index", "type": "Directory" }]
+  },
+  "argv": [
+    "bowtie2-build",
+    "--threads", "{param.threads}",
+    "{input.ref}",
+    "{work}/out/index"
+  ],
+  "outputs": {
+    "index": { "glob": "{work}/out", "type": "Directory" }
+  }
+}

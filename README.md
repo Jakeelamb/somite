@@ -79,10 +79,28 @@ browsable workflow section; paired reads remain separate R1 and R2 streams.
 The Project panel is the engine-neutral entry point for local workflow
 projects. Somite detects a supported project and adds its visible structure to
 the canvas. The current adapter recognizes Snakemake projects and Snakefiles
-through their declared Pixi environment. Imported nf-core and Snakemake
-workflows expand into editable structural nodes and edges; engine-authored
-references remain clearly marked and are not presented as independently
-executable tools until they have reviewed Somite contracts.
+through their declared Pixi environment.
+
+An imported nf-core release stays one source-backed Workflow on the canvas.
+Its exact Git revision and raw immutable commit-tree blobs remain source truth;
+Somite does not pretend that its outline is an executable native graph. The
+outer canvas keeps it as one compact node. Entering that node opens a separate
+nested source canvas containing only the current scope and its immediate child
+invocations. Enter a child to move inward one layer; Back, breadcrumbs, or Escape
+returns outward. These Source scopes are explicitly source calls, not runnable
+graph nodes or data wires. The inspector stays focused on parameters, readiness,
+and provenance. Any source invocation can be assigned a catalog-pinned
+replacement. **Edit on canvas** then promotes that one call into a normal native
+Somite Graph: real typed ports, ordinary Edges, deterministic Readiness, generated
+Nextflow, and a shared Pixi environment. The exact original source Node and
+invocation-to-Node mapping stay attached as non-executable provenance; returning
+to the pinned source is explicit and undoable. Promotion never guesses adjacent
+channels, so missing inputs immediately appear as ordinary Logic checks that the
+user or Agent can resolve by rewiring. Representative validation is the proof
+that the resulting native variant works. Run and executable export remain honest
+while required connections or resources are unresolved. Snakemake imports remain structural
+references and are likewise not presented as independently executable tools
+without a real execution path.
 
 Rebuild from a Paper searches bioRxiv by topic, title, author, or DOI without
 mixing literature into the Add surface. Papers whose JATS full text is available

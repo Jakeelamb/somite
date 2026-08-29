@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use somite_ir::{
-    Direction, Graph, ParamValue, Port, PortType, LEGACY_SCHEMA_VERSION, SCHEMA_VERSION,
+    Direction, Graph, ParamValue, Port, PortType, LEGACY_SCHEMA_VERSION, PINNED_SCHEMA_VERSION,
+    SCHEMA_VERSION,
 };
 use thiserror::Error;
 
@@ -38,6 +39,10 @@ pub enum OpsError {
     },
     #[error("node {node} ports do not match operator {operator}")]
     PortContractMismatch { node: String, operator: String },
+    #[error("node {node} source workflow does not match operator {operator}")]
+    SourceWorkflowContractMismatch { node: String, operator: String },
+    #[error("source-backed workflows currently require one source node and no edges")]
+    SourceWorkflowGraphShape,
     #[error("graph schema {0} cannot be migrated")]
     GraphSchema(u32),
     #[error("invalid graph after pinning: {0}")]
@@ -148,6 +153,7 @@ pub enum OpKind {
     External,
     Inprocess,
     Reference,
+    Source,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,7 +465,7 @@ impl Catalog {
         Ok(format!("blake3:{}", blake3::hash(&encoded).to_hex()))
     }
 
-    /// Upgrade a schema-v1 graph or verify every existing schema-v2 pin.
+    /// Upgrade an older Graph or verify every existing current-schema pin.
     pub fn pin_graph(&self, graph: &mut Graph) -> Result<(), OpsError> {
         match graph.schema_version {
             LEGACY_SCHEMA_VERSION => {
@@ -468,9 +474,13 @@ impl Catalog {
                 }
                 graph.schema_version = SCHEMA_VERSION;
             }
-            SCHEMA_VERSION => self.verify_graph(graph)?,
+            PINNED_SCHEMA_VERSION => {
+                graph.schema_version = SCHEMA_VERSION;
+            }
+            SCHEMA_VERSION => {}
             other => return Err(OpsError::GraphSchema(other)),
         }
+        self.verify_graph(graph)?;
         graph
             .validate()
             .map_err(|error| OpsError::InvalidGraph(error.to_string()))
@@ -480,32 +490,76 @@ impl Catalog {
         if graph.schema_version != SCHEMA_VERSION {
             return Err(OpsError::GraphSchema(graph.schema_version));
         }
+        let source_nodes = graph
+            .nodes
+            .iter()
+            .filter(|node| node.source_workflow.is_some())
+            .count();
+        if source_nodes > 0
+            && (source_nodes != 1 || graph.nodes.len() != 1 || !graph.edges.is_empty())
+        {
+            return Err(OpsError::SourceWorkflowGraphShape);
+        }
         for node in &graph.nodes {
-            let expected = self.revision(&node.operator)?;
-            if node.operator_revision != expected {
-                return Err(OpsError::RevisionMismatch {
-                    node: node.id.clone(),
-                    operator: node.operator.clone(),
-                    actual: node.operator_revision.clone(),
-                    expected,
-                });
+            self.verify_node(node)?;
+        }
+        if let Some(origin) = &graph.variant_origin {
+            self.verify_node(&origin.source_node)?;
+        }
+        Ok(())
+    }
+
+    fn verify_node(&self, node: &somite_ir::Node) -> Result<(), OpsError> {
+        let expected = self.revision(&node.operator)?;
+        if node.operator_revision != expected {
+            return Err(OpsError::RevisionMismatch {
+                node: node.id.clone(),
+                operator: node.operator.clone(),
+                actual: node.operator_revision.clone(),
+                expected,
+            });
+        }
+        let operator = self.get(&node.operator)?;
+        if (operator.kind == OpKind::Source) != node.source_workflow.is_some() {
+            return Err(OpsError::SourceWorkflowContractMismatch {
+                node: node.id.clone(),
+                operator: node.operator.clone(),
+            });
+        }
+        // Source parameters have one canonical home: the pinned instance's
+        // typed bindings. The outer Node map belongs to native Operators and
+        // must not retain a second, hidden parameter state.
+        if node.source_workflow.is_some() && !node.params.is_empty() {
+            return Err(OpsError::SourceWorkflowContractMismatch {
+                node: node.id.clone(),
+                operator: node.operator.clone(),
+            });
+        }
+        if let Some(workflow) = &node.source_workflow {
+            for replacement in &workflow.replacements {
+                let expected = self.revision(&replacement.operator)?;
+                if replacement.operator_revision != expected {
+                    return Err(OpsError::RevisionMismatch {
+                        node: format!("{}::{}", node.id, replacement.invocation_id),
+                        operator: replacement.operator.clone(),
+                        actual: replacement.operator_revision.clone(),
+                        expected,
+                    });
+                }
             }
-            let operator = self.get(&node.operator)?;
-            let structural_adapter = operator
-                .resolution
-                .as_ref()
-                .is_some_and(|resolution| resolution.kind == OperatorResolutionKind::Adapter);
-            let valid_workflow_reference = operator.id == "workflow.reference"
-                && operator.kind == OpKind::Reference
-                && workflow::reference_node_contract_is_valid(node);
-            if (node.ports != operator.ir_ports() && !structural_adapter)
-                && !valid_workflow_reference
-            {
-                return Err(OpsError::PortContractMismatch {
-                    node: node.id.clone(),
-                    operator: node.operator.clone(),
-                });
-            }
+        }
+        let structural_adapter = operator
+            .resolution
+            .as_ref()
+            .is_some_and(|resolution| resolution.kind == OperatorResolutionKind::Adapter);
+        let valid_workflow_reference = operator.id == "workflow.reference"
+            && operator.kind == OpKind::Reference
+            && workflow::reference_node_contract_is_valid(node);
+        if (node.ports != operator.ir_ports() && !structural_adapter) && !valid_workflow_reference {
+            return Err(OpsError::PortContractMismatch {
+                node: node.id.clone(),
+                operator: node.operator.clone(),
+            });
         }
         Ok(())
     }
@@ -633,7 +687,37 @@ fn subst(tok: &str, b: &Bindings<'_>) -> Result<String, OpsError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use somite_ir::{Graph, Layout, Node, LEGACY_SCHEMA_VERSION, SCHEMA_VERSION};
+    use somite_ir::{
+        Graph, Layout, Node, SourceInvocation, SourceInvocationReplacement, SourceSpan,
+        SourceWorkflowInstance, SourceWorkflowVariantOrigin, LEGACY_SCHEMA_VERSION,
+        PINNED_SCHEMA_VERSION, SCHEMA_VERSION,
+    };
+
+    fn source_workflow() -> SourceWorkflowInstance {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "workflow_revision": format!("blake3:{}", "a".repeat(64)),
+            "source": {
+                "provider": "nf_core",
+                "repository": "nf-core/pangenome",
+                "requested_revision": "1.1.3",
+                "resolved_revision": "3d02bd1df79f48b4bfdb4ad95d4ca0d7f6aeb337",
+                "source_digest": format!("blake3:{}", "b".repeat(64)),
+                "entrypoint": "main.nf",
+                "file_count": 170,
+                "source_bytes": 1_286_324
+            },
+            "capabilities": {
+                "exact_execution": false,
+                "parameter_edits": true,
+                "hierarchy_indexed": true,
+                "structural_edits": false,
+                "channel_contracts": false,
+                "source_edits": false
+            }
+        }))
+        .unwrap()
+    }
 
     #[test]
     fn subst_mixed() {
@@ -800,6 +884,7 @@ mod tests {
             "align.star",
             "align.hisat2",
             "align.bwa",
+            "align.bowtie2",
             "quant.salmon",
             "class.kraken2",
         ] {
@@ -811,6 +896,43 @@ mod tests {
                 .iter()
                 .any(|port| port.name == "r2" && port.optional));
         }
+    }
+
+    #[test]
+    fn bowtie2_contract_freezes_pixi_and_supports_paired_reads() {
+        let catalog =
+            Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
+                .unwrap();
+        let operator = catalog.get("align.bowtie2").unwrap();
+        assert_eq!(operator.pixi, ["bioconda::bowtie2"]);
+        let params = BTreeMap::from([("threads".into(), ParamValue::Int(8))]);
+        let inputs = BTreeMap::from([
+            ("r1".into(), PathBuf::from("/reads/R1.fastq.gz")),
+            ("r2".into(), PathBuf::from("/reads/R2.fastq.gz")),
+            ("index".into(), PathBuf::from("/index")),
+        ]);
+        let work = PathBuf::from("/w");
+        let bindings = Bindings {
+            params: &params,
+            inputs: &inputs,
+            work_out: &work.join("out"),
+            work_tmp: &work.join("tmp"),
+            work: &work,
+        };
+        assert_eq!(
+            render_argv(operator, &bindings).unwrap(),
+            vec![
+                "bowtie2",
+                "-p",
+                "8",
+                "-x",
+                "/index/index",
+                "-1",
+                "/reads/R1.fastq.gz",
+                "-2",
+                "/reads/R2.fastq.gz",
+            ]
+        );
     }
 
     #[test]
@@ -1008,7 +1130,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_graphs_migrate_once_and_stale_v2_pins_fail() {
+    fn normal_legacy_native_graph_pins_once_and_stale_current_pins_fail() {
         let catalog =
             Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
                 .unwrap();
@@ -1022,12 +1144,14 @@ mod tests {
                 operator_revision: String::new(),
                 ports: operator.ir_ports(),
                 params: BTreeMap::new(),
+                source_workflow: None,
                 layout: Layout { x: 0.0, y: 0.0 },
                 note: None,
                 color: None,
             }],
             edges: Vec::new(),
             annotations: Vec::new(),
+            variant_origin: None,
         };
 
         catalog.pin_graph(&mut graph).unwrap();
@@ -1041,6 +1165,249 @@ mod tests {
         assert!(matches!(
             catalog.pin_graph(&mut graph),
             Err(OpsError::RevisionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn legacy_mixed_source_and_native_graph_is_rejected_after_pinning() {
+        let catalog =
+            Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
+                .unwrap();
+        let source = catalog.get("workflow.source").unwrap();
+        let native = catalog.get("qc.fastqc").unwrap();
+        let mut graph = Graph {
+            schema_version: LEGACY_SCHEMA_VERSION,
+            name: Some("Crafted mixed legacy graph".into()),
+            nodes: vec![
+                Node {
+                    id: "source".into(),
+                    operator: source.id.clone(),
+                    operator_revision: String::new(),
+                    ports: source.ir_ports(),
+                    params: BTreeMap::new(),
+                    source_workflow: Some(source_workflow()),
+                    layout: Layout { x: 0.0, y: 0.0 },
+                    note: None,
+                    color: None,
+                },
+                Node {
+                    id: "fastqc".into(),
+                    operator: native.id.clone(),
+                    operator_revision: String::new(),
+                    ports: native.ir_ports(),
+                    params: BTreeMap::new(),
+                    source_workflow: None,
+                    layout: Layout { x: 300.0, y: 0.0 },
+                    note: None,
+                    color: None,
+                },
+            ],
+            edges: Vec::new(),
+            annotations: Vec::new(),
+            variant_origin: None,
+        };
+
+        assert!(matches!(
+            catalog.pin_graph(&mut graph),
+            Err(OpsError::SourceWorkflowGraphShape)
+        ));
+        assert_eq!(graph.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn pinned_v2_graphs_upgrade_without_repinning_operators() {
+        let catalog =
+            Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
+                .unwrap();
+        let operator = catalog.get("qc.fastqc").unwrap();
+        let revision = operator.revision().unwrap();
+        let mut graph = Graph {
+            schema_version: PINNED_SCHEMA_VERSION,
+            name: None,
+            nodes: vec![Node {
+                id: "fastqc1".into(),
+                operator: operator.id.clone(),
+                operator_revision: revision.clone(),
+                ports: operator.ir_ports(),
+                params: BTreeMap::new(),
+                source_workflow: None,
+                layout: Layout { x: 0.0, y: 0.0 },
+                note: None,
+                color: None,
+            }],
+            edges: Vec::new(),
+            annotations: Vec::new(),
+            variant_origin: None,
+        };
+
+        catalog.pin_graph(&mut graph).unwrap();
+        assert_eq!(graph.schema_version, SCHEMA_VERSION);
+        assert_eq!(graph.nodes[0].operator_revision, revision);
+    }
+
+    #[test]
+    fn source_workflow_is_one_collapsed_node_without_fabricated_ports() {
+        let catalog =
+            Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
+                .unwrap();
+        let operator = catalog.get("workflow.source").unwrap();
+        let source_node = Node {
+            id: "pangenome".into(),
+            operator: operator.id.clone(),
+            operator_revision: operator.revision().unwrap(),
+            ports: Vec::new(),
+            params: BTreeMap::new(),
+            source_workflow: Some(source_workflow()),
+            layout: Layout { x: 0.0, y: 0.0 },
+            note: None,
+            color: None,
+        };
+        let graph = Graph {
+            schema_version: SCHEMA_VERSION,
+            name: Some("Pangenome".into()),
+            nodes: vec![source_node.clone()],
+            edges: Vec::new(),
+            annotations: Vec::new(),
+            variant_origin: None,
+        };
+        catalog.verify_graph(&graph).unwrap();
+        assert!(graph.nodes[0].ports.is_empty());
+
+        let mut duplicate_params = graph.clone();
+        duplicate_params.nodes[0]
+            .params
+            .insert("input".into(), ParamValue::String("hidden.fasta.gz".into()));
+        assert!(matches!(
+            catalog.verify_graph(&duplicate_params),
+            Err(OpsError::SourceWorkflowContractMismatch { .. })
+        ));
+
+        let mut mixed = graph;
+        let fastqc = catalog.get("qc.fastqc").unwrap();
+        mixed.nodes.push(Node {
+            id: "fastqc".into(),
+            operator: fastqc.id.clone(),
+            operator_revision: fastqc.revision().unwrap(),
+            ports: fastqc.ir_ports(),
+            params: BTreeMap::new(),
+            source_workflow: None,
+            layout: Layout { x: 300.0, y: 0.0 },
+            note: None,
+            color: None,
+        });
+        assert!(matches!(
+            catalog.verify_graph(&mixed),
+            Err(OpsError::SourceWorkflowGraphShape)
+        ));
+
+        let mut missing_instance = source_node;
+        missing_instance.source_workflow = None;
+        let missing = Graph {
+            schema_version: SCHEMA_VERSION,
+            name: None,
+            nodes: vec![missing_instance],
+            edges: Vec::new(),
+            annotations: Vec::new(),
+            variant_origin: None,
+        };
+        assert!(matches!(
+            catalog.verify_graph(&missing),
+            Err(OpsError::SourceWorkflowContractMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn source_replacements_pin_real_catalog_operators() {
+        let catalog =
+            Catalog::load_dir(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../operators"))
+                .unwrap();
+        let source_operator = catalog.get("workflow.source").unwrap();
+        let bowtie2_revision = catalog.revision("align.bowtie2").unwrap();
+        let mut workflow = source_workflow();
+        workflow.invocations.push(SourceInvocation {
+            id: "call-align".into(),
+            caller: "scope-main".into(),
+            name: "BWAMEM2".into(),
+            callee: None,
+            span: SourceSpan {
+                path: "main.nf".into(),
+                start_line: 20,
+                end_line: 20,
+            },
+        });
+        workflow.replacements.push(SourceInvocationReplacement {
+            invocation_id: "call-align".into(),
+            operator: "align.bowtie2".into(),
+            operator_revision: bowtie2_revision,
+            params: BTreeMap::from([("threads".into(), ParamValue::Int(8))]),
+        });
+        let graph = Graph {
+            schema_version: SCHEMA_VERSION,
+            name: Some("Creative variant".into()),
+            nodes: vec![Node {
+                id: "source".into(),
+                operator: source_operator.id.clone(),
+                operator_revision: source_operator.revision().unwrap(),
+                ports: Vec::new(),
+                params: BTreeMap::new(),
+                source_workflow: Some(workflow),
+                layout: Layout { x: 0.0, y: 0.0 },
+                note: None,
+                color: None,
+            }],
+            edges: Vec::new(),
+            annotations: Vec::new(),
+            variant_origin: None,
+        };
+        catalog.verify_graph(&graph).unwrap();
+
+        let source_node = graph.nodes[0].clone();
+        let bowtie2 = catalog.get("align.bowtie2").unwrap();
+        let native = Graph {
+            schema_version: SCHEMA_VERSION,
+            name: Some("Native creative variant".into()),
+            nodes: vec![Node {
+                id: "bowtie2".into(),
+                operator: bowtie2.id.clone(),
+                operator_revision: bowtie2.revision().unwrap(),
+                ports: bowtie2.ir_ports(),
+                params: BTreeMap::from([("threads".into(), ParamValue::Int(8))]),
+                source_workflow: None,
+                layout: Layout { x: 0.0, y: 0.0 },
+                note: None,
+                color: None,
+            }],
+            edges: Vec::new(),
+            annotations: Vec::new(),
+            variant_origin: Some(SourceWorkflowVariantOrigin {
+                source_node,
+                promoted_invocations: BTreeMap::from([("call-align".into(), "bowtie2".into())]),
+            }),
+        };
+        catalog.verify_graph(&native).unwrap();
+
+        let mut stale_origin = native;
+        stale_origin
+            .variant_origin
+            .as_mut()
+            .unwrap()
+            .source_node
+            .operator_revision = format!("blake3:{}", "e".repeat(64));
+        assert!(matches!(
+            catalog.verify_graph(&stale_origin),
+            Err(OpsError::RevisionMismatch { operator, .. }) if operator == "workflow.source"
+        ));
+
+        let mut stale = graph;
+        stale.nodes[0]
+            .source_workflow
+            .as_mut()
+            .unwrap()
+            .replacements[0]
+            .operator_revision = format!("blake3:{}", "d".repeat(64));
+        assert!(matches!(
+            catalog.verify_graph(&stale),
+            Err(OpsError::RevisionMismatch { operator, .. }) if operator == "align.bowtie2"
         ));
     }
 
@@ -1135,12 +1502,14 @@ mod tests {
                 operator_revision: operator.revision().unwrap(),
                 ports: operator.ir_ports(),
                 params: BTreeMap::new(),
+                source_workflow: None,
                 layout: Layout { x: 0.0, y: 0.0 },
                 note: None,
                 color: None,
             }],
             edges: Vec::new(),
             annotations: Vec::new(),
+            variant_origin: None,
         };
         graph.nodes[0].ports.push(Port {
             name: "invented".into(),
