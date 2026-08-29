@@ -130,6 +130,7 @@ test("starter preview is removed and the real canvas is wired", async () => {
   assert.match(app, /api\/source-workflows\/restore/);
   assert.match(app, /Native variant/);
   assert.match(app, /Return to pinned source/);
+  assert.match(app, /setVariantOrigin\(loaded\.graph\.variant_origin\)/);
   assert.match(app, /resetSourceInvocation/);
   assert.match(app, /aria-label="Nested source canvas breadcrumbs"/);
   assert.match(app, /sourceNetworkEnterPath/);

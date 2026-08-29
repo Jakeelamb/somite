@@ -23,6 +23,12 @@ export function canonicalRefreshAccepted(disposition: CanonicalRefreshDispositio
   return disposition === "replace" || disposition === "preserve_local";
 }
 
+export function graphNodeSetChanged(previous: SomiteGraph, next: SomiteGraph) {
+  if (previous.nodes.length !== next.nodes.length) return true;
+  const previousIds = new Set(previous.nodes.map((node) => node.id));
+  return next.nodes.some((node) => !previousIds.has(node.id));
+}
+
 export type CanonicalRefreshSnapshot = {
   canonicalEpoch: number;
   graphEpoch: number;

@@ -134,7 +134,7 @@ import { appendStrokePoint, canvasColor as getCanvasColor, canvasPalette, create
 import type { CatalogExpansionActivity } from "./catalogExpansion";
 import { editableRequiredSourceFileParameters, mergeCanonicalSourceWorkflow, opaqueNfcoreFallback, sourceScopeTitle, sourceSpanLabel, sourceWorkflowCanAppendGraph, sourceWorkflowCanvasIsEmpty, sourceWorkflowProvider, sourceWorkflowReplacementCandidate, sourceWorkflowRevision, sourceWorkflowSetupLabel, sourceWorkflowTitle } from "./sourceWorkflowPresentation";
 import { projectSourceNetwork, sourceNetworkEnterPath, sourceNetworkExitPath } from "./sourceWorkflowNetwork";
-import { canonicalRefreshAccepted, canonicalRefreshDisposition, captureGraphWrite, commitIfCanonicalEpochCurrent, enqueueGraphWrite, type GraphWritePath, type GraphWriteSnapshot } from "./graphPersistence";
+import { canonicalRefreshAccepted, canonicalRefreshDisposition, captureGraphWrite, commitIfCanonicalEpochCurrent, enqueueGraphWrite, graphNodeSetChanged, type GraphWritePath, type GraphWriteSnapshot } from "./graphPersistence";
 
 const SNAP: [number, number] = [20, 20];
 const HISTORY_LIMIT = 80;
@@ -627,6 +627,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const reconcilingGraphRef = useRef(false);
   const titleEditStartRef = useRef<{ graph: SomiteGraph; dirty: boolean; title: string } | null>(null);
   const titleEditCancelledRef = useRef(false);
+  const initialViewportFitRef = useRef(false);
   const running = activeIntent !== null;
 
   const availableOperators = useMemo(() => {
@@ -638,10 +639,10 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   }, [nfcoreCatalog, session, snakemakeCatalog]);
   const operatorMap = useMemo(() => new Map(availableOperators.map((operator) => [operator.id, operator])), [availableOperators]);
   const snapshot = useCallback(() => somiteGraph(workflowTitle, nodes, edges, annotations, variantOrigin), [annotations, edges, nodes, variantOrigin, workflowTitle]);
-  const semanticKey = useMemo(() => semanticGraphKey(somiteGraph(workflowTitle, nodes, edges, annotations, variantOrigin)), [annotations, edges, nodes, variantOrigin, workflowTitle]);
+  const renderedGraph = useMemo(() => somiteGraph(workflowTitle, nodes, edges, annotations, variantOrigin), [annotations, edges, nodes, variantOrigin, workflowTitle]);
+  const semanticKey = useMemo(() => semanticGraphKey(renderedGraph), [renderedGraph]);
   semanticKeyRef.current = semanticKey;
-  const renderedGraph = somiteGraph(workflowTitle, nodes, edges, annotations, variantOrigin);
-  const renderedGraphKey = JSON.stringify(renderedGraph);
+  const renderedGraphKey = useMemo(() => JSON.stringify(renderedGraph), [renderedGraph]);
   if (renderedGraphKey !== graphSnapshotKeyRef.current) {
     graphEpochRef.current += 1;
     graphSnapshotKeyRef.current = renderedGraphKey;
@@ -726,7 +727,13 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     setHistory((current) => ({ past: [...current.past.slice(-(HISTORY_LIMIT - 1)), graph], future: [] }));
   }, [snapshot]);
 
-  const restoreGraph = useCallback((graph: SomiteGraph, markDirty = true) => {
+  const fitGraph = useCallback((duration = 260) => {
+    window.setTimeout(() => {
+      void flow?.fitView({ padding: .25, duration, maxZoom: 1 });
+    }, 0);
+  }, [flow]);
+
+  const restoreGraph = useCallback((graph: SomiteGraph, markDirty = true, fitAfterRestore = false) => {
     const hidden = new Map(nodes.map((node) => [node.id, node.data.viewerHidden]));
     const states = new Map(nodes.map((node) => [node.id, node.data.runState]));
     const requirements = new Map(nodes.map((node) => [node.id, node.data.readinessItems]));
@@ -738,7 +745,8 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     setSelectedIds([]);
     setSelectedAnnotationId(null);
     setDirty(markDirty);
-  }, [nodes, operatorMap, setEdges, setNodes]);
+    if (fitAfterRestore) fitGraph();
+  }, [fitGraph, nodes, operatorMap, setEdges, setNodes]);
 
   const writeBrowserGraph = useCallback((path: GraphWritePath, snapshot: GraphWriteSnapshot) => {
     return enqueueGraphWrite(
@@ -811,7 +819,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
         }));
       }
       markCanonicalGraph(loaded.graph);
-      restoreGraph(loaded.graph, false);
+      restoreGraph(loaded.graph, false, graphNodeSetChanged(localDraft, loaded.graph));
       return { disposition, loaded };
     } finally {
       reconcilingGraphRef.current = false;
@@ -961,7 +969,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
               future: [],
             }));
             markCanonicalGraph(nextGraph);
-            restoreGraph(nextGraph, false);
+            restoreGraph(nextGraph, false, graphNodeSetChanged(localDraft, nextGraph));
             setStatus(transactions.length === 1
               ? `Agent applied “${last.summary}” · Undo available`
               : `Agent applied ${transactions.length} transactions · Undo each from the history`);
@@ -995,7 +1003,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     }
     const current = snapshot();
     setHistory({ past: history.past.slice(0, -1), future: [current, ...history.future].slice(0, HISTORY_LIMIT) });
-    restoreGraph(previous);
+    restoreGraph(previous, true, graphNodeSetChanged(current, previous));
     setStatus("Undid edit");
   }, [history, restoreGraph, snapshot]);
 
@@ -1007,7 +1015,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     }
     const current = snapshot();
     setHistory({ past: [...history.past, current].slice(-HISTORY_LIMIT), future: history.future.slice(1) });
-    restoreGraph(next);
+    restoreGraph(next, true, graphNodeSetChanged(current, next));
     setStatus("Redid edit");
   }, [history, restoreGraph, snapshot]);
 
@@ -1048,6 +1056,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
         stateRevisionRef.current = loaded.state_revision;
         acknowledgedGraphRef.current = JSON.stringify(loaded.graph);
         if (disposition === "preserve_local") {
+          if (localDraft.nodes.length > 0) setLibraryVisible(false);
           setHistory((current) => ({
             past: [...current.past, loaded.graph].slice(-HISTORY_LIMIT),
             future: [],
@@ -1059,6 +1068,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
           setStatus("Project opened · kept the canvas edits you made while connecting · project canvas is available in Undo");
           return;
         }
+        if (loaded.graph.nodes.length > 0) setLibraryVisible(false);
         markCanonicalGraph(loaded.graph);
         setWorkflowTitle(workflowName(loaded.graph, loaded.graph_path));
         agentCursorRef.current = loaded.agent_cursor;
@@ -1066,6 +1076,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
         setNodes(loaded.graph.nodes.map((node) => flowNode(node, operators)));
         setEdges((loaded.graph.edges ?? []).map((edge) => flowEdge(edge, loaded.graph.nodes)));
         setAnnotations(loaded.graph.annotations ?? []);
+        setVariantOrigin(loaded.graph.variant_origin);
         setStatus(loaded.recovered_autosave ? "Recovered the last autosave" : "Tab add · drag ports to wire · space-drag pan · F fit");
       })
       .catch((error) => setStatus(`Project engine is not running — ${errorMessage(error)}`));
@@ -1081,6 +1092,15 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   // project bootstrap into a fetch -> set state -> fetch render loop.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!flow || !session || nodes.length === 0 || initialViewportFitRef.current) return;
+    initialViewportFitRef.current = true;
+    const timeout = window.setTimeout(() => {
+      void flow.fitView({ padding: .25, duration: 220, maxZoom: 1 });
+    }, 0);
+    return () => window.clearTimeout(timeout);
+  }, [flow, nodes.length, session]);
 
   const connectAgent = useCallback(async (command: string) => {
     try {
@@ -1675,7 +1695,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       setHistory((current) => ({ past: [...current.past, previousGraph].slice(-HISTORY_LIMIT), future: [] }));
       markCanonicalGraph(response.graph);
       setSourceNetworkView(null);
-      restoreGraph(response.graph);
+      restoreGraph(response.graph, true, true);
       setStatus(`${title} is editable on the canvas · wire its typed inputs, then validate`);
     });
     browserWriteChainRef.current = operation.catch(() => undefined);
@@ -1718,7 +1738,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       setHistory((current) => ({ past: [...current.past, previousGraph].slice(-HISTORY_LIMIT), future: [] }));
       markCanonicalGraph(response.graph);
       setSourceNetworkView(null);
-      restoreGraph(response.graph);
+      restoreGraph(response.graph, true, true);
       setStatus("Pinned source workflow restored · the native variant is available in Undo");
     });
     browserWriteChainRef.current = operation.catch(() => undefined);

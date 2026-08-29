@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canonicalRefreshAccepted, canonicalRefreshDisposition, captureGraphWrite, commitIfCanonicalEpochCurrent, enqueueGraphWrite } from "../app/graphPersistence.ts";
+import { canonicalRefreshAccepted, canonicalRefreshDisposition, captureGraphWrite, commitIfCanonicalEpochCurrent, enqueueGraphWrite, graphNodeSetChanged } from "../app/graphPersistence.ts";
 import type { SomiteGraph } from "../app/types.ts";
 
 const graph = (name: string): SomiteGraph => ({ schema_version: 3, name, nodes: [], edges: [] });
@@ -142,4 +142,23 @@ test("only an accepted post-event refresh can supersede an Agent event batch", (
   assert.equal(canonicalRefreshAccepted("preserve_local"), true);
   assert.equal(canonicalRefreshAccepted("stale"), false);
   assert.equal(canonicalRefreshAccepted("busy"), false);
+});
+
+test("viewport fitting follows node-set changes but ignores ordinary graph edits", () => {
+  const node = (id: string, x = 0) => ({
+    id,
+    operator: "qc.fastqc",
+    operator_revision: "revision",
+    ports: [],
+    params: {},
+    layout: { x, y: 0 },
+  });
+  const first: SomiteGraph = { schema_version: 3, nodes: [node("fastqc")], edges: [] };
+  const moved: SomiteGraph = { schema_version: 3, nodes: [node("fastqc", 400)], edges: [] };
+  const added: SomiteGraph = { schema_version: 3, nodes: [node("fastqc"), node("multiqc")], edges: [] };
+  const swapped: SomiteGraph = { schema_version: 3, nodes: [node("bowtie2")], edges: [] };
+
+  assert.equal(graphNodeSetChanged(first, moved), false);
+  assert.equal(graphNodeSetChanged(first, added), true);
+  assert.equal(graphNodeSetChanged(first, swapped), true);
 });
