@@ -76,12 +76,28 @@ export type WorkflowGraphResponse = {
   cached: boolean;
 };
 
+export type ProjectOpenResponse = {
+  kind: "somite" | "nextflow" | "snakemake";
+  project_path: string;
+  entrypoint: string;
+  graph: SomiteGraph;
+  cached?: boolean;
+  revision?: string;
+  source_digest?: string;
+  workflow_revision?: string;
+  exclusions?: {
+    count: number;
+    examples: Array<{ path: string; reason: "runtime_state" | "sensitive" | "not_workflow_source" }>;
+  };
+};
+
 export type ProjectSession = {
   project_name: string;
   graph_path: string;
   graph: SomiteGraph;
   operators: Operator[];
   recovered_autosave: boolean;
+  autosave_recovery_warning: string | null;
   agent_cursor: number;
   state_revision: string;
 };

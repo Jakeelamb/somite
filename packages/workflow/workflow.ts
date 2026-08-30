@@ -344,8 +344,12 @@ export function validateSourceWorkflow(workflow: SourceWorkflowInstance): string
       return `${field} must be bounded, non-empty, and contain no control characters`;
     }
   }
-  if (!canonicalGitObjectId(workflow.source.resolved_revision)) {
-    return "resolved_revision must be a canonical lowercase full Git object ID";
+  if (workflow.source.provider === "nf_core" && !canonicalGitObjectId(workflow.source.resolved_revision)) {
+    return "nf-core resolved_revision must be a canonical lowercase full Git object ID";
+  }
+  if (workflow.source.provider === "local"
+    && workflow.source.resolved_revision !== workflow.source.source_digest.slice("blake3:".length)) {
+    return "local resolved_revision must equal the exact frozen source BLAKE3 identity";
   }
   if (!safeRelativePath(workflow.source.entrypoint)) return "entrypoint must be a safe relative path";
   if (!Number.isInteger(workflow.source.file_count) || workflow.source.file_count <= 0

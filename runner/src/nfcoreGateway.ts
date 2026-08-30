@@ -1,6 +1,4 @@
-import { chmod, mkdir, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { gunzip } from "node:zlib";
 
 import type { OperatorCatalog } from "@somite/workflow/catalog";
@@ -16,14 +14,14 @@ import {
 import {
   safeSourcePath,
   type FrozenSourceFile,
-  type SourceManifest,
 } from "@somite/workflow/nextflowSource";
 import { deriveSourceWorkflow, SOURCE_INDEXER_REVISION, sourceWorkflowRevision } from "@somite/workflow/sourceWorkflow";
 import { validateGraph } from "@somite/workflow/workflow";
-import { atomicWrite, containedPath, ensurePrivateDirectory, pathExists, regularFile } from "./files.ts";
-import { readSourceObject, verifyGraphSourceWorkflowTrust } from "./sourceWorkflowTrust.ts";
+import { atomicWrite, ensurePrivateDirectory, pathExists, regularFile } from "./files.ts";
+import { persistSourceObject } from "./sourceWorkflowStore.ts";
+import { verifyGraphSourceWorkflowTrust } from "./sourceWorkflowTrust.ts";
 
-export { readSourceObject } from "./sourceWorkflowTrust.ts";
+export { readSourceObject } from "./sourceWorkflowStore.ts";
 
 const MAX_CATALOG_BYTES = 64 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES = 128 * 1024 * 1024;
@@ -149,35 +147,6 @@ export async function extractGithubTarGz(compressed: Uint8Array): Promise<Frozen
   });
 }
 
-async function writeSourceObject(root: string, manifest: SourceManifest, files: readonly FrozenSourceFile[]) {
-  const objects = await ensurePrivateDirectory(root, ".somite/source-workflows/objects");
-  const identity = manifest.source_digest.slice("blake3:".length);
-  const destination = join(objects, identity);
-  if (await pathExists(destination)) {
-    await readSourceObject(root, manifest.source_digest);
-    return;
-  }
-  const temporary = join(objects, `.incoming-${identity}-${randomUUID()}`);
-  await mkdir(join(temporary, "source"), { recursive: true });
-  try {
-    for (const file of files) {
-      const path = containedPath(join(temporary, "source"), file.path);
-      await mkdir(dirname(path), { recursive: true });
-      await writeFile(path, file.bytes, { flag: "wx", mode: file.mode === 0o100755 ? 0o755 : 0o644 });
-      if (file.mode === 0o100755) await chmod(path, 0o755);
-    }
-    await writeFile(join(temporary, "source-manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { flag: "wx" });
-    await rename(temporary, destination);
-  } catch (error) {
-    await rm(temporary, { recursive: true, force: true }).catch(() => undefined);
-    if ((error as NodeJS.ErrnoException).code === "EEXIST" && await pathExists(destination)) {
-      await readSourceObject(root, manifest.source_digest);
-      return;
-    }
-    throw error;
-  }
-}
-
 function requestKey(workflow: string, revision: string) {
   return byteDigest(encoder.encode(`somite-nfcore-source-request-ts-v1\0${SOURCE_INDEXER_REVISION}\0${workflow}\0${revision}`)).slice("blake3:".length);
 }
@@ -237,7 +206,7 @@ export class NfcoreGateway {
       entrypoint: "main.nf",
     });
     if (!files.some((file) => file.path === "main.nf")) throw new Error(`${workflow}@${revision} has no main.nf entrypoint`);
-    await writeSourceObject(this.#root, derived.manifest, files);
+    await persistSourceObject(this.#root, derived.manifest, files);
     const response = await this.#response(workflow, revision, derived.workflow, false);
     await atomicWrite(requestPath, `${JSON.stringify({
       schema_version: 1,

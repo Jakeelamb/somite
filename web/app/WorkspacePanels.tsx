@@ -733,7 +733,7 @@ export function ProjectPanel({ projectName, graphPath, onImportProject, onClose 
           .finally(() => setImporting(false));
       }}>
         <div className="project-import-title"><FolderOpen size={18} aria-hidden="true" /><span><strong>Open a local project</strong><small>Detect its workflow structure automatically</small></span></div>
-        <p>Somite adds the project’s visible workflow structure to this canvas. Unsupported formats fail closed.</p>
+        <p>Open a Somite graph, Nextflow project, or Snakemake project. Somite freezes workflow source while leaving runtime data and sensitive files in place.</p>
         <label><span>Project folder or workflow file</span><input aria-label="Local project folder or workflow file" autoComplete="off" spellCheck={false} placeholder="/path/to/project" value={path} onChange={(event) => setPath(event.target.value)} /></label>
         {error && <p className="project-import-error" role="alert">{error}</p>}
         <button type="submit" disabled={!path.trim() || importing}>{importing ? <><LoaderCircle className="spin" size={13} />Opening project…</> : <><FolderOpen size={13} />Open project</>}</button>

@@ -31,6 +31,7 @@ import { NfcoreGateway } from "./nfcoreGateway.ts";
 import { extractPaper, PaperExtractionError } from "./paperExtractor.ts";
 import { PaperManager } from "./paperManager.ts";
 import { PaperStoreError } from "./paperStore.ts";
+import { ProjectGateway, ProjectGatewayError } from "./projectGateway.ts";
 import { SnakemakeGateway } from "./snakemakeGateway.ts";
 import { SourceSearchGateway } from "./sourceSearchGateway.ts";
 import { SourceWorkflowTrustError, verifyGraphSourceWorkflowTrust } from "./sourceWorkflowTrust.ts";
@@ -54,12 +55,14 @@ type ProjectState = {
   runs: RunManager;
   nfcore: NfcoreGateway;
   snakemake: SnakemakeGateway;
+  projects: ProjectGateway;
   sourceSearch: SourceSearchGateway;
   uploads: UploadStore;
   papers: PaperManager;
   literature: LiteratureGateway;
   graph: SomiteGraph;
   recoveredAutosave: boolean;
+  autosaveRecoveryWarning: string | null;
   writeChain: Promise<void>;
   allowedOrigin: string;
   agentCapability: string;
@@ -204,6 +207,21 @@ async function readGraph(path: string, catalog: OperatorCatalog) {
   return migrateGraph(JSON.parse(new TextDecoder().decode(bytes)), catalog);
 }
 
+async function readVerifiedProjectGraph(root: string, catalog: OperatorCatalog, path: string) {
+  const graph = await readGraph(path, catalog);
+  const verified = catalog.verifyGraph(graph);
+  if (!verified.ok) throw new Error(verified.issue.message);
+  await verifyGraphSourceWorkflowTrust(root, catalog, graph);
+  return graph;
+}
+
+function autosaveRecoveryWarning(error: unknown, openedSavedGraph: boolean) {
+  const reason = error instanceof SyntaxError
+    ? "is not valid JSON"
+    : `could not be validated: ${error instanceof Error ? error.message : String(error)}`;
+  return `Autosave ${reason}. ${openedSavedGraph ? "Opened the saved workflow instead." : "Started a new untitled workflow instead."}`;
+}
+
 function autosavePath(root: string, graphPath: string) {
   const defaultGraph = join(root, ".somite", "web.somite.json");
   if (resolve(graphPath) === resolve(defaultGraph)) return join(root, ".somite", "autosave.somite.json");
@@ -251,18 +269,27 @@ async function initializeProject(serverUrl: string, options: ServerOptions): Pro
   const recovery = await projectGraphPath(root, autosavePath(root, graphPath), "workflow autosave");
   let graph: SomiteGraph;
   let recoveredAutosave = false;
+  let recoveryWarning: string | null = null;
   if (await pathExists(recovery)) {
-    graph = await readGraph(recovery, catalogLoaded.catalog);
-    recoveredAutosave = true;
+    try {
+      graph = await readVerifiedProjectGraph(root, catalogLoaded.catalog, recovery);
+      recoveredAutosave = true;
+    } catch (recoveryError) {
+      const savedGraphExists = await pathExists(graphPath);
+      if (savedGraphExists) {
+        graph = await readVerifiedProjectGraph(root, catalogLoaded.catalog, graphPath);
+      } else {
+        graph = { schema_version: 3, name: "Untitled workflow", nodes: [], edges: [] };
+        await atomicWrite(graphPath, `${JSON.stringify(graph, null, 2)}\n`);
+      }
+      recoveryWarning = autosaveRecoveryWarning(recoveryError, savedGraphExists);
+    }
   } else if (await pathExists(graphPath)) {
-    graph = await readGraph(graphPath, catalogLoaded.catalog);
+    graph = await readVerifiedProjectGraph(root, catalogLoaded.catalog, graphPath);
   } else {
     graph = { schema_version: 3, name: "Untitled workflow", nodes: [], edges: [] };
     await atomicWrite(graphPath, `${JSON.stringify(graph, null, 2)}\n`);
   }
-  const verified = catalogLoaded.catalog.verifyGraph(graph);
-  if (!verified.ok) throw new Error(verified.issue.message);
-  await verifyGraphSourceWorkflowTrust(root, catalogLoaded.catalog, graph);
   const availableBinaries = new Set<string>();
   await Promise.all([...catalogLoaded.catalog.values()].map(async (operator) => {
     if (operator.bin && await executablePath(root, operator.bin)) availableBinaries.add(operator.bin);
@@ -272,6 +299,7 @@ async function initializeProject(serverUrl: string, options: ServerOptions): Pro
     throw new Error("SOMITE_AGENT_CAPABILITY must contain exactly 64 lowercase hexadecimal characters");
   }
   const agentCapability = configuredCapability ?? randomBytes(32).toString("hex");
+  const snakemake = new SnakemakeGateway(root, catalogLoaded.catalog);
   return {
     root,
     graphPath,
@@ -283,13 +311,15 @@ async function initializeProject(serverUrl: string, options: ServerOptions): Pro
     availableBinaries,
     runs: new RunManager(root, repositoryRoot, catalogLoaded.catalog),
     nfcore: new NfcoreGateway(root, catalogLoaded.catalog),
-    snakemake: new SnakemakeGateway(root, catalogLoaded.catalog),
+    snakemake,
+    projects: new ProjectGateway(root, catalogLoaded.catalog, snakemake),
     sourceSearch: new SourceSearchGateway(),
     uploads: new UploadStore(root),
     papers: new PaperManager(root, catalogLoaded.catalog, catalogLoaded.revision),
     literature: new LiteratureGateway(root),
     graph,
     recoveredAutosave,
+    autosaveRecoveryWarning: recoveryWarning,
     writeChain: Promise.resolve(),
     allowedOrigin: normalizedAllowedOrigin(options.allowedOrigin ?? process.env.SOMITE_ALLOWED_ORIGIN ?? "http://localhost:3000"),
     agentCapability,
@@ -733,6 +763,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
       graph: state.graph,
       operators: state.operators,
       recovered_autosave: state.recoveredAutosave,
+      autosave_recovery_warning: state.autosaveRecoveryWarning,
       agent_cursor: 0,
       state_revision: graphStateRevision(state.graph),
     });
@@ -905,6 +936,9 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     } catch (error) {
       throw new HttpError(422, error instanceof Error ? error.message : String(error));
     }
+  }
+  if (request.method === "POST" && url.pathname === "/api/projects/open") {
+    return json(await state.projects.open(await requestJson(request)));
   }
   if (request.method === "GET" && url.pathname === "/api/sources/search") {
     const provider = url.searchParams.get("provider");
@@ -1190,6 +1224,13 @@ export async function startServer(options: ServerOptions = {}) {
         ? errorResponse(error.status, error.message, error.extra)
         : error instanceof SourceWorkflowTrustError
           ? errorResponse(422, error.message, { code: error.code })
+        : error instanceof ProjectGatewayError
+          ? errorResponse(
+            error.code === "project_ambiguous" ? 409
+              : error.code === "project_request_invalid" || error.code === "project_path_invalid" ? 400 : 422,
+            error.message,
+            { code: error.code },
+          )
         : error instanceof AgentManagerError
           ? errorResponse(error.code === "already_connected" || error.code === "busy" ? 409 : error.code === "not_connected" ? 404 : 400, error.message, { code: error.code })
         : error instanceof PaperStoreError

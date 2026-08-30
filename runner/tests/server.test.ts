@@ -34,7 +34,7 @@ async function statusWithHost(port: number, host: string) {
   });
 }
 
-test("the TypeScript runner serves the browser session, streaming uploads, and local Snakemake import", { skip: process.platform === "win32" }, async () => {
+test("the TypeScript runner serves the browser session, streaming uploads, and generic local-project import", { skip: process.platform === "win32" }, async () => {
   const root = await mkdtemp(join(tmpdir(), "somite-runner-"));
   const port = await unusedPort();
   const bin = join(root, ".pixi", "envs", "default", "bin");
@@ -78,26 +78,26 @@ test("the TypeScript runner serves the browser session, streaming uploads, and l
     hostile.set("file", new Blob(["hostile\n"]), "hostile.fastq");
     assert.equal((await fetch(`${base}/api/files`, { method: "POST", headers: { origin: "https://attacker.example" }, body: hostile })).status, 403);
 
-    const originlessMutation = await fetch(`${base}/api/workflows/snakemake/import`, {
+    const originlessMutation = await fetch(`${base}/api/projects/open`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ path: root, targets: ["all"] }),
+      body: JSON.stringify({ path: root, snakemake_targets: ["all"] }),
     });
     assert.equal(originlessMutation.status, 403);
 
-    const otherLoopbackOrigin = await fetch(`${base}/api/workflows/snakemake/import`, {
+    const otherLoopbackOrigin = await fetch(`${base}/api/projects/open`, {
       method: "POST",
       headers: { "content-type": "application/json", origin: "http://localhost:3999" },
-      body: JSON.stringify({ path: root, targets: ["all"] }),
+      body: JSON.stringify({ path: root, snakemake_targets: ["all"] }),
     });
     assert.equal(otherLoopbackOrigin.status, 403);
 
     assert.equal(await statusWithHost(port, "attacker.example:7310"), 403);
 
-    const imported = await fetch(`${base}/api/workflows/snakemake/import`, {
+    const imported = await fetch(`${base}/api/projects/open`, {
       method: "POST",
       headers: { "content-type": "application/json", origin: "http://localhost:3000" },
-      body: JSON.stringify({ path: root, targets: ["all"] }),
+      body: JSON.stringify({ path: root, snakemake_targets: ["all"] }),
     });
     assert.equal(imported.status, 200, await imported.clone().text());
     const graph = (await imported.json() as { graph: { nodes: unknown[]; edges: unknown[] } }).graph;
@@ -210,5 +210,81 @@ test("project startup rejects graph paths and state directories outside the cano
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("project startup falls back to the saved graph when autosave recovery is corrupt or untrusted", async (context) => {
+  const cases = [
+    {
+      name: "corrupt JSON",
+      autosave: "{not valid json\n",
+      warning: /autosave.*valid JSON.*saved workflow/i,
+    },
+    {
+      name: "untrusted graph",
+      autosave: `${JSON.stringify({
+        schema_version: 3,
+        name: "Untrusted autosave",
+        nodes: [{
+          id: "forged",
+          operator: "untrusted.operator",
+          operator_revision: "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+          ports: [],
+          layout: { x: 0, y: 0 },
+        }],
+        edges: [],
+      }, null, 2)}\n`,
+      warning: /autosave.*unknown operator.*saved workflow/i,
+    },
+  ];
+
+  for (const fixture of cases) {
+    await context.test(fixture.name, async () => {
+      const root = await mkdtemp(join(tmpdir(), "somite-runner-autosave-fallback-"));
+      const graphPath = join(root, "saved.somite.json");
+      const autosavePath = join(root, "saved.somite.autosave.somite.json");
+      const saved = { schema_version: 3, name: "Saved workflow", nodes: [], edges: [] };
+      await writeFile(graphPath, `${JSON.stringify(saved, null, 2)}\n`);
+      await writeFile(autosavePath, fixture.autosave);
+      const running = await startServer({ projectRoot: root, graph: "saved.somite.json", port: await unusedPort() });
+      try {
+        const response = await fetch(`${running.url}/api/session`);
+        assert.equal(response.status, 200, await response.clone().text());
+        const session = await response.json() as {
+          graph: { name?: string };
+          recovered_autosave: boolean;
+          autosave_recovery_warning: string | null;
+        };
+        assert.equal(session.graph.name, "Saved workflow");
+        assert.equal(session.recovered_autosave, false);
+        assert.match(session.autosave_recovery_warning ?? "", fixture.warning);
+        assert.equal(await readFile(autosavePath, "utf8"), fixture.autosave, "the rejected autosave remains available for diagnosis");
+      } finally {
+        await running.close();
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("project startup still recovers a valid autosave without a warning", async () => {
+  const root = await mkdtemp(join(tmpdir(), "somite-runner-autosave-valid-"));
+  const saved = { schema_version: 3, name: "Saved workflow", nodes: [], edges: [] };
+  const autosaved = { schema_version: 3, name: "Recovered autosave", nodes: [], edges: [] };
+  await writeFile(join(root, "saved.somite.json"), `${JSON.stringify(saved, null, 2)}\n`);
+  await writeFile(join(root, "saved.somite.autosave.somite.json"), `${JSON.stringify(autosaved, null, 2)}\n`);
+  const running = await startServer({ projectRoot: root, graph: "saved.somite.json", port: await unusedPort() });
+  try {
+    const session = await fetch(`${running.url}/api/session`).then((response) => response.json()) as {
+      graph: { name?: string };
+      recovered_autosave: boolean;
+      autosave_recovery_warning: string | null;
+    };
+    assert.equal(session.graph.name, "Recovered autosave");
+    assert.equal(session.recovered_autosave, true);
+    assert.equal(session.autosave_recovery_warning, null);
+  } finally {
+    await running.close();
+    await rm(root, { recursive: true, force: true });
   }
 });

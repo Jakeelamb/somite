@@ -1,5 +1,4 @@
-import { constants } from "node:fs";
-import { lstat, open, readdir, realpath } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import type { OperatorCatalog, ParamSpec } from "@somite/workflow/catalog";
@@ -9,186 +8,22 @@ import type {
   SourceWorkflowInstance,
   WorkflowBinding,
 } from "@somite/workflow/model";
-import {
-  buildSourceManifest,
-  safeSourcePath,
-  type FrozenSourceFile,
-  type SourceManifest,
-} from "@somite/workflow/nextflowSource";
+import { safeSourcePath } from "@somite/workflow/nextflowSource";
 import { deriveSourceWorkflow, sourceWorkflowRevision } from "@somite/workflow/sourceWorkflow";
 import { validateSourceWorkflow } from "@somite/workflow/workflow";
 
-import { regularDirectory, regularFile } from "./files.ts";
+import {
+  SourceWorkflowTrustError,
+  sourceWorkflowTrustFailure,
+  type SourceWorkflowTrustCode,
+} from "./sourceWorkflowErrors.ts";
+import { readSourceObject } from "./sourceWorkflowStore.ts";
 
-const MAX_MANIFEST_BYTES = 16 * 1024 * 1024;
-const decoder = new TextDecoder("utf-8", { fatal: true });
-
-export type SourceWorkflowTrustCode =
-  | "source_object_invalid"
-  | "workflow_revision_invalid"
-  | "source_derivation_mismatch"
-  | "binding_invalid"
-  | "replacement_invalid";
-
-/** A source-workflow failure at a runner trust boundary, safe to return as 422. */
-export class SourceWorkflowTrustError extends Error {
-  readonly code: SourceWorkflowTrustCode;
-
-  constructor(code: SourceWorkflowTrustCode, message: string, cause?: unknown) {
-    super(message, cause === undefined ? undefined : { cause });
-    this.name = "SourceWorkflowTrustError";
-    this.code = code;
-  }
-}
+export { SourceWorkflowTrustError, type SourceWorkflowTrustCode } from "./sourceWorkflowErrors.ts";
+export { readSourceObject } from "./sourceWorkflowStore.ts";
 
 function trustFailure(code: SourceWorkflowTrustCode, message: string, cause?: unknown): never {
-  throw new SourceWorkflowTrustError(code, message, cause);
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function parseManifest(bytes: Uint8Array, expectedDigest: string): SourceManifest {
-  let value: unknown;
-  try {
-    value = JSON.parse(decoder.decode(bytes));
-  } catch (error) {
-    return trustFailure("source_object_invalid", `source object ${expectedDigest} has an invalid manifest`, error);
-  }
-  if (!isObject(value) || value.schema_version !== 1 || value.source_digest !== expectedDigest
-    || !Number.isSafeInteger(value.source_bytes) || (value.source_bytes as number) < 0 || !Array.isArray(value.files)) {
-    return trustFailure("source_object_invalid", `source object ${expectedDigest} has an invalid manifest contract`);
-  }
-  for (const entry of value.files) {
-    if (!isObject(entry) || typeof entry.path !== "string" || !safeSourcePath(entry.path)
-      || (entry.mode !== 0o100644 && entry.mode !== 0o100755)
-      || !Number.isSafeInteger(entry.bytes) || (entry.bytes as number) < 0
-      || typeof entry.digest !== "string" || !/^blake3:[0-9a-f]{64}$/.test(entry.digest)) {
-      return trustFailure("source_object_invalid", `source object ${expectedDigest} has an invalid manifest entry`);
-    }
-  }
-  return value as unknown as SourceManifest;
-}
-
-function expectedSourceEntries(manifest: SourceManifest) {
-  const files = new Map(manifest.files.map((entry) => [entry.path, entry]));
-  const directories = new Set<string>();
-  for (const entry of manifest.files) {
-    for (const match of entry.path.matchAll(/\//g)) directories.add(entry.path.slice(0, match.index));
-  }
-  return { files, directories };
-}
-
-function sameFileIdentity(left: Awaited<ReturnType<typeof lstat>>, right: Awaited<ReturnType<typeof lstat>>) {
-  return left.dev === right.dev && left.ino === right.ino && left.size === right.size
-    && left.mode === right.mode && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
-}
-
-async function readInspectedFile(path: string, inspected: Awaited<ReturnType<typeof lstat>>, label: string) {
-  const noFollow = process.platform === "win32" ? 0 : constants.O_NOFOLLOW;
-  const handle = await open(path, constants.O_RDONLY | noFollow);
-  try {
-    const opened = await handle.stat();
-    if (!opened.isFile() || !sameFileIdentity(inspected, opened)) {
-      return trustFailure("source_object_invalid", `${label} changed between inspection and open`);
-    }
-    const bytes = await handle.readFile();
-    const confirmed = await handle.stat();
-    if (bytes.byteLength !== inspected.size || !sameFileIdentity(opened, confirmed)) {
-      return trustFailure("source_object_invalid", `${label} changed while it was read`);
-    }
-    return bytes;
-  } finally {
-    await handle.close();
-  }
-}
-
-async function exactDirectory(parent: string, name: string, label: string) {
-  const path = join(parent, name);
-  await regularDirectory(path, label);
-  const canonical = await realpath(path);
-  if (canonical !== resolve(path)) trustFailure("source_object_invalid", `${label} must not cross a symbolic link`);
-  return path;
-}
-
-/** Read and content-verify one immutable source object without creating store paths. */
-export async function readSourceObject(root: string, sourceDigest: string) {
-  if (!/^blake3:[0-9a-f]{64}$/.test(sourceDigest)) {
-    return trustFailure("source_object_invalid", "source digest is malformed");
-  }
-  let canonicalRoot: string;
-  try {
-    canonicalRoot = await realpath(root);
-    await regularDirectory(canonicalRoot, "project root");
-    const state = await exactDirectory(canonicalRoot, ".somite", "source workflow state");
-    const store = await exactDirectory(state, "source-workflows", "source workflow store");
-    const objects = await exactDirectory(store, "objects", "source object store");
-    const directory = await exactDirectory(objects, sourceDigest.slice("blake3:".length), `source object ${sourceDigest}`);
-
-    const objectEntries = (await readdir(directory)).sort();
-    if (objectEntries.length !== 2 || objectEntries[0] !== "source" || objectEntries[1] !== "source-manifest.json") {
-      return trustFailure("source_object_invalid", `source object ${sourceDigest} contains unmanifested entries`);
-    }
-    const source = await exactDirectory(directory, "source", `source object ${sourceDigest} tree`);
-    const manifest = parseManifest(
-      await regularFile(join(directory, "source-manifest.json"), MAX_MANIFEST_BYTES, `source object ${sourceDigest} manifest`),
-      sourceDigest,
-    );
-    const expected = expectedSourceEntries(manifest);
-    const foundFiles = new Set<string>();
-    const foundDirectories = new Set<string>();
-    const filesByPath = new Map<string, FrozenSourceFile>();
-    const pending: Array<{ directory: string; prefix: string }> = [{ directory: source, prefix: "" }];
-
-    while (pending.length) {
-      const current = pending.pop()!;
-      for (const entry of await readdir(current.directory, { withFileTypes: true })) {
-        const relativePath = current.prefix ? `${current.prefix}/${entry.name}` : entry.name;
-        if (!safeSourcePath(relativePath)) {
-          return trustFailure("source_object_invalid", `source object ${sourceDigest} contains unsafe path ${relativePath}`);
-        }
-        const path = join(current.directory, entry.name);
-        const metadata = await lstat(path);
-        if (metadata.isSymbolicLink()) {
-          return trustFailure("source_object_invalid", `source object ${sourceDigest} contains symlink ${relativePath}`);
-        }
-        if (metadata.isDirectory()) {
-          if (!expected.directories.has(relativePath) || foundDirectories.has(relativePath)) {
-            return trustFailure("source_object_invalid", `source object ${sourceDigest} contains unmanifested directory ${relativePath}`);
-          }
-          foundDirectories.add(relativePath);
-          pending.push({ directory: path, prefix: relativePath });
-          continue;
-        }
-        if (!metadata.isFile()) {
-          return trustFailure("source_object_invalid", `source object ${sourceDigest} contains unsupported entry ${relativePath}`);
-        }
-        const expectedFile = expected.files.get(relativePath);
-        if (!expectedFile || foundFiles.has(relativePath) || metadata.size !== expectedFile.bytes) {
-          return trustFailure("source_object_invalid", `source file ${relativePath} does not match its manifest`);
-        }
-        if (process.platform !== "win32" && Boolean(metadata.mode & 0o111) !== (expectedFile.mode === 0o100755)) {
-          return trustFailure("source_object_invalid", `source file ${relativePath} does not match its manifest mode`);
-        }
-        const bytes = await readInspectedFile(path, metadata, `source file ${relativePath}`);
-        filesByPath.set(relativePath, { path: relativePath, mode: expectedFile.mode, bytes });
-        foundFiles.add(relativePath);
-      }
-    }
-    if (foundFiles.size !== expected.files.size || foundDirectories.size !== expected.directories.size) {
-      return trustFailure("source_object_invalid", `source object ${sourceDigest} does not exactly match its manifest`);
-    }
-    const files = manifest.files.map((entry) => filesByPath.get(entry.path)!);
-    const actual = buildSourceManifest(files);
-    if (canonicalJsonDigest(actual) !== canonicalJsonDigest(manifest) || actual.source_digest !== sourceDigest) {
-      return trustFailure("source_object_invalid", `source object ${sourceDigest} failed exact content verification`);
-    }
-    return { manifest: actual, files };
-  } catch (error) {
-    if (error instanceof SourceWorkflowTrustError) throw error;
-    return trustFailure("source_object_invalid", `source object ${sourceDigest} could not be verified: ${error instanceof Error ? error.message : String(error)}`, error);
-  }
+  return sourceWorkflowTrustFailure(code, message, cause);
 }
 
 function immutableProjection(workflow: SourceWorkflowInstance) {

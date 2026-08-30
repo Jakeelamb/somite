@@ -193,8 +193,8 @@ async function sourceRevision(project: string) {
   try {
     const commit = await captured("git", ["rev-parse", "--short=12", "HEAD"], project, 5_000, 64 * 1024);
     if (commit.code !== 0 || !commit.stdout.trim()) return "local-worktree";
-    const dirty = await captured("git", ["status", "--porcelain", "--untracked-files=normal", "--", "workflow", "Snakefile", "config", "pixi.toml", "pixi.lock", "pyproject.toml"], project, 5_000, 512 * 1024);
-    return `git:${commit.stdout.trim()}${dirty.code === 0 && dirty.stdout ? "+worktree" : ""}`;
+    const dirty = await captured("git", ["status", "--porcelain", "--untracked-files=normal"], project, 5_000, 512 * 1024);
+    return `git:${commit.stdout.trim()}${dirty.code !== 0 || dirty.signal !== null || dirty.stdout ? "+worktree" : ""}`;
   } catch {
     return "local-worktree";
   }
@@ -238,7 +238,7 @@ export class SnakemakeGateway {
     return { engine: "snakemake", workflow, revision, graph: graphFromDot("snakemake", workflow, revision, reference.revision, entry.rulegraph), cached: true } as const;
   }
 
-  async importLocal(path: string, targetsValue: unknown) {
+  async importLocal(path: string, targetsValue: unknown, workflowLabel?: string) {
     if (!path.trim()) throw new Error("local workflow path must be a non-empty string");
     const { project, snakefile } = await projectEntrypoint(path.trim());
     const targets = normalizedTargets(targetsValue);
@@ -254,8 +254,9 @@ export class SnakemakeGateway {
     const reference = this.#catalog.get("workflow.reference");
     if (!reference) throw new Error("workflow.reference operator is missing");
     const revision = await sourceRevision(project);
-    const graph: SomiteGraph = graphFromDot("snakemake", project, revision, reference.revision, output.stdout);
-    return { engine: "snakemake", workflow: project, revision, graph, cached: false } as const;
+    const workflow = workflowLabel?.trim() || project;
+    const graph: SomiteGraph = graphFromDot("snakemake", workflow, revision, reference.revision, output.stdout);
+    return { engine: "snakemake", workflow, revision, graph, cached: false } as const;
   }
 
   #load() {

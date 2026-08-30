@@ -110,6 +110,7 @@ import type {
   PaperEvidence,
   PaperSearchResult,
   ExportPlan,
+  ProjectOpenResponse,
   ProjectSession,
   ReadinessItem,
   ReadinessSnapshot,
@@ -1068,6 +1069,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
           graphEpoch: graphEpochRef.current,
           stateRevision: stateRevisionRef.current,
         });
+        const recoveryWarning = loaded.autosave_recovery_warning;
         setSession(loaded);
         stateRevisionRef.current = loaded.state_revision;
         acknowledgedGraphRef.current = JSON.stringify(loaded.graph);
@@ -1081,7 +1083,9 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
           agentCursorRef.current = loaded.agent_cursor;
           setAgentSnapshot((current) => ({ ...current, cursor: loaded.agent_cursor }));
           setDirty(true);
-          setStatus("Project opened · kept the canvas edits you made while connecting · project canvas is available in Undo");
+          setStatus(recoveryWarning
+            ? `${recoveryWarning} Kept the canvas edits you made while connecting; the saved project canvas is available in Undo.`
+            : "Project opened · kept the canvas edits you made while connecting · project canvas is available in Undo");
           return;
         }
         if (loaded.graph.nodes.length > 0) setLibraryVisible(false);
@@ -1093,7 +1097,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
         setEdges((loaded.graph.edges ?? []).map((edge) => flowEdge(edge, loaded.graph.nodes)));
         setAnnotations(loaded.graph.annotations ?? []);
         setVariantOrigin(loaded.graph.variant_origin);
-        setStatus(loaded.recovered_autosave ? "Recovered the last autosave" : "Tab add · drag ports to wire · space-drag pan · F fit");
+        setStatus(recoveryWarning ?? (loaded.recovered_autosave ? "Recovered the last autosave" : "Tab add · drag ports to wire · space-drag pan · F fit"));
       })
       .catch((error) => setStatus(`Project engine is not running — ${errorMessage(error)}`));
     jsonRequest<SystemProfile>("/api/system").then(setSystem).catch(() => undefined);
@@ -1414,7 +1418,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     if (!agentSnapshot.connected && !agentDiscovery && !agentDiscoveryLoading) void refreshAgentDiscovery();
   }, [agentDiscovery, agentDiscoveryLoading, agentSnapshot.connected, focusRequirement, readiness, refreshAgentDiscovery]);
 
-  const insertImportedGraph = useCallback((imported: WorkflowGraphResponse, target: { x: number; y: number }, title: string, recentId?: string) => {
+  const insertImportedGraph = useCallback((imported: { graph: SomiteGraph }, target: { x: number; y: number }, title: string, recentId?: string) => {
     const currentGraph = graphSnapshotRef.current;
     const currentSource = currentGraph.nodes.some((node) => Boolean(node.source_workflow));
     if (!sourceWorkflowCanAppendGraph(currentGraph, imported.graph)) {
@@ -1471,13 +1475,17 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     const target = pendingAddPosition ?? canvasCenter();
     setStatus(`Opening local project ${path}…`);
     try {
-      const imported = await jsonRequest<WorkflowGraphResponse>("/api/workflows/snakemake/import", {
+      const imported = await jsonRequest<ProjectOpenResponse>("/api/projects/open", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path, targets: [] }),
+        body: JSON.stringify({ path, snakemake_targets: [] }),
       });
       const label = path.split("/").filter(Boolean).at(-1) ?? "Local project";
-      insertImportedGraph(imported, target, `Opened ${label} ${imported.revision}`);
+      const kind = imported.kind === "somite" ? "Somite graph" : imported.kind === "nextflow" ? "frozen Nextflow source" : "Snakemake rules";
+      const exclusions = imported.exclusions?.count
+        ? ` · ${countFormatter.format(imported.exclusions.count)} runtime, sensitive, or unrelated item${imported.exclusions.count === 1 ? "" : "s"} left out`
+        : "";
+      insertImportedGraph(imported, target, `Opened ${label} · ${kind}${exclusions}`);
       setProjectVisible(false);
     } catch (error) {
       setStatus(`Could not open local project — ${errorMessage(error)}`);
