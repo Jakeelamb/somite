@@ -36,7 +36,7 @@ import { EvidenceStore } from "./evidenceStore.ts";
 import { atomicWrite } from "./files.ts";
 import { PixiCache } from "./pixiCache.ts";
 import { terminateProcessTree } from "./process.ts";
-import { materializeProductionGraph } from "./productionGraph.ts";
+import { materializeProductionGraph, type GraphInputLocation } from "./productionGraph.ts";
 import { RunStorage } from "./runStorage.ts";
 import { requireReadyWorkflow } from "./workflowAdmission.ts";
 import { executablePath, pixiPlatform } from "./system.ts";
@@ -219,7 +219,7 @@ async function materializeFixtureObject(projectRoot: string, sourcePath: string)
 export class RunManager {
   readonly #projectRoot: string;
   readonly #repositoryRoot: string;
-  readonly #graphBase: string;
+  readonly #graphLocation: GraphInputLocation;
   readonly #catalog: OperatorCatalog;
   readonly #evidence: EvidenceStore;
   readonly #pixi: PixiCache;
@@ -231,15 +231,20 @@ export class RunManager {
   constructor(projectRoot: string, repositoryRoot: string, catalog: OperatorCatalog, graphBase = projectRoot) {
     this.#projectRoot = projectRoot;
     this.#repositoryRoot = repositoryRoot;
-    this.#graphBase = graphBase;
+    this.#graphLocation = { graphBase, relativeInputOrder: "project_first" };
     this.#catalog = catalog;
     this.#evidence = new EvidenceStore(projectRoot);
     this.#pixi = new PixiCache(projectRoot);
     this.#storage = new RunStorage(projectRoot);
   }
 
-  async start(graph: SomiteGraph, intent: "run" | "validation", idempotencyKey?: string): Promise<RunStart> {
-    const requestIdentity = `${intent}:${semanticGraphRevision(graph)}`;
+  async start(
+    graph: SomiteGraph,
+    intent: "run" | "validation",
+    idempotencyKey?: string,
+    graphLocation: GraphInputLocation = this.#graphLocation,
+  ): Promise<RunStart> {
+    const requestIdentity = `${intent}:${semanticGraphRevision(graph)}:${JSON.stringify(graphLocation)}`;
     if (idempotencyKey) {
       if (!/^[A-Za-z0-9_-]{8,128}$/.test(idempotencyKey)) throw new Error("invalid run idempotency key");
       const replay = this.#startReplays.get(idempotencyKey);
@@ -254,7 +259,7 @@ export class RunManager {
       validation?.binding.graph ?? graph,
       this.#catalog,
       this.#projectRoot,
-      this.#graphBase,
+      graphLocation,
     );
     const id = `${intent}-${Date.now().toString(16)}-${randomUUID().slice(0, 8)}`;
     const job: RunJob = {
@@ -340,13 +345,13 @@ export class RunManager {
     };
   }
 
-  async compile(graph: SomiteGraph, target: ExportTarget) {
+  async compile(graph: SomiteGraph, target: ExportTarget, graphLocation: GraphInputLocation = this.#graphLocation) {
     requireReadyWorkflow(graph, this.#catalog, "compile");
     const parent = join(this.#projectRoot, ".somite", "compiled");
     const temporary = join(parent, `.compile-${randomUUID()}.partial`);
     await mkdir(parent, { recursive: true });
     try {
-      const runnable = await materializeProductionGraph(graph, this.#catalog, this.#projectRoot, this.#graphBase);
+      const runnable = await materializeProductionGraph(graph, this.#catalog, this.#projectRoot, graphLocation);
       const { frozen } = await prepareFrozenPackage(runnable, this.#catalog, target, temporary, this.#projectRoot, this.#pixi);
       const destination = join(parent, frozen.closure.closure_digest.replace(/^blake3:/, ""));
       let reused = false;
@@ -392,12 +397,12 @@ export class RunManager {
     return this.#storage.dehydrateRuns(runIds, this.#activeRunIds());
   }
 
-  async export(graph: SomiteGraph, target: ExportTarget) {
+  async export(graph: SomiteGraph, target: ExportTarget, graphLocation: GraphInputLocation = this.#graphLocation) {
     requireReadyWorkflow(graph, this.#catalog, "export");
     const directory = join(this.#projectRoot, ".somite", "exports", `export-${randomUUID()}`);
     await mkdir(join(directory, ".."), { recursive: true });
     try {
-      const runnable = await materializeProductionGraph(graph, this.#catalog, this.#projectRoot, this.#graphBase);
+      const runnable = await materializeProductionGraph(graph, this.#catalog, this.#projectRoot, graphLocation);
       const { frozen } = await prepareFrozenPackage(runnable, this.#catalog, target, directory, this.#projectRoot, this.#pixi);
       return { filename: frozen.plan.filename, bytes: archiveFrozenPackage(frozen.files) };
     } finally {

@@ -81,6 +81,8 @@ export type ProjectOpenResponse =
   | Readonly<ProjectLocation & {
       kind: "somite";
       graph: SomiteGraph;
+      /** Canonical runner-only location; the HTTP adapter replaces it with an opaque identifier. */
+      input_base: string;
     }>
   | Readonly<ProjectLocation & {
       kind: "nextflow";
@@ -490,7 +492,13 @@ export class ProjectGateway {
       const graph = await readSomiteGraph(detected.file, this.#catalog);
       await importSomiteSourceObjects(root, detected.project, graph);
       await verifyGraphSourceWorkflowTrust(root, this.#catalog, graph);
-      return { kind: "somite", project_path: projectPath, entrypoint: detected.entrypoint, graph };
+      return {
+        kind: "somite",
+        project_path: projectPath,
+        entrypoint: detected.entrypoint,
+        graph,
+        input_base: dirname(detected.file),
+      };
     }
     if (detected.kind === "nextflow") {
       try {

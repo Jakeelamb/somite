@@ -25,6 +25,7 @@ import { graphStateRevision, semanticGraphRevision } from "@somite/workflow/work
 import { atomicWrite, containedPath, ensurePrivateDirectory, pathExists, regularDirectory, regularFile } from "./files.ts";
 import { discoverAgents } from "./agentDiscovery.ts";
 import { AgentManager, AgentManagerError } from "./agentManager.ts";
+import { InputOriginError, InputOrigins } from "./inputOrigins.ts";
 import { RunManager } from "./jobs.ts";
 import { LiteratureGateway } from "./literatureGateway.ts";
 import { NfcoreGateway } from "./nfcoreGateway.ts";
@@ -59,6 +60,7 @@ type ProjectState = {
   nfcore: NfcoreGateway;
   snakemake: SnakemakeGateway;
   projects: ProjectGateway;
+  inputOrigins: InputOrigins;
   sourceSearch: SourceSearchGateway;
   uploads: UploadStore;
   papers: PaperManager;
@@ -303,6 +305,7 @@ async function initializeProject(serverUrl: string, options: ServerOptions): Pro
   }
   const agentCapability = configuredCapability ?? randomBytes(32).toString("hex");
   const snakemake = new SnakemakeGateway(root, catalogLoaded.catalog);
+  const inputOrigins = await InputOrigins.open(root, graphPath, dirname(graphPath), graph);
   return {
     root,
     graphPath,
@@ -316,6 +319,7 @@ async function initializeProject(serverUrl: string, options: ServerOptions): Pro
     nfcore: new NfcoreGateway(root, catalogLoaded.catalog),
     snakemake,
     projects: new ProjectGateway(root, catalogLoaded.catalog, snakemake),
+    inputOrigins,
     sourceSearch: new SourceSearchGateway(),
     uploads: new UploadStore(root),
     papers: new PaperManager(root, catalogLoaded.catalog, catalogLoaded.revision),
@@ -346,6 +350,47 @@ function knownFields(value: Record<string, unknown>, label: string, allowed: rea
 function requiredString(value: unknown, label: string) {
   if (typeof value !== "string" || !value.trim()) throw new HttpError(400, `${label} must be a non-empty string`);
   return value;
+}
+
+function scopedGraph(state: ProjectState, value: unknown, label: string) {
+  const candidate = value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+  if (!candidate || !("graph" in candidate) || "schema_version" in candidate) {
+    return {
+      graph: parseGraph(value),
+      inputOriginId: state.inputOrigins.currentId,
+      inputLocation: state.inputOrigins.location(),
+    };
+  }
+  knownFields(candidate, label, ["graph", "input_origin_id"]);
+  const inputOriginId = candidate.input_origin_id === undefined
+    ? state.inputOrigins.currentId
+    : requiredString(candidate.input_origin_id, "input_origin_id");
+  return {
+    graph: parseGraph(candidate.graph),
+    inputOriginId,
+    inputLocation: state.inputOrigins.location(inputOriginId),
+  };
+}
+
+/** Canvas concurrency identity includes the runner-owned input base as well as portable graph bytes. */
+function projectStateRevision(
+  state: ProjectState,
+  graph = state.graph,
+  inputOriginId = state.inputOrigins.currentId,
+) {
+  return canonicalJsonDigest({
+    graph_state_revision: graphStateRevision(graph),
+    input_location: state.inputOrigins.location(inputOriginId),
+  });
+}
+
+async function commitAutosavedGraph(state: ProjectState, graph: SomiteGraph, inputOriginId = state.inputOrigins.currentId) {
+  await atomicWrite(state.autosavePath, `${JSON.stringify(graph, null, 2)}\n`);
+  await state.inputOrigins.record(inputOriginId, graph);
+  state.graph = graph;
+  state.recoveredAutosave = true;
 }
 
 function parseSourceWorkflowEdits(value: unknown): SourceWorkflowEdit[] {
@@ -388,17 +433,14 @@ function parseSourceWorkflowEdits(value: unknown): SourceWorkflowEdit[] {
 async function mutateGraph(state: ProjectState, baseStateRevision: string, mutate: (graph: SomiteGraph) => SomiteGraph) {
   let response: ReturnType<typeof sourceWorkflowEditResponse> | undefined;
   const operation = state.writeChain.then(async () => {
-    const currentRevision = graphStateRevision(state.graph);
+    const currentRevision = projectStateRevision(state);
     if (baseStateRevision !== currentRevision) throw new HttpError(409, "canvas changed since this edit started", { state_revision: currentRevision });
     const graph = mutate(structuredClone(state.graph));
     const verified = state.catalog.verifyGraph(graph);
     if (!verified.ok) throw new HttpError(400, verified.issue.message);
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
-    const encoded = `${JSON.stringify(graph, null, 2)}\n`;
-    await atomicWrite(state.autosavePath, encoded);
-    state.graph = graph;
-    state.recoveredAutosave = true;
-    response = sourceWorkflowEditResponse(graph);
+    await commitAutosavedGraph(state, graph);
+    response = { ...sourceWorkflowEditResponse(graph), state_revision: projectStateRevision(state) };
   });
   state.writeChain = operation.catch(() => undefined);
   await operation;
@@ -507,11 +549,26 @@ async function applyAgentGraphTransaction(state: ProjectState, value: unknown) {
       response = { ...replay.result, replayed: true };
       return;
     }
-    const result = applyGraphTransaction(state.graph, state.catalog, request, `transaction-${randomUUID()}`);
+    const previousStateRevision = projectStateRevision(state);
+    if (request.base_state_revision !== previousStateRevision) {
+      throw new HttpError(409, `transaction base ${request.base_state_revision} is stale; current state revision is ${previousStateRevision}`, {
+        code: "stale_transaction",
+        state_revision: previousStateRevision,
+      });
+    }
+    const nativeResult = applyGraphTransaction(
+      state.graph,
+      state.catalog,
+      { ...request, base_state_revision: graphStateRevision(state.graph) },
+      `transaction-${randomUUID()}`,
+    );
+    const result: AgentTransactionResult = {
+      ...nativeResult,
+      previous_state_revision: previousStateRevision,
+      state_revision: projectStateRevision(state, nativeResult.graph),
+    };
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, result.graph);
-    await atomicWrite(state.autosavePath, `${JSON.stringify(result.graph, null, 2)}\n`);
-    state.graph = result.graph;
-    state.recoveredAutosave = true;
+    await commitAutosavedGraph(state, result.graph);
     rememberTransactionReplay(state, request.idempotency_key, requestDigest, result);
     response = { ...result, replayed: false };
   });
@@ -520,7 +577,7 @@ async function applyAgentGraphTransaction(state: ProjectState, value: unknown) {
     await operation;
   } catch (error) {
     if (error instanceof AgentTransactionError) {
-      throw new HttpError(error.code === "stale_transaction" ? 409 : 422, error.message, { code: error.code, state_revision: graphStateRevision(state.graph) });
+      throw new HttpError(error.code === "stale_transaction" ? 409 : 422, error.message, { code: error.code, state_revision: projectStateRevision(state) });
     }
     throw error;
   }
@@ -551,7 +608,7 @@ async function commitAgentMutation(
       response = { ...replay.result, replayed: true };
       return;
     }
-    const previousStateRevision = graphStateRevision(state.graph);
+    const previousStateRevision = projectStateRevision(state);
     if (request.baseStateRevision !== previousStateRevision) throw new HttpError(409, "canvas changed since this edit started", { state_revision: previousStateRevision });
     const graph = mutate(structuredClone(state.graph));
     const verified = state.catalog.verifyGraph(graph);
@@ -560,14 +617,12 @@ async function commitAgentMutation(
     const result: AgentTransactionResult = {
       transaction_id: `transaction-${randomUUID()}`,
       previous_state_revision: previousStateRevision,
-      state_revision: graphStateRevision(graph),
+      state_revision: projectStateRevision(state, graph),
       graph_revision: semanticGraphRevision(graph),
       summary: request.summary,
       graph,
     };
-    await atomicWrite(state.autosavePath, `${JSON.stringify(graph, null, 2)}\n`);
-    state.graph = graph;
-    state.recoveredAutosave = true;
+    await commitAutosavedGraph(state, graph);
     rememberTransactionReplay(state, request.idempotencyKey, request.requestDigest, result);
     response = { ...result, replayed: false };
   });
@@ -591,7 +646,7 @@ async function resolveAgentNfcore(state: ProjectState, value: unknown) {
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, replay.result.graph);
     return { ...replay.result, replayed: true };
   }
-  const currentRevision = graphStateRevision(state.graph);
+  const currentRevision = projectStateRevision(state);
   if (fields.baseStateRevision !== currentRevision) throw new HttpError(409, "canvas changed since this import started", { state_revision: currentRevision });
   if (state.graph.nodes.length || state.graph.edges.length) throw new HttpError(422, "source workflow import requires an empty canvas");
   const imported = await state.nfcore.import(workflow, revision);
@@ -632,22 +687,24 @@ async function promoteAgentSourceWorkflow(state: ProjectState, value: unknown) {
 
 async function saveAgentPromptGraph(state: ProjectState, value: unknown) {
   const body = object(value, "agent prompt");
-  knownFields(body, "agent prompt", ["message", "base_state_revision", "graph"]);
+  knownFields(body, "agent prompt", ["message", "base_state_revision", "graph", "input_origin_id"]);
   const message = requiredString(body.message, "message");
   state.agent.preflightPrompt(message);
   const baseStateRevision = requiredString(body.base_state_revision, "base_state_revision");
   const graph = parseGraph(body.graph);
+  const inputOriginId = body.input_origin_id === undefined
+    ? state.inputOrigins.currentId
+    : requiredString(body.input_origin_id, "input_origin_id");
+  state.inputOrigins.location(inputOriginId);
   const verified = state.catalog.verifyGraph(graph);
   if (!verified.ok) throw new HttpError(400, verified.issue.message);
   let stateRevision = "";
   const operation = state.writeChain.then(async () => {
-    const currentRevision = graphStateRevision(state.graph);
+    const currentRevision = projectStateRevision(state);
     if (baseStateRevision !== currentRevision) throw new HttpError(409, "canvas changed since this prompt started", { state_revision: currentRevision });
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
-    await atomicWrite(state.autosavePath, `${JSON.stringify(graph, null, 2)}\n`);
-    state.graph = graph;
-    state.recoveredAutosave = true;
-    stateRevision = graphStateRevision(graph);
+    await commitAutosavedGraph(state, graph, inputOriginId);
+    stateRevision = projectStateRevision(state);
   });
   state.writeChain = operation.catch(() => undefined);
   await operation;
@@ -657,23 +714,26 @@ async function saveAgentPromptGraph(state: ProjectState, value: unknown) {
 
 async function saveGraph(state: ProjectState, request: Request, canonical: boolean) {
   const body = object(await requestJson(request), "graph write");
+  knownFields(body, "graph write", ["base_state_revision", "graph", "input_origin_id"]);
   if (typeof body.base_state_revision !== "string") throw new HttpError(400, "base_state_revision must be a string");
   const graph = parseGraph(body.graph);
+  const inputOriginId = body.input_origin_id === undefined
+    ? state.inputOrigins.currentId
+    : requiredString(body.input_origin_id, "input_origin_id");
+  state.inputOrigins.location(inputOriginId);
   const catalogResult = state.catalog.verifyGraph(graph);
   if (!catalogResult.ok) throw new HttpError(400, catalogResult.issue.message);
   let responseRevision = "";
   const operation = state.writeChain.then(async () => {
-    const currentRevision = graphStateRevision(state.graph);
+    const currentRevision = projectStateRevision(state);
     if (body.base_state_revision !== currentRevision) {
       throw new HttpError(409, "canvas changed since this edit started", { state_revision: currentRevision });
     }
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     const encoded = `${JSON.stringify(graph, null, 2)}\n`;
     if (canonical) await atomicWrite(state.graphPath, encoded);
-    await atomicWrite(state.autosavePath, encoded);
-    state.graph = graph;
-    state.recoveredAutosave = true;
-    responseRevision = graphStateRevision(graph);
+    await commitAutosavedGraph(state, graph, inputOriginId);
+    responseRevision = projectStateRevision(state);
   });
   state.writeChain = operation.catch(() => undefined);
   await operation;
@@ -765,8 +825,10 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
       operators: state.operators,
       recovered_autosave: state.recoveredAutosave,
       autosave_recovery_warning: state.autosaveRecoveryWarning,
+      input_origin_warning: state.inputOrigins.warning,
+      input_origin_id: state.inputOrigins.currentId,
       agent_cursor: 0,
-      state_revision: graphStateRevision(state.graph),
+      state_revision: projectStateRevision(state),
     });
   }
   if (request.method === "GET" && url.pathname === "/api/agent/discover") {
@@ -796,7 +858,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
   }
   if (request.method === "GET" && url.pathname === "/api/agent/events") {
     const after = Number(url.searchParams.get("after") ?? 0);
-    return json(state.agent.snapshot(Number.isSafeInteger(after) && after >= 0 ? after : 0, graphStateRevision(state.graph)));
+    return json(state.agent.snapshot(Number.isSafeInteger(after) && after >= 0 ? after : 0, projectStateRevision(state)));
   }
   if (request.method === "GET" && url.pathname === "/api/agent/transcript") {
     return json(state.agent.transcript());
@@ -814,7 +876,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     await state.writeChain;
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, state.graph);
     return json({
-      state_revision: graphStateRevision(state.graph),
+      state_revision: projectStateRevision(state),
       graph_revision: semanticGraphRevision(state.graph),
       graph: state.graph,
     });
@@ -855,7 +917,11 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     await requestJson(request);
     await state.writeChain;
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, state.graph);
-    return json(await state.runs.compile(state.graph, { archiveName: state.graph.name ?? basename(state.root), platform: pixiPlatform() }));
+    return json(await state.runs.compile(
+      state.graph,
+      { archiveName: state.graph.name ?? basename(state.root), platform: pixiPlatform() },
+      state.inputOrigins.location(),
+    ));
   }
   if (request.method === "GET" && url.pathname === "/api/agent/evidence") {
     requireAgentCapability(request, state);
@@ -944,7 +1010,11 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     }
   }
   if (request.method === "POST" && url.pathname === "/api/projects/open") {
-    return json(await state.projects.open(await requestJson(request)));
+    const opened = await state.projects.open(await requestJson(request));
+    if (opened.kind !== "somite") return json(opened);
+    const inputOriginId = await state.inputOrigins.registerOpenedGraph(opened.input_base);
+    const { input_base: _inputBase, ...response } = opened;
+    return json({ ...response, input_origin_id: inputOriginId });
   }
   if (request.method === "GET" && url.pathname === "/api/sources/search") {
     const provider = url.searchParams.get("provider");
@@ -1073,14 +1143,14 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
   if (request.method === "PUT" && url.pathname === "/api/graph") return saveGraph(state, request, true);
   if (request.method === "PUT" && url.pathname === "/api/graph/autosave") return saveGraph(state, request, false);
   if (request.method === "POST" && url.pathname === "/api/graph/validate") {
-    const graph = parseGraph(await requestJson(request));
+    const { graph } = scopedGraph(state, await requestJson(request), "graph validation request");
     const verified = state.catalog.verifyGraph(graph);
     if (!verified.ok) throw new HttpError(400, verified.issue.message);
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     return json({ valid: true });
   }
   if (request.method === "POST" && url.pathname === "/api/export/plan") {
-    const graph = parseGraph(await requestJson(request));
+    const { graph } = scopedGraph(state, await requestJson(request), "export plan request");
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     return json(planFrozenPackage(graph, state.catalog, {
       archiveName: graph.name ?? basename(state.root),
@@ -1088,12 +1158,12 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     }, (binary) => state.availableBinaries.has(binary)));
   }
   if (request.method === "POST" && url.pathname === "/api/export") {
-    const graph = parseGraph(await requestJson(request));
+    const { graph, inputLocation } = scopedGraph(state, await requestJson(request), "export request");
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     const exported = await state.runs.export(graph, {
       archiveName: graph.name ?? basename(state.root),
       platform: pixiPlatform(),
-    });
+    }, inputLocation);
     return new Response(exported.bytes, {
       headers: {
         "content-type": "application/zip",
@@ -1102,13 +1172,14 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     });
   }
   if (request.method === "POST" && (url.pathname === "/api/runs" || url.pathname === "/api/validations")) {
-    const graph = parseGraph(await requestJson(request));
+    const { graph, inputLocation } = scopedGraph(state, await requestJson(request), "run request");
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     try {
       const started = await state.runs.start(
         graph,
         url.pathname === "/api/validations" ? "validation" : "run",
         url.searchParams.get("idempotency_key") ?? undefined,
+        inputLocation,
       );
       return json(started, { status: 202 });
     } catch (error) {
@@ -1117,7 +1188,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     }
   }
   if (request.method === "POST" && url.pathname === "/api/validations/status") {
-    const graph = parseGraph(await requestJson(request));
+    const { graph } = scopedGraph(state, await requestJson(request), "validation status request");
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     try {
       return json(await state.runs.validationStatus(graph));
@@ -1242,6 +1313,8 @@ export async function startServer(options: ServerOptions = {}) {
             error.message,
             { code: error.code },
           )
+        : error instanceof InputOriginError
+          ? errorResponse(400, error.message, { code: error.code })
         : error instanceof AgentManagerError
           ? errorResponse(error.code === "already_connected" || error.code === "busy" ? 409 : error.code === "not_connected" ? 404 : 400, error.message, { code: error.code })
         : error instanceof PaperStoreError

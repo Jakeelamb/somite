@@ -47,6 +47,15 @@ test("production inputs resolve project then graph-relative files without mutati
     await rm(join(root, "data"), { recursive: true });
     const graphFallback = await materializeProductionGraph(graph, catalog, root, graphBase);
     assert.equal(graphFallback.nodes[0]?.params?.path, join(graphBase, "data", "reads.fastq"));
+
+    await mkdir(join(root, "data"));
+    await writeFile(join(root, "data", "reads.fastq"), "project collision\n");
+    const openedDocument = await materializeProductionGraph(graph, catalog, root, {
+      graphBase,
+      relativeInputOrder: "graph_first",
+    });
+    assert.equal(openedDocument.nodes[0]?.params?.path, join(graphBase, "data", "reads.fastq"));
+    assert.equal(graph.nodes[0]?.params?.path, "data/reads.fastq", "origin-aware materialization must still leave the canvas untouched");
   } finally {
     await rm(root, { recursive: true, force: true });
   }

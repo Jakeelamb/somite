@@ -146,14 +146,13 @@ test("production runs resolve graph-relative inputs before entering the run dire
   process.env.PATH = project.path;
   try {
     const graphBase = join(project.root, "graphs");
-    await rm(join(project.root, "data"), { recursive: true });
     await mkdir(join(graphBase, "data"), { recursive: true });
     await writeFile(join(graphBase, "data", "reads.fastq"), "@graph\nTGCA\n+\n!!!!\n");
     const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
     const graph = await graphFixture();
-    const manager = new RunManager(project.root, repositoryRoot, catalog, graphBase);
+    const manager = new RunManager(project.root, repositoryRoot, catalog);
 
-    const started = await manager.start(graph, "run");
+    const started = await manager.start(graph, "run", undefined, { graphBase, relativeInputOrder: "graph_first" });
     const run = await terminalStatus(manager, started.run_id);
     assert.equal(run.phase, "completed", run.error);
     const params = JSON.parse(await readFile(join(project.root, ".somite", "runs", started.run_id, "params.json"), "utf8"));

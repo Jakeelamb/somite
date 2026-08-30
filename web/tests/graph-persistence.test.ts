@@ -8,27 +8,27 @@ const graph = (name: string): SomiteGraph => ({ schema_version: 3, name, nodes: 
 test("browser writes serialize and each write observes the acknowledged revision", async () => {
   const queue = { current: Promise.resolve() };
   let revision = "state-a";
-  const observed: Array<{ base: string; name?: string }> = [];
+  const observed: Array<{ base: string; name?: string; origin?: string }> = [];
   let releaseFirst: (() => void) | undefined;
   const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
   let calls = 0;
-  const transport = async (_path: "/api/graph" | "/api/graph/autosave", request: { base_state_revision: string; graph: SomiteGraph }) => {
-    observed.push({ base: request.base_state_revision, name: request.graph.name });
+  const transport = async (_path: "/api/graph" | "/api/graph/autosave", request: { base_state_revision: string; graph: SomiteGraph; input_origin_id?: string }) => {
+    observed.push({ base: request.base_state_revision, name: request.graph.name, origin: request.input_origin_id });
     calls += 1;
     if (calls === 1) await firstGate;
     return { valid: true, state_revision: calls === 1 ? "state-b" : "state-c" };
   };
 
-  const first = enqueueGraphWrite(queue, () => revision, (next) => { revision = next; }, transport, "/api/graph/autosave", captureGraphWrite(graph("first"), 1));
-  const second = enqueueGraphWrite(queue, () => revision, (next) => { revision = next; }, transport, "/api/graph/autosave", captureGraphWrite(graph("second"), 2));
+  const first = enqueueGraphWrite(queue, () => revision, (next) => { revision = next; }, transport, "/api/graph/autosave", captureGraphWrite(graph("first"), 1, "origin-a"));
+  const second = enqueueGraphWrite(queue, () => revision, (next) => { revision = next; }, transport, "/api/graph/autosave", captureGraphWrite(graph("second"), 2, "origin-b"));
   await Promise.resolve();
-  assert.deepEqual(observed, [{ base: "state-a", name: "first" }]);
+  assert.deepEqual(observed, [{ base: "state-a", name: "first", origin: "origin-a" }]);
   releaseFirst?.();
   await Promise.all([first, second]);
 
   assert.deepEqual(observed, [
-    { base: "state-a", name: "first" },
-    { base: "state-b", name: "second" },
+    { base: "state-a", name: "first", origin: "origin-a" },
+    { base: "state-b", name: "second", origin: "origin-b" },
   ]);
   assert.equal(revision, "state-c");
 });

@@ -89,8 +89,10 @@ test("ProjectGateway opens current and legacy Somite graphs through catalog and 
     });
     const opened = await gateway.open({ path: "graphs" });
     assert.equal(opened.kind, "somite");
+    if (opened.kind !== "somite") throw new Error("expected a Somite graph");
     assert.equal(opened.project_path, "graphs");
     assert.equal(opened.entrypoint, "legacy.somite.json");
+    assert.equal(opened.input_base, join(root, "graphs"));
     assert.equal(opened.graph.schema_version, 3);
     assert.equal(opened.graph.nodes[0]?.operator_revision, catalog.get("files.import")?.revision);
     assert.deepEqual(opened.graph.nodes[0]?.ports, [{ name: "file", dir: "out", ty: "Fastq" }]);
@@ -122,6 +124,8 @@ test("ProjectGateway carries verified frozen source when opening another Somite 
 
     const opened = await gateway.open({ path: graphPath });
     assert.equal(opened.kind, "somite");
+    if (opened.kind !== "somite") throw new Error("expected a Somite graph");
+    assert.equal(opened.input_base, external);
     assert.deepEqual(opened.graph, parseGraph(frozen.graph));
     await verifyGraphSourceWorkflowTrust(root, catalog, opened.graph);
     const stored = await readSourceObject(root, frozen.source_digest);

@@ -21,6 +21,11 @@ export class ProductionInputError extends Error {
   }
 }
 
+export type GraphInputLocation = Readonly<{
+  graphBase: string;
+  relativeInputOrder: "project_first" | "graph_first";
+}>;
+
 function inside(root: string, path: string) {
   const fromRoot = relative(root, path);
   return fromRoot !== ".." && !fromRoot.startsWith(`..${sep}`) && !isAbsolute(fromRoot);
@@ -56,6 +61,7 @@ async function resolveInputPath(
   expected: "file" | "directory",
   projectRoot: string,
   graphBase: string,
+  relativeInputOrder: GraphInputLocation["relativeInputOrder"],
   label: string,
 ) {
   if (!value || value.length > 4096 || [...value].some((character) => {
@@ -69,8 +75,13 @@ async function resolveInputPath(
   else {
     const projectCandidate = resolve(projectRoot, value);
     const graphCandidate = resolve(graphBase, value);
-    candidates = [projectCandidate, graphCandidate]
-      .filter((candidate, index, all) => inside(index === 0 ? projectRoot : graphBase, candidate) && all.indexOf(candidate) === index);
+    const ordered = relativeInputOrder === "graph_first"
+      ? [{ candidate: graphCandidate, root: graphBase }, { candidate: projectCandidate, root: projectRoot }]
+      : [{ candidate: projectCandidate, root: projectRoot }, { candidate: graphCandidate, root: graphBase }];
+    candidates = ordered
+      .filter(({ candidate, root }) => inside(root, candidate))
+      .map(({ candidate }) => candidate)
+      .filter((candidate, index, all) => all.indexOf(candidate) === index);
     if (!candidates.length) throw new ProductionInputError("input_path_unsafe", `${label} escapes its project and graph directories`);
   }
 
@@ -102,6 +113,7 @@ async function materializeBinding(
   binding: WorkflowBinding,
   projectRoot: string,
   graphBase: string,
+  relativeInputOrder: GraphInputLocation["relativeInputOrder"],
   label: string,
 ): Promise<WorkflowBinding> {
   if (binding.kind === "literal") return binding;
@@ -112,6 +124,7 @@ async function materializeBinding(
       binding.kind === "project_directory" ? "directory" : "file",
       projectRoot,
       graphBase,
+      relativeInputOrder,
       label,
     ),
   };
@@ -122,8 +135,10 @@ export async function materializeProductionGraph(
   graph: SomiteGraph,
   catalog: OperatorCatalog,
   projectRootValue: string,
-  graphBaseValue = projectRootValue,
+  graphLocation: string | GraphInputLocation = projectRootValue,
 ) {
+  const graphBaseValue = typeof graphLocation === "string" ? graphLocation : graphLocation.graphBase;
+  const relativeInputOrder = typeof graphLocation === "string" ? "project_first" : graphLocation.relativeInputOrder;
   const [projectRoot, graphBase] = await Promise.all([
     canonicalDirectory(projectRootValue, "project root"),
     canonicalDirectory(graphBaseValue, "workflow graph directory"),
@@ -141,13 +156,14 @@ export async function materializeProductionGraph(
         contract.kind,
         projectRoot,
         graphBase,
+        relativeInputOrder,
         `${operator.title} ${contract.parameter}`,
       );
     }
     if (!node.source_workflow?.bindings) continue;
     const bindings: Record<string, WorkflowBinding> = {};
     for (const [name, binding] of Object.entries(node.source_workflow.bindings)) {
-      bindings[name] = await materializeBinding(binding, projectRoot, graphBase, `${operator.title} ${name}`);
+      bindings[name] = await materializeBinding(binding, projectRoot, graphBase, relativeInputOrder, `${operator.title} ${name}`);
     }
     node.source_workflow.bindings = bindings;
   }

@@ -195,6 +195,7 @@ Generated state lives under `.somite/` and is ignored by Git:
 .somite/
   web.somite.json
   autosave.somite.json
+  input-origins/
   uploads/
   papers/
   catalog/

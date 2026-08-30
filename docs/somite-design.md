@@ -203,6 +203,7 @@ session. Redacted normalized transcripts persist under
 .somite/
   web.somite.json       canonical working graph
   autosave.somite.json  validated recovery graph
+  input-origins/        local input bases scoped to recovered graphs
   uploads/              browser-imported scientific files
   catalog/              bounded remote catalog cache
   papers/               content-addressed artifacts and derived caches

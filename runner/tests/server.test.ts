@@ -110,6 +110,129 @@ test("the TypeScript runner serves the browser session, streaming uploads, and g
   }
 });
 
+test("opening an external Somite document preserves it exactly and carries its relative-input origin through autosave and restart", async () => {
+  const root = await mkdtemp(join(tmpdir(), "somite-runner-open-document-"));
+  const external = await mkdtemp(join(tmpdir(), "somite-runner-external-document-"));
+  const mutationHeaders = { "content-type": "application/json", origin: "http://localhost:3000" };
+  let running = await startServer({ projectRoot: root, port: await unusedPort() });
+  try {
+    const firstSession = await fetch(`${running.url}/api/session`).then((response) => response.json()) as {
+      operators: Array<{ id: string; revision?: string }>;
+      state_revision: string;
+      input_origin_id: string;
+    };
+    const revision = firstSession.operators.find((operator) => operator.id === "files.import")?.revision;
+    assert.ok(revision);
+    await mkdir(join(external, "data"));
+    await writeFile(join(external, "data", "reads.fastq"), "@external\nACGT\n+\n!!!!\n");
+    const sourceNode = {
+      id: "source-original",
+      operator: "files.import",
+      operator_revision: revision,
+      ports: [{ name: "file", dir: "out", ty: "Fastq" }],
+      params: { path: "data/reads.fastq" },
+      layout: { x: -300, y: 20 },
+    };
+    const graph = {
+      schema_version: 3,
+      name: "External exact document",
+      nodes: [{ ...sourceNode, id: "reads", layout: { x: 120, y: 240 } }],
+      edges: [],
+      annotations: [{ id: "note", kind: "sticky", text: "Keep this", color: "teal", layout: { x: 20, y: 40 }, width: 220, height: 140 }],
+    };
+    const graphPath = join(external, "external.somite.json");
+    await writeFile(graphPath, `${JSON.stringify(graph, null, 2)}\n`);
+
+    const openedResponse = await fetch(`${running.url}/api/projects/open`, {
+      method: "POST",
+      headers: mutationHeaders,
+      body: JSON.stringify({ path: graphPath, snakemake_targets: [] }),
+    });
+    assert.equal(openedResponse.status, 200, await openedResponse.clone().text());
+    const openedText = await openedResponse.text();
+    assert.equal(openedText.includes(external), false, "the browser response must not expose the machine-local input base");
+    const opened = JSON.parse(openedText) as { kind: string; graph: unknown; input_origin_id: string };
+    assert.equal(opened.kind, "somite");
+    assert.deepEqual(opened.graph, graph);
+    assert.match(opened.input_origin_id, /^[A-Za-z0-9_-]{24}$/);
+
+    const autosave = await fetch(`${running.url}/api/graph/autosave`, {
+      method: "PUT",
+      headers: mutationHeaders,
+      body: JSON.stringify({
+        base_state_revision: firstSession.state_revision,
+        graph: opened.graph,
+        input_origin_id: opened.input_origin_id,
+      }),
+    });
+    assert.equal(autosave.status, 200, await autosave.clone().text());
+    const externalRevision = (await autosave.json() as { state_revision: string }).state_revision;
+    assert.notEqual(externalRevision, firstSession.state_revision);
+    assert.deepEqual(JSON.parse(await readFile(join(root, ".somite", "autosave.somite.json"), "utf8")), graph);
+    assert.deepEqual(JSON.parse(await readFile(graphPath, "utf8")), graph, "opening and autosaving must not rewrite the source graph");
+
+    const projectOrigin = await fetch(`${running.url}/api/graph/autosave`, {
+      method: "PUT",
+      headers: mutationHeaders,
+      body: JSON.stringify({
+        base_state_revision: externalRevision,
+        graph,
+        input_origin_id: firstSession.input_origin_id,
+      }),
+    });
+    assert.equal(projectOrigin.status, 200, await projectOrigin.clone().text());
+    const projectRevision = (await projectOrigin.json() as { state_revision: string }).state_revision;
+    assert.notEqual(projectRevision, externalRevision, "origin-only changes must change concurrency identity");
+    const staleOriginSwitch = await fetch(`${running.url}/api/graph/autosave`, {
+      method: "PUT",
+      headers: mutationHeaders,
+      body: JSON.stringify({
+        base_state_revision: externalRevision,
+        graph,
+        input_origin_id: opened.input_origin_id,
+      }),
+    });
+    assert.equal(staleOriginSwitch.status, 409, await staleOriginSwitch.clone().text());
+    const restoreExternal = await fetch(`${running.url}/api/graph/autosave`, {
+      method: "PUT",
+      headers: mutationHeaders,
+      body: JSON.stringify({
+        base_state_revision: projectRevision,
+        graph,
+        input_origin_id: opened.input_origin_id,
+      }),
+    });
+    assert.equal(restoreExternal.status, 200, await restoreExternal.clone().text());
+
+    const run = await fetch(`${running.url}/api/runs`, {
+      method: "POST",
+      headers: mutationHeaders,
+      body: JSON.stringify({ graph, input_origin_id: opened.input_origin_id }),
+    });
+    assert.equal(run.status, 202, await run.clone().text());
+    await running.close();
+
+    running = await startServer({ projectRoot: root, port: await unusedPort() });
+    const restoredSession = await fetch(`${running.url}/api/session`).then((response) => response.json()) as {
+      graph: unknown;
+      input_origin_id: string;
+      input_origin_warning: string | null;
+    };
+    assert.deepEqual(restoredSession.graph, graph);
+    assert.equal(restoredSession.input_origin_warning, null);
+    const restoredRun = await fetch(`${running.url}/api/runs`, {
+      method: "POST",
+      headers: mutationHeaders,
+      body: JSON.stringify({ graph, input_origin_id: restoredSession.input_origin_id }),
+    });
+    assert.equal(restoredRun.status, 202, await restoredRun.clone().text());
+  } finally {
+    await running.close().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+    await rm(external, { recursive: true, force: true });
+  }
+});
+
 test("paper upload streams past the global JSON body limit into content-addressed storage", async () => {
   const root = await mkdtemp(join(tmpdir(), "somite-runner-paper-stream-"));
   const running = await startServer({ projectRoot: root, port: await unusedPort() });
