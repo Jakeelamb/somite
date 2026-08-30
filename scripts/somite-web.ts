@@ -7,9 +7,15 @@ import { startServer } from "../runner/src/server.ts";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const npm = process.platform === "win32" ? "npm.cmd" : "npm";
-const graph = process.argv[2];
+const argumentsList = process.argv.slice(2);
+const production = argumentsList[0] === "--production";
+if (production) argumentsList.shift();
+const invalidArguments = argumentsList.length > 1 || argumentsList[0]?.startsWith("--");
+const graph = argumentsList[0];
+const workspaceRoot = resolve(process.env.SOMITE_PROJECT_ROOT ?? projectRoot);
 const port = Number(process.env.SOMITE_PORT ?? 7310);
 const host = process.env.SOMITE_HOST ?? "127.0.0.1";
+const webPort = Number(process.env.PORT ?? 3000);
 const connectHost = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host === "::1" ? "[::1]" : host;
 const runnerUrl = `http://${connectHost}:${port}`;
 const children = new Set<ChildProcess>();
@@ -31,12 +37,17 @@ function launch(args: string[], environment: NodeJS.ProcessEnv = process.env) {
 }
 
 function terminate(child: ChildProcess, hard = false) {
-  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+  if (!child.pid) return;
   if (process.platform === "win32") {
+    if (child.exitCode !== null || child.signalCode !== null) return;
     spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true, stdio: "ignore" });
     return;
   }
-  try { process.kill(-child.pid, hard ? "SIGKILL" : "SIGINT"); } catch { child.kill(hard ? "SIGKILL" : "SIGINT"); }
+  try {
+    process.kill(-child.pid, hard ? "SIGKILL" : "SIGINT");
+  } catch {
+    if (child.exitCode === null && child.signalCode === null) child.kill(hard ? "SIGKILL" : "SIGINT");
+  }
 }
 
 function stop(code: number) {
@@ -47,12 +58,17 @@ function stop(code: number) {
   for (const child of activeChildren) terminate(child);
   shutdown = (async () => {
     await runningServer?.close();
-    await Promise.race([
-      Promise.all(activeChildren.map((child) => child.exitCode !== null || child.signalCode !== null
-        ? Promise.resolve()
-        : new Promise<void>((resolvePromise) => child.once("close", () => resolvePromise())))),
-      new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 3_000)),
-    ]);
+    let timeout: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        Promise.all(activeChildren.map((child) => child.exitCode !== null || child.signalCode !== null
+          ? Promise.resolve()
+          : new Promise<void>((resolvePromise) => child.once("close", () => resolvePromise())))),
+        new Promise<void>((resolvePromise) => { timeout = setTimeout(resolvePromise, 3_000); }),
+      ]);
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
     for (const child of activeChildren) terminate(child, true);
   })();
   return shutdown;
@@ -63,11 +79,25 @@ process.once("SIGTERM", () => { void stop(143); });
 if (process.platform !== "win32") process.once("SIGHUP", () => { void stop(129); });
 
 try {
+  if (invalidArguments) throw new Error(`Usage: npm ${production ? "start" : "run dev"} -- [workflow.somite.json]`);
   if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) throw new Error("SOMITE_PORT must be an integer from 1 to 65535");
+  if (!Number.isSafeInteger(webPort) || webPort < 1 || webPort > 65_535) throw new Error("PORT must be an integer from 1 to 65535");
   const modules = await lstat(join(projectRoot, "node_modules")).catch(() => undefined);
   if (!modules?.isDirectory()) throw new Error("Somite dependencies are missing. Run: npm ci");
-  runningServer = await startServer({ projectRoot, ...(graph ? { graph } : {}), port, host });
-  const web = launch(["run", "dev", "--workspace=somite-web"], {
+  if (production) {
+    const build = await lstat(join(projectRoot, "web", "dist", "server", "BUILD_ID")).catch(() => undefined);
+    if (!build?.isFile()) throw new Error("Somite's production web bundle is missing. Run: npm run build");
+  }
+  runningServer = await startServer({
+    projectRoot: workspaceRoot,
+    ...(graph ? { graph } : {}),
+    port,
+    host,
+    allowedOrigin: process.env.SOMITE_ALLOWED_ORIGIN ?? `http://localhost:${webPort}`,
+  });
+  const web = launch(production
+    ? ["run", "start", "--workspace=somite-web", "--", "--hostname", "127.0.0.1"]
+    : ["run", "dev", "--workspace=somite-web"], {
     ...process.env,
     NEXT_PUBLIC_SOMITE_SERVER: process.env.NEXT_PUBLIC_SOMITE_SERVER ?? runnerUrl,
   });

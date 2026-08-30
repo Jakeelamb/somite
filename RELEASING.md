@@ -22,11 +22,15 @@ Linux and macOS; Windows verification runs inside WSL2, not native Windows.
    git diff --check
    ```
 
-5. Run `pixi install --locked`, then launch `pixi run dev` from the clean
-   checkout. Verify runner health, a clean browser console, autosave, local file
-   import, catalog loading, Agent discovery, representative validation, and a
-   frozen export for the same graph revision.
-6. Review the README from a new-user perspective and verify every command,
+5. Run `pixi install --locked`, `pixi run setup`, and `pixi run smoke` from the
+   clean checkout. The smoke must start the already-built production app and
+   complete representative validation through the real `RunManager`, Pixi, and
+   Nextflow path without mocked executables.
+6. Launch `pixi run start` without rebuilding. Verify runner health, a clean
+   browser console, autosave, local file import, catalog loading, Agent
+   discovery, representative validation, and a frozen export for the same graph
+   revision.
+7. Review the README from a new-user perspective and verify every command,
    relative link, requirement, and limitation.
 
 ## Publish
@@ -39,8 +43,10 @@ git push origin v0.1.0
 ```
 
 `.github/workflows/release.yml` repeats the locked TypeScript gate, rejects a
-tag that does not match the workspace versions, and creates a GitHub release
-with generated notes. GitHub provides the source archives.
+tag that does not match the workspace versions, runs the real execution smoke,
+and creates a GitHub release with generated notes. GitHub's generated source
+archives are the only release artifacts; do not attach build directories or
+partially installable bundles.
 
 After publication, verify the release page, source archives, rendered README,
 license detection, and installation instructions from a fresh directory. Fix

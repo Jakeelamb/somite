@@ -11,19 +11,21 @@ permissions:
 jobs:
   release:
     name: Verify and publish
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - name: Check out tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - name: Set up locked Pixi environment
+        uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
         with:
-          node-version-file: .nvmrc
-          cache: npm
-          cache-dependency-path: package-lock.json
+          pixi-version: v0.77.1
+          locked: true
+          cache: true
+          cache-write: false
+          activate-environment: true
       - name: Verify tag and package versions
         shell: bash
         run: |
@@ -57,7 +59,10 @@ jobs:
         run: npm run lint
       - name: Build and test product
         run: npm test
-      - name: Create GitHub release
+      - name: Exercise production startup and real workflow execution
+        run: pixi run smoke
+      # GitHub's generated source archives are the only release artifacts.
+      - name: Create source-only GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-

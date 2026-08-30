@@ -23,20 +23,24 @@ same graph as a Nextflow workflow frozen with Pixi.
 
 ## Start Somite
 
-The shortest reproducible setup uses Pixi:
+For a normal local install, use Pixi to install and build once:
 
 ```bash
 git clone https://github.com/Jakeelamb/somite.git
 cd somite
 pixi run setup
-pixi run dev
+pixi run start
 ```
 
-Or use Node.js 22.13 or newer directly:
+Later launches use the existing production bundle, so `pixi run start` does not
+rebuild it. After pulling application changes, run `pixi run setup` again.
+
+Or use Node.js 22.13 or newer directly and keep the same build-once flow:
 
 ```bash
 npm ci
-npm run dev
+npm run build
+npm start
 ```
 
 Open <http://localhost:3000>. The launcher starts both the React app and the
@@ -44,8 +48,11 @@ TypeScript runner, waits for the runner to become healthy, and stops both
 process trees together. To open a specific graph:
 
 ```bash
-npm run dev -- path/to/workflow.somite.json
+npm start -- path/to/workflow.somite.json
 ```
+
+For active development, install once with `pixi run install`, then use
+`pixi run dev` for the hot-reloading server.
 
 Pixi is optional for browsing and editing. It is required to freeze and execute
 the generated Nextflow environment.
@@ -207,6 +214,11 @@ npm audit
 `npm run check` typechecks every workspace and the launcher, lints the browser,
 builds the production web bundle, and runs the runner, shared-workflow, and UI
 tests.
+
+Maintainers and CI also run `pixi run smoke`. This networked release gate starts
+the built application and executes a tiny FastQC validation through the real
+`RunManager`, Pixi lock/install, and Nextflow path; it does not use fake
+executables.
 
 Bug reports and user-outcome proposals are welcome through
 [GitHub Issues](https://github.com/Jakeelamb/somite/issues); workflow questions

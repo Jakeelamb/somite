@@ -9,6 +9,10 @@ platforms = ["linux-64", "linux-aarch64", "osx-64", "osx-arm64"]
 nodejs = ">=22.13,<23"
 
 [tasks]
-setup = "npm ci"
+install = "npm ci"
+build = "npm run build"
+setup = "npm ci && npm run build"
 dev = "npm run dev"
+start = "npm start"
+smoke = "npm run smoke:release"
 check = "npm run check"

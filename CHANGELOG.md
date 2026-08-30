@@ -33,6 +33,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   request guidance.
 - A source-release workflow that verifies the tag against both package versions
   before creating a GitHub release.
+- A build-once production launcher and gated POSIX release smoke that exercises
+  the real Pixi, Nextflow, representative-data, and `RunManager` execution path.
 - Security, contribution, conduct, and release-maintainer policies.
 
 ### Changed

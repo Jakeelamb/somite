@@ -16,10 +16,10 @@ outcome; implementation details should follow from that outcome.
 
 ## Development setup
 
-Use the checked-in Pixi environment:
+Use the checked-in Pixi environment for development:
 
 ```bash
-pixi run setup
+pixi run install
 pixi run dev
 ```
 
@@ -29,6 +29,9 @@ Or use Node.js from `.nvmrc` directly:
 npm ci
 npm run dev
 ```
+
+To exercise the production path, run `pixi run setup` once and then
+`pixi run start`. Starting the app reuses the built bundle.
 
 The repository is one npm workspace: `web/`, `runner/`, and
 `packages/workflow/`. Local graphs, uploads, evidence, and generated tool
@@ -63,6 +66,10 @@ git diff --check
 
 In the pull request, list exact commands and manual checks. If a check is
 unavailable, state that directly and explain why.
+
+Release-affecting changes also require `pixi run smoke` on a supported POSIX
+host. This is a slower networked gate because it resolves and executes the real
+pinned Pixi and Nextflow environment.
 
 ## License
 
