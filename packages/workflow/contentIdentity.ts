@@ -5,6 +5,22 @@ export function byteDigest(bytes: Uint8Array) {
   return `blake3:${bytesToHex(blake3(bytes))}`;
 }
 
+/** Incremental content identity for bounded streaming inputs. */
+export function createByteDigester() {
+  const hasher = blake3.create();
+  let result: string | undefined;
+  return {
+    update(bytes: Uint8Array) {
+      if (result) throw new Error("byte digester is already finalized");
+      hasher.update(bytes);
+    },
+    digest() {
+      result ??= `blake3:${bytesToHex(hasher.digest())}`;
+      return result;
+    },
+  };
+}
+
 export function jsonDigest(value: unknown) {
   return byteDigest(new TextEncoder().encode(JSON.stringify(value)));
 }

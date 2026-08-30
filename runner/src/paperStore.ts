@@ -1,11 +1,18 @@
-import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
-import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
+import Busboy from "busboy";
+import { createReadStream, createWriteStream } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { lstat, link, mkdir, open, readFile, realpath, unlink } from "node:fs/promises";
+import type { IncomingHttpHeaders, IncomingMessage } from "node:http";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 
-import { byteDigest } from "@somite/workflow/contentIdentity";
+import { byteDigest, createByteDigester } from "@somite/workflow/contentIdentity";
 import { atomicWrite, containedPath, ensurePrivateDirectory, pathExists, regularFile } from "./files.ts";
 import type { PaperMediaKind } from "./paperExtractor.ts";
 
 const MAX_PAPER_BYTES = 64 * 1024 * 1024;
+const MAX_MULTIPART_BYTES = MAX_PAPER_BYTES + 1024 * 1024;
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
 export type PaperArtifact = Readonly<{
@@ -37,12 +44,15 @@ export class PaperStoreError extends Error {
 }
 
 function safeFilename(value: string) {
-  const name = basename(value);
-  if (!name || name === "." || name === ".." || name.includes("\0")) throw new PaperStoreError(400, "paper_filename_invalid", "Paper filename is invalid.");
+  const name = basename(value.replaceAll("\\", "/"));
+  if (!name || name === "." || name === ".." || Buffer.byteLength(name) > 255
+    || [...name].some((character) => /[\p{Cc}\p{Cf}]/u.test(character))) {
+    throw new PaperStoreError(400, "paper_filename_invalid", "Paper filename is invalid.");
+  }
   return name;
 }
 
-function mediaKind(filename: string, contentType: string, bytes: Uint8Array): PaperMediaKind {
+function mediaKind(filename: string, contentType: string): PaperMediaKind {
   const extension = extname(filename).toLocaleLowerCase("en-US");
   const suppliedType = contentType.toLocaleLowerCase("en-US").split(";", 1)[0];
   const pdf = extension === ".pdf";
@@ -50,9 +60,17 @@ function mediaKind(filename: string, contentType: string, bytes: Uint8Array): Pa
   if ((!pdf && !text) || (pdf && suppliedType.startsWith("text/")) || (text && suppliedType === "application/pdf")) {
     throw new PaperStoreError(415, "paper_media_unsupported", "Choose a PDF, text, or Markdown paper with a matching filename.");
   }
-  if (pdf) {
-    if (bytes.length < 5 || new TextDecoder().decode(bytes.subarray(0, 5)) !== "%PDF-") throw new PaperStoreError(415, "paper_pdf_invalid", "The uploaded .pdf does not contain a PDF header.");
-    return "pdf";
+  return pdf ? "pdf" : "text";
+}
+
+function validatedMediaKind(filename: string, contentType: string, bytes: Uint8Array) {
+  const kind = mediaKind(filename, contentType);
+  if (!bytes.byteLength) throw new PaperStoreError(400, "paper_empty", "The paper file is empty.");
+  if (kind === "pdf") {
+    if (bytes.byteLength < 5 || new TextDecoder().decode(bytes.subarray(0, 5)) !== "%PDF-") {
+      throw new PaperStoreError(415, "paper_pdf_invalid", "The uploaded .pdf does not contain a PDF header.");
+    }
+    return kind;
   }
   if (bytes.includes(0)) throw new PaperStoreError(415, "paper_text_invalid", "Text and Markdown papers cannot contain binary zero bytes.");
   try {
@@ -60,17 +78,90 @@ function mediaKind(filename: string, contentType: string, bytes: Uint8Array): Pa
   } catch {
     throw new PaperStoreError(415, "paper_text_invalid", "Text and Markdown papers must contain valid UTF-8 text.");
   }
-  return "text";
+  return kind;
 }
 
-async function installImmutable(path: string, bytes: Uint8Array) {
+function validatingStream(kind: PaperMediaKind) {
+  const digester = createByteDigester();
+  const header = Buffer.alloc(5);
+  const textDecoder = kind === "text" ? new TextDecoder("utf-8", { fatal: true }) : undefined;
+  let headerBytes = 0;
+  let total = 0;
+  const stream = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      total += bytes.byteLength;
+      if (total > MAX_PAPER_BYTES) {
+        callback(new PaperStoreError(413, "paper_upload_too_large", `Paper upload exceeds ${MAX_PAPER_BYTES} bytes.`));
+        return;
+      }
+      digester.update(bytes);
+      if (headerBytes < header.byteLength) {
+        headerBytes += bytes.copy(header, headerBytes, 0, header.byteLength - headerBytes);
+      }
+      if (textDecoder) {
+        if (bytes.includes(0)) {
+          callback(new PaperStoreError(415, "paper_text_invalid", "Text and Markdown papers cannot contain binary zero bytes."));
+          return;
+        }
+        try {
+          textDecoder.decode(bytes, { stream: true });
+        } catch {
+          callback(new PaperStoreError(415, "paper_text_invalid", "Text and Markdown papers must contain valid UTF-8 text."));
+          return;
+        }
+      }
+      callback(null, bytes);
+    },
+    flush(callback) {
+      if (!total) {
+        callback(new PaperStoreError(400, "paper_empty", "The paper file is empty."));
+        return;
+      }
+      if (kind === "pdf" && (headerBytes < header.byteLength || header.toString("ascii") !== "%PDF-")) {
+        callback(new PaperStoreError(415, "paper_pdf_invalid", "The uploaded .pdf does not contain a PDF header."));
+        return;
+      }
+      if (kind === "text" && headerBytes === header.byteLength && header.toString("ascii") === "%PDF-") {
+        callback(new PaperStoreError(415, "paper_media_unsupported", "The paper filename does not match its PDF content."));
+        return;
+      }
+      try {
+        textDecoder?.decode();
+        callback();
+      } catch {
+        callback(new PaperStoreError(415, "paper_text_invalid", "Text and Markdown papers must contain valid UTF-8 text."));
+      }
+    },
+  });
+  return { stream, result: () => ({ digest: digester.digest(), size: total }) };
+}
+
+async function fileIdentity(path: string, expectedSize: number) {
+  const metadata = await lstat(path);
+  if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.size !== expectedSize) {
+    throw new PaperStoreError(409, "paper_object_conflict", "A stored paper object is not the expected regular file.");
+  }
+  const digester = createByteDigester();
+  for await (const chunk of createReadStream(path)) digester.update(chunk);
+  return digester.digest();
+}
+
+async function syncDirectory(path: string) {
+  const handle = await open(path, "r");
+  try { await handle.sync(); } finally { await handle.close(); }
+}
+
+async function installImmutable(temporary: string, destination: string, digest: string, size: number) {
   try {
-    await writeFile(path, bytes, { flag: "wx", mode: 0o600 });
+    await link(temporary, destination);
+    await unlink(temporary);
+    await syncDirectory(dirname(destination));
     return false;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    const existing = await regularFile(path, MAX_PAPER_BYTES, "stored paper");
-    if (existing.byteLength !== bytes.byteLength || byteDigest(existing) !== byteDigest(bytes)) throw new PaperStoreError(409, "paper_object_conflict", "A stored paper object does not match its content address.");
+    if (await fileIdentity(destination, size) !== digest) throw new PaperStoreError(409, "paper_object_conflict", "A stored paper object does not match its content address.");
+    await unlink(temporary);
     return true;
   }
 }
@@ -91,54 +182,133 @@ export class PaperStore {
     this.#root = resolve(root);
   }
 
-  async upload(request: Request): Promise<PaperArtifact> {
-    const announced = Number(request.headers.get("content-length") ?? 0);
-    if (Number.isFinite(announced) && announced > MAX_PAPER_BYTES + 1024 * 1024) throw new PaperStoreError(413, "paper_upload_too_large", `Paper upload exceeds ${MAX_PAPER_BYTES} bytes.`);
-    let form: FormData;
-    try {
-      form = await request.formData();
-    } catch (error) {
-      throw new PaperStoreError(400, "paper_multipart_invalid", `Paper upload is not valid multipart data: ${error instanceof Error ? error.message : String(error)}`);
-    }
-    const value = form.get("file");
-    if (!(value instanceof File)) throw new PaperStoreError(400, "paper_file_missing", "Multipart field file is required.");
-    if (!value.size) throw new PaperStoreError(400, "paper_empty", "The paper file is empty.");
-    if (value.size > MAX_PAPER_BYTES) throw new PaperStoreError(413, "paper_upload_too_large", `Paper upload exceeds ${MAX_PAPER_BYTES} bytes.`);
-    const filename = safeFilename(value.name);
-    const bytes = new Uint8Array(await value.arrayBuffer());
-    if (bytes.byteLength !== value.size) throw new PaperStoreError(400, "paper_upload_changed", "Paper upload changed while it was read.");
-    const kind = mediaKind(filename, value.type, bytes);
-    const digest = byteDigest(bytes);
-    const identity = digest.slice("blake3:".length);
+  receive(request: IncomingMessage) {
+    return this.#receiveMultipart(request, request.headers);
+  }
+
+  upload(request: Request) {
+    const headers: IncomingHttpHeaders = {};
+    request.headers.forEach((value, key) => { headers[key] = value; });
+    const source = request.body
+      ? Readable.fromWeb(request.body as import("node:stream/web").ReadableStream)
+      : Readable.from([]);
+    return this.#receiveMultipart(source, headers);
+  }
+
+  async #receiveMultipart(source: Readable, headers: IncomingHttpHeaders): Promise<PaperArtifact> {
+    const announced = Number(headers["content-length"] ?? 0);
+    if (Number.isFinite(announced) && announced > MAX_MULTIPART_BYTES) throw new PaperStoreError(413, "paper_upload_too_large", `Paper upload exceeds ${MAX_PAPER_BYTES} bytes.`);
     const objects = await ensurePrivateDirectory(this.#root, ".somite/papers/objects");
-    const directory = join(objects, identity);
-    await mkdir(directory, { mode: 0o700, recursive: false }).catch((error) => {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    let temporary: string | undefined;
+    let uploaded: { filename: string; kind: PaperMediaKind; digest: string; size: number } | undefined;
+    let fileWrite: Promise<void> | undefined;
+    let files = 0;
+    let received = 0;
+    let rejected: PaperStoreError | undefined;
+    const parser = (() => {
+      try {
+        return Busboy({
+          headers,
+          limits: { fileSize: MAX_PAPER_BYTES + 1, files: 2, fields: 1, parts: 3, headerPairs: 100 },
+        });
+      } catch (error) {
+        throw new PaperStoreError(400, "paper_multipart_invalid", `Paper upload is not valid multipart data: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    })();
+    const parsed = new Promise<void>((resolvePromise, rejectPromise) => {
+      source.on("data", (chunk: Buffer) => {
+        received += chunk.byteLength;
+        if (received > MAX_MULTIPART_BYTES) {
+          source.destroy(new PaperStoreError(413, "paper_upload_too_large", `Paper upload exceeds ${MAX_PAPER_BYTES} bytes.`));
+        }
+      });
+      source.once("error", (error) => rejectPromise(error instanceof PaperStoreError
+        ? error
+        : new PaperStoreError(400, "paper_multipart_invalid", error.message)));
+      parser.once("error", (error: Error) => rejectPromise(new PaperStoreError(400, "paper_multipart_invalid", error.message)));
+      parser.once("filesLimit", () => { rejected = new PaperStoreError(400, "paper_file_invalid", "Paper upload must contain exactly one file field."); });
+      parser.once("fieldsLimit", () => { rejected = new PaperStoreError(400, "paper_field_invalid", "Paper upload may not contain form fields."); });
+      parser.once("partsLimit", () => { rejected = new PaperStoreError(400, "paper_file_invalid", "Paper upload must contain exactly one file part."); });
+      parser.on("field", () => { rejected = new PaperStoreError(400, "paper_field_invalid", "Paper upload may not contain form fields."); });
+      parser.on("file", (field, stream, information) => {
+        files += 1;
+        if (field !== "file" || files !== 1) {
+          rejected = new PaperStoreError(400, "paper_file_invalid", "Paper upload must contain exactly one field named file.");
+          stream.resume();
+          return;
+        }
+        let filename: string;
+        let kind: PaperMediaKind;
+        try {
+          filename = safeFilename(information.filename);
+          kind = mediaKind(filename, information.mimeType);
+        } catch (error) {
+          rejected = error instanceof PaperStoreError ? error : new PaperStoreError(400, "paper_file_invalid", String(error));
+          stream.resume();
+          return;
+        }
+        temporary = join(objects, `.paper-upload-${process.pid}-${randomUUID()}`);
+        const destination = createWriteStream(temporary, { flags: "wx", mode: 0o600 });
+        const validator = validatingStream(kind);
+        let limited = false;
+        stream.once("limit", () => { limited = true; });
+        fileWrite = pipeline(stream, validator.stream, destination).then(async () => {
+          const metadata = await lstat(temporary!);
+          if (limited || stream.truncated || metadata.size > MAX_PAPER_BYTES) {
+            throw new PaperStoreError(413, "paper_upload_too_large", `Paper upload exceeds ${MAX_PAPER_BYTES} bytes.`);
+          }
+          const result = validator.result();
+          if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.size !== result.size) {
+            throw new PaperStoreError(400, "paper_upload_changed", "Paper upload changed while it was stored.");
+          }
+          const handle = await open(temporary!, "r");
+          try { await handle.sync(); } finally { await handle.close(); }
+          uploaded = { filename, kind, digest: result.digest, size: result.size };
+        });
+        fileWrite.catch(rejectPromise);
+      });
+      parser.once("close", resolvePromise);
     });
-    const metadata = await lstat(directory);
-    if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new PaperStoreError(409, "paper_object_invalid", "Paper object directory is not a regular directory.");
-    const destination = join(directory, kind === "pdf" ? "payload.pdf" : "payload.txt");
-    const reused = await installImmutable(destination, bytes);
-    const record: StoredArtifact = { schema_version: 1, digest, size_bytes: bytes.byteLength, media_kind: kind };
-    const metadataPath = join(directory, "artifact.json");
-    if (await pathExists(metadataPath)) {
-      const existing = storedArtifact(JSON.parse(await readFile(metadataPath, "utf8")));
-      if (JSON.stringify(existing) !== JSON.stringify(record)) throw new PaperStoreError(409, "paper_object_conflict", "Stored paper metadata does not match its content address.");
-    } else {
-      await atomicWrite(metadataPath, `${JSON.stringify(record, null, 2)}\n`);
+    source.pipe(parser);
+    try {
+      await parsed;
+      if (fileWrite) await fileWrite;
+      if (rejected) throw rejected;
+      if (files !== 1 || !temporary || !uploaded) throw new PaperStoreError(400, "paper_file_missing", "Multipart field file is required.");
+      const { digest, filename, kind, size } = uploaded;
+      const identity = digest.slice("blake3:".length);
+      const directory = join(objects, identity);
+      await mkdir(directory, { mode: 0o700, recursive: false }).catch((error) => {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      });
+      const metadata = await lstat(directory);
+      if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new PaperStoreError(409, "paper_object_invalid", "Paper object directory is not a regular directory.");
+      const destination = join(directory, kind === "pdf" ? "payload.pdf" : "payload.txt");
+      const reused = await installImmutable(temporary, destination, digest, size);
+      temporary = undefined;
+      const record: StoredArtifact = { schema_version: 1, digest, size_bytes: size, media_kind: kind };
+      const metadataPath = join(directory, "artifact.json");
+      if (await pathExists(metadataPath)) {
+        const existing = storedArtifact(JSON.parse(await readFile(metadataPath, "utf8")));
+        if (JSON.stringify(existing) !== JSON.stringify(record)) throw new PaperStoreError(409, "paper_object_conflict", "Stored paper metadata does not match its content address.");
+      } else {
+        await atomicWrite(metadataPath, `${JSON.stringify(record, null, 2)}\n`);
+      }
+      const displayDirectory = await ensurePrivateDirectory(this.#root, `.somite/papers/display-names/${identity}`);
+      const displayIdentity = byteDigest(new TextEncoder().encode(filename)).slice("blake3:".length);
+      const displayPath = join(displayDirectory, `${displayIdentity}.json`);
+      if (!await pathExists(displayPath)) await atomicWrite(displayPath, `${JSON.stringify({ schema_version: 1, digest, filename }, null, 2)}\n`);
+      return {
+        digest,
+        path: relative(this.#root, destination).split("\\").join("/"),
+        filename,
+        size_bytes: size,
+        media_kind: kind,
+        reused,
+      };
+    } finally {
+      if (temporary) await unlink(temporary).catch(() => undefined);
     }
-    const displayDirectory = await ensurePrivateDirectory(this.#root, `.somite/papers/display-names/${identity}`);
-    const displayIdentity = byteDigest(new TextEncoder().encode(filename)).slice("blake3:".length);
-    const displayPath = join(displayDirectory, `${displayIdentity}.json`);
-    if (!await pathExists(displayPath)) await atomicWrite(displayPath, `${JSON.stringify({ schema_version: 1, digest, filename }, null, 2)}\n`);
-    return {
-      digest,
-      path: relative(this.#root, destination),
-      filename,
-      size_bytes: bytes.byteLength,
-      media_kind: kind,
-      reused,
-    };
   }
 
   async resolveDigest(digest: string) {
@@ -166,7 +336,7 @@ export class PaperStore {
     if (!shown || shown.startsWith("..") || isAbsolute(shown)) throw new PaperStoreError(403, "paper_path_outside_project", "Paper path must stay inside this project.");
     const bytes = await regularFile(destination, MAX_PAPER_BYTES, "paper");
     const filename = safeFilename(destination);
-    const kind = mediaKind(filename, "", bytes);
+    const kind = validatedMediaKind(filename, "", bytes);
     return { bytes, mediaKind: kind, filename, path: destination };
   }
 }

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import test from "node:test";
 
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
@@ -75,6 +76,53 @@ test("content-addressed PDF intake extracts through the isolated worker", async 
   }
 });
 
+test("oversized extraction caches are ignored and replaced within the byte bound", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "somite-paper-cache-bound-"));
+  try {
+    const manager = new PaperManager(root, loaded.catalog, loaded.revision);
+    const methods = "Methods\nRNA-seq reads were quality checked with FastQC and aligned with STAR.";
+    const artifact = await manager.store.upload(uploadRequest("methods.txt", methods));
+    const cacheDirectory = path.join(root, ".somite", "papers", "cache", "extracted");
+    await mkdir(cacheDirectory, { recursive: true });
+    const cachePath = path.join(cacheDirectory, `${artifact.digest.slice("blake3:".length)}-pdfjs-v1.json`);
+    await writeFile(cachePath, "");
+    await truncate(cachePath, 72 * 1024 * 1024 + 1);
+
+    const started = await manager.start(artifact.digest);
+    const status = await completed(manager, started.job_id);
+    assert.equal(status.phase, "completed");
+    assert.equal(status.cache.extraction, false);
+    assert.ok((await stat(cachePath)).size < 72 * 1024 * 1024);
+    await manager.shutdown();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("reconstruction cache prunes least-recent entries instead of growing without bound", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "somite-paper-reconstruction-cache-"));
+  try {
+    const manager = new PaperManager(root, loaded.catalog, loaded.revision);
+    const digests: string[] = [];
+    for (let index = 0; index < 17; index += 1) {
+      const methods = `Methods\nSample ${index} RNA-seq reads were quality checked with FastQC and aligned with STAR.`;
+      const artifact = await manager.store.upload(uploadRequest(`methods-${index}.txt`, methods));
+      digests.push(artifact.digest);
+      const status = await completed(manager, (await manager.start(artifact.digest)).job_id);
+      assert.equal(status.phase, "completed");
+      assert.equal(status.cache.reconstruction, false);
+    }
+
+    const first = await completed(manager, (await manager.start(digests[0]!)).job_id);
+    assert.deepEqual(first.cache, { extraction: true, reconstruction: false });
+    const newest = await completed(manager, (await manager.start(digests.at(-1)!)).job_id);
+    assert.deepEqual(newest.cache, { extraction: true, reconstruction: true });
+    await manager.shutdown();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("paper cancellation reaches a terminal observable state", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "somite-paper-cancel-"));
   try {
@@ -101,6 +149,40 @@ test("paper upload rejects disguised and unsupported files before storage", asyn
     await assert.rejects(
       () => manager.store.upload(uploadRequest("paper.csv", "a,b\n1,2", "text/csv")),
       (error: unknown) => error instanceof PaperStoreError && error.code === "paper_media_unsupported",
+    );
+    await assert.rejects(
+      () => manager.store.upload(uploadRequest("disguised.txt", "%PDF-1.7\n", "text/plain")),
+      (error: unknown) => error instanceof PaperStoreError && error.code === "paper_media_unsupported",
+    );
+    const oversized = new Request("http://localhost/api/papers/uploads", {
+      method: "POST",
+      headers: {
+        "content-type": "multipart/form-data; boundary=somite-test",
+        "content-length": String(65 * 1024 * 1024 + 1),
+      },
+      body: "--somite-test--\r\n",
+    });
+    await assert.rejects(
+      () => manager.store.upload(oversized),
+      (error: unknown) => error instanceof PaperStoreError && error.status === 413 && error.code === "paper_upload_too_large",
+    );
+
+    const boundary = "somite-unbounded-field";
+    const megabyte = Buffer.alloc(1024 * 1024, "A");
+    async function* oversizedChunkedBody() {
+      yield Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="notes"\r\n\r\n`);
+      for (let index = 0; index < 66; index += 1) yield megabyte;
+      yield Buffer.from(`\r\n--${boundary}--\r\n`);
+    }
+    const chunked = new Request("http://localhost/api/papers/uploads", {
+      method: "POST",
+      headers: { "content-type": `multipart/form-data; boundary=${boundary}` },
+      body: Readable.toWeb(Readable.from(oversizedChunkedBody())),
+      duplex: "half",
+    } as RequestInit & { duplex: "half" });
+    await assert.rejects(
+      () => manager.store.upload(chunked),
+      (error: unknown) => error instanceof PaperStoreError && error.status === 413 && error.code === "paper_upload_too_large",
     );
   } finally {
     await rm(root, { recursive: true, force: true });

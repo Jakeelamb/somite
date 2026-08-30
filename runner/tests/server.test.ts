@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer, request as httpRequest } from "node:http";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { byteDigest } from "@somite/workflow/contentIdentity";
 import { startServer } from "../src/server.ts";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
@@ -105,6 +106,33 @@ test("the TypeScript runner serves the browser session, streaming uploads, and l
   } finally {
     child.kill("SIGTERM");
     await once(child, "close").catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("paper upload streams past the global JSON body limit into content-addressed storage", async () => {
+  const root = await mkdtemp(join(tmpdir(), "somite-runner-paper-stream-"));
+  const running = await startServer({ projectRoot: root, port: await unusedPort() });
+  try {
+    const bytes = new Uint8Array(17 * 1024 * 1024 + 137);
+    bytes.fill("A".charCodeAt(0));
+    const form = new FormData();
+    form.set("file", new Blob([bytes], { type: "text/plain" }), "large-methods.txt");
+    const response = await fetch(`${running.url}/api/papers/uploads`, {
+      method: "POST",
+      headers: { origin: "http://localhost:3000" },
+      body: form,
+    });
+    assert.equal(response.status, 200, await response.clone().text());
+    const artifact = await response.json() as { digest: string; path: string; size_bytes: number; media_kind: string; reused: boolean };
+    assert.equal(artifact.size_bytes, bytes.byteLength);
+    assert.equal(artifact.size_bytes > 16 * 1024 * 1024, true);
+    assert.equal(artifact.digest, byteDigest(bytes));
+    assert.equal(artifact.media_kind, "text");
+    assert.equal(artifact.reused, false);
+    assert.equal((await stat(join(root, artifact.path))).size, bytes.byteLength);
+  } finally {
+    await running.close();
     await rm(root, { recursive: true, force: true });
   }
 });

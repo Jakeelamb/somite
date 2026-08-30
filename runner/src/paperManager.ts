@@ -1,4 +1,3 @@
-import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 
@@ -57,8 +56,11 @@ const EXTRACTOR_REVISION = "pdfjs-v1";
 const RECONSTRUCTOR_REVISION = "typed-paper-v1";
 const MAX_JOBS = 8;
 const MAX_EXTRACTION_CACHE_BYTES = 72 * 1024 * 1024;
+const MAX_RECONSTRUCTION_CACHE_ENTRIES = 16;
+const MAX_RECONSTRUCTION_CACHE_BYTES = 16 * 1024 * 1024;
 const terminal = new Set<PaperIntakePhase>(["completed", "failed", "cancelled"]);
 const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 
 function now() {
   return performance.now();
@@ -100,10 +102,11 @@ export class PaperManager {
   readonly #catalogRevision: string;
   readonly #jobs = new Map<string, PaperJob>();
   readonly #replays = new Map<string, { digest: string; jobId: string }>();
-  readonly #reconstructionCache = new Map<string, PaperReview>();
+  readonly #reconstructionCache = new Map<string, { review: PaperReview; bytes: number }>();
   readonly #pending: PaperJob[] = [];
   readonly #executions = new Set<Promise<void>>();
   #active = 0;
+  #reconstructionCacheBytes = 0;
 
   constructor(root: string, catalog: OperatorCatalog, catalogRevision: string) {
     this.#root = root;
@@ -199,6 +202,34 @@ export class PaperManager {
     }
   }
 
+  #cachedReconstruction(key: string) {
+    const entry = this.#reconstructionCache.get(key);
+    if (!entry) return undefined;
+    this.#reconstructionCache.delete(key);
+    this.#reconstructionCache.set(key, entry);
+    return entry.review;
+  }
+
+  #cacheReconstruction(key: string, review: PaperReview) {
+    const bytes = Buffer.byteLength(JSON.stringify(review));
+    if (bytes > MAX_RECONSTRUCTION_CACHE_BYTES) return;
+    const replaced = this.#reconstructionCache.get(key);
+    if (replaced) {
+      this.#reconstructionCache.delete(key);
+      this.#reconstructionCacheBytes -= replaced.bytes;
+    }
+    while (this.#reconstructionCache.size >= MAX_RECONSTRUCTION_CACHE_ENTRIES
+      || this.#reconstructionCacheBytes + bytes > MAX_RECONSTRUCTION_CACHE_BYTES) {
+      const oldest = this.#reconstructionCache.keys().next().value;
+      if (oldest === undefined) break;
+      const removed = this.#reconstructionCache.get(oldest)!;
+      this.#reconstructionCache.delete(oldest);
+      this.#reconstructionCacheBytes -= removed.bytes;
+    }
+    this.#reconstructionCache.set(key, { review, bytes });
+    this.#reconstructionCacheBytes += bytes;
+  }
+
   #touch(job: PaperJob) {
     job.revision += 1;
     for (const waiter of [...job.waiters]) waiter();
@@ -232,7 +263,8 @@ export class PaperManager {
     const cachePath = join(directory, `${job.status.source_digest.slice("blake3:".length)}-${EXTRACTOR_REVISION}.json`);
     if (await pathExists(cachePath)) {
       try {
-        const cached = extractionCache(JSON.parse(await readFile(cachePath, "utf8")), job.status.source_digest);
+        const bytes = await regularFile(cachePath, MAX_EXTRACTION_CACHE_BYTES, "paper extraction cache");
+        const cached = extractionCache(JSON.parse(decoder.decode(bytes)), job.status.source_digest);
         if (cached) {
           job.status.cache.extraction = true;
           return { text: cached.text, extractedVia: cached.extracted_via, ...(cached.pages ? { pages: cached.pages } : {}) };
@@ -263,7 +295,8 @@ export class PaperManager {
       text: extracted.text,
       ...(extracted.pages ? { pages: extracted.pages } : {}),
     };
-    await atomicWrite(cachePath, `${JSON.stringify(cached)}\n`);
+    const serialized = encoder.encode(`${JSON.stringify(cached)}\n`);
+    if (serialized.byteLength <= MAX_EXTRACTION_CACHE_BYTES) await atomicWrite(cachePath, serialized);
     return extracted;
   }
 
@@ -291,11 +324,11 @@ export class PaperManager {
       const reconstructionStarted = now();
       const textDigest = byteDigest(encoder.encode(extracted.text));
       const reconstructionKey = canonicalJsonDigest({ textDigest, catalogRevision: this.#catalogRevision, reconstructorRevision: RECONSTRUCTOR_REVISION });
-      let review = this.#reconstructionCache.get(reconstructionKey);
+      let review = this.#cachedReconstruction(reconstructionKey);
       if (review) job.status.cache.reconstruction = true;
       else {
         review = reconstructPaper(this.#catalog, extracted.text, extracted.extractedVia);
-        this.#reconstructionCache.set(reconstructionKey, review);
+        this.#cacheReconstruction(reconstructionKey, review);
       }
       job.status.durations_ms.reconstruction = elapsed(reconstructionStarted);
       if (job.controller.signal.aborted) throw new PaperExtractionError("paper_extraction_cancelled", "Paper intake was cancelled.", true);

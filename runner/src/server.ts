@@ -919,9 +919,6 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
   if (request.method === "POST" && url.pathname === "/api/paper/resources/resolve") {
     return json(await resolvePaperResources(state, await requestJson(request)));
   }
-  if (request.method === "POST" && url.pathname === "/api/papers/uploads") {
-    return json(await state.papers.store.upload(request));
-  }
   if (request.method === "POST" && url.pathname === "/api/papers/intakes") {
     const body = object(await requestJson(request), "paper intake request");
     knownFields(body, "paper intake request", ["digest"]);
@@ -1167,13 +1164,17 @@ export async function startServer(options: ServerOptions = {}) {
   const loopbackHost = host === "::1" ? "[::1]" : host;
   const state = await initializeProject(`http://${loopbackHost}:${port}`, options);
   const server = createServer(async (incoming, outgoing) => {
-    const isFileUpload = incoming.method === "POST" && new URL(incoming.url ?? "/", `http://${incoming.headers.host ?? `127.0.0.1:${port}`}`).pathname === "/api/files";
-    const request = isFileUpload ? uploadRequest(incoming) : nodeRequest(incoming);
+    const pathname = new URL(incoming.url ?? "/", `http://${incoming.headers.host ?? `127.0.0.1:${port}`}`).pathname;
+    const isFileUpload = incoming.method === "POST" && pathname === "/api/files";
+    const isPaperUpload = incoming.method === "POST" && pathname === "/api/papers/uploads";
+    const request = isFileUpload || isPaperUpload ? uploadRequest(incoming) : nodeRequest(incoming);
     let response: Response;
     try {
       authorizeRequest(request, state);
       if (isFileUpload) {
         response = json(await state.uploads.receive(incoming));
+      } else if (isPaperUpload) {
+        response = json(await state.papers.store.receive(incoming));
       } else response = await route(request, state);
     } catch (error) {
       response = error instanceof HttpError
