@@ -75,6 +75,14 @@ test("TypeScript runner freezes, executes, traces, validates, and exports one pa
     assert.equal(validation.evidence_receipt?.fixture_digests.length, 1);
     const evidence = await manager.validationStatus(graph);
     assert.equal(evidence.receipt?.receipt_digest, validation.evidence_receipt?.receipt_digest);
+    const receiptPath = join(
+      project.root,
+      ".somite",
+      "evidence",
+      "receipts",
+      `${validation.evidence_receipt!.receipt_digest.slice("blake3:".length)}.json`,
+    );
+    assert.equal(JSON.parse(await readFile(receiptPath, "utf8")).receipt_digest, validation.evidence_receipt?.receipt_digest);
 
     const exported = await manager.export(graph, { archiveName: "RNA seq", platform: "linux-64" });
     assert.equal(exported.filename, "RNA-seq.somite-run.zip");
@@ -126,6 +134,24 @@ test("runner shutdown cancels active workflow process trees before returning", a
   } finally {
     delete process.env.SOMITE_MOCK_RUN_DELAY_MS;
     process.env.PATH = previousPath;
+    await rm(project.root, { recursive: true, force: true });
+  }
+});
+
+test("evidence lookup fails closed when its durable index is malformed", async () => {
+  const project = await mockProject();
+  try {
+    const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+    const manager = new RunManager(project.root, repositoryRoot, catalog);
+    const evidenceDirectory = join(project.root, ".somite", "evidence");
+    await import("node:fs/promises").then(({ mkdir }) => mkdir(evidenceDirectory, { recursive: true }));
+    await writeFile(join(evidenceDirectory, "index.json"), "{not valid json\n", "utf8");
+
+    await assert.rejects(
+      manager.evidence("blake3:subject"),
+      /evidence index is malformed/,
+    );
+  } finally {
     await rm(project.root, { recursive: true, force: true });
   }
 });

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { atomicWrite, containedPath } from "../src/files.ts";
+import { atomicWrite, containedPath, immutableWrite } from "../src/files.ts";
 
 test("contained paths reject traversal and atomic writes reject symlinked parents", { skip: process.platform === "win32" }, async () => {
   const root = await mkdtemp(join(tmpdir(), "somite-files-root-"));
@@ -16,6 +16,9 @@ test("contained paths reject traversal and atomic writes reject symlinked parent
     await mkdir(join(root, "safe"));
     await atomicWrite(join(root, "safe", "value.txt"), "safe\n");
     assert.equal(await readFile(join(root, "safe", "value.txt"), "utf8"), "safe\n");
+    await immutableWrite(join(root, "safe", "receipt.json"), "first\n");
+    await assert.rejects(immutableWrite(join(root, "safe", "receipt.json"), "second\n"), { code: "EEXIST" });
+    assert.equal(await readFile(join(root, "safe", "receipt.json"), "utf8"), "first\n");
 
     await writeFile(join(outside, "preserve.txt"), "preserve\n");
     await symlink(outside, join(root, "linked"));

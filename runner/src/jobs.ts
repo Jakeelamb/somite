@@ -19,7 +19,7 @@ import {
   type FrozenPackage,
 } from "@somite/workflow/bundle";
 import { OperatorCatalog } from "@somite/workflow/catalog";
-import { byteDigest, canonicalJsonValue } from "@somite/workflow/contentIdentity";
+import { byteDigest } from "@somite/workflow/contentIdentity";
 import {
   bindRepresentativeFastq,
   type FixtureBinding,
@@ -27,15 +27,13 @@ import {
 } from "@somite/workflow/fixtures";
 import {
   createEvidenceReceipt,
-  emptyEvidenceIndex,
-  insertEvidence,
-  type EvidenceIndex,
   type EvidenceReceipt,
   type EvidenceResult,
 } from "@somite/workflow/linker";
 import type { SomiteGraph } from "@somite/workflow/model";
 import { compileNextflow, PINNED_NEXTFLOW_VERSION, PINNED_OPENJDK_VERSION } from "@somite/workflow/nextflow";
 import { semanticGraphRevision } from "@somite/workflow/workflow";
+import { EvidenceStore } from "./evidenceStore.ts";
 import { executablePath, pixiPlatform } from "./system.ts";
 
 export type RunPhase = "preparing" | "running" | "finalizing" | "completed" | "failed" | "cancelling" | "cancelled";
@@ -265,17 +263,6 @@ async function digestsForPaths(paths: readonly string[]) {
   return Promise.all([...paths].sort().map(fileDigest));
 }
 
-async function readEvidenceIndex(path: string): Promise<EvidenceIndex> {
-  try {
-    const value = JSON.parse(await readFile(path, "utf8")) as EvidenceIndex;
-    if (value.schema_version === 1 && Array.isArray(value.receipts)) return value;
-  } catch {
-    // A missing index starts empty. Malformed content is replaced only after a
-    // new receipt has been fully constructed.
-  }
-  return emptyEvidenceIndex();
-}
-
 async function materializeFixtureObject(projectRoot: string, sourcePath: string): Promise<MaterializedFastqFixture> {
   const bytes = await readFile(sourcePath);
   const digest = byteDigest(bytes);
@@ -298,6 +285,7 @@ export class RunManager {
   readonly #projectRoot: string;
   readonly #repositoryRoot: string;
   readonly #catalog: OperatorCatalog;
+  readonly #evidence: EvidenceStore;
   readonly #jobs = new Map<string, RunJob>();
   readonly #startReplays = new Map<string, { request: string; result: RunStart }>();
   readonly #executions = new Set<Promise<void>>();
@@ -306,6 +294,7 @@ export class RunManager {
     this.#projectRoot = projectRoot;
     this.#repositoryRoot = repositoryRoot;
     this.#catalog = catalog;
+    this.#evidence = new EvidenceStore(projectRoot);
   }
 
   async start(graph: SomiteGraph, intent: "run" | "validation", idempotencyKey?: string): Promise<RunStart> {
@@ -401,8 +390,7 @@ export class RunManager {
 
   async validationStatus(graph: SomiteGraph) {
     const validation = await this.#validationContext(graph);
-    const index = await readEvidenceIndex(join(this.#projectRoot, ".somite", "evidence", "index.json"));
-    const receipt = [...index.receipts].reverse().find((candidate) => candidate.subject_digest === validation.subjectDigest
+    const receipt = [...await this.#evidence.forSubject(validation.subjectDigest)].reverse().find((candidate) => candidate.subject_digest === validation.subjectDigest
       && candidate.configuration_digest === validation.binding.configuration_digest);
     return {
       subject_digest: validation.subjectDigest,
@@ -453,8 +441,7 @@ export class RunManager {
   }
 
   async evidence(subjectDigest: string) {
-    const index = await readEvidenceIndex(join(this.#projectRoot, ".somite", "evidence", "index.json"));
-    return { subject_digest: subjectDigest, receipts: index.receipts.filter((receipt) => receipt.subject_digest === subjectDigest) };
+    return { subject_digest: subjectDigest, receipts: await this.#evidence.forSubject(subjectDigest) };
   }
 
   async export(graph: SomiteGraph, target: ExportTarget) {
@@ -619,12 +606,7 @@ export class RunManager {
       artifact_digests: await digestsForPaths(artifactFiles),
       log_digests: await digestsForPaths(logFiles),
     });
-    const projectIndexPath = join(this.#projectRoot, ".somite", "evidence", "index.json");
-    const index = insertEvidence(await readEvidenceIndex(projectIndexPath), receipt);
-    await mkdir(join(projectIndexPath, ".."), { recursive: true });
-    const encoded = `${JSON.stringify(canonicalJsonValue(index), null, 2)}\n`;
-    await writeFile(projectIndexPath, encoded);
-    await writeFile(join(job.packagePath, "evidence", "index.json"), encoded);
+    await this.#evidence.append(receipt, join(job.packagePath, "evidence"));
     this.#update(job, { phase: terminalPhase, evidence_receipt: receipt });
   }
 
