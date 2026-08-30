@@ -61,6 +61,7 @@ import { formatResourceBytes } from "./readinessState";
 import { nextPaperReadSlot, paperAttentionItems, paperParameterValue, paperResourceApplied, paperSupportedCount } from "./paperResolution";
 import { formatPaperElapsed, paperCandidateCanApply, paperIntakeIsBusy, paperIntakePresentation, paperUnsupportedMentions, type PaperIntakeState } from "./paperIntake";
 import { paperReadingPresentation } from "./paperReading";
+import { publicSourceOutcome, type PublicSourceFailures } from "./publicSourceSearch";
 import { catalogExpansionPresentation, type CatalogExpansionActivity } from "./catalogExpansion";
 import type { WorkflowCatalogLoadState } from "./backgroundRequests";
 import {
@@ -521,11 +522,14 @@ export function LibraryPanel({
   const [sourceResults, setSourceResults] = useState<SourceSearchResult[]>([]);
   const [sourceSearching, setSourceSearching] = useState(false);
   const [sourceSearched, setSourceSearched] = useState(false);
+  const [sourceFailures, setSourceFailures] = useState<PublicSourceFailures>({});
+  const [sourceRetry, setSourceRetry] = useState(0);
   const [activeSourceResult, setActiveSourceResult] = useState(0);
   const sections = useMemo(
     () => buildSections(operators, filterQuery, favorites, recent, continuation),
     [continuation, favorites, filterQuery, operators, recent],
   );
+  const sourceOutcome = publicSourceOutcome(sourceSearching, sourceSearched, sourceResults.length, sourceFailures);
 
   useEffect(() => {
     const sourceQuery = filterQuery.trim();
@@ -535,12 +539,14 @@ export function LibraryPanel({
         setSourceResults([]);
         setSourceSearching(false);
         setSourceSearched(false);
+        setSourceFailures({});
         setActiveSourceResult(0);
         return;
       }
       setSourceResults([]);
       setSourceSearching(true);
       setSourceSearched(false);
+      setSourceFailures({});
       setActiveSourceResult(0);
       let pending = 2;
       for (const provider of ["ncbi", "ensembl"] as const) {
@@ -554,7 +560,13 @@ export function LibraryPanel({
               ...response.results,
             ]);
           })
-          .catch(() => undefined)
+          .catch((error: unknown) => {
+            if (controller.signal.aborted) return;
+            setSourceFailures((current) => ({
+              ...current,
+              [provider]: (error instanceof Error ? error.message : "provider request failed").slice(0, 240),
+            }));
+          })
           .finally(() => {
             if (controller.signal.aborted) return;
             pending -= 1;
@@ -569,12 +581,13 @@ export function LibraryPanel({
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [continuation, filterQuery]);
+  }, [continuation, filterQuery, sourceRetry]);
 
   const chooseSource = (source: SourceRequest) => {
     onAddSource(source);
     onQuery("");
     setSourceResults([]);
+    setSourceFailures({});
     setActiveSourceResult(0);
   };
 
@@ -648,17 +661,18 @@ export function LibraryPanel({
               ))}
             </div>
           )}
-          <div className={`source-preview ${request ? "valid" : ""}`} aria-live="polite">
+          <div className={`source-preview ${request ? "valid" : ""} tone-${sourceOutcome.tone}`} aria-live="polite">
             {request ? (
               <><strong>{request.provider}</strong><code>{request.value}</code><span>{request.result}</span></>
-            ) : sourceSearching ? (
-              <span>Searching live NCBI and Ensembl records…</span>
-            ) : sourceSearched && !sourceResults.length ? (
-              <span>No public data matches · tools and workflows remain below</span>
             ) : (
-              <span>Searching public data alongside the local catalog…</span>
+              <span>{sourceOutcome.message}</span>
             )}
           </div>
+          {!sourceSearching && sourceOutcome.failed.length > 0 && <div className="source-provider-status" role="status">
+            <CircleAlert size={13} aria-hidden="true" />
+            <span><strong>{sourceOutcome.failed.map((provider) => provider === "ncbi" ? "NCBI" : "Ensembl").join(" + ")} unavailable</strong><small>{sourceOutcome.failed.map((provider) => sourceFailures[provider]).filter(Boolean).join(" · ")}</small></span>
+            <button type="button" onClick={() => setSourceRetry((current) => current + 1)}>Retry</button>
+          </div>}
           {request && <button type="button" className="source-action" onClick={() => chooseSource(request)}>{request.action}</button>}
         </section>
       )}

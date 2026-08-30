@@ -620,6 +620,13 @@ button:disabled { cursor: default; opacity: .42; }
 .source-preview strong { color: var(--accent); }
 .source-preview code { overflow: hidden; color: var(--text); font: 9px var(--font-readout), monospace; text-overflow: ellipsis; white-space: nowrap; }
 .source-preview span { grid-column: 1 / -1; line-height: 1.45; }
+.source-preview.tone-degraded, .source-preview.tone-unavailable { color: var(--text); }
+.source-provider-status { margin-top: 7px; padding: 7px 8px; display: grid; grid-template-columns: 13px minmax(0, 1fr) auto; gap: 7px; align-items: center; border: 1px solid color-mix(in srgb, var(--warning) 42%, var(--border)); border-radius: 6px; background: color-mix(in srgb, var(--warning) 7%, var(--control)); color: var(--text); }
+.source-provider-status > svg { color: var(--warning); }
+.source-provider-status strong, .source-provider-status small { display: block; }
+.source-provider-status strong { font-size: 10px; }
+.source-provider-status small { margin-top: 2px; overflow: hidden; color: var(--muted); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.source-provider-status button { min-height: 26px; padding: 0 8px; border: 1px solid var(--border-strong); border-radius: 5px; background: var(--surface); color: var(--text); font-size: 9px; cursor: pointer; }
 .source-action { height: 28px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-active); color: var(--text); font-size: 10px; cursor: pointer; }
 .source-action:hover:not(:disabled) { border-color: var(--accent); background: rgb(111 212 137 / 12%); }
 
