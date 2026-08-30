@@ -16,9 +16,16 @@ test("the documented npm launcher serves production and stops its complete proce
   context.after(app.stop);
 
   try {
-    const [runnerResponse, webResponse] = await Promise.all([fetch(`${app.runnerUrl}/api/health`), fetch(`${app.webUrl}/`)]);
+    const [runnerResponse, webResponse, sessionResponse] = await Promise.all([
+      fetch(`${app.runnerUrl}/api/health`),
+      fetch(`${app.webUrl}/`),
+      fetch(`${app.runnerUrl}/api/session`),
+    ]);
     const runner = await runnerResponse.json() as { ok?: boolean; runtime?: string };
+    const session = await sessionResponse.json() as { graph_path?: string };
     assert.deepEqual(runner, { ok: true, runtime: "typescript", version: SOMITE_VERSION });
+    assert.equal(session.graph_path, ".somite/web.somite.json");
+    await assert.rejects(stat(join(app.projectRoot, "--production")), { code: "ENOENT" });
     const html = await webResponse.text();
     assert.match(html, /Somite/);
     assert.doesNotMatch(app.output(), /vinext build/);

@@ -305,7 +305,7 @@ async function initializeProject(serverUrl: string, options: ServerOptions): Pro
   const root = await realpath(requestedRoot);
   await regularDirectory(root, "project root");
   const projectState = await ensurePrivateDirectory(root, ".somite");
-  const configuredGraph = options.graph ?? process.env.SOMITE_GRAPH ?? process.argv[2];
+  const configuredGraph = options.graph ?? process.env.SOMITE_GRAPH;
   const graphPath = await projectGraphPath(root, configuredGraph ?? join(projectState, "web.somite.json"), "workflow graph");
   const catalogLoaded = await loadOperatorCatalog(join(repositoryRoot, "operators"));
   const recovery = await projectGraphPath(root, autosavePath(root, graphPath), "workflow autosave");
@@ -1439,7 +1439,9 @@ export async function startServer(options: ServerOptions = {}) {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))) {
-  const running = await startServer();
+  const [graph, ...extraArguments] = process.argv.slice(2);
+  if (extraArguments.length > 0 || graph?.startsWith("--")) throw new Error("Usage: somite-runner [workflow.somite.json]");
+  const running = await startServer(graph ? { graph } : {});
   let stopping = false;
   const stop = (code: number) => {
     if (stopping) return;
