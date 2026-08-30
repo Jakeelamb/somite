@@ -6,7 +6,6 @@ import { fileURLToPath } from "node:url";
 import { startServer } from "../runner/src/server.ts";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 const argumentsList = process.argv.slice(2);
 const production = argumentsList[0] === "--production";
 if (production) argumentsList.shift();
@@ -23,11 +22,19 @@ let stopping = false;
 let runningServer: Awaited<ReturnType<typeof startServer>> | undefined;
 let shutdown: Promise<void> | undefined;
 
-function launch(args: string[], environment: NodeJS.ProcessEnv = process.env) {
-  const child = spawn(npm, args, {
-    cwd: projectRoot,
+async function resolveVinextCli() {
+  for (const modules of [join(projectRoot, "web", "node_modules"), join(projectRoot, "node_modules")]) {
+    const candidate = join(modules, "vinext", "dist", "cli.js");
+    if ((await lstat(candidate).catch(() => undefined))?.isFile()) return candidate;
+  }
+  throw new Error("Somite's web runtime is missing. Run: npm ci");
+}
+
+function launchWeb(vinext: string, args: string[], environment: NodeJS.ProcessEnv = process.env) {
+  const child = spawn(process.execPath, [vinext, ...args], {
+    cwd: join(projectRoot, "web"),
     env: environment,
-    detached: process.platform !== "win32",
+    detached: false,
     windowsHide: true,
     stdio: "inherit",
   });
@@ -43,11 +50,7 @@ function terminate(child: ChildProcess, hard = false) {
     spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true, stdio: "ignore" });
     return;
   }
-  try {
-    process.kill(-child.pid, hard ? "SIGKILL" : "SIGINT");
-  } catch {
-    if (child.exitCode === null && child.signalCode === null) child.kill(hard ? "SIGKILL" : "SIGINT");
-  }
+  if (child.exitCode === null && child.signalCode === null) child.kill(hard ? "SIGKILL" : "SIGINT");
 }
 
 function stop(code: number) {
@@ -95,9 +98,10 @@ try {
     host,
     allowedOrigin: process.env.SOMITE_ALLOWED_ORIGIN ?? `http://localhost:${webPort}`,
   });
-  const web = launch(production
-    ? ["run", "start", "--workspace=somite-web", "--", "--hostname", "127.0.0.1"]
-    : ["run", "dev", "--workspace=somite-web"], {
+  const vinext = await resolveVinextCli();
+  const web = launchWeb(vinext, production
+    ? ["start", "--hostname", "127.0.0.1"]
+    : ["dev"], {
     ...process.env,
     NEXT_PUBLIC_SOMITE_SERVER: process.env.NEXT_PUBLIC_SOMITE_SERVER ?? runnerUrl,
   });

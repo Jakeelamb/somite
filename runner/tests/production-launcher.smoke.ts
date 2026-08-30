@@ -46,7 +46,9 @@ function closeResult(child: ChildProcess) {
 }
 
 async function stopLauncher(child: ChildProcess, closed: Promise<unknown>) {
-  if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+  if (child.exitCode === null && child.signalCode === null) {
+    try { process.kill(-child.pid!, "SIGINT"); } catch { child.kill("SIGINT"); }
+  }
   let timeout: NodeJS.Timeout | undefined;
   await Promise.race([
     closed,
@@ -56,10 +58,12 @@ async function stopLauncher(child: ChildProcess, closed: Promise<unknown>) {
     }),
   ]);
   if (timeout) clearTimeout(timeout);
-  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  if (child.exitCode === null && child.signalCode === null) {
+    try { process.kill(-child.pid!, "SIGKILL"); } catch { child.kill("SIGKILL"); }
+  }
 }
 
-test("the production launcher serves the built app and runner without rebuilding", { timeout: 60_000 }, async (context) => {
+test("the documented npm launcher serves production and stops its complete process tree", { timeout: 60_000 }, async (context) => {
   assert.notEqual(process.platform, "win32", "the release smoke runs on supported POSIX hosts");
   const buildId = join(repositoryRoot, "web", "dist", "server", "BUILD_ID");
   const before = await stat(buildId).catch(() => undefined);
@@ -70,7 +74,7 @@ test("the production launcher serves the built app and runner without rebuilding
   assert.notEqual(webPort, runnerPort);
 
   let output = "";
-  const child = spawn(process.execPath, ["--experimental-strip-types", "scripts/somite-web.ts", "--production"], {
+  const child = spawn(process.platform === "win32" ? "npm.cmd" : "npm", ["start"], {
     cwd: repositoryRoot,
     env: {
       ...process.env,
@@ -81,6 +85,7 @@ test("the production launcher serves the built app and runner without rebuilding
       SOMITE_ALLOWED_ORIGIN: `http://localhost:${webPort}`,
       NEXT_PUBLIC_SOMITE_SERVER: `http://127.0.0.1:${runnerPort}`,
     },
+    detached: true,
     stdio: ["ignore", "pipe", "pipe"],
   });
   const closed = closeResult(child);
@@ -118,4 +123,5 @@ test("the production launcher serves the built app and runner without rebuilding
   await stopLauncher(child, closed);
   assert.ok(child.exitCode !== null || child.signalCode !== null, `production launcher did not stop\n${output}`);
   await assert.rejects(fetch(`http://127.0.0.1:${runnerPort}/api/health`));
+  await assert.rejects(fetch(`http://127.0.0.1:${webPort}/`));
 });
