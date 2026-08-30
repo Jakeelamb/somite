@@ -1,28 +1,12 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
   buildSourceManifest,
   indexNextflowSource,
   tokenizeNextflow,
-  type FrozenSourceFile,
-  type SourceManifest,
 } from "@somite/workflow/nextflowSource";
-import type { SourceWorkflowInstance } from "@somite/workflow/model";
-
-const objectRoot = new URL("../../.somite/source-workflows/objects/4b8e157a3fbd3009095b60e4d857fba2af999ffe29c21bd01bd8304aaa427442/", import.meta.url);
-const instancePath = new URL("../../.somite/source-workflows/instances/779d9b35a620a72180c6bd4d545bb753fb343a9396c9771818d6cc21aa5481fe.json", import.meta.url);
-
-async function pangenomeSource() {
-  const manifest = JSON.parse(await readFile(new URL("source-manifest.json", objectRoot), "utf8")) as SourceManifest;
-  const files = await Promise.all(manifest.files.map(async (entry): Promise<FrozenSourceFile> => ({
-    path: entry.path,
-    mode: entry.mode,
-    bytes: await readFile(new URL(`source/${entry.path}`, objectRoot)),
-  })));
-  return { manifest, files };
-}
+import { trackedSourceWorkflowFixture } from "./source-workflow-fixture.ts";
 
 test("Nextflow tokenizer ignores comments and triple-quoted scripts", () => {
   const tokens = tokenizeNextflow(new TextEncoder().encode(`workflow TOP {
@@ -35,18 +19,31 @@ test("Nextflow tokenizer ignores comments and triple-quoted scripts", () => {
   assert.equal(tokens.filter((token) => token.kind === "string").length, 1);
 });
 
-test("TypeScript reproduces the exact stored pangenome source identity", async () => {
-  const { manifest, files } = await pangenomeSource();
+test("the tracked source fixture has a stable portable identity", async () => {
+  const { manifest, files } = await trackedSourceWorkflowFixture();
   assert.deepEqual(buildSourceManifest(files), manifest);
+  assert.equal(manifest.source_digest, "blake3:a0ba64ca1eb87ef7b49909ac6f97c361e9cdd2a7b7c34e1957e6e0dec5dc414c");
 });
 
-test("pangenome import reproduces the accepted nested source projection", async () => {
-  const { manifest, files } = await pangenomeSource();
-  const record = JSON.parse(await readFile(instancePath, "utf8")) as { workflow: SourceWorkflowInstance };
+test("the tracked source fixture produces a resolved nested outline", async () => {
+  const { manifest, files, workflow } = await trackedSourceWorkflowFixture();
   const indexed = indexNextflowSource(files, "main.nf", manifest.source_digest);
-  assert.deepEqual(indexed.scopes, record.workflow.scopes);
-  assert.deepEqual(indexed.invocations, record.workflow.invocations);
-  const outlineDiagnostics = (record.workflow.diagnostics ?? []).filter((diagnostic) =>
-    diagnostic.code === "source_only_invocation" || diagnostic.code === "non_utf8_nextflow_source" || diagnostic.code === "source_outline_empty");
-  assert.deepEqual(indexed.diagnostics, outlineDiagnostics);
+  assert.deepEqual(indexed.scopes, workflow.scopes);
+  assert.deepEqual(indexed.invocations, workflow.invocations);
+  assert.deepEqual(indexed.scopes.map(({ title, kind }) => ({ title, kind })), [
+    { title: "NFCORE_PANGENOME", kind: "workflow" },
+    { title: "Entry workflow", kind: "entry_workflow" },
+    { title: "ODGI_STATS", kind: "process" },
+    { title: "WFMASH_MAP_ALIGN", kind: "process" },
+    { title: "ODGI_QC", kind: "workflow" },
+    { title: "PANGENOME", kind: "workflow" },
+  ]);
+  assert.deepEqual(indexed.invocations.map(({ name, callee }) => ({ name, resolved: Boolean(callee) })), [
+    { name: "PANGENOME", resolved: true },
+    { name: "NFCORE_PANGENOME", resolved: true },
+    { name: "ODGI_STATS", resolved: true },
+    { name: "WFMASH_MAP_ALIGN", resolved: true },
+    { name: "ODGI_QC", resolved: true },
+  ]);
+  assert.deepEqual(indexed.diagnostics, []);
 });

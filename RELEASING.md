@@ -2,7 +2,8 @@
 
 Somite's current release is source-only. It does not yet publish a managed
 hosted service or a standalone desktop bundle. Do not attach a partial artifact
-and describe it as an installable application.
+and describe it as an installable application. Direct source execution supports
+Linux and macOS; Windows verification runs inside WSL2, not native Windows.
 
 ## Prepare the release
 

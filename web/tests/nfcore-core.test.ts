@@ -38,9 +38,11 @@ test("nf-core search requires every term and exposes exact release pairs", () =>
   ]);
 });
 
-test("the checked-in live nf-core cache remains parseable", async () => {
-  const raw = await readFile(new URL("../../.somite/catalog/nfcore-pipelines.json", import.meta.url), "utf8");
+test("the tracked representative nf-core response remains parseable", async () => {
+  const raw = await readFile(new URL("../../testdata/catalog/nfcore-response.json", import.meta.url), "utf8");
   const pipelines = parseNfcoreCatalog(raw);
-  assert.ok(pipelines.length > 50);
-  assert.ok(pipelines.every((pipeline) => /^[0-9a-f]{40}$/.test(pipeline.resolvedRevision)));
+  assert.deepEqual(pipelines.map(({ name, revision, resolvedRevision }) => ({ name, revision, resolvedRevision })), [
+    { name: "pangenome", revision: "1.1.3", resolvedRevision: "3d02bd1df79f48b4bfdb4ad95d4ca0d7f6aeb337" },
+    { name: "rnaseq", revision: "3.26.0", resolvedRevision: "e7ca46272c8f9d5ceee3f71759f4ba551d3217a4" },
+  ]);
 });

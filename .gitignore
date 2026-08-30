@@ -1,4 +1,5 @@
 /node_modules/
+/output/
 **/.somite/
 *.swp
 .DS_Store

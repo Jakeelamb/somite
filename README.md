@@ -50,6 +50,10 @@ npm run dev -- path/to/workflow.somite.json
 Pixi is optional for browsing and editing. It is required to freeze and execute
 the generated Nextflow environment.
 
+Linux and macOS are supported directly. On Windows, run Somite inside WSL2;
+native Windows execution is not supported because Somite's reviewed Nextflow
+execution path and bioinformatics package set target a POSIX environment.
+
 ## What Somite does
 
 ### Build and understand workflows
@@ -166,8 +170,9 @@ does not depend on UI code. Pixi and Nextflow remain external execution tools,
 and scientific Python belongs inside frozen workflow environments rather than
 the Somite application.
 
-The current source release binds the browser to a loopback runner. The execution
-Interface already accepts a frozen job and emits ordered events, allowing a
+The current source release binds the browser to a loopback runner. Windows users
+run that local stack inside WSL2. The execution Interface already accepts a
+frozen job and emits ordered events, allowing a
 future hosted Linux adapter without introducing a second graph or compiler.
 See [the architecture](docs/somite-design.md),
 [domain model](docs/domain-model.md), and

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { environmentBinaryDirectories, executablePath } from "../src/system.ts";
+import { environmentBinaryDirectories, executablePath, pixiPlatform } from "../src/system.ts";
 
 test("Pixi binary search uses native environment layouts", () => {
   const root = join("project", "root");
@@ -26,4 +26,12 @@ test("project Pixi binaries take precedence over the ambient path", { skip: proc
   await chmod(binary, 0o755);
 
   assert.equal(await executablePath(root, "example-tool"), binary);
+});
+
+test("workflow execution supports Unix Pixi targets and directs Windows users to WSL", () => {
+  assert.equal(pixiPlatform("linux", "x64"), "linux-64");
+  assert.equal(pixiPlatform("linux", "arm64"), "linux-aarch64");
+  assert.equal(pixiPlatform("darwin", "x64"), "osx-64");
+  assert.equal(pixiPlatform("darwin", "arm64"), "osx-arm64");
+  assert.throws(() => pixiPlatform("win32", "x64"), /WSL2/);
 });

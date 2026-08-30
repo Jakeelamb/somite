@@ -30,9 +30,13 @@ export async function executablePath(projectRoot: string, binary: string) {
   return undefined;
 }
 
-export function pixiPlatform() {
-  const machine = process.arch;
-  if (platform() === "darwin") return machine === "arm64" ? "osx-arm64" : "osx-64";
-  if (platform() === "win32") return "win-64";
+export function pixiPlatform(
+  operatingSystem: NodeJS.Platform = platform(),
+  machine: string = process.arch,
+) {
+  if (operatingSystem === "win32") {
+    throw new Error("Native Windows workflow execution is unsupported; run Somite inside WSL2.");
+  }
+  if (operatingSystem === "darwin") return machine === "arm64" ? "osx-arm64" : "osx-64";
   return machine === "arm64" ? "linux-aarch64" : "linux-64";
 }

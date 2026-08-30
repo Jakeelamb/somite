@@ -34,6 +34,9 @@ The repository is one npm workspace: `web/`, `runner/`, and
 `packages/workflow/`. Local graphs, uploads, evidence, and generated tool
 environments live under `.somite/` and must not be committed.
 
+Development is supported directly on Linux and macOS. Windows contributors
+should use WSL2; the project does not claim a native Windows execution path.
+
 ## Make a reviewable change
 
 - Keep one production path and delete obsolete code before adding abstraction.

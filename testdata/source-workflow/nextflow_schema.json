@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "$defs": {
+    "input_output_options": {
+      "title": "Input/output options",
+      "type": "object",
+      "properties": {
+        "input": {
+          "type": "string",
+          "format": "file-path",
+          "description": "Input sequence sheet"
+        },
+        "outdir": {
+          "type": "string",
+          "format": "directory-path",
+          "default": "results"
+        }
+      },
+      "required": ["input"]
+    },
+    "analysis_options": {
+      "title": "Analysis options",
+      "type": "object",
+      "properties": {
+        "threads": {
+          "type": "integer",
+          "default": 4,
+          "minimum": 1,
+          "maximum": 64
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["map", "qc"],
+          "default": "map"
+        },
+        "source_only_list": {
+          "type": "array",
+          "description": "Optional unsupported shape retained as a diagnostic"
+        }
+      }
+    }
+  },
+  "allOf": [
+    { "$ref": "#/$defs/input_output_options" },
+    { "$ref": "#/$defs/analysis_options" }
+  ]
+}

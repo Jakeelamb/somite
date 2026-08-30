@@ -24,8 +24,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   extraction, cached reconstruction, explicit outcomes, and retained evidence.
 - Streaming, bounded local-file intake; engine-authored Snakemake import; and a
   thin stdio MCP adapter for Somite-owned Agent tools.
-- One root npm workspace and Pixi development lock spanning Linux, macOS, and
-  Windows, with a launcher that starts and stops the browser and runner together.
+- One root npm workspace and Pixi development lock spanning Linux and macOS,
+  with a launcher that starts and stops the browser and runner together. Windows
+  users run the same Linux path through WSL2.
 - Continuous verification for the complete TypeScript product on pushes and
   pull requests.
 - Dependency review, automated dependency updates, issue forms, and pull
@@ -65,6 +66,6 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   same bounded replay cache.
 - Launcher shutdown now cancels active workflow, paper, and Agent process trees
   without leaving the local runner behind. Module paths and Pixi executable
-  discovery now use native Windows, macOS, and Linux layouts.
+  discovery use platform-appropriate layouts on supported direct platforms.
 
 [Unreleased]: https://github.com/Jakeelamb/somite/commits/main
