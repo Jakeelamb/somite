@@ -1120,7 +1120,7 @@ export function PaperPanel({ intake, active, applied, preparingField, onFile, on
                 return null;
               })}
               {currentAttention.fields.some((field) => field.input_mode === "connection" || field.input_mode === "choice") && <button type="button" className="paper-canvas-resolution" disabled={intakeBusy} onClick={() => onApply(active)}>{applied === active ? "Reconnect this input on the canvas" : "Add draft to connect this input"}</button>}
-              {currentAttention.resolutions.some((resolution) => resolution.source_url) && <div className="paper-resolution-links">{currentAttention.resolutions.filter((resolution) => resolution.source_url).map((resolution) => <a key={resolution.id} href={resolution.source_url} target="_blank" rel="noreferrer"><ExternalLink size={11} />Official guide</a>)}</div>}
+              {currentAttention.resolutions.some((resolution) => resolution.source_url) && <div className="paper-resolution-links">{currentAttention.resolutions.filter((resolution) => resolution.source_url).map((resolution) => <a key={resolution.id} href={resolution.source_url ?? undefined} target="_blank" rel="noreferrer"><ExternalLink size={11} />Official guide</a>)}</div>}
               {currentAttention.recipes.map((recipe) => <details className="paper-recipe" key={recipe.id}>
                 <summary><span><strong>{recipe.title}</strong><small>Reusable recipe · v{recipe.version}</small></span><ChevronDown size={12} /></summary>
                 <p>{recipe.summary}</p><ol>{recipe.steps.map((step) => <li key={step}>{step}</li>)}</ol>

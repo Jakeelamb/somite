@@ -1,0 +1,81 @@
+import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { createServer } from "node:http";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { once } from "node:events";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+
+const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
+
+async function unusedPort() {
+  const reservation = createServer();
+  reservation.listen(0, "127.0.0.1");
+  await once(reservation, "listening");
+  const address = reservation.address();
+  if (!address || typeof address === "string") throw new Error("could not reserve test port");
+  await new Promise<void>((resolvePromise, rejectPromise) => reservation.close((error) => error ? rejectPromise(error) : resolvePromise()));
+  return address.port;
+}
+
+test("the TypeScript runner serves the browser session, streaming uploads, and local Snakemake import", { skip: process.platform === "win32" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "somite-runner-"));
+  const port = await unusedPort();
+  const bin = join(root, ".pixi", "envs", "default", "bin");
+  await mkdir(join(root, "workflow"), { recursive: true });
+  await mkdir(bin, { recursive: true });
+  await writeFile(join(root, "workflow", "Snakefile"), "rule all:\n    input: 'done'\n");
+  await writeFile(join(root, "pixi.lock"), "test\n");
+  const pixi = join(bin, "pixi");
+  await writeFile(pixi, "#!/bin/sh\nprintf '%s\\n' 'digraph snakemake_dag {' '0[label = \"prepare\"];' '1[label = \"all\"];' '0 -> 1' '}'\n");
+  await chmod(pixi, 0o755);
+  const child = spawn(process.execPath, ["--experimental-strip-types", join(repositoryRoot, "runner", "src", "server.ts")], {
+    cwd: repositoryRoot,
+    env: { ...process.env, SOMITE_PROJECT_ROOT: root, SOMITE_PORT: String(port) },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let diagnostics = "";
+  child.stdout.on("data", (chunk: Buffer) => { diagnostics += chunk.toString("utf8"); });
+  child.stderr.on("data", (chunk: Buffer) => { diagnostics += chunk.toString("utf8"); });
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    let healthy = false;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (child.exitCode !== null) break;
+      healthy = await fetch(`${base}/api/health`).then((response) => response.ok).catch(() => false);
+      if (healthy) break;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+    }
+    assert.equal(healthy, true, diagnostics);
+    const session = await fetch(`${base}/api/session`).then((response) => response.json()) as Record<string, unknown>;
+    assert.equal((session.graph as Record<string, unknown>).schema_version, 3);
+
+    const form = new FormData();
+    form.set("file", new Blob(["@read\nACGT\n+\n!!!!\n"]), "reads.fastq");
+    const uploadedResponse = await fetch(`${base}/api/files`, { method: "POST", headers: { origin: "http://localhost:3000" }, body: form });
+    assert.equal(uploadedResponse.status, 200, await uploadedResponse.clone().text().then((value) => value || diagnostics));
+    const uploaded = await uploadedResponse.json() as { path: string };
+    const storedPath = uploaded.path;
+    assert.equal(await readFile(join(root, storedPath), "utf8"), "@read\nACGT\n+\n!!!!\n");
+
+    const hostile = new FormData();
+    hostile.set("file", new Blob(["hostile\n"]), "hostile.fastq");
+    assert.equal((await fetch(`${base}/api/files`, { method: "POST", headers: { origin: "https://attacker.example" }, body: hostile })).status, 403);
+
+    const imported = await fetch(`${base}/api/workflows/snakemake/import`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "http://localhost:3000" },
+      body: JSON.stringify({ path: root, targets: ["all"] }),
+    });
+    assert.equal(imported.status, 200, await imported.clone().text());
+    const graph = (await imported.json() as { graph: { nodes: unknown[]; edges: unknown[] } }).graph;
+    assert.equal(graph.nodes.length, 2);
+    assert.equal(graph.edges.length, 1);
+  } finally {
+    child.kill("SIGTERM");
+    await once(child, "close").catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});

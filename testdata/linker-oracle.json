@@ -1,0 +1,76 @@
+{
+  "draft": {
+    "schema_version": 1,
+    "graph_revision": "blake3:8faa17898bcf575f4fe387e975dc7cdd4095c9ca5bf296aabb63d442df945694",
+    "target_platform": "linux-64",
+    "operators": [
+      {
+        "operator_id": "files.import",
+        "revision": "blake3:4919927a3059aa4543d45380fd700993964e3e239ceb9e3fda73b5956b89bc4a"
+      },
+      {
+        "operator_id": "qc.fastqc",
+        "revision": "blake3:25e0002b51061db054034e75aaa0c7fa7bb2036bcb615b3d37a6eb9fec6e9259"
+      }
+    ],
+    "environment_manifest_digest": "blake3:72b3e746a1f0eae062e566ce333120dd8315191268aefb626851fca4e700b7f8",
+    "compiler_identity": "somite-nextflow@0.1.0",
+    "nextflow_identity": "nextflow@26.04.6",
+    "openjdk_identity": "openjdk@25.0.2"
+  },
+  "closure": {
+    "schema_version": 1,
+    "closure_digest": "blake3:0dbd54c656207ebdcfa9d2d172eea2e971b55f3a5b35db95a463f9013c2b9bef",
+    "graph_revision": "blake3:8faa17898bcf575f4fe387e975dc7cdd4095c9ca5bf296aabb63d442df945694",
+    "target_platform": "linux-64",
+    "operators": [
+      {
+        "operator_id": "files.import",
+        "revision": "blake3:4919927a3059aa4543d45380fd700993964e3e239ceb9e3fda73b5956b89bc4a"
+      },
+      {
+        "operator_id": "qc.fastqc",
+        "revision": "blake3:25e0002b51061db054034e75aaa0c7fa7bb2036bcb615b3d37a6eb9fec6e9259"
+      }
+    ],
+    "environment": {
+      "manifest_digest": "blake3:72b3e746a1f0eae062e566ce333120dd8315191268aefb626851fca4e700b7f8",
+      "lock_digest": "blake3:443153cea9b2e043461b402853a843efd9e512575edc2b957f102238afaa6253"
+    },
+    "compiler_identity": "somite-nextflow@0.1.0",
+    "nextflow_identity": "nextflow@26.04.6",
+    "openjdk_identity": "openjdk@25.0.2"
+  },
+  "evidence": {
+    "receipt_digest": "blake3:a33261664df29c8d2466ef8e0bd1be1f0727d9b512a8388d94f0428ff2c04751",
+    "recorded_at_unix_ms": 1787718000000,
+    "subject_digest": "blake3:8faa17898bcf575f4fe387e975dc7cdd4095c9ca5bf296aabb63d442df945694",
+    "observed_closure_digest": "blake3:0dbd54c656207ebdcfa9d2d172eea2e971b55f3a5b35db95a463f9013c2b9bef",
+    "kind": "configuration_validation",
+    "scope": "graph_e2e",
+    "configuration_digest": "blake3:fixture-config",
+    "fixture_digests": [
+      "blake3:a",
+      "blake3:b"
+    ],
+    "verifier": "somite-nextflow@0.1.0",
+    "result": "passed",
+    "node_results": {
+      "fastqc1": "passed",
+      "input1": "passed"
+    },
+    "edge_results": {
+      "reads": "passed"
+    },
+    "artifact_digests": [
+      "blake3:output"
+    ],
+    "log_digests": [
+      "blake3:log"
+    ]
+  },
+  "operator_manifest_digests": {
+    "files.import": "blake3:a07af27d68dc8d73ca528e224b2a1620fba544a3ad9a5bece487e45102dcb5b2",
+    "qc.fastqc": "blake3:868998a1859d3a579c02e80b91fe086de90f11493707e1e117450a315babba03"
+  }
+}

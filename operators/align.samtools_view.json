@@ -6,6 +6,11 @@
   "cost": "low",
   "bin": "samtools",
   "pixi": ["bioconda::samtools"],
+  "paper": {
+    "aliases": ["SAMtools view"],
+    "operation_class": "bam_processing",
+    "assays": ["assembly", "variants"]
+  },
   "params": {
     "exclude_flags": { "type": "int", "label": "Exclude SAM flags", "page": "Filter", "default": 2308, "min": 0 }
   },

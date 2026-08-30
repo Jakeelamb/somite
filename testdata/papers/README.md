@@ -9,7 +9,7 @@ This corpus has two layers:
 `gold.tsv` is the versioned, machine-readable contract for every committed text
 fixture. Add or change a row only after reviewing the corresponding fixture;
 recognizer output must never rewrite the gold expectations automatically.
-Ordinary `cargo test -p somite-paper` fails if a committed `.txt` fixture has no
+Ordinary `npm test` fails if a committed `.txt` fixture has no
 gold row, an input cannot be extracted, a candidate is empty or invalid, or any
 annotated expectation fails.
 
@@ -22,7 +22,7 @@ and `|` for branch arms or alternatives.
 | field | assertion |
 |---|---|
 | `fixture` | committed text input relative to this directory |
-| `extract_via` | required `utf8`, `poppler`, or `tesseract` extraction path |
+| `extract_via` | required fixture extraction path (`utf8` for committed text fixtures) |
 | `outcome` | exact reconstruction outcome |
 | `tracks` | exact set of candidate assay tracks |
 | `expected_entities` | exact normalized method-entity set used for recall and precision |
@@ -47,7 +47,7 @@ edges, topology, parameters, evidence spans, and cited-resource selection as
 separate deterministic metrics. Run it with its concise corpus summary visible:
 
 ```bash
-cargo test -p somite-paper committed_gold_manifest_reconstructs_through_the_public_interface -- --nocapture
+node --experimental-strip-types --test web/tests/paper-core.test.ts
 ```
 
 Run `scripts/fetch-paper-corpus` from anywhere in the checkout. Downloads are
@@ -72,9 +72,9 @@ This is deliberate: two early corpus files had valid PDFs with the wrong papers.
 The PMC assets come from the [current NLM PMC article dataset on
 AWS](https://pmc.ncbi.nlm.nih.gov/tools/pmcaws/), not scraped article pages.
 For the complex cases, the official PMC plain text is the canonical extraction
-input and the PDF remains the layout/OCR fallback. `downloaded_real_paper_corpus_reconstructs`
-runs all ten full-text cases when the corpus is present and requires the corpus
-to be complete once `pdf/` exists.
+input and the PDF remains the layout reference. The runner corpus test crosses
+real PDF.js extraction for the PDF cases and all ten reconstructions when the
+corpus is present; it requires the corpus to be complete once `pdf/` exists.
 
 ## Curated fixtures
 
@@ -100,5 +100,5 @@ The fetched full-paper gate is intentionally explicit and all-or-nothing:
 
 ```bash
 scripts/fetch-paper-corpus
-SOMITE_PAPER_CORPUS=required cargo test -p somite-paper downloaded_real_paper_corpus_reconstructs -- --nocapture
+SOMITE_PAPER_CORPUS=required node --experimental-strip-types --test runner/tests/paper-corpus.test.ts
 ```

@@ -1,0 +1,80 @@
+[
+  {
+    "name": "empty canvas",
+    "graph_revision": "blake3:8b187492fe40f856e55fb53ac1bd29e1d5b4010fe788a4f4e57a922589d7b746",
+    "state": "empty",
+    "required_count": 0,
+    "item_ids": [],
+    "assessment_digest": "blake3:dc1cf53b5066fd0aee64100de8200debd3daf86bc5555b005b9d27d611050f11"
+  },
+  {
+    "name": "local input still needs a path",
+    "graph_revision": "blake3:27185804ef7f020503624ad993252a8bb9c182e0c98a0d9670af46c5de1d732a",
+    "state": "building",
+    "required_count": 1,
+    "item_ids": ["parameter:input1:path"],
+    "assessment_digest": "blake3:689326bfe355642a59db140e0a32a7d1fe9ca057f198f71b58ccc3367f032cff"
+  },
+  {
+    "name": "managed tool still needs an input",
+    "graph_revision": "blake3:bec9d221ad9ff592527803bafb8fb8f3656190bd9c2c2f101c1b8d948216dd25",
+    "state": "building",
+    "required_count": 1,
+    "item_ids": ["input:fastqc1:fastq"],
+    "assessment_digest": "blake3:c1d68b2129b29eff434c468449325a5a5b846549b6c4262739db1cfeab749d52"
+  },
+  {
+    "name": "scientific database is a distinct managed resource",
+    "graph_revision": "blake3:158cc272c8c0537c4cab9db04408bc62ce2952a2b2080b943948e97af56f4ce5",
+    "state": "needs_action",
+    "required_count": 2,
+    "item_ids": ["input:kraken1:r1", "input:kraken1:db"],
+    "assessment_digest": "blake3:51ba300c0187d0614344cce454197d5c584d36059807b1e41b93b6004c7e0d58"
+  },
+  {
+    "name": "connected local FastQC workflow is ready",
+    "graph_revision": "blake3:8faa17898bcf575f4fe387e975dc7cdd4095c9ca5bf296aabb63d442df945694",
+    "state": "ready",
+    "required_count": 0,
+    "item_ids": [],
+    "assessment_digest": "blake3:ea8a3e4c0fd9943abaf0969ec7955b86ff1e8b478e5552b9dc517804750eb1ca"
+  },
+  {
+    "name": "paper gap retains a reviewed adapter action",
+    "graph_revision": "blake3:4395cda13aa24b74d7c0bef6aa43d704fa3b727131eb2d4d29760f3a02a3f8b1",
+    "state": "needs_action",
+    "required_count": 1,
+    "item_ids": ["resolution:gap1:adapter"],
+    "assessment_digest": "blake3:33af9ce72078b707b19cbfcb67f0ccc96d90dbddb460025f67a4a6646ab7d8c1"
+  },
+  {
+    "name": "manual checkpoint is unresolved until its artifact is attached",
+    "graph_revision": "blake3:a52212a8f5b59d891d185379eab985bd76abfbd3ece7c49d4ecb2f8d92a70495",
+    "state": "needs_action",
+    "required_count": 1,
+    "item_ids": ["resolution:joinmap1:attach"],
+    "assessment_digest": "blake3:d4707410e5bec8d6d612d7b747445a253b8141754c17de4506c9211887e3934a"
+  },
+  {
+    "name": "manual checkpoint becomes ready after attachment",
+    "graph_revision": "blake3:f99148ca0b1ce1f42801a3b08af84e88b6cefb88b8738028017e2048bad6ae6b",
+    "state": "ready",
+    "required_count": 0,
+    "item_ids": [],
+    "assessment_digest": "blake3:2491110b40e958d118ee032dc8647e2382078fef64a27cbe364fd42d67942d93"
+  },
+  {
+    "name": "source workflow exposes every honest blocker",
+    "graph_revision": "blake3:bfb5d1053c06a08008ea01bc202a7208aa397446c8bf92be87282a68f45bd916",
+    "state": "needs_action",
+    "required_count": 5,
+    "item_ids": [
+      "source-unsupported-parameter:source1:complex",
+      "source-parameter:source1:input",
+      "source-schema:source1",
+      "source-replacement:source1:invoke-fastqc",
+      "source-environment:source1"
+    ],
+    "assessment_digest": "blake3:16965dd8b5bf6359ba955198fe86bf5ab68973ddcaec24d64b19e90cd44fb6d2"
+  }
+]

@@ -1,0 +1,169 @@
+[
+  {
+    "name": "valid connected graph",
+    "graph": {
+      "schema_version": 3,
+      "name": "Parity workflow",
+      "nodes": [
+        {
+          "id": "source",
+          "operator": "files.import",
+          "operator_revision": "source-revision",
+          "ports": [{ "name": "reads", "dir": "out", "ty": "Fastq" }],
+          "params": {},
+          "layout": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "sink",
+          "operator": "qc.fastqc",
+          "operator_revision": "sink-revision",
+          "ports": [{ "name": "reads", "dir": "in", "ty": "Fastq" }],
+          "params": {},
+          "layout": { "x": 240, "y": 0 }
+        }
+      ],
+      "edges": [
+        { "id": "reads-edge", "from_node": "source", "from_port": "reads", "to_node": "sink", "to_port": "reads" }
+      ],
+      "annotations": []
+    },
+    "error": null,
+    "topological_order": ["source", "sink"]
+  },
+  {
+    "name": "schema mismatch",
+    "graph": { "schema_version": 2, "nodes": [], "edges": [] },
+    "error": "schema_version 2 != 3"
+  },
+  {
+    "name": "empty graph name",
+    "graph": { "schema_version": 3, "name": "   ", "nodes": [], "edges": [] },
+    "error": "graph name must be 1 to 100 characters and contain no control characters"
+  },
+  {
+    "name": "unpinned operator",
+    "graph": {
+      "schema_version": 3,
+      "nodes": [{ "id": "node", "operator": "qc.fastqc", "operator_revision": "", "ports": [], "layout": { "x": 0, "y": 0 } }],
+      "edges": []
+    },
+    "error": "node node does not pin an operator revision"
+  },
+  {
+    "name": "duplicate node id",
+    "graph": {
+      "schema_version": 3,
+      "nodes": [
+        { "id": "node", "operator": "first", "operator_revision": "first-revision", "ports": [], "layout": { "x": 0, "y": 0 } },
+        { "id": "node", "operator": "second", "operator_revision": "second-revision", "ports": [], "layout": { "x": 100, "y": 0 } }
+      ],
+      "edges": []
+    },
+    "error": "duplicate id node"
+  },
+  {
+    "name": "unknown source node",
+    "graph": {
+      "schema_version": 3,
+      "nodes": [{ "id": "sink", "operator": "qc.fastqc", "operator_revision": "sink-revision", "ports": [{ "name": "reads", "dir": "in", "ty": "Fastq" }], "layout": { "x": 0, "y": 0 } }],
+      "edges": [{ "id": "edge", "from_node": "missing", "from_port": "reads", "to_node": "sink", "to_port": "reads" }]
+    },
+    "error": "unknown node missing"
+  },
+  {
+    "name": "unknown output port",
+    "graph": {
+      "schema_version": 3,
+      "nodes": [
+        { "id": "source", "operator": "files.import", "operator_revision": "source-revision", "ports": [], "layout": { "x": 0, "y": 0 } },
+        { "id": "sink", "operator": "qc.fastqc", "operator_revision": "sink-revision", "ports": [{ "name": "reads", "dir": "in", "ty": "Fastq" }], "layout": { "x": 100, "y": 0 } }
+      ],
+      "edges": [{ "id": "edge", "from_node": "source", "from_port": "missing", "to_node": "sink", "to_port": "reads" }]
+    },
+    "error": "unknown port source.missing"
+  },
+  {
+    "name": "incompatible port types",
+    "graph": {
+      "schema_version": 3,
+      "nodes": [
+        { "id": "source", "operator": "files.import", "operator_revision": "source-revision", "ports": [{ "name": "reads", "dir": "out", "ty": "Fastq" }], "layout": { "x": 0, "y": 0 } },
+        { "id": "sink", "operator": "align", "operator_revision": "sink-revision", "ports": [{ "name": "reference", "dir": "in", "ty": "Fasta" }], "layout": { "x": 100, "y": 0 } }
+      ],
+      "edges": [{ "id": "edge", "from_node": "source", "from_port": "reads", "to_node": "sink", "to_port": "reference" }]
+    },
+    "error": "type mismatch source.reads:Fastq → sink.reference:Fasta"
+  },
+  {
+    "name": "self edge",
+    "graph": {
+      "schema_version": 3,
+      "nodes": [{ "id": "node", "operator": "tool", "operator_revision": "revision", "ports": [], "layout": { "x": 0, "y": 0 } }],
+      "edges": [{ "id": "edge", "from_node": "node", "from_port": "out", "to_node": "node", "to_port": "in" }]
+    },
+    "error": "self-edge edge"
+  },
+  {
+    "name": "multiple scalar inputs",
+    "graph": {
+      "schema_version": 3,
+      "nodes": [
+        { "id": "a", "operator": "source", "operator_revision": "a-revision", "ports": [{ "name": "out", "dir": "out", "ty": "Fastq" }], "layout": { "x": 0, "y": 0 } },
+        { "id": "b", "operator": "source", "operator_revision": "b-revision", "ports": [{ "name": "out", "dir": "out", "ty": "Fastq" }], "layout": { "x": 0, "y": 100 } },
+        { "id": "sink", "operator": "sink", "operator_revision": "sink-revision", "ports": [{ "name": "in", "dir": "in", "ty": "Fastq" }], "layout": { "x": 200, "y": 0 } }
+      ],
+      "edges": [
+        { "id": "a-edge", "from_node": "a", "from_port": "out", "to_node": "sink", "to_port": "in" },
+        { "id": "b-edge", "from_node": "b", "from_port": "out", "to_node": "sink", "to_port": "in" }
+      ]
+    },
+    "error": "multiple edges target scalar input sink.in"
+  },
+  {
+    "name": "invalid annotation dimensions",
+    "graph": {
+      "schema_version": 3,
+      "nodes": [],
+      "edges": [],
+      "annotations": [{ "id": "sticky", "kind": "sticky", "text": "note", "color": "yellow", "layout": { "x": 0, "y": 0 }, "width": 40, "height": 60 }]
+    },
+    "error": "invalid canvas annotation sticky"
+  },
+  {
+    "name": "cycle",
+    "graph": {
+      "schema_version": 3,
+      "nodes": [
+        { "id": "a", "operator": "a", "operator_revision": "a-revision", "ports": [{ "name": "in", "dir": "in", "ty": "Text" }, { "name": "out", "dir": "out", "ty": "Text" }], "layout": { "x": 0, "y": 0 } },
+        { "id": "b", "operator": "b", "operator_revision": "b-revision", "ports": [{ "name": "in", "dir": "in", "ty": "Text" }, { "name": "out", "dir": "out", "ty": "Text" }], "layout": { "x": 100, "y": 0 } }
+      ],
+      "edges": [
+        { "id": "a-b", "from_node": "a", "from_port": "out", "to_node": "b", "to_port": "in" },
+        { "id": "b-a", "from_node": "b", "from_port": "out", "to_node": "a", "to_port": "in" }
+      ]
+    },
+    "error": "cycle"
+  },
+  {
+    "name": "unsafe browser integer",
+    "graph": {
+      "schema_version": 3,
+      "nodes": [{ "id": "node", "operator": "tool", "operator_revision": "revision", "ports": [], "params": { "count": 9007199254740992 }, "layout": { "x": 0, "y": 0 } }],
+      "edges": []
+    },
+    "error": "node node parameter count is not stable through browser JSON"
+  },
+  {
+    "name": "retained source is required for a native variant",
+    "graph": {
+      "schema_version": 3,
+      "nodes": [],
+      "edges": [],
+      "variant_origin": {
+        "source_node": { "id": "source", "operator": "nf-core/test", "operator_revision": "source-revision", "ports": [], "layout": { "x": 0, "y": 0 } },
+        "promoted_invocations": {}
+      }
+    },
+    "error": "invalid native workflow variant origin: the retained source Node has no source workflow"
+  }
+]

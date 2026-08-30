@@ -135,6 +135,8 @@ import type { CatalogExpansionActivity } from "./catalogExpansion";
 import { editableRequiredSourceFileParameters, mergeCanonicalSourceWorkflow, opaqueNfcoreFallback, sourceScopeTitle, sourceSpanLabel, sourceWorkflowCanAppendGraph, sourceWorkflowCanvasIsEmpty, sourceWorkflowProvider, sourceWorkflowReplacementCandidate, sourceWorkflowRevision, sourceWorkflowSetupLabel, sourceWorkflowTitle } from "./sourceWorkflowPresentation";
 import { projectSourceNetwork, sourceNetworkEnterPath, sourceNetworkExitPath } from "./sourceWorkflowNetwork";
 import { canonicalRefreshAccepted, canonicalRefreshDisposition, captureGraphWrite, commitIfCanonicalEpochCurrent, enqueueGraphWrite, graphNodeSetChanged, type GraphWritePath, type GraphWriteSnapshot } from "./graphPersistence";
+import { assessWorkflow } from "@somite/workflow/assessment";
+import { OperatorCatalog } from "@somite/workflow/catalog";
 
 const SNAP: [number, number] = [20, 20];
 const HISTORY_LIMIT = 80;
@@ -638,6 +640,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     return [...operators.values()];
   }, [nfcoreCatalog, session, snakemakeCatalog]);
   const operatorMap = useMemo(() => new Map(availableOperators.map((operator) => [operator.id, operator])), [availableOperators]);
+  const workflowCatalog = useMemo(() => session ? new OperatorCatalog(session.operators) : null, [session]);
   const snapshot = useCallback(() => somiteGraph(workflowTitle, nodes, edges, annotations, variantOrigin), [annotations, edges, nodes, variantOrigin, workflowTitle]);
   const renderedGraph = useMemo(() => somiteGraph(workflowTitle, nodes, edges, annotations, variantOrigin), [annotations, edges, nodes, variantOrigin, workflowTitle]);
   const semanticKey = useMemo(() => semanticGraphKey(renderedGraph), [renderedGraph]);
@@ -700,28 +703,26 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   }, [activeIntent, semanticKey, session, setEdges, setNodes]);
 
   useEffect(() => {
-    if (!session || activeIntent) return;
+    if (!workflowCatalog || activeIntent) return;
     const requestedKey = semanticKey;
     const graph = graphSnapshotRef.current;
-    const timeout = window.setTimeout(() => {
-      void jsonRequest<ReadinessSnapshot>("/api/readiness", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(graph) })
-        .then((snapshot) => {
-          if (semanticKeyRef.current !== requestedKey) return;
-          setReadinessError(null);
-          setReadiness(snapshot);
-          const itemsByNode = new Map<string, ReadinessItem[]>();
-          for (const item of snapshot.items) itemsByNode.set(item.node_id, [...(itemsByNode.get(item.node_id) ?? []), item]);
-          setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, readinessItems: itemsByNode.get(node.id) ?? [] } })));
-        })
-        .catch((error) => {
-          if (semanticKeyRef.current !== requestedKey) return;
-          setReadiness(null);
-          setReadinessError(errorMessage(error));
-          setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, readinessItems: [] } })));
-        });
-    }, 120);
-    return () => window.clearTimeout(timeout);
-  }, [activeIntent, readinessRetry, semanticKey, session, setNodes]);
+    let cancelled = false;
+    let outcome: { readiness: ReadinessSnapshot; error: null } | { readiness: null; error: string };
+    try {
+      outcome = { readiness: assessWorkflow(graph, workflowCatalog), error: null };
+    } catch (error) {
+      outcome = { readiness: null, error: errorMessage(error) };
+    }
+    queueMicrotask(() => {
+      if (cancelled || semanticKeyRef.current !== requestedKey) return;
+      setReadinessError(outcome.error);
+      setReadiness(outcome.readiness);
+      const itemsByNode = new Map<string, ReadinessItem[]>();
+      for (const item of outcome.readiness?.items ?? []) itemsByNode.set(item.node_id, [...(itemsByNode.get(item.node_id) ?? []), item]);
+      setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, readinessItems: itemsByNode.get(node.id) ?? [] } })));
+    });
+    return () => { cancelled = true; };
+  }, [activeIntent, readinessRetry, semanticKey, setNodes, workflowCatalog]);
 
   const remember = useCallback((graph = snapshot()) => {
     setHistory((current) => ({ past: [...current.past.slice(-(HISTORY_LIMIT - 1)), graph], future: [] }));
@@ -1783,11 +1784,8 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   }, [editSourceWorkflowBinding, remember, setNodes, upload]);
 
   const updatePaperCandidateGraph = useCallback(async (index: number, previousGraph: SomiteGraph, graph: SomiteGraph) => {
-    const assessment = await jsonRequest<ReadinessSnapshot>("/api/readiness", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(graph),
-    });
+    if (!workflowCatalog) throw new Error("operator catalog is not ready");
+    const assessment = assessWorkflow(graph, workflowCatalog);
     paperIntakeCoordinator.updateReview((current) => ({
       ...current,
       candidates: current.candidates.map((entry, candidateIndex) => candidateIndex === index ? { ...entry, graph, assessment } : entry),
@@ -1830,7 +1828,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     }
     setDirty(true);
     return true;
-  }, [appliedPaperCandidate, flow, operatorMap, paperIntakeCoordinator, remember, setEdges, setNodes]);
+  }, [appliedPaperCandidate, flow, operatorMap, paperIntakeCoordinator, remember, setEdges, setNodes, workflowCatalog]);
 
   const updatePaperCandidateParameter = useCallback(async (index: number, item: ReadinessItem, field: string, value: ParamValue) => {
     const candidate = paperReview?.candidates[index];
@@ -2175,7 +2173,8 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     const requestedKey = semanticKey;
     const graph = snapshot();
     try {
-      const latest = await jsonRequest<ReadinessSnapshot>("/api/readiness", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(graph) });
+      if (!workflowCatalog) throw new Error("operator catalog is not ready");
+      const latest = assessWorkflow(graph, workflowCatalog);
       if (semanticKeyRef.current !== requestedKey) return;
       setReadiness(latest);
       const itemsByNode = new Map<string, ReadinessItem[]>();
@@ -2234,7 +2233,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       setActiveRunId(null);
       setActiveIntent(null);
     }
-  }, [focusRequirement, running, semanticKey, setEdges, setNodes, snapshot]);
+  }, [focusRequirement, running, semanticKey, setEdges, setNodes, snapshot, workflowCatalog]);
 
   const runGraph = useCallback(() => executeGraph("run"), [executeGraph]);
   const validateGraphWithFixtures = useCallback(() => executeGraph("validation"), [executeGraph]);

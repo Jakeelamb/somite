@@ -6,6 +6,11 @@
   "cost": "high",
   "bin": "rascaf",
   "pixi": ["bioconda::rascaf"],
+  "paper": {
+    "aliases": ["Rascaf"],
+    "operation_class": "genome_scaffolding",
+    "assays": ["assembly"]
+  },
   "params": {
     "minimum_support": { "type": "int", "label": "Minimum supporting alignments", "page": "Rascaf", "default": 5, "min": 2 }
   },

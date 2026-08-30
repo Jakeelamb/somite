@@ -6,6 +6,11 @@
   "cost": "low",
   "bin": "vcftools",
   "pixi": ["bioconda::vcftools"],
+  "paper": {
+    "aliases": ["VCF tools", "VCFtools"],
+    "operation_class": "variant_filtering",
+    "assays": ["assembly", "variants"]
+  },
   "params": {
     "minimum_spacing": { "type": "int", "label": "Minimum SNP spacing (bp)", "page": "Filter", "default": 75, "min": 1 }
   },

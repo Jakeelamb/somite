@@ -1,6 +1,6 @@
 # Somite domain model
 
-Somite has one persisted graph model shared by the canvas, CLI, executor, and
+Somite has one persisted graph model shared by the canvas, runner, Agent, and
 exporter. These terms are intentionally small and precise.
 
 ## Graph structure
@@ -66,7 +66,7 @@ identity.
 
 **Port** — a named, typed input or output on an operator.
 
-**Edge** — an IR connection from an output port to a compatible input port.
+**Edge** — a Graph connection from an output port to a compatible input port.
 The canvas draws an edge as a wire.
 
 **Parameter** — node configuration that does not flow through an edge, such as
@@ -129,12 +129,6 @@ to a validation Graph; it never replaces the user's configured data.
 
 **Node source map** — the explicit mapping from every executable Node to its
 generated process identity and, when applicable, its pinned upstream source.
-
-**Cook** — the temporary native-oracle action that realizes a node's outputs.
-It is not Somite's long-term production execution identity.
-
-**Cache** — the artifact store and cook index. A cook key covers the operator
-contract, parameters, and input hashes.
 
 **Staging** — materializing cached inputs in an isolated work directory under
 tool-friendly names.
@@ -252,7 +246,7 @@ Reconstruction outcome because no reliable source text was available.
 **Candidate graph** — one named interpretation of a distinct method track.
 Parallel analyses and mutually exclusive alternatives remain separate. A
 Candidate is never empty or source-only; all exported Candidates validate
-before they cross the `somite-paper` boundary.
+before they cross the shared Workflow Module boundary.
 
 **Method mention** — a normalized method identity plus its exact surface name,
 nearby evidence, optional source page, operation class, and either a reviewed
@@ -265,7 +259,7 @@ identical bytes reuses the artifact; retry references its digest and does not
 upload the bytes again.
 
 **Paper intake job** — the observable attempt to copy a local paper, extract
-its methods, and build Candidate graphs. Queued, text extraction, bounded OCR,
+its methods, and build Candidate graphs. Queued, native text extraction,
 method location, recognition, assessment, cancellation, and terminal phases are
 transport lifecycle state, distinct from Reconstruction outcome. A terminal job
 retains stage timings, cache reuse, result or actionable error. Failure never
@@ -273,7 +267,7 @@ mutates the previous Reconstruction or Graph.
 
 **Paper extraction cache** — normalized source text keyed by artifact digest and
 extractor version. Reconstruction is cached separately by extracted-text key and
-Catalog digest, so reviewed recognition changes do not rerun Poppler or OCR.
+Catalog digest, so reviewed recognition changes do not rerun PDF.js extraction.
 
 **Evidence** — retained source text or explicit inference attached to a
 reconstructed node or edge. Operator support is shown separately as built-in,
@@ -317,7 +311,8 @@ downloadable run or silently chooses the first member of a collection.
   ready outcome solely from Candidate count.
 - Paper artifact identity is content-based; filenames and retries do not create
   duplicate scientific bytes.
-- All persisted graph writes are validated by the Rust graph model.
+- All persisted graph writes are runtime-validated by the canonical Graph
+  Module; static TypeScript types alone never admit persisted or network data.
 - Generated engine syntax never introduces an unmapped executable node.
 - Workflow name, presentation-only layout, notes, Canvas annotations, and Node
   colors never alter the semantic Graph revision; all remain part of the

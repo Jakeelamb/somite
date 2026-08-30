@@ -4,6 +4,11 @@
   "palette": ["Resolve"],
   "kind": "inprocess",
   "cost": "low",
+  "paper": {
+    "aliases": ["JoinMap4.1", "JoinMap"],
+    "operation_class": "linkage_mapping",
+    "assays": ["assembly"]
+  },
   "params": {
     "path": { "type": "string", "label": "Exported linkage map", "page": "Manual checkpoint", "required": true },
     "version": { "type": "string", "label": "Reported version", "page": "Paper", "default": "4.1", "required": true }

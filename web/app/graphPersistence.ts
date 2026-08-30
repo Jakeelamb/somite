@@ -1,4 +1,5 @@
 import type { GraphWriteResponse, SomiteGraph } from "./types";
+import { validateGraph } from "@somite/workflow/workflow";
 
 export type GraphWritePath = "/api/graph" | "/api/graph/autosave";
 export type GraphWriteSnapshot = { graph: SomiteGraph; epoch: number };
@@ -58,6 +59,8 @@ export function enqueueGraphWrite(
 ) {
   const operation = queue.current.then(async () => {
     if (snapshot.epoch < minimumEpoch()) return;
+    const validation = validateGraph(snapshot.graph);
+    if (!validation.ok) throw new Error(validation.issue.message);
     const response = await transport(path, { base_state_revision: getRevision(), graph: snapshot.graph });
     commitIfCanonicalEpochCurrent(snapshot.epoch, minimumEpoch, () => {
       setRevision(response.state_revision);

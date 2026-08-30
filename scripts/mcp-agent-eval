@@ -21,7 +21,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-for command in cargo curl jq npx openssl; do
+for command in curl jq node npx openssl; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 1
@@ -44,12 +44,12 @@ if [[ "$scenario" == metagenomics ]]; then
 fi
 install -m 0644 "$graph_fixture" "$graph_path"
 
-cargo build --manifest-path "$project_root/Cargo.toml" -p somite-server
-SOMITE_MCP_RUNTIME_CAPABILITY="$capability" \
+SOMITE_AGENT_CAPABILITY="$capability" \
 SOMITE_PROJECT_ROOT="$project_root" \
 SOMITE_GRAPH="$graph_path" \
-SOMITE_WEB_ADDR="127.0.0.1:$port" \
-  "$project_root/target/debug/somite-server" >"$output_dir/server.log" 2>&1 &
+SOMITE_HOST="127.0.0.1" \
+SOMITE_PORT="$port" \
+  node --experimental-strip-types "$project_root/runner/src/server.ts" >"$output_dir/server.log" 2>&1 &
 server_pid=$!
 
 for _ in $(seq 1 100); do
@@ -99,10 +99,10 @@ fi
 install -m 0644 "$prompt_fixture" "$output_dir/prompt.txt"
 
 curl --fail --silent "$server_url/api/agent/graph" \
-  --header "authorization: Bearer $capability" >"$output_dir/initial-workflow.json"
+  --header "x-somite-mcp-capability: $capability" >"$output_dir/initial-workflow.json"
 jq -n --rawfile message "$output_dir/prompt.txt" \
   --slurpfile workflow "$output_dir/initial-workflow.json" \
-  '{message: $message, graph: $workflow[0].graph}' >"$output_dir/prompt-request.json"
+  '{message: $message, base_state_revision: $workflow[0].state_revision, graph: $workflow[0].graph}' >"$output_dir/prompt-request.json"
 curl --fail --silent --request POST "$server_url/api/agent/prompt" \
   --header 'content-type: application/json' \
   --data-binary @"$output_dir/prompt-request.json" >/dev/null
@@ -115,7 +115,7 @@ if [[ "$scenario" == stale ]]; then
       .kind == "tool" and .title == "somite.workflow.get" and
       ((.detail // "") | contains("200 OK")))' "$output_dir/events.json" >/dev/null; then
       curl --fail --silent "$server_url/api/agent/graph" \
-        --header "authorization: Bearer $capability" \
+        --header "x-somite-mcp-capability: $capability" \
         >"$output_dir/pre-injection-workflow.json"
       jq '{
         base_state_revision: .state_revision,
@@ -132,7 +132,7 @@ if [[ "$scenario" == stale ]]; then
       }' "$output_dir/pre-injection-workflow.json" >"$output_dir/injection-request.json"
       curl --fail --silent --request POST "$server_url/api/agent/transactions" \
         --header 'content-type: application/json' \
-        --header "authorization: Bearer $capability" \
+        --header "x-somite-mcp-capability: $capability" \
         --data-binary @"$output_dir/injection-request.json" \
         >"$output_dir/injection-response.json"
       injected=true
@@ -191,7 +191,7 @@ fi
 
 curl --fail --silent "$server_url/api/agent/transcript" >"$output_dir/transcript.json"
 curl --fail --silent "$server_url/api/agent/graph" \
-  --header "authorization: Bearer $capability" >"$output_dir/final-workflow.json"
+  --header "x-somite-mcp-capability: $capability" >"$output_dir/final-workflow.json"
 curl --fail --silent --request POST "$server_url/api/agent/disconnect" >/dev/null
 
 jq -n \

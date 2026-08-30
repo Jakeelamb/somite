@@ -17,15 +17,16 @@ remains reachable through Somite's capability surface, and normalized
 transcripts are still persisted there. The session receives Somite's MCP server
 in its `session/new` request, using ACP's mandatory stdio MCP transport.
 
-MCP is the capability boundary between the agent and Somite. The server is the
-same `somite-server` executable in a protocol-only mode:
+MCP is the capability boundary between the agent and Somite. The parent runner
+launches the small TypeScript stdio Adapter for the ACP session:
 
 ```bash
-somite-server mcp --server-url http://127.0.0.1:7310
+node --experimental-strip-types runner/src/mcp.ts --server-url http://127.0.0.1:7310
 ```
 
-Standard output is reserved for newline-delimited MCP JSON-RPC. Operational
-logging never initializes in this mode. The MCP proxy accepts only a loopback
+This command is illustrative; a capability supplied only by the parent process
+is also required. Standard output is reserved for newline-delimited MCP
+JSON-RPC. The MCP proxy accepts only a loopback
 Somite runtime URL. The parent runtime gives each MCP child a cryptographically
 random capability through its process environment; every tool call back into
 the HTTP runtime must present that capability. It never appears in the command
@@ -181,7 +182,7 @@ one history entry for each, so normal Undo reverses them individually.
   timeout expires.
 - Disconnect and Stop remain available while the agent works. Canvas, run,
   validation, and export remain available without an agent.
-- Graph writes pass through the same Rust validation and autosave boundary as
+- Graph writes pass through the same shared Workflow validation and autosave boundary as
   human edits. Compile, run, and validation tools call the same production
   freezer and supervisor as the web controls.
 
@@ -202,13 +203,12 @@ bounded response time.
 
 ## Verification
 
-Server tests cover invalid, failed, stale, replayed, and successful atomic
-transactions and launches; authenticated loopback calls; structured tool
-errors and output schemas; transcript correlation and secret redaction; HTTP
-persistence and activity events; a spawned ACP v1 subprocess turn; and an
-official RMCP client spawning Somite's stdio server, listing every tool,
-editing a graph, and reading the result back. Web tests cover event
-de-duplication and exactly-once transaction delivery to canvas history.
+Tests cover strict, stale, replayed, and successful graph transactions;
+capability-authenticated loopback calls; transcript correlation and recursive
+secret redaction; a spawned ACP v1 subprocess turn; and the stdio MCP Adapter's
+modern discovery, legacy initialization, tool listing, structured calls, and
+cancellation. Web tests cover event de-duplication and exactly-once transaction
+delivery to canvas history.
 
 The repeatable live-agent harness runs the same blind task against a selected
 Codex ACP model and reasoning level, auto-approves only exact `somite.*`
@@ -231,4 +231,5 @@ Protocol references:
 - [ACP session setup](https://agentclientprotocol.com/protocol/v1/session-setup)
 - [MCP stdio transport](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/stdio)
 - [MCP tools](https://modelcontextprotocol.io/specification/2026-07-28/server/tools)
-- [Official MCP Rust SDK](https://github.com/modelcontextprotocol/rust-sdk)
+- [Official ACP TypeScript SDK](https://github.com/agentclientprotocol/typescript-sdk)
+- [MCP protocol versions](https://github.com/modelcontextprotocol/typescript-sdk/blob/main/docs/protocol-versions.md)

@@ -48,6 +48,28 @@ test("a failed write does not poison the serialization queue", async () => {
   assert.equal(revision, "state-b");
 });
 
+test("invalid browser graphs fail locally before crossing the transport", async () => {
+  const queue = { current: Promise.resolve() };
+  let transported = false;
+  const invalid: SomiteGraph = {
+    schema_version: 3,
+    nodes: [{ id: "node", operator: "tool", operator_revision: "", ports: [], layout: { x: 0, y: 0 } }],
+    edges: [],
+  };
+  await assert.rejects(
+    enqueueGraphWrite(
+      queue,
+      () => "state-a",
+      () => undefined,
+      async () => { transported = true; return { valid: true, state_revision: "state-b" }; },
+      "/api/graph",
+      captureGraphWrite(invalid, 1),
+    ),
+    /node node does not pin an operator revision/,
+  );
+  assert.equal(transported, false);
+});
+
 test("a canonical response invalidates older queued snapshots before transport", async () => {
   let releaseQueue: (() => void) | undefined;
   const queue = { current: new Promise<void>((resolve) => { releaseQueue = resolve; }) };

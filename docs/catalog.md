@@ -117,12 +117,9 @@ Git revision and visibly marks a dirty worktree. Custom graph launches use a
 graph-scoped autosave, so previewing a workflow cannot recover or overwrite an
 unrelated canvas autosave.
 
-The same path is available without the web app:
-
-```bash
-cargo run -p somite-cli -- import-snakemake \
-  path/to/project output.somite.json target_a target_b
-```
+The TypeScript runner exposes this same import through
+`POST /api/workflows/snakemake/import`; the browser does not maintain a second
+import implementation.
 
 ## Version and provenance rules
 

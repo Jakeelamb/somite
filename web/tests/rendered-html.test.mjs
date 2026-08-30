@@ -48,7 +48,8 @@ test("starter preview is removed and the real canvas is wired", async () => {
   assert.match(app, /ContinuationContext/);
   assert.match(app, /focusPaperEvidence/);
   assert.match(app, /api\/agent\/events/);
-  assert.match(app, /api\/readiness/);
+  assert.match(app, /assessWorkflow/);
+  assert.doesNotMatch(app, /api\/readiness/);
   assert.match(app, /api\/agent\/discover/);
   assert.match(app, /api\/agent\/config/);
   assert.match(app, /api\/workflows\/snakemake\/import/);

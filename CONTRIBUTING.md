@@ -1,66 +1,65 @@
 # Contributing to Somite
 
 Somite welcomes focused bug fixes, documentation improvements, operator
-contracts, and workflow capabilities. Start with the user or scientific outcome;
-implementation details should follow from that outcome.
+contracts, and workflow capabilities. Start with the user or scientific
+outcome; implementation details should follow from that outcome.
 
 ## Before opening a change
 
 - Search existing issues and discussions.
-- Open an issue before a large feature, new execution engine, graph-schema
+- Open an issue before a large feature, graph-schema change, execution-target
   change, or operator-contract change.
 - Never include credentials, private datasets, unpublished paper content, or
   machine-specific absolute paths.
-- Keep execution claims evidence-bound. A graph edit, successful compilation,
+- Keep claims evidence-bound. A graph edit, successful compilation,
   representative validation, and production execution are different outcomes.
 
 ## Development setup
 
-Requirements:
-
-- Rust via `rustup`; the repository pins the toolchain in `rust-toolchain.toml`.
-- Node.js from `.nvmrc` (22.13.0 or newer compatible release).
-- [Pixi](https://pixi.sh/) for resolving and running bioinformatics tools.
-
-Install the locked web dependencies and launch the app:
+Use the checked-in Pixi environment:
 
 ```bash
-cd web
-npm ci
-cd ..
-scripts/somite-web
+pixi run setup
+pixi run dev
 ```
 
-Open <http://localhost:3000>. Local graphs, evidence, and generated tool
+Or use Node.js from `.nvmrc` directly:
+
+```bash
+npm ci
+npm run dev
+```
+
+The repository is one npm workspace: `web/`, `runner/`, and
+`packages/workflow/`. Local graphs, uploads, evidence, and generated tool
 environments live under `.somite/` and must not be committed.
 
 ## Make a reviewable change
 
 - Keep one production path and delete obsolete code before adding abstraction.
-- Add tests for new behavior. Prefer property tests for graph invariants and
-  end-to-end checks for user-visible paths.
-- Avoid `unwrap()` in library code. Return typed errors with useful context.
-- Preserve graph identity, operator revisions, provenance, and fail-closed
-  behavior when changing compilation or execution.
+- Put graph semantics, validation, compilation, and identity in
+  `@somite/workflow`; keep browser interaction in `web/` and host/process I/O in
+  `runner/`.
+- Runtime-validate every persisted, network, catalog, paper, and Agent value.
+  TypeScript types alone are not a trust boundary.
+- Add tests at the narrowest useful Interface. Add a spawned-runner or browser
+  test when behavior crosses Modules.
+- Preserve graph identity, operator revisions, provenance, atomic writes, and
+  fail-closed behavior.
 - Update the README, relevant design documentation, and `CHANGELOG.md` when
   public behavior changes.
 
-Run the full local gate before requesting review:
+Run the full gate before requesting review:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
-cargo build --workspace --release --locked
-
-cd web
-npm run typecheck
-npm run lint
-npm test
+npm ci
+npm run check
+npm audit
+git diff --check
 ```
 
-In the pull request, list the exact commands and manual checks that passed. If a
-check is unavailable, state that directly and explain why.
+In the pull request, list exact commands and manual checks. If a check is
+unavailable, state that directly and explain why.
 
 ## License
 

@@ -1,0 +1,212 @@
+[
+  {
+    "name": "empty canvas",
+    "graph": { "schema_version": 3, "nodes": [], "edges": [] }
+  },
+  {
+    "name": "local input still needs a path",
+    "graph": {
+      "schema_version": 3,
+      "nodes": [{
+        "id": "input1",
+        "operator": "files.import",
+        "operator_revision": "blake3:4919927a3059aa4543d45380fd700993964e3e239ceb9e3fda73b5956b89bc4a",
+        "ports": [{ "name": "file", "dir": "out", "ty": "Fastq" }],
+        "layout": { "x": 0, "y": 0 }
+      }],
+      "edges": []
+    }
+  },
+  {
+    "name": "managed tool still needs an input",
+    "graph": {
+      "schema_version": 3,
+      "nodes": [{
+        "id": "fastqc1",
+        "operator": "qc.fastqc",
+        "operator_revision": "blake3:25e0002b51061db054034e75aaa0c7fa7bb2036bcb615b3d37a6eb9fec6e9259",
+        "ports": [
+          { "name": "fastq", "dir": "in", "ty": "Fastq", "union": ["Fastq", "FastqGz"] },
+          { "name": "html", "dir": "out", "ty": "Html" },
+          { "name": "preview", "dir": "out", "ty": "Preview", "optional": true }
+        ],
+        "layout": { "x": 0, "y": 0 }
+      }],
+      "edges": []
+    }
+  },
+  {
+    "name": "scientific database is a distinct managed resource",
+    "graph": {
+      "schema_version": 3,
+      "nodes": [{
+        "id": "kraken1",
+        "operator": "class.kraken2",
+        "operator_revision": "blake3:a370d1ec6ecdb21cd42a98c021b849eeda1fe1e9ddea97587cf51d2104453768",
+        "ports": [
+          { "name": "r1", "dir": "in", "ty": "Fastq", "union": ["Fastq", "FastqGz"] },
+          { "name": "r2", "dir": "in", "ty": "Fastq", "union": ["Fastq", "FastqGz"], "optional": true },
+          { "name": "db", "dir": "in", "ty": "Directory" },
+          { "name": "report", "dir": "out", "ty": "Table" }
+        ],
+        "layout": { "x": 0, "y": 0 }
+      }],
+      "edges": []
+    }
+  },
+  {
+    "name": "connected local FastQC workflow is ready",
+    "graph": {
+      "schema_version": 3,
+      "nodes": [
+        {
+          "id": "input1",
+          "operator": "files.import",
+          "operator_revision": "blake3:4919927a3059aa4543d45380fd700993964e3e239ceb9e3fda73b5956b89bc4a",
+          "ports": [{ "name": "file", "dir": "out", "ty": "Fastq" }],
+          "params": { "path": "data/reads.fastq" },
+          "layout": { "x": 0, "y": 0 }
+        },
+        {
+          "id": "fastqc1",
+          "operator": "qc.fastqc",
+          "operator_revision": "blake3:25e0002b51061db054034e75aaa0c7fa7bb2036bcb615b3d37a6eb9fec6e9259",
+          "ports": [
+            { "name": "fastq", "dir": "in", "ty": "Fastq", "union": ["Fastq", "FastqGz"] },
+            { "name": "html", "dir": "out", "ty": "Html" },
+            { "name": "preview", "dir": "out", "ty": "Preview", "optional": true }
+          ],
+          "layout": { "x": 240, "y": 0 }
+        }
+      ],
+      "edges": [{
+        "id": "reads",
+        "from_node": "input1",
+        "from_port": "file",
+        "to_node": "fastqc1",
+        "to_port": "fastq"
+      }]
+    }
+  },
+  {
+    "name": "paper gap retains a reviewed adapter action",
+    "graph": {
+      "schema_version": 3,
+      "nodes": [{
+        "id": "gap1",
+        "operator": "gap.missing",
+        "operator_revision": "blake3:b52aa44cf71ad53b70e59b27f940f0c3c39f62e86d4dd00b5c627f222f23f4c1",
+        "ports": [
+          { "name": "in", "dir": "in", "ty": "Directory", "optional": true },
+          { "name": "out", "dir": "out", "ty": "Directory", "optional": true }
+        ],
+        "params": { "tool": "OUwie" },
+        "layout": { "x": 0, "y": 0 }
+      }],
+      "edges": []
+    }
+  },
+  {
+    "name": "manual checkpoint is unresolved until its artifact is attached",
+    "graph": {
+      "schema_version": 3,
+      "nodes": [{
+        "id": "joinmap1",
+        "operator": "manual.joinmap",
+        "operator_revision": "blake3:e8076ca74c5bff7ebe0dd9f1de048d39a2f047dc10075d84a9f3327c0ef13601",
+        "ports": [
+          { "name": "variants", "dir": "in", "ty": "Vcf", "union": ["Vcf", "VcfGz"], "optional": true },
+          { "name": "map", "dir": "out", "ty": "Table" }
+        ],
+        "layout": { "x": 0, "y": 0 }
+      }],
+      "edges": []
+    }
+  },
+  {
+    "name": "manual checkpoint becomes ready after attachment",
+    "graph": {
+      "schema_version": 3,
+      "nodes": [{
+        "id": "joinmap1",
+        "operator": "manual.joinmap",
+        "operator_revision": "blake3:e8076ca74c5bff7ebe0dd9f1de048d39a2f047dc10075d84a9f3327c0ef13601",
+        "ports": [
+          { "name": "variants", "dir": "in", "ty": "Vcf", "union": ["Vcf", "VcfGz"], "optional": true },
+          { "name": "map", "dir": "out", "ty": "Table" }
+        ],
+        "params": { "path": "data/joinmap.csv" },
+        "layout": { "x": 0, "y": 0 }
+      }],
+      "edges": []
+    }
+  },
+  {
+    "name": "source workflow exposes every honest blocker",
+    "graph": {
+      "schema_version": 3,
+      "nodes": [{
+        "id": "source1",
+        "operator": "workflow.source",
+        "operator_revision": "blake3:35f8bef9c45e0d4d2d32a4e1c1e19957000ec9119ccba7f11661f89d820400c9",
+        "ports": [],
+        "source_workflow": {
+          "schema_version": 1,
+          "workflow_revision": "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "source": {
+            "provider": "nf_core",
+            "repository": "nf-core/rnaseq",
+            "requested_revision": "3.26.0",
+            "resolved_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "source_digest": "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "entrypoint": "main.nf",
+            "file_count": 12,
+            "source_bytes": 2048
+          },
+          "parameters": [{
+            "name": "input",
+            "label": "Input samplesheet",
+            "group": "Input/output options",
+            "description": "Samplesheet describing the reads.",
+            "type": "string",
+            "required": true,
+            "format": "file-path"
+          }],
+          "unsupported_required_parameters": [{
+            "name": "complex",
+            "label": "Complex upstream value",
+            "group": "Advanced",
+            "reason": "nested objects are not representable"
+          }],
+          "scopes": [{
+            "id": "entry",
+            "title": "RNA-seq",
+            "kind": "entry_workflow",
+            "span": { "path": "main.nf", "start_line": 1, "end_line": 20 }
+          }],
+          "invocations": [{
+            "id": "invoke-fastqc",
+            "caller": "entry",
+            "name": "FASTQC",
+            "span": { "path": "main.nf", "start_line": 8, "end_line": 8 }
+          }],
+          "replacements": [{
+            "invocation_id": "invoke-fastqc",
+            "operator": "qc.fastqc",
+            "operator_revision": "blake3:25e0002b51061db054034e75aaa0c7fa7bb2036bcb615b3d37a6eb9fec6e9259"
+          }],
+          "capabilities": {
+            "exact_execution": false,
+            "parameter_edits": false,
+            "hierarchy_indexed": true,
+            "structural_edits": false,
+            "channel_contracts": false,
+            "source_edits": false
+          }
+        },
+        "layout": { "x": 0, "y": 0 }
+      }],
+      "edges": []
+    }
+  }
+]

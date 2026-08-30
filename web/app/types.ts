@@ -1,301 +1,62 @@
-export type PortType =
-  | "Sra"
-  | "Fastq"
-  | "FastqGz"
-  | "Fasta"
-  | "FastaGz"
-  | "Gtf"
-  | "GtfGz"
-  | "Gff3"
-  | "Sam"
-  | "Bam"
-  | "Bai"
-  | "Vcf"
-  | "VcfGz"
-  | "Bed"
-  | "Agp"
-  | "Chain"
-  | "Table"
-  | "Json"
-  | "Html"
-  | "Image"
-  | "Zip"
-  | "Directory"
-  | "Text"
-  | "Preview";
+export type {
+  CanvasAnnotation,
+  CanvasColor,
+  CanvasPoint,
+  ParamValue,
+  PortType,
+  SomiteEdge,
+  SomiteGraph,
+  SomiteGraphNode,
+  SomitePort,
+  SourceCapabilities,
+  SourceDiagnostic,
+  SourceInvocation,
+  SourceInvocationReplacement,
+  SourceProvider,
+  SourceScope,
+  SourceSpan,
+  SourceWorkflowInstance,
+  SourceWorkflowVariantOrigin,
+  UnsupportedRequiredWorkflowParameter,
+  WorkflowBinding,
+  WorkflowParameterField,
+  WorkflowSourcePin,
+} from "@somite/workflow/model";
 
-export type ParamValue = string | number | boolean;
+export type {
+  CommandBindings,
+  Operator,
+  OperatorResolutionKind,
+  OperatorResolutionSpec,
+  OutputSpec,
+  PaperRecognitionSpec,
+  ParamSpec,
+  PinnedOperator,
+  PortSpec,
+  ResolutionRecipe,
+  ResolutionRecipeKind,
+  ResourceResolutionKind,
+  ResourceResolutionSpec,
+  ResourceSpec,
+} from "@somite/workflow/catalog";
 
-export type CanvasColor = "yellow" | "orange" | "rose" | "violet" | "blue" | "teal" | "green" | "gray";
+export type {
+  NodeAssessment,
+  ReadinessItem,
+  ReadinessResolution,
+  ReadinessSnapshot,
+  ReadinessState,
+  RequirementField,
+  RequirementInputMode,
+  RequirementKind,
+  ResolutionKind,
+  SupportKind,
+  WorkflowAssessment,
+} from "@somite/workflow/assessment";
 
-export type CanvasPoint = { x: number; y: number };
-
-export type CanvasAnnotation =
-  | { id: string; kind: "sticky" | "box"; text: string; color: CanvasColor; layout: CanvasPoint; width: number; height: number }
-  | { id: string; kind: "stroke"; color: CanvasColor; points: CanvasPoint[] };
-
-export type SomitePort = {
-  name: string;
-  dir: "in" | "out";
-  ty: PortType;
-  union?: PortType[];
-  optional?: boolean;
-};
-
-export type SourceProvider = "nf_core" | "local";
-
-export type WorkflowSourcePin = {
-  provider: SourceProvider;
-  repository: string;
-  requested_revision: string;
-  resolved_revision: string;
-  source_digest: string;
-  entrypoint: string;
-  file_count: number;
-  source_bytes: number;
-};
-
-export type WorkflowParameterField = {
-  name: string;
-  label: string;
-  group: string;
-  description?: string;
-  help?: string;
-  type: "string" | "integer" | "number" | "boolean";
-  required?: boolean;
-  hidden?: boolean;
-  managed?: boolean;
-  format?: string;
-  pattern?: string;
-  default?: ParamValue;
-  choices?: ParamValue[];
-  minimum?: number;
-  maximum?: number;
-};
-
-export type WorkflowBinding =
-  | { kind: "project_file"; path: string }
-  | { kind: "project_directory"; path: string }
-  | { kind: "literal"; value: ParamValue };
-
-export type SourceSpan = {
-  path: string;
-  start_line: number;
-  end_line: number;
-};
-
-export type SourceScope = {
-  id: string;
-  title: string;
-  symbol?: string;
-  kind: "entry_workflow" | "workflow" | "process";
-  span: SourceSpan;
-};
-
-export type SourceInvocation = {
-  id: string;
-  caller: string;
-  name: string;
-  callee?: string;
-  span: SourceSpan;
-};
-
-export type SourceInvocationReplacement = {
-  invocation_id: string;
-  operator: string;
-  operator_revision: string;
-  params?: Record<string, ParamValue>;
-};
-
-export type SourceCapabilities = {
-  exact_execution: boolean;
-  parameter_edits: boolean;
-  hierarchy_indexed: boolean;
-  structural_edits: boolean;
-  channel_contracts: boolean;
-  source_edits: boolean;
-};
-
-export type SourceDiagnostic = {
-  code: string;
-  message: string;
-  span?: SourceSpan;
-};
-
-export type SourceWorkflowInstance = {
-  schema_version: number;
-  workflow_revision: string;
-  source: WorkflowSourcePin;
-  profiles?: string[];
-  parameters?: WorkflowParameterField[];
-  bindings?: Record<string, WorkflowBinding>;
-  scopes?: SourceScope[];
-  invocations?: SourceInvocation[];
-  replacements?: SourceInvocationReplacement[];
-  capabilities: SourceCapabilities;
-  diagnostics?: SourceDiagnostic[];
-};
-
-export type SomiteGraphNode = {
-  id: string;
-  operator: string;
-  operator_revision: string;
-  ports: SomitePort[];
-  params?: Record<string, ParamValue>;
-  source_workflow?: SourceWorkflowInstance;
-  layout: { x: number; y: number };
-  note?: string;
-  color?: CanvasColor;
-};
-
-export type SourceWorkflowVariantOrigin = {
-  source_node: SomiteGraphNode;
-  promoted_invocations?: Record<string, string>;
-};
-
-export type SomiteEdge = {
-  id: string;
-  from_node: string;
-  from_port: string;
-  to_node: string;
-  to_port: string;
-};
-
-export type SomiteGraph = {
-  schema_version: number;
-  name?: string;
-  nodes: SomiteGraphNode[];
-  edges: SomiteEdge[];
-  annotations?: CanvasAnnotation[];
-  variant_origin?: SourceWorkflowVariantOrigin;
-};
-
-export type ParamSpec = {
-  type: string;
-  label?: string;
-  page?: string;
-  default?: ParamValue;
-  required?: boolean;
-  min?: number;
-  max?: number;
-};
-
-export type PortSpec = {
-  name: string;
-  type: PortType;
-  union?: PortType[];
-  optional?: boolean;
-  resource?: ResourceSpec;
-};
-
-export type ResourceResolutionKind = "use_existing" | "download" | "build";
-
-export type ResourceResolutionSpec = {
-  id: string;
-  label: string;
-  detail: string;
-  kind: ResourceResolutionKind;
-  recommended?: boolean;
-  download_bytes?: number | null;
-  stored_bytes?: number | null;
-  scientific_effect?: string;
-};
-
-export type ResourceSpec = {
-  profile: string;
-  title: string;
-  detail: string;
-  resolutions: ResourceResolutionSpec[];
-};
-
-export type ReadinessState = "empty" | "building" | "needs_action" | "ready";
-export type RequirementKind = "input" | "parameter" | "managed_resource" | "manual_checkpoint" | "method_details" | "legacy_tool" | "adapter";
-export type ResolutionKind = "connect" | "configure" | "use_existing" | "download" | "build" | "attach" | "review" | "setup" | "add_adapter";
-export type RequirementInputMode = "connection" | "file" | "text" | "choice" | "guide" | "agent";
-export type SupportKind = "input_required" | "managed_tool" | "source_workflow" | "built_in" | "system_tool" | "manual_checkpoint" | "method_details" | "legacy_source" | "adapter";
-export type ResolutionRecipeKind = "external_checkpoint" | "environment" | "method_selection" | "artifact_preparation" | "adapter_contract";
-
-export type ResolutionRecipe = {
-  id: string;
-  title: string;
-  summary: string;
-  version: string;
-  kind: ResolutionRecipeKind;
-  steps: string[];
-  parameters: string[];
-  source_url?: string;
-};
-
-export type RequirementField = {
-  name: string;
-  label: string;
-  input_mode: RequirementInputMode;
-};
-
-export type ReadinessResolution = {
-  id: string;
-  label: string;
-  detail: string;
-  kind: ResolutionKind;
-  recommended: boolean;
-  download_bytes?: number | null;
-  stored_bytes?: number | null;
-  scientific_effect?: string;
-  source_url?: string;
-};
-
-export type ReadinessItem = {
-  id: string;
-  node_id: string;
-  operator_id: string;
-  field: string;
-  fields: RequirementField[];
-  title: string;
-  detail: string;
-  kind: RequirementKind;
-  priority: number;
-  escalatable: boolean;
-  resource_profile?: string;
-  resolutions: ReadinessResolution[];
-  recipes: ResolutionRecipe[];
-};
-
-export type NodeAssessment = {
-  node_id: string;
-  operator_id: string;
-  title: string;
-  kind: SupportKind;
-  label: string;
-  detail: string;
-  requires_action: boolean;
-  recipes: ResolutionRecipe[];
-};
-
-export type WorkflowAssessment = {
-  graph_revision: string;
-  state: ReadinessState;
-  required_count: number;
-  items: ReadinessItem[];
-  nodes: NodeAssessment[];
-};
-
-export type ReadinessSnapshot = WorkflowAssessment;
-
-export type Operator = {
-  id: string;
-  revision?: string;
-  title: string;
-  palette: string[];
-  kind: "external" | "inprocess" | "reference" | "source";
-  cost: "low" | "high";
-  bin?: string;
-  pixi?: string[];
-  params: Record<string, ParamSpec>;
-  ports: { in: PortSpec[]; out: PortSpec[] };
-  description?: string;
-  topics?: string[];
-  expandable?: boolean;
-};
+import type { SomiteGraph } from "@somite/workflow/model";
+import type { Operator } from "@somite/workflow/catalog";
+import type { WorkflowAssessment } from "@somite/workflow/assessment";
 
 export type NfcoreCatalog = {
   entries: Array<{ operator: Operator; description: string; topics: string[]; revision: string }>;
@@ -544,7 +305,7 @@ export type PaperMethodMention = {
 };
 
 export type PaperReview = {
-  extracted_via: "text" | "poppler" | "ocr" | "jats";
+  extracted_via: "text" | "pdfjs" | "poppler" | "ocr" | "jats";
   outcome: PaperReconstructionOutcome;
   warnings: string[];
   mentions: PaperMethodMention[];

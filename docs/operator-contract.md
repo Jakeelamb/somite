@@ -193,8 +193,9 @@ Readiness, Nextflow compilation, and Pixi freezing apply without a separate
 source execution path.
 
 JSON Schema `pattern` bindings fail closed across regex engines. Somite accepts
-only printable-ASCII patterns and values from a deliberately shared ECMA-262 / Rust
-`regex` subset: ordinary and non-capturing groups, alternation, anchors, `.`,
+only printable-ASCII patterns and values from the deliberately constrained
+ECMA-262 subset shared by browser and runner: ordinary and non-capturing groups,
+alternation, anchors, `.`,
 ASCII classes and ranges, common class/boundary escapes, and `*`, `+`, or `?`
 quantifiers. Lookarounds, inline modes, backreferences, Unicode or hex escapes,
 counted quantifiers, POSIX classes, and class set operations remain Source-only.

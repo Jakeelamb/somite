@@ -1,0 +1,33 @@
+{
+  "name": "somite",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "workspaces": [
+    "web",
+    "runner",
+    "packages/*"
+  ],
+  "scripts": {
+    "app": "node --experimental-strip-types scripts/somite-web.ts",
+    "build": "npm run build --workspace=somite-web",
+    "check": "npm run typecheck && npm run lint && npm test",
+    "dev": "node --experimental-strip-types scripts/somite-web.ts",
+    "dev:web": "npm run dev --workspace=somite-web",
+    "lint": "npm run lint --workspace=somite-web",
+    "start:runner": "npm run start --workspace=somite-runner",
+    "test": "npm run test --workspace=somite-runner && npm run test --workspace=somite-web",
+    "typecheck": "tsc --noEmit -p tsconfig.json && npm run typecheck --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.19",
+    "typescript": "5.9.3"
+  },
+  "allowScripts": {
+    "esbuild": true,
+    "workerd": true
+  }
+}

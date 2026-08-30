@@ -5,7 +5,7 @@
   "paper": {
     "aliases": ["BWA-MEM", "BWA MEM"],
     "operation_class": "read_alignment",
-    "assays": ["variants"]
+    "assays": ["assembly", "variants"]
   },
   "kind": "external",
   "cost": "high",

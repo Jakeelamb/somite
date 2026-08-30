@@ -19,8 +19,8 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: Operating system, architecture, Rust, Node.js, and Pixi versions.
-      placeholder: Ubuntu 24.04, x86_64, rustc 1.96.0, Node 22.13.0, Pixi 0.77.1
+      description: Operating system, architecture, Node.js, and Pixi versions.
+      placeholder: Ubuntu 24.04, x86_64, Node 22.13.0, Pixi 0.77.1
     validations:
       required: true
   - type: dropdown
@@ -33,7 +33,7 @@ body:
         - Validation or evidence
         - Paper reconstruction
         - Agent or MCP integration
-        - CLI
+        - Local runner
         - Documentation
         - Other
     validations:

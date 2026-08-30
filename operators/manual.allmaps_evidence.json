@@ -4,6 +4,11 @@
   "palette": ["Resolve"],
   "kind": "inprocess",
   "cost": "low",
+  "paper": {
+    "aliases": ["ALLMAPS"],
+    "operation_class": "scaffolding_evidence",
+    "assays": ["assembly"]
+  },
   "params": {
     "map_path": { "type": "string", "label": "Combined ALLMAPS BED", "page": "Manual checkpoint", "required": true },
     "weights_path": { "type": "string", "label": "ALLMAPS weights file", "page": "Manual checkpoint", "required": true }

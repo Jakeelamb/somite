@@ -4,6 +4,11 @@
   "palette": ["Resolve"],
   "kind": "reference",
   "cost": "low",
+  "paper": {
+    "aliases": ["AGOUTI"],
+    "operation_class": "genome_scaffolding",
+    "assays": ["assembly"]
+  },
   "params": {
     "minimum_support": { "type": "int", "label": "Minimum read-pair support", "page": "Paper", "default": 5, "min": 1 },
     "minimum_mapping_quality": { "type": "int", "label": "Minimum mapping quality", "page": "Paper", "default": 20, "min": 0 }

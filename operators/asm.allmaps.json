@@ -6,6 +6,11 @@
   "cost": "high",
   "bin": "python",
   "pixi": ["bioconda::jcvi"],
+  "paper": {
+    "aliases": ["ALLMAPS"],
+    "operation_class": "genome_scaffolding",
+    "assays": ["assembly"]
+  },
   "params": {
     "threads": { "type": "int", "label": "Threads", "page": "ALLMAPS", "default": 8, "min": 1, "max": 64 },
     "gap_size": { "type": "int", "label": "Inter-scaffold gap size", "page": "ALLMAPS", "default": 100, "min": 0 }

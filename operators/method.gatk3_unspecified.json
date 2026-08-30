@@ -4,6 +4,11 @@
   "palette": ["Resolve"],
   "kind": "reference",
   "cost": "low",
+  "paper": {
+    "aliases": ["GATK V3.5", "GATK 3.5"],
+    "operation_class": "variant_calling",
+    "assays": ["assembly", "variants"]
+  },
   "params": {
     "version": { "type": "string", "label": "Reported version", "page": "Paper", "default": "3.5", "required": true }
   },

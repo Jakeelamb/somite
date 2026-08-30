@@ -1,0 +1,24 @@
+{
+  "artifacts": {
+    "main_nf": {
+      "digest": "blake3:cefecbf6641e0ffe4465bb214ec48c0f05e06e5bddff1fc1a922168625f44622",
+      "bytes": 3706
+    },
+    "nextflow_config": {
+      "digest": "blake3:3cf6605e9fecd239bc92cccf58fe6385dfdeb063c1d8efac344d90158065f433",
+      "bytes": 182
+    },
+    "node_map_json": {
+      "digest": "blake3:ce4a02e5aaecfc754f953c5483cd97cd61ff724d98cac0a798bca25a97880cce",
+      "bytes": 1312
+    },
+    "params_json": {
+      "digest": "blake3:39521e3a17014394dd3d2b5f2095e0f5f0ea891744810267095fea8931d946ee",
+      "bytes": 201
+    },
+    "pixi_toml": {
+      "digest": "blake3:b405a1212293f8caa0dbc8add5bcc8798869706b8d73602c0b702c00001a07c8",
+      "bytes": 331
+    }
+  }
+}

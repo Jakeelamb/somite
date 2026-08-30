@@ -20,7 +20,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   unsupported-method, input, resource, and manual-checkpoint boundaries.
 - Bring-your-own ACP agents backed by revision-safe MCP tools and normal,
   undoable canvas transactions.
-- Continuous verification for Rust and web code on pushes and pull requests.
+- A content-addressed, observable paper-intake pipeline using native PDF.js
+  extraction, cached reconstruction, explicit outcomes, and retained evidence.
+- Streaming, bounded local-file intake; engine-authored Snakemake import; and a
+  thin stdio MCP adapter for Somite-owned Agent tools.
+- One root npm workspace and Pixi development lock spanning Linux, macOS, and
+  Windows, with a launcher that starts and stops the browser and runner together.
+- Continuous verification for the complete TypeScript product on pushes and
+  pull requests.
 - Dependency review, automated dependency updates, issue forms, and pull
   request guidance.
 - A source-release workflow that verifies the tag against both package versions
@@ -29,6 +36,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Completed the migration to one TypeScript web product. The browser and runner
+  now share graph contracts, catalog loading, assessment, compilation, Pixi
+  freezing, source-workflow handling, and paper reconstruction through
+  `@somite/workflow`.
+- Removed the Cargo workspace, Rust toolchain, native-executor spike, duplicate
+  web lockfile, and obsolete implementation documents. Accepted output fixtures
+  remain as language-independent regression contracts.
+- Replaced the server and shell launcher with a cross-platform TypeScript runner
+  and process supervisor. Pixi and Nextflow remain external execution tools.
 - Replaced the abbreviated license notice with the complete Apache License 2.0
   text so hosting and compliance tools can identify the project license.
 
@@ -44,5 +60,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The Agent window is clamped into the current viewport when it opens or the
   browser is resized, so its launcher cannot disappear behind an off-screen
   panel.
+- Custom runner ports now propagate into the browser, Agent discovery avoids a
+  repeated remote-registry round trip, and every Agent mutation path uses the
+  same bounded replay cache.
+- Launcher shutdown now cancels active workflow, paper, and Agent process trees
+  without leaving the local runner behind. Module paths and Pixi executable
+  discovery now use native Windows, macOS, and Linux layouts.
 
 [Unreleased]: https://github.com/Jakeelamb/somite/commits/main
