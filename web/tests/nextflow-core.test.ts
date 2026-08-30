@@ -46,6 +46,42 @@ async function pairedFixture() {
   return { graph, catalog };
 }
 
+function repeatedFastpGraph(graph: SomiteGraph, processCount: number) {
+  const reads = graph.nodes.find((node) => node.id === "reads");
+  const fastp = graph.nodes.find((node) => node.id === "fastp");
+  assert.ok(reads);
+  assert.ok(fastp);
+
+  const nodes: SomiteGraphNode[] = [reads];
+  const rawEdges: SomiteGraph["edges"] = [];
+  for (let index = 0; index < processCount; index += 1) {
+    const id = `fastp_${String(index).padStart(3, "0")}`;
+    const previous = index === 0 ? reads.id : `fastp_${String(index - 1).padStart(3, "0")}`;
+    nodes.push({ ...fastp, id, layout: { x: 320 * (index + 1), y: 0 } });
+    for (const port of ["r1", "r2"] as const) {
+      rawEdges.push({
+        id: `edge_${String(index).padStart(3, "0")}_${port}`,
+        from_node: previous,
+        from_port: port,
+        to_node: id,
+        to_port: port,
+      });
+    }
+  }
+
+  let edgeElementReads = 0;
+  const edges = new Proxy(rawEdges, {
+    get(target, property, receiver) {
+      if (typeof property === "string" && /^(?:0|[1-9][0-9]*)$/.test(property)) edgeElementReads += 1;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  return {
+    graph: { ...graph, nodes, edges },
+    edgeElementReads: () => edgeElementReads,
+  };
+}
+
 function artifactOracle(compiled: CompiledWorkflow) {
   const artifacts = {
     main_nf: compiled.mainNf,
@@ -68,6 +104,19 @@ test("the compiler reproduces every byte of the reviewed Nextflow artifacts", as
   const oracle = JSON.parse(await readFile(oraclePath, "utf8"));
   assert.deepEqual(artifactOracle(compiled), oracle);
   assert.equal(compiled.mainNf, await readFile(goldenPath, "utf8"));
+});
+
+test("compiler edge indexing scales linearly with repeated external processes", async () => {
+  const fixture = await pairedFixture();
+  const smaller = repeatedFastpGraph(fixture.graph, 12);
+  compileNextflow(smaller.graph, fixture.catalog, options);
+  const larger = repeatedFastpGraph(fixture.graph, 24);
+  compileNextflow(larger.graph, fixture.catalog, options);
+
+  assert.ok(
+    larger.edgeElementReads() <= smaller.edgeElementReads() * 2 + 8,
+    `doubling a linear graph must not more than double edge traversal work: ${smaller.edgeElementReads()} -> ${larger.edgeElementReads()}`,
+  );
 });
 
 test("compiler keeps hostile path and parameter values out of generated shell code", async () => {

@@ -88,6 +88,11 @@ type ExternalCompilation = Readonly<{
 
 type ResolvedParams = ReadonlyMap<string, ParamValue>;
 
+type CompilationGraphIndex = Readonly<{
+  nodes: ReadonlyMap<string, SomiteGraphNode>;
+  incomingEdges: ReadonlyMap<string, ReadonlyMap<string, SomiteEdge>>;
+}>;
+
 function fail(code: NextflowCompileErrorCode, message: string): never {
   throw new NextflowCompileError(code, message);
 }
@@ -161,7 +166,7 @@ export function compileNextflow(
   if (!catalogValidation.ok) fail("invalid_graph", `invalid graph: ${catalogValidation.issue.message}`);
   validateOptions(options);
 
-  const nodes = new Map(graph.nodes.map((node) => [node.id, node]));
+  const graphIndex = indexCompilationGraph(graph);
   const paramsInputs = new Map<string, ParamValue>();
   const paramsValues = new Map<string, ParamValue>();
   const channels = new Map<string, string>();
@@ -171,7 +176,7 @@ export function compileNextflow(
   const packages = new Set<string>();
 
   for (const nodeId of topologicalOrder(graph)) {
-    const node = nodes.get(nodeId);
+    const node = graphIndex.nodes.get(nodeId);
     if (!node) fail("invalid_graph", `invalid graph: missing node ${nodeId}`);
     const operator = catalog.get(node.operator);
     if (!operator) fail("unknown_operator", `node ${node.id} uses unknown operator ${node.operator}`);
@@ -187,7 +192,7 @@ export function compileNextflow(
       continue;
     }
 
-    const compiled = compileExternal(graph, catalog, node, operator, channels, paramsValues);
+    const compiled = compileExternal(graphIndex, catalog, node, operator, channels, paramsValues);
     for (const requirement of operator.pixi ?? []) packages.add(requirement);
     for (const [port, expression] of compiled.outputs) channels.set(channelKey(node.id, port), expression);
     workflowLines.push(compiled.invocation);
@@ -220,6 +225,23 @@ export function compileNextflow(
     nodeMapJson: prettyJson({ schema_version: 1, nodes: nodesJson, edges: edgesJson }),
     pixiToml: renderPixi(options, packages),
   };
+}
+
+function indexCompilationGraph(graph: SomiteGraph): CompilationGraphIndex {
+  const nodes = new Map(graph.nodes.map((node) => [node.id, node]));
+  const incomingEdges = new Map<string, Map<string, SomiteEdge>>();
+  for (const edge of graph.edges) {
+    let byPort = incomingEdges.get(edge.to_node);
+    if (!byPort) {
+      byPort = new Map();
+      incomingEdges.set(edge.to_node, byPort);
+    }
+    if (byPort.has(edge.to_port)) {
+      fail("multiple_inputs", `node ${edge.to_node} input ${edge.to_port} has more than one source`);
+    }
+    byPort.set(edge.to_port, edge);
+  }
+  return { nodes, incomingEdges };
 }
 
 function compileImport(
@@ -317,7 +339,7 @@ function promotedSourceEntry(graph: SomiteGraph, node: SomiteGraphNode): Promote
 }
 
 function compileExternal(
-  graph: SomiteGraph,
+  graphIndex: CompilationGraphIndex,
   catalog: OperatorCatalog,
   node: SomiteGraphNode,
   operator: PinnedOperator,
@@ -339,14 +361,13 @@ function compileExternal(
   const values = resolvedParams(node, operator);
   const hash = shortHash(node.id);
   const processName = `SOMITE_${ident(node.id)}_${hash}`;
-  const incoming = incomingEdges(graph, node);
+  const incoming = graphIndex.incomingEdges.get(node.id);
   const inputDeclarations: string[] = [];
   const invocationArguments: string[] = [];
   const inputTokens = new Map<string, string>();
-  const graphNodes = new Map(graph.nodes.map((candidate) => [candidate.id, candidate]));
 
   for (const [index, port] of operator.ports.in.entries()) {
-    const edge = incoming.get(port.name);
+    const edge = incoming?.get(port.name);
     if (!edge) {
       if (port.optional) continue;
       fail("missing_input", `node ${node.id} input ${port.name} has no source`);
@@ -358,7 +379,7 @@ function compileExternal(
         `node ${node.id} input ${port.name} references unavailable source ${edge.from_node}.${edge.from_port}`,
       );
     }
-    const sourceNode = graphNodes.get(edge.from_node);
+    const sourceNode = graphIndex.nodes.get(edge.from_node);
     const sourcePort = sourceNode?.ports.find((candidate) => candidate.name === edge.from_port && candidate.dir === "out");
     if (!sourceNode || !sourcePort) {
       fail(
@@ -427,17 +448,6 @@ function compileExternal(
     invocation: `    ${processName}(${invocationArguments.join(", ")})`,
     outputs: new Map(operator.ports.out.map((port) => [port.name, `${processName}.out.out_${lowerIdent(port.name)}`])),
   };
-}
-
-function incomingEdges(graph: SomiteGraph, node: SomiteGraphNode) {
-  const incoming = new Map<string, SomiteEdge>();
-  for (const edge of graph.edges.filter((candidate) => candidate.to_node === node.id)) {
-    if (incoming.has(edge.to_port)) {
-      fail("multiple_inputs", `node ${node.id} input ${edge.to_port} has more than one source`);
-    }
-    incoming.set(edge.to_port, edge);
-  }
-  return incoming;
 }
 
 function renderBashArgv(
