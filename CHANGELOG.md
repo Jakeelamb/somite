@@ -38,6 +38,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A deterministic production-browser gate covering document persistence, Agent
   controls, data and pinned-workflow placement, nested visualization, paper
   reconstruction, readiness, and validate/run/export control journeys.
+- Browser-to-runner release smoke that validates and runs a real frozen
+  Nextflow package, records durable evidence, and downloads the exported ZIP.
+- Enforced source and production-client size budgets, including rejection of
+  tracked generated state and oversized browser chunks.
 - Security, contribution, conduct, and release-maintainer policies.
 
 ### Changed
@@ -52,9 +56,17 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Replaced the server and shell launcher with a cross-platform TypeScript runner
   and process supervisor. Pixi and Nextflow remain external execution tools.
 - Paper intake now has one startup-validated configuration for its upload, text,
-  PDF-page, OCR-page, and Tesseract-language bounds, with actionable failures.
+  PDF-page, OCR-page, command-timeout, concurrency, and Tesseract-language
+  bounds, with actionable failures.
 - Kept all 15 concrete Agent result contracts while reducing their serialized
   discovery footprint from 87,874 to 24,042 bytes.
+- Snakemake catalog intake now streams the current upstream catalog within
+  aggregate wire, entry, and cache limits instead of buffering its full source.
+- Nextflow source indexing and parameter-schema projection now carry aggregate
+  cardinality, depth, precision, string, and derived-memory limits across the
+  complete pinned workflow.
+- Release verification separates read-only tagged-source execution from the
+  minimal publish authority and crosses Linux and macOS on x64 and arm64.
 - Replaced the abbreviated license notice with the complete Apache License 2.0
   text so hosting and compliance tools can identify the project license.
 
@@ -75,6 +87,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   same bounded replay cache.
 - Portable workflow open, import, and save paths again accept documents up to
   64 MiB without widening general or Agent request limits.
+- Source parameter editing now fails closed on duplicate JSON members,
+  precision-losing numbers, coupled or future schema assertions, malformed
+  annotations, and type-incompatible constraints while leaving independently
+  proven parameters editable.
+- Local Snakemake projects now cross the production browser and runner path in
+  release tests, including actionable Pixi-environment failure guidance and a
+  verified engine-authored rule graph.
 - Production-browser export now starts the generated ZIP download and reports
   its filename instead of stopping after bundle creation.
 - Launcher shutdown now cancels active workflow, paper, and Agent process trees

@@ -24,9 +24,10 @@ Linux and macOS; Windows verification runs inside WSL2, not native Windows.
    ```
 
 5. Run `pixi install --locked`, `pixi run setup`, and `pixi run smoke` from the
-   clean checkout. The smoke must start the already-built production app and
-   complete representative validation through the real `RunManager`, Pixi, and
-   Nextflow path without mocked executables.
+   clean checkout. Setup must pass the source/client size contract. The smoke
+   must complete both direct-runner and browser-to-runner representative
+   validation through real Pixi and Nextflow, retain the evidence, execute the
+   workflow, and download the ZIP without mocked executables.
 6. Launch `pixi run start` without rebuilding. Verify runner health, a clean
    browser console, autosave, local file import, catalog loading, Agent
    discovery, representative validation, and a frozen export for the same graph

@@ -244,18 +244,19 @@ npm audit --audit-level=moderate
 ```
 
 `npm run check` typechecks every workspace and the launcher, lints the browser,
-builds the production web bundle, and runs the runner, shared-workflow, and UI
-tests. `npm run smoke:browser` then launches that built bundle in a system
-Chrome or Chromium and checks document persistence, Agent controls, data and
-workflow placement, paper reconstruction, readiness, and validate/run/export
-control journeys. Set `SOMITE_BROWSER_PATH` when the browser is not in a
-standard system location; this deterministic gate does not replace real
-workflow execution.
+builds the production web bundle, enforces tracked-source and client-bundle
+size budgets, and runs the runner, shared-workflow, and UI tests.
+`npm run smoke:browser` then launches that built bundle in a system Chrome or
+Chromium and checks document persistence, Agent controls, local and public data,
+local Snakemake and pinned Nextflow workflows, paper reconstruction, readiness,
+and validate/run/export control journeys. Set `SOMITE_BROWSER_PATH` when the
+browser is not in a standard system location; this deterministic gate does not
+replace real workflow execution.
 
-Maintainers and CI also run `pixi run smoke`. This networked release gate starts
-the built application and executes a tiny FastQC validation through the real
-`RunManager`, Pixi lock/install, and Nextflow path; it does not use fake
-executables.
+Maintainers and CI also run `pixi run smoke`. This networked release gate first
+exercises the runner directly, then drives the built browser through validation,
+execution, durable evidence, and ZIP export for a tiny FastQC workflow using the
+real Pixi lock/install and Nextflow path. It does not use fake executables.
 
 Bug reports and user-outcome proposals are welcome through
 [GitHub Issues](https://github.com/Jakeelamb/somite/issues); workflow questions
