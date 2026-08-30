@@ -5,8 +5,9 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { chromium, type Browser, type Page, type Route } from "playwright-core";
-import { nfcoreCatalogResponse } from "@somite/workflow/nfcore";
-import type { SomiteGraph } from "@somite/workflow/model";
+import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
+import { NfcoreGateway } from "../src/nfcoreGateway.ts";
+import { nfcoreCatalogFixture, nfcoreSourceArchive } from "./helpers/nfcoreFixture.ts";
 import { repositoryRoot, startProductionApp, type ProductionApp } from "./helpers/productionApp.ts";
 
 const browserCandidates = process.platform === "darwin"
@@ -126,41 +127,36 @@ test("production workbench persists its name, restores Agent controls, and adds 
 });
 
 test("production Nextflow catalog selection resolves into visible editable nodes", { timeout: 60_000 }, async (context) => {
-  const app = await startProductionApp();
+  const projectRoot = await mkdtemp(join(tmpdir(), "somite-browser-nextflow-"));
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+  const gateway = new NfcoreGateway(projectRoot, catalog, async (input) => String(input).includes("pipelines.json")
+    ? new Response(nfcoreCatalogFixture, { headers: { "content-type": "application/json" } })
+    : new Response(nfcoreSourceArchive(), { headers: { "content-type": "application/gzip" } }));
+  const discovery = await gateway.catalog();
+  const imported = await gateway.import("nf-core/demo", "1.0.0");
+  const app = await startProductionApp({ projectRoot });
   context.after(app.stop);
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
   context.after(() => page.close());
   const assertNoPageErrors = watchPage(page);
-  const catalog = nfcoreCatalogResponse([{
-    name: "demo",
-    description: "Deterministic demonstration pipeline",
-    topics: ["testing"],
-    revision: "1.0.0",
-    resolvedRevision: "a".repeat(40),
-  }], true);
-  const cases = JSON.parse(await readFile(join(repositoryRoot, "testdata", "assessment-parity-graphs.json"), "utf8")) as Array<{ name: string; graph: SomiteGraph }>;
-  const graph = cases.find((candidate) => candidate.name === "connected local FastQC workflow is ready")?.graph;
-  assert.ok(graph);
-  await page.route(`${app.runnerUrl}/api/catalog/nfcore`, (route) => fulfillJson(route, app, catalog));
+  await page.route(`${app.runnerUrl}/api/catalog/nfcore`, (route) => fulfillJson(route, app, discovery));
+  await page.route(`${app.runnerUrl}/api/catalog/nfcore/expand`, (route) => fulfillJson(route, app, imported));
   await page.route(`${app.runnerUrl}/api/catalog/snakemake`, (route) => fulfillJson(route, app, { entries: [], cached: true }));
-  await page.route(`${app.runnerUrl}/api/catalog/nfcore/expand`, (route) => fulfillJson(route, app, {
-    engine: "nextflow",
-    workflow: "nf-core/demo",
-    revision: "1.0.0",
-    graph,
-    cached: true,
-  }));
 
   await page.goto(app.webUrl);
   await page.getByRole("textbox", { name: "Workflow name" }).waitFor();
   await page.getByRole("button", { name: /Browse Nextflow workflows/ }).click();
   await page.locator("button.operator-add", { hasText: "nf-core/demo" }).click();
-  await page.locator(".react-flow__node").nth(1).waitFor();
-  assert.equal(await page.locator(".react-flow__node").count(), 2);
-  const cards = (await page.locator(".node-collapsed-body").allTextContents()).join("\n");
-  assert.match(cards, /Import file/);
-  assert.match(cards, /FastQC/);
-  await page.locator(".status-copy").getByText(/Added nf-core\/demo 1\.0\.0/).waitFor();
+  const sourceNode = page.locator(".source-workflow-node");
+  await sourceNode.waitFor();
+  assert.equal(await page.locator(".react-flow__node").count(), 1);
+  await sourceNode.dblclick();
+  const nested = page.locator("section[aria-label='Nested source canvas']");
+  await nested.waitFor();
+  const nestedText = await nested.textContent();
+  assert.match(nestedText ?? "", /FASTQC/i);
+  assert.match(nestedText ?? "", /Source invocations · not data wires/);
   assertNoPageErrors();
 });
 
