@@ -196,9 +196,11 @@ assessment, compiler, runner, and evidence Modules used by humans.
 Agent edits are short atomic transactions against a Graph state revision. Somite
 applies them to a clone, validates the complete result, atomically persists all
 or none, and presents each successful transaction as one undoable canvas edit.
-Only exact `somite.*` permission requests are automatically allowed for the
-session. Redacted normalized transcripts persist under
-`.somite/agent-transcripts/`.
+Only requests whose structured server and tool identities match the Somite MCP
+boundary and one of its exact advertised tool names are automatically allowed
+for the session. Prefix-shaped labels, conflicting identities, shell actions,
+and all other tools remain user-approved. Redacted normalized transcripts
+persist under `.somite/agent-transcripts/`.
 
 ## Project data
 

@@ -173,10 +173,11 @@ one history entry for each, so normal Undo reverses them individually.
 - The agent command is not saved in the project.
 - Agent messages, status, tool input/output, transactions, and permission
   prompts appear in one chronological feed.
-- Somite-owned `somite.*` calls are automatically allowed for the active agent
-  session and remain visible and correlated by ACP tool-call id in the activity
-  feed and transcript. This covers only Somite's typed, server-enforced
-  capability surface; it does not approve shell commands or other tools.
+- Calls whose structured server and tool identities match the Somite MCP
+  boundary and one exact advertised tool name are automatically allowed for the
+  active agent session and remain visible and correlated by ACP tool-call id in
+  the activity feed and transcript. Prefix-shaped labels, conflicting
+  identities, shell commands, and other tools remain user-approved.
 - Non-Somite permission requests identify the exact tool-call id and block until
   the user chooses an advertised ACP option, cancels it, or the five-minute
   timeout expires.
@@ -211,8 +212,9 @@ cancellation. Web tests cover event de-duplication and exactly-once transaction
 delivery to canvas history.
 
 The repeatable live-agent harness runs the same blind task against a selected
-Codex ACP model and reasoning level, auto-approves only exact `somite.*`
-permissions, and writes a deterministic score plus redacted evidence:
+Codex ACP model and reasoning level, auto-approves only exact tools advertised
+by Somite's MCP boundary with consistent ACP identity, and writes a
+deterministic score plus redacted evidence:
 
 ```bash
 scripts/mcp-agent-eval gpt-5.6-luna low 7391 baseline

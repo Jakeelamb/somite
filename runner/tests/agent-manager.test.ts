@@ -5,7 +5,8 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { AgentManager, AgentManagerError, parseAgentCommand } from "../src/agentManager.ts";
+import { AgentManager, AgentManagerError, parseAgentCommand, trustedSomiteMcpPermissionTool } from "../src/agentManager.ts";
+import { SOMITE_MCP_TOOL_NAMES } from "../src/mcpTools.ts";
 
 async function until(predicate: () => boolean | Promise<boolean>, timeoutMs = 5_000) {
   const started = Date.now();
@@ -29,6 +30,17 @@ test("agent command parsing never invokes a shell and preserves quoted arguments
     args: ["--mode", "fast"],
   });
   assert.throws(() => parseAgentCommand("agent 'unfinished"), AgentManagerError);
+});
+
+test("every canonical Somite MCP tool has one exact trusted permission identity", () => {
+  for (const name of SOMITE_MCP_TOOL_NAMES) {
+    assert.equal(trustedSomiteMcpPermissionTool({
+      toolCallId: `tool-${name}`,
+      title: `mcp.Somite.${name}`,
+      name: `mcp.Somite.${name}`,
+      rawInput: { server: "Somite", tool: name, arguments: {} },
+    }), name);
+  }
 });
 
 test("ACP manager streams events, configures the session, and auto-approves only Somite tools", async (context) => {
@@ -66,4 +78,35 @@ test("ACP manager streams events, configures the session, and auto-approves only
   assert.equal(stored.tool_calls[0].input.arguments.api_key, "[redacted]");
   await manager.disconnect();
   await until(() => !manager.snapshot().connected && !manager.snapshot().connecting);
+});
+
+test("ACP manager never auto-approves unknown Somite labels or shell actions", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "somite-agent-permissions-"));
+  const fixture = fileURLToPath(new URL("./fixtures/fake-acp-agent.ts", import.meta.url));
+  const manager = new AgentManager("http://127.0.0.1:9", "test-capability", fixture, root);
+  context.after(async () => {
+    await manager.disconnect().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  });
+  const command = `${JSON.stringify(process.execPath)} --experimental-strip-types ${JSON.stringify(fixture)}`;
+  await manager.connect(command);
+  await until(() => manager.snapshot().connected);
+
+  for (const [prompt, title] of [
+    ["[test:unknown-somite-tool]", "Approve somite.workflow.erase"],
+    ["[test:shell-mislabeled-as-somite]", "Approve shell (claims somite.workflow.get)"],
+  ]) {
+    const cursor = manager.snapshot().cursor;
+    await manager.prompt(prompt);
+    await until(() => {
+      const snapshot = manager.snapshot(cursor);
+      return !snapshot.busy || snapshot.events.some((event) => event.kind === "permission" && event.status === "waiting");
+    });
+    const waiting = manager.snapshot(cursor).events.find((event) => event.kind === "permission" && event.status === "waiting");
+    assert.ok(waiting, `${title} must wait for the user`);
+    assert.equal(waiting.title, title);
+    assert.ok(waiting.permission_id);
+    manager.answerPermission(waiting.permission_id);
+    await until(() => !manager.snapshot().busy);
+  }
 });

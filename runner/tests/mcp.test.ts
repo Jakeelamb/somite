@@ -6,6 +6,8 @@ import { createInterface } from "node:readline";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { SOMITE_MCP_TOOL_NAMES } from "../src/mcpTools.ts";
+
 type RpcResponse = { id: number; result?: Record<string, unknown>; error?: Record<string, unknown> };
 
 class McpClient {
@@ -63,6 +65,7 @@ test("thin MCP adapter supports modern discovery, legacy initialization, and str
   assert.equal(initialized.result?.protocolVersion, "2025-06-18");
   const listed = await client.request(3, "tools/list");
   const tools = listed.result?.tools as Array<{ name: string }>;
+  assert.deepEqual(tools.map((tool) => tool.name), SOMITE_MCP_TOOL_NAMES);
   assert.ok(tools.some((tool) => tool.name === "somite.graph.apply_transaction"));
   assert.ok(tools.some((tool) => tool.name === "somite.validation.start"));
   const called = await client.request(4, "tools/call", { name: "somite.workflow.get", arguments: {} });

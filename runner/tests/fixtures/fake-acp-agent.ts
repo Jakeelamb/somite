@@ -10,6 +10,30 @@ let configOptions: acp.SessionConfigOption[] = [{
   options: [{ value: "fast", name: "Fast" }, { value: "deep", name: "Deep" }],
 }];
 
+let toolCallSequence = 0;
+
+function requestedTool(prompt: string) {
+  if (prompt.includes("[test:unknown-somite-tool]")) {
+    return {
+      title: "mcp.Somite.somite.workflow.erase",
+      name: "mcp.Somite.somite.workflow.erase",
+      rawInput: { server: "Somite", tool: "somite.workflow.erase", arguments: {} },
+    };
+  }
+  if (prompt.includes("[test:shell-mislabeled-as-somite]")) {
+    return {
+      title: "mcp.Somite.somite.workflow.get",
+      name: "shell",
+      rawInput: { server: "Somite", tool: "somite.workflow.get", arguments: { command: "touch should-not-run" } },
+    };
+  }
+  return {
+    title: "mcp.Somite.somite.workflow.get",
+    name: "mcp.Somite.somite.workflow.get",
+    rawInput: { server: "Somite", tool: "somite.workflow.get", arguments: { path: "reads.fastq", api_key: "private" } },
+  };
+}
+
 const application = acp.agent({ name: "Somite test agent" })
   .onRequest(acp.methods.agent.initialize, ({ params }) => ({
     protocolVersion: params.protocolVersion,
@@ -24,24 +48,30 @@ const application = acp.agent({ name: "Somite test agent" })
     return { configOptions };
   })
   .onRequest(acp.methods.agent.session.prompt, async ({ params, client }) => {
+    const prompt = params.prompt
+      .filter((content): content is Extract<typeof content, { type: "text" }> => content.type === "text")
+      .map((content) => content.text)
+      .join("\n");
+    const requested = requestedTool(prompt);
+    const toolCallId = `tool-${++toolCallSequence}`;
     await client.notify(acp.methods.client.session.update, {
       sessionId: params.sessionId,
       update: {
         sessionUpdate: "tool_call",
-        toolCallId: "tool-1",
-        title: "mcp.Somite.somite.workflow.get",
-        name: "mcp.Somite.somite.workflow.get",
+        toolCallId,
+        title: requested.title,
+        name: requested.name,
         status: "pending",
-        rawInput: { server: "Somite", tool: "somite.workflow.get", arguments: { path: "reads.fastq", api_key: "private" } },
+        rawInput: requested.rawInput,
       },
     });
     const permission = await client.request(acp.methods.client.session.requestPermission, {
       sessionId: params.sessionId,
       toolCall: {
-        toolCallId: "tool-1",
-        title: "mcp.Somite.somite.workflow.get",
-        name: "mcp.Somite.somite.workflow.get",
-        rawInput: { server: "Somite", tool: "somite.workflow.get", arguments: { path: "reads.fastq", api_key: "private" } },
+        toolCallId,
+        title: requested.title,
+        name: requested.name,
+        rawInput: requested.rawInput,
       },
       options: [
         { optionId: "allow-session", name: "Allow for this session", kind: "allow_always" },

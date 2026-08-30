@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 
 import type { AgentTransactionResult } from "@somite/workflow/agentTransaction";
 import { atomicWrite, ensurePrivateDirectory } from "./files.ts";
+import { isSomiteMcpToolName, type SomiteMcpToolName } from "./mcpTools.ts";
 
 const EVENT_LIMIT = 4_096;
 const TRANSACTION_EVENT_LIMIT = 32;
@@ -178,8 +179,27 @@ function toolAction(tool: acp.ToolCallUpdate) {
     ? tool.rawInput as Record<string, unknown>
     : undefined;
   const rawTool = typeof input?.tool === "string" ? input.tool : undefined;
-  const candidate = rawTool ?? tool.name ?? tool.title ?? `Tool ${tool.toolCallId}`;
-  return candidate.replace(/^mcp\.Somite\./, "");
+  const presented = (tool.name ?? tool.title)?.replace(/^mcp\.Somite\./, "");
+  if (rawTool && presented && rawTool !== presented) return `${presented} (claims ${rawTool})`;
+  return rawTool ?? presented ?? `Tool ${tool.toolCallId}`;
+}
+
+function presentedSomiteToolName(value: unknown): SomiteMcpToolName | undefined {
+  if (typeof value !== "string") return undefined;
+  const candidate = value.replace(/^mcp\.Somite\./, "");
+  return isSomiteMcpToolName(candidate) ? candidate : undefined;
+}
+
+/** Trust only a canonical tool attributed consistently to Somite's MCP server. */
+export function trustedSomiteMcpPermissionTool(tool: acp.ToolCallUpdate): SomiteMcpToolName | undefined {
+  const input = tool.rawInput && typeof tool.rawInput === "object" && !Array.isArray(tool.rawInput)
+    ? tool.rawInput as Record<string, unknown>
+    : undefined;
+  if (input?.server !== "Somite" || !isSomiteMcpToolName(input.tool)) return undefined;
+  const presented = tool.name === undefined
+    ? presentedSomiteToolName(tool.title)
+    : presentedSomiteToolName(tool.name);
+  return presented === input.tool ? input.tool : undefined;
 }
 
 function permissionDetail(request: acp.RequestPermissionRequest, action: string) {
@@ -513,7 +533,7 @@ export class AgentManager {
       name: option.name,
       kind: option.kind,
     }));
-    const automatic = /^somite\.[A-Za-z0-9._]+$/.test(action)
+    const automatic = trustedSomiteMcpPermissionTool(request.toolCall)
       ? choices.find((choice) => choice.kind === "allow_always" && choice.name.toLowerCase().includes("session"))
         ?? choices.find((choice) => choice.kind === "allow_once")
       : undefined;

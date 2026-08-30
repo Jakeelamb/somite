@@ -1,5 +1,7 @@
 import { URL } from "node:url";
 
+import { SOMITE_MCP_TOOL } from "./mcpTools.ts";
+
 const VERSION = "0.1.0";
 const MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
 const LEGACY_PROTOCOLS = new Set(["2024-10-07", "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]);
@@ -51,43 +53,43 @@ function tool(
 }
 
 const TOOLS: Tool[] = [
-  tool("somite.workflow.get", "Inspect Somite workflow", "Read the current typed graph and its full canvas and semantic revisions.", objectSchema()),
-  tool("somite.readiness.get", "Inspect Somite readiness", "List every deterministic missing input, parameter, dependency, resource, and known resolution.", objectSchema()),
-  tool("somite.catalog.search", "Search Somite tools", "Search revision-pinned operator contracts. Never invent operator ids, ports, revisions, or parameters.", objectSchema({
+  tool(SOMITE_MCP_TOOL.workflowGet, "Inspect Somite workflow", "Read the current typed graph and its full canvas and semantic revisions.", objectSchema()),
+  tool(SOMITE_MCP_TOOL.readinessGet, "Inspect Somite readiness", "List every deterministic missing input, parameter, dependency, resource, and known resolution.", objectSchema()),
+  tool(SOMITE_MCP_TOOL.catalogSearch, "Search Somite tools", "Search revision-pinned operator contracts. Never invent operator ids, ports, revisions, or parameters.", objectSchema({
     query: stringSchema("Short operator, artifact, or task phrase.", { minLength: 1, maxLength: 120 }),
     limit: { type: "integer", minimum: 1, maximum: 50, default: 12 },
     cursor: stringSchema("Opaque cursor from an earlier search page."),
   }, ["query"])),
-  tool("somite.source_workflow.search_nfcore", "Search nf-core workflows", "Search the official nf-core catalog for exact repository and release pairs.", objectSchema({
+  tool(SOMITE_MCP_TOOL.sourceWorkflowSearchNfcore, "Search nf-core workflows", "Search the official nf-core catalog for exact repository and release pairs.", objectSchema({
     query: stringSchema("Pipeline name, topic, or scientific purpose.", { minLength: 1, maxLength: 120 }),
     limit: { type: "integer", minimum: 1, maximum: 50, default: 12 },
   }, ["query"]), { openWorldHint: true }),
-  tool("somite.source_workflow.resolve_nfcore", "Resolve nf-core workflow", "Place one exact, pinned nf-core release on an unchanged empty canvas.", objectSchema({
+  tool(SOMITE_MCP_TOOL.sourceWorkflowResolveNfcore, "Resolve nf-core workflow", "Place one exact, pinned nf-core release on an unchanged empty canvas.", objectSchema({
     workflow: stringSchema("Exact nf-core repository such as nf-core/rnaseq."),
     revision: stringSchema("Exact catalog-advertised release tag."),
     base_state_revision: stateSchema,
     idempotency_key: keySchema,
     summary: summarySchema,
   }, ["workflow", "revision", "base_state_revision", "idempotency_key", "summary"]), { readOnlyHint: false, openWorldHint: true }),
-  tool("somite.source_workflow.edit", "Edit source workflow", "Apply typed parameter or invocation-replacement edits to a pinned source workflow.", objectSchema({
+  tool(SOMITE_MCP_TOOL.sourceWorkflowEdit, "Edit source workflow", "Apply typed parameter or invocation-replacement edits to a pinned source workflow.", objectSchema({
     base_state_revision: stateSchema,
     workflow_revision: stringSchema("Exact current source workflow revision."),
     idempotency_key: keySchema,
     summary: summarySchema,
     edits: { type: "array", minItems: 1, maxItems: 64, items: { type: "object" } },
   }, ["base_state_revision", "workflow_revision", "idempotency_key", "summary", "edits"]), { readOnlyHint: false, destructiveHint: true }),
-  tool("somite.source_workflow.promote", "Promote source call", "Promote one selected source invocation replacement into an ordinary editable typed node.", objectSchema({
+  tool(SOMITE_MCP_TOOL.sourceWorkflowPromote, "Promote source call", "Promote one selected source invocation replacement into an ordinary editable typed node.", objectSchema({
     base_state_revision: stateSchema,
     workflow_revision: stringSchema("Exact current source workflow revision."),
     invocation_id: stringSchema("Exact source invocation id that has a selected replacement."),
     idempotency_key: keySchema,
     summary: summarySchema,
   }, ["base_state_revision", "workflow_revision", "invocation_id", "idempotency_key", "summary"]), { readOnlyHint: false, destructiveHint: true }),
-  tool("somite.source.search", "Search scientific sources", "Search current NCBI or Ensembl records for accessions, organisms, reads, assemblies, references, or genes.", objectSchema({
+  tool(SOMITE_MCP_TOOL.sourceSearch, "Search scientific sources", "Search current NCBI or Ensembl records for accessions, organisms, reads, assemblies, references, or genes.", objectSchema({
     query: stringSchema("Scientific entity, accession, organism, assembly, run, or gene.", { minLength: 2, maxLength: 120 }),
     provider: { type: "string", enum: ["ncbi", "ensembl"] },
   }, ["query", "provider"]), { openWorldHint: true }),
-  tool("somite.graph.apply_transaction", "Edit Somite workflow", "Apply one small atomic typed graph edit against the latest state revision.", objectSchema({
+  tool(SOMITE_MCP_TOOL.graphApplyTransaction, "Edit Somite workflow", "Apply one small atomic typed graph edit against the latest state revision.", objectSchema({
     base_state_revision: stateSchema,
     idempotency_key: keySchema,
     summary: summarySchema,
@@ -102,15 +104,15 @@ const TOOLS: Tool[] = [
       },
     },
   }, ["base_state_revision", "idempotency_key", "summary", "operations"]), { readOnlyHint: false, destructiveHint: true }),
-  tool("somite.workflow.compile", "Compile Somite workflow", "Freeze the ready graph into content-addressed Nextflow and Pixi artifacts.", objectSchema(), { readOnlyHint: false, openWorldHint: true }),
-  tool("somite.run.start", "Run Somite workflow", "Start a real Nextflow run through the Pixi-frozen runtime.", objectSchema({ idempotency_key: keySchema }, ["idempotency_key"]), { readOnlyHint: false, openWorldHint: true }),
-  tool("somite.validation.start", "Validate Somite workflow", "Start representative-data validation and produce immutable evidence.", objectSchema({ idempotency_key: keySchema }, ["idempotency_key"]), { readOnlyHint: false, openWorldHint: true }),
-  tool("somite.run.status", "Inspect Somite run", "Read run lifecycle, node states, closure identity, and evidence.", objectSchema({
+  tool(SOMITE_MCP_TOOL.workflowCompile, "Compile Somite workflow", "Freeze the ready graph into content-addressed Nextflow and Pixi artifacts.", objectSchema(), { readOnlyHint: false, openWorldHint: true }),
+  tool(SOMITE_MCP_TOOL.runStart, "Run Somite workflow", "Start a real Nextflow run through the Pixi-frozen runtime.", objectSchema({ idempotency_key: keySchema }, ["idempotency_key"]), { readOnlyHint: false, openWorldHint: true }),
+  tool(SOMITE_MCP_TOOL.validationStart, "Validate Somite workflow", "Start representative-data validation and produce immutable evidence.", objectSchema({ idempotency_key: keySchema }, ["idempotency_key"]), { readOnlyHint: false, openWorldHint: true }),
+  tool(SOMITE_MCP_TOOL.runStatus, "Inspect Somite run", "Read run lifecycle, node states, closure identity, and evidence.", objectSchema({
     run_id: stringSchema("Run id returned by run.start or validation.start."),
     wait_ms: { type: "integer", minimum: 0, maximum: 25_000, default: 0 },
   }, ["run_id"])),
-  tool("somite.run.cancel", "Cancel Somite run", "Cancel an active run or validation and its process tree.", objectSchema({ run_id: stringSchema("Run id to cancel.") }, ["run_id"]), { readOnlyHint: false, destructiveHint: true }),
-  tool("somite.evidence.lookup", "Inspect Somite evidence", "Read immutable validation receipts for a semantic graph revision.", objectSchema({ subject_digest: stringSchema("Optional graph_revision; omit for the current graph.") })),
+  tool(SOMITE_MCP_TOOL.runCancel, "Cancel Somite run", "Cancel an active run or validation and its process tree.", objectSchema({ run_id: stringSchema("Run id to cancel.") }, ["run_id"]), { readOnlyHint: false, destructiveHint: true }),
+  tool(SOMITE_MCP_TOOL.evidenceLookup, "Inspect Somite evidence", "Read immutable validation receipts for a semantic graph revision.", objectSchema({ subject_digest: stringSchema("Optional graph_revision; omit for the current graph.") })),
 ];
 
 function argumentsObject(value: unknown) {
@@ -192,24 +194,24 @@ function query(path: string, fields: Record<string, unknown>) {
 
 async function callTool(name: string, value: unknown, signal: AbortSignal) {
   const args = argumentsObject(value);
-  if (name === "somite.workflow.get") return http("GET", "/api/agent/graph", undefined, signal);
-  if (name === "somite.readiness.get") return http("GET", "/api/agent/readiness", undefined, signal);
-  if (name === "somite.catalog.search") return http("GET", query("/api/agent/catalog", { q: args.query, limit: args.limit ?? 12, cursor: args.cursor }), undefined, signal);
-  if (name === "somite.source_workflow.search_nfcore") return http("GET", query("/api/source-workflows/nfcore/search", { q: args.query, limit: args.limit ?? 12 }), undefined, signal);
-  if (name === "somite.source_workflow.resolve_nfcore") return http("POST", "/api/agent/source-workflows/nfcore/resolve", args, signal, 300_000);
-  if (name === "somite.source_workflow.edit") return http("POST", "/api/agent/source-workflows/edit", args, signal);
-  if (name === "somite.source_workflow.promote") return http("POST", "/api/agent/source-workflows/promote", args, signal);
-  if (name === "somite.source.search") return http("GET", query("/api/sources/search", { q: args.query, provider: args.provider }), undefined, signal);
-  if (name === "somite.graph.apply_transaction") return http("POST", "/api/agent/transactions", args, signal);
-  if (name === "somite.workflow.compile") return http("POST", "/api/agent/compile", {}, signal, 300_000);
-  if (name === "somite.run.start" || name === "somite.validation.start") {
+  if (name === SOMITE_MCP_TOOL.workflowGet) return http("GET", "/api/agent/graph", undefined, signal);
+  if (name === SOMITE_MCP_TOOL.readinessGet) return http("GET", "/api/agent/readiness", undefined, signal);
+  if (name === SOMITE_MCP_TOOL.catalogSearch) return http("GET", query("/api/agent/catalog", { q: args.query, limit: args.limit ?? 12, cursor: args.cursor }), undefined, signal);
+  if (name === SOMITE_MCP_TOOL.sourceWorkflowSearchNfcore) return http("GET", query("/api/source-workflows/nfcore/search", { q: args.query, limit: args.limit ?? 12 }), undefined, signal);
+  if (name === SOMITE_MCP_TOOL.sourceWorkflowResolveNfcore) return http("POST", "/api/agent/source-workflows/nfcore/resolve", args, signal, 300_000);
+  if (name === SOMITE_MCP_TOOL.sourceWorkflowEdit) return http("POST", "/api/agent/source-workflows/edit", args, signal);
+  if (name === SOMITE_MCP_TOOL.sourceWorkflowPromote) return http("POST", "/api/agent/source-workflows/promote", args, signal);
+  if (name === SOMITE_MCP_TOOL.sourceSearch) return http("GET", query("/api/sources/search", { q: args.query, provider: args.provider }), undefined, signal);
+  if (name === SOMITE_MCP_TOOL.graphApplyTransaction) return http("POST", "/api/agent/transactions", args, signal);
+  if (name === SOMITE_MCP_TOOL.workflowCompile) return http("POST", "/api/agent/compile", {}, signal, 300_000);
+  if (name === SOMITE_MCP_TOOL.runStart || name === SOMITE_MCP_TOOL.validationStart) {
     const workflow = await currentGraph(signal);
-    const path = name === "somite.run.start" ? "/api/runs" : "/api/validations";
+    const path = name === SOMITE_MCP_TOOL.runStart ? "/api/runs" : "/api/validations";
     return http("POST", query(path, { idempotency_key: args.idempotency_key }), workflow.graph, signal, 300_000);
   }
-  if (name === "somite.run.status") return http("GET", query(`/api/runs/${encodeURIComponent(requiredString(args.run_id, "run_id"))}`, { wait_ms: args.wait_ms ?? 0 }), undefined, signal, 30_000);
-  if (name === "somite.run.cancel") return http("POST", `/api/runs/${encodeURIComponent(requiredString(args.run_id, "run_id"))}/cancel`, {}, signal);
-  if (name === "somite.evidence.lookup") return http("GET", query("/api/agent/evidence", { subject: args.subject_digest }), undefined, signal);
+  if (name === SOMITE_MCP_TOOL.runStatus) return http("GET", query(`/api/runs/${encodeURIComponent(requiredString(args.run_id, "run_id"))}`, { wait_ms: args.wait_ms ?? 0 }), undefined, signal, 30_000);
+  if (name === SOMITE_MCP_TOOL.runCancel) return http("POST", `/api/runs/${encodeURIComponent(requiredString(args.run_id, "run_id"))}/cancel`, {}, signal);
+  if (name === SOMITE_MCP_TOOL.evidenceLookup) return http("GET", query("/api/agent/evidence", { subject: args.subject_digest }), undefined, signal);
   throw new Error(`unknown Somite tool ${name}`);
 }
 
