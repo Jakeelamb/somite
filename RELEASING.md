@@ -18,7 +18,8 @@ Linux and macOS; Windows verification runs inside WSL2, not native Windows.
    ```bash
    npm ci
    npm run check
-   npm audit
+   npm run smoke:browser
+   npm audit --audit-level=moderate
    git diff --check
    ```
 
@@ -44,11 +45,11 @@ git tag -a "v${release_version}" -m "Somite v${release_version}"
 git push origin "v${release_version}"
 ```
 
-`.github/workflows/release.yml` repeats the locked TypeScript gate, rejects a
-tag that does not match the workspace versions, runs the real execution smoke,
-and creates a GitHub release with generated notes. GitHub's generated source
-archives are the only release artifacts; do not attach build directories or
-partially installable bundles.
+`.github/workflows/release.yml` repeats the locked TypeScript and production
+browser gates, rejects a tag that does not match the workspace versions, runs
+the real execution smoke, and creates a GitHub release with generated notes.
+GitHub's generated source archives are the only release artifacts; do not
+attach build directories or partially installable bundles.
 
 After publication, verify the release page, source archives, rendered README,
 license detection, and installation instructions from a fresh directory. Fix

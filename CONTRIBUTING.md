@@ -60,12 +60,16 @@ Run the full gate before requesting review:
 ```bash
 npm ci
 npm run check
-npm audit
+npm run smoke:browser
+npm audit --audit-level=moderate
 git diff --check
 ```
 
 In the pull request, list exact commands and manual checks. If a check is
 unavailable, state that directly and explain why.
+
+The browser smoke uses a system Chrome or Chromium against the built production
+bundle. Set `SOMITE_BROWSER_PATH` for a nonstandard executable location.
 
 Release-affecting changes also require `pixi run smoke` on a supported POSIX
 host. This is a slower networked gate because it resolves and executes the real

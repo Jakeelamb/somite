@@ -52,6 +52,10 @@ process trees together. To open a specific graph:
 npm start -- path/to/workflow.somite.json
 ```
 
+Portable `.somite.json` documents are capped at 64 MiB when opened, imported,
+or saved. This compatibility envelope does not widen general or Agent request
+limits.
+
 For active development, install once with `pixi run install`, then use
 `pixi run dev` for the hot-reloading server.
 
@@ -233,12 +237,18 @@ Generated state lives under `.somite/` and is ignored by Git:
 ```bash
 npm ci
 npm run check
-npm audit
+npm run smoke:browser
+npm audit --audit-level=moderate
 ```
 
 `npm run check` typechecks every workspace and the launcher, lints the browser,
 builds the production web bundle, and runs the runner, shared-workflow, and UI
-tests.
+tests. `npm run smoke:browser` then launches that built bundle in a system
+Chrome or Chromium and checks document persistence, Agent controls, data and
+workflow placement, paper reconstruction, readiness, and validate/run/export
+control journeys. Set `SOMITE_BROWSER_PATH` when the browser is not in a
+standard system location; this deterministic gate does not replace real
+workflow execution.
 
 Maintainers and CI also run `pixi run smoke`. This networked release gate starts
 the built application and executes a tiny FastQC validation through the real

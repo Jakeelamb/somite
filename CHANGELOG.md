@@ -35,6 +35,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before creating a GitHub release.
 - A build-once production launcher and gated POSIX release smoke that exercises
   the real Pixi, Nextflow, representative-data, and `RunManager` execution path.
+- A deterministic production-browser gate covering document persistence, Agent
+  controls, data and pinned-workflow placement, nested visualization, paper
+  reconstruction, readiness, and validate/run/export control journeys.
 - Security, contribution, conduct, and release-maintainer policies.
 
 ### Changed
@@ -48,6 +51,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   remain as language-independent regression contracts.
 - Replaced the server and shell launcher with a cross-platform TypeScript runner
   and process supervisor. Pixi and Nextflow remain external execution tools.
+- Paper intake now has one startup-validated configuration for its upload, text,
+  PDF-page, OCR-page, and Tesseract-language bounds, with actionable failures.
+- Kept all 15 concrete Agent result contracts while reducing their serialized
+  discovery footprint from 87,874 to 24,042 bytes.
 - Replaced the abbreviated license notice with the complete Apache License 2.0
   text so hosting and compliance tools can identify the project license.
 
@@ -66,6 +73,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Custom runner ports now propagate into the browser, Agent discovery avoids a
   repeated remote-registry round trip, and every Agent mutation path uses the
   same bounded replay cache.
+- Portable workflow open, import, and save paths again accept documents up to
+  64 MiB without widening general or Agent request limits.
+- Production-browser export now starts the generated ZIP download and reports
+  its filename instead of stopping after bundle creation.
 - Launcher shutdown now cancels active workflow, paper, and Agent process trees
   without leaving the local runner behind. Module paths and Pixi executable
   discovery use platform-appropriate layouts on supported direct platforms.
