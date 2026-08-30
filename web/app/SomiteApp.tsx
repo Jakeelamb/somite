@@ -2439,7 +2439,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       const anchor = document.createElement("a");
       anchor.href = url;
       anchor.download = exportPlan?.filename ?? `${safeWorkflowFilename(workflowTitle)}.somite-run.zip`;
-      document.body.append(anchor);
+      document.body.appendChild(anchor);
       anchor.click();
       anchor.remove();
       window.setTimeout(() => URL.revokeObjectURL(url), 0);
