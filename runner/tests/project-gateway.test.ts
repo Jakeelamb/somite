@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile as execFileCallback } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import test from "node:test";
@@ -14,6 +14,7 @@ import { validateSourceWorkflow } from "@somite/workflow/workflow";
 import { ProjectGateway, ProjectGatewayError } from "../src/projectGateway.ts";
 import { readSourceObject } from "../src/sourceWorkflowStore.ts";
 import { verifyGraphSourceWorkflowTrust } from "../src/sourceWorkflowTrust.ts";
+import { MAX_WORKFLOW_DOCUMENT_BYTES } from "../src/workflowLimits.ts";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 const execFile = promisify(execFileCallback);
@@ -105,6 +106,30 @@ test("ProjectGateway opens current and legacy Somite graphs through catalog and 
     await assert.rejects(
       gateway.open({ path: "graphs/bad.somite.json" }),
       (error: unknown) => error instanceof ProjectGatewayError && error.code === "project_graph_invalid",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("ProjectGateway accepts Somite documents above the generic request limit and caps them at 64 MiB", async () => {
+  const { root, gateway } = await fixture("somite-project-large-graph-");
+  try {
+    const large = join(root, "large.somite.json");
+    const document = `${" ".repeat(16 * 1024 * 1024)}${JSON.stringify({ schema_version: 3, name: "Large project", nodes: [], edges: [] })}`;
+    await writeFile(large, document);
+    const opened = await gateway.open({ path: "large.somite.json" });
+    assert.equal(opened.kind, "somite");
+    assert.equal(opened.graph.name, "Large project");
+
+    const oversized = join(root, "oversized.somite.json");
+    await writeFile(oversized, "{}");
+    await truncate(oversized, MAX_WORKFLOW_DOCUMENT_BYTES + 1);
+    await assert.rejects(
+      gateway.open({ path: "oversized.somite.json" }),
+      (error: unknown) => error instanceof ProjectGatewayError
+        && error.code === "project_graph_invalid"
+        && error.message.includes("exceeds 67108864 bytes"),
     );
   } finally {
     await rm(root, { recursive: true, force: true });

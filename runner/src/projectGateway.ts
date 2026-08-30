@@ -13,8 +13,8 @@ import { pathExists, regularDirectory } from "./files.ts";
 import { SnakemakeGateway } from "./snakemakeGateway.ts";
 import { persistSourceObject, readSourceObject } from "./sourceWorkflowStore.ts";
 import { verifyGraphSourceWorkflowTrust } from "./sourceWorkflowTrust.ts";
+import { MAX_WORKFLOW_DOCUMENT_BYTES } from "./workflowLimits.ts";
 
-const MAX_GRAPH_BYTES = 16 * 1024 * 1024;
 const MAX_SOURCE_FILES = 20_000;
 const MAX_SOURCE_DIRECTORIES = 20_000;
 const MAX_SOURCE_FILE_BYTES = 64 * 1024 * 1024;
@@ -303,7 +303,7 @@ function legacyGraph(value: unknown, catalog: OperatorCatalog) {
 async function readSomiteGraph(path: string, catalog: OperatorCatalog) {
   try {
     const metadata = await lstat(path);
-    const bytes = await readStableFile(path, metadata, MAX_GRAPH_BYTES, "Somite graph", "project_graph_invalid");
+    const bytes = await readStableFile(path, metadata, MAX_WORKFLOW_DOCUMENT_BYTES, "Somite graph", "project_graph_invalid");
     const graph = legacyGraph(JSON.parse(decoder.decode(bytes)), catalog);
     const verified = catalog.verifyGraph(graph);
     if (!verified.ok) failure("project_graph_invalid", verified.issue.message);

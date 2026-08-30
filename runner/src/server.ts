@@ -45,8 +45,9 @@ import { UploadError, UploadStore } from "./uploadStore.ts";
 import { detectHardwareProfile } from "./hardwareProfile.ts";
 import { ProductionInputError } from "./productionGraph.ts";
 import { WorkflowAdmissionError } from "./workflowAdmission.ts";
+import { MAX_WORKFLOW_DOCUMENT_BYTES, MAX_WORKFLOW_REQUEST_BYTES } from "./workflowLimits.ts";
 
-const MAX_REQUEST_BYTES = 16 * 1024 * 1024;
+const MAX_GENERIC_REQUEST_BYTES = 16 * 1024 * 1024;
 const DEFAULT_PORT = 7310;
 const MAX_TRANSACTION_REPLAYS = 256;
 
@@ -135,9 +136,9 @@ function requestIsMutation(request: Request) {
   return request.method !== "GET" && request.method !== "HEAD" && request.method !== "OPTIONS";
 }
 
-async function requestBytes(request: Request) {
+async function requestBytes(request: Request, maximumBytes = MAX_GENERIC_REQUEST_BYTES) {
   const announced = Number(request.headers.get("content-length") ?? 0);
-  if (Number.isFinite(announced) && announced > MAX_REQUEST_BYTES) throw new HttpError(413, "request is too large");
+  if (Number.isFinite(announced) && announced > maximumBytes) throw new HttpError(413, "request is too large");
   if (!request.body) return new Uint8Array();
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
@@ -146,7 +147,7 @@ async function requestBytes(request: Request) {
     const { done, value } = await reader.read();
     if (done) break;
     total += value.byteLength;
-    if (total > MAX_REQUEST_BYTES) throw new HttpError(413, "request is too large");
+    if (total > maximumBytes) throw new HttpError(413, "request is too large");
     chunks.push(value);
   }
   const bytes = new Uint8Array(total);
@@ -158,14 +159,18 @@ async function requestBytes(request: Request) {
   return bytes;
 }
 
-async function requestJson(request: Request) {
-  const bytes = await requestBytes(request);
+async function requestJson(request: Request, maximumBytes = MAX_GENERIC_REQUEST_BYTES) {
+  const bytes = await requestBytes(request, maximumBytes);
   if (!bytes.byteLength) throw new HttpError(400, "JSON body is required");
   try {
     return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
   } catch {
     throw new HttpError(400, "request body is not valid JSON");
   }
+}
+
+function requestWorkflowJson(request: Request) {
+  return requestJson(request, MAX_WORKFLOW_REQUEST_BYTES);
 }
 
 class HttpError extends Error {
@@ -211,8 +216,16 @@ function migrateGraph(value: unknown, catalog: OperatorCatalog) {
 }
 
 async function readGraph(path: string, catalog: OperatorCatalog) {
-  const bytes = await regularFile(path, MAX_REQUEST_BYTES, "workflow graph");
+  const bytes = await regularFile(path, MAX_WORKFLOW_DOCUMENT_BYTES, "workflow graph");
   return migrateGraph(JSON.parse(new TextDecoder().decode(bytes)), catalog);
+}
+
+function encodeGraph(graph: SomiteGraph) {
+  const encoded = `${JSON.stringify(graph, null, 2)}\n`;
+  if (Buffer.byteLength(encoded) > MAX_WORKFLOW_DOCUMENT_BYTES) {
+    throw new HttpError(413, `workflow graph exceeds ${MAX_WORKFLOW_DOCUMENT_BYTES} bytes`);
+  }
+  return encoded;
 }
 
 async function readVerifiedProjectGraph(root: string, catalog: OperatorCatalog, path: string) {
@@ -289,7 +302,7 @@ async function initializeProject(serverUrl: string, options: ServerOptions): Pro
         graph = await readVerifiedProjectGraph(root, catalogLoaded.catalog, graphPath);
       } else {
         graph = { schema_version: 3, name: "Untitled workflow", nodes: [], edges: [] };
-        await atomicWrite(graphPath, `${JSON.stringify(graph, null, 2)}\n`);
+        await atomicWrite(graphPath, encodeGraph(graph));
       }
       recoveryWarning = autosaveRecoveryWarning(recoveryError, savedGraphExists);
     }
@@ -297,7 +310,7 @@ async function initializeProject(serverUrl: string, options: ServerOptions): Pro
     graph = await readVerifiedProjectGraph(root, catalogLoaded.catalog, graphPath);
   } else {
     graph = { schema_version: 3, name: "Untitled workflow", nodes: [], edges: [] };
-    await atomicWrite(graphPath, `${JSON.stringify(graph, null, 2)}\n`);
+    await atomicWrite(graphPath, encodeGraph(graph));
   }
   const availableBinaries = new Set<string>();
   await Promise.all([...catalogLoaded.catalog.values()].map(async (operator) => {
@@ -390,8 +403,15 @@ function projectStateRevision(
   });
 }
 
-async function commitAutosavedGraph(state: ProjectState, graph: SomiteGraph, inputOriginId = state.inputOrigins.currentId) {
-  await atomicWrite(state.autosavePath, `${JSON.stringify(graph, null, 2)}\n`);
+async function commitAutosavedGraph(
+  state: ProjectState,
+  graph: SomiteGraph,
+  inputOriginId = state.inputOrigins.currentId,
+  canonical = false,
+) {
+  const encoded = encodeGraph(graph);
+  if (canonical) await atomicWrite(state.graphPath, encoded);
+  await atomicWrite(state.autosavePath, encoded);
   await state.inputOrigins.record(inputOriginId, graph);
   state.graph = graph;
   state.recoveredAutosave = true;
@@ -717,7 +737,7 @@ async function saveAgentPromptGraph(state: ProjectState, value: unknown) {
 }
 
 async function saveGraph(state: ProjectState, request: Request, canonical: boolean) {
-  const body = object(await requestJson(request), "graph write");
+  const body = object(await requestWorkflowJson(request), "graph write");
   knownFields(body, "graph write", ["base_state_revision", "graph", "input_origin_id"]);
   if (typeof body.base_state_revision !== "string") throw new HttpError(400, "base_state_revision must be a string");
   const graph = parseGraph(body.graph);
@@ -734,9 +754,7 @@ async function saveGraph(state: ProjectState, request: Request, canonical: boole
       throw new HttpError(409, "canvas changed since this edit started", { state_revision: currentRevision });
     }
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
-    const encoded = `${JSON.stringify(graph, null, 2)}\n`;
-    if (canonical) await atomicWrite(state.graphPath, encoded);
-    await commitAutosavedGraph(state, graph, inputOriginId);
+    await commitAutosavedGraph(state, graph, inputOriginId, canonical);
     responseRevision = projectStateRevision(state);
   });
   state.writeChain = operation.catch(() => undefined);
@@ -1147,14 +1165,14 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
   if (request.method === "PUT" && url.pathname === "/api/graph") return saveGraph(state, request, true);
   if (request.method === "PUT" && url.pathname === "/api/graph/autosave") return saveGraph(state, request, false);
   if (request.method === "POST" && url.pathname === "/api/graph/validate") {
-    const { graph } = scopedGraph(state, await requestJson(request), "graph validation request");
+    const { graph } = scopedGraph(state, await requestWorkflowJson(request), "graph validation request");
     const verified = state.catalog.verifyGraph(graph);
     if (!verified.ok) throw new HttpError(400, verified.issue.message);
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     return json({ valid: true });
   }
   if (request.method === "POST" && url.pathname === "/api/export/plan") {
-    const { graph } = scopedGraph(state, await requestJson(request), "export plan request");
+    const { graph } = scopedGraph(state, await requestWorkflowJson(request), "export plan request");
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     return json(planFrozenPackage(graph, state.catalog, {
       archiveName: graph.name ?? basename(state.root),
@@ -1162,7 +1180,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     }, (binary) => state.availableBinaries.has(binary)));
   }
   if (request.method === "POST" && url.pathname === "/api/export") {
-    const { graph, inputLocation } = scopedGraph(state, await requestJson(request), "export request");
+    const { graph, inputLocation } = scopedGraph(state, await requestWorkflowJson(request), "export request");
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     const exported = await state.runs.export(graph, {
       archiveName: graph.name ?? basename(state.root),
@@ -1176,7 +1194,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     });
   }
   if (request.method === "POST" && (url.pathname === "/api/runs" || url.pathname === "/api/validations")) {
-    const { graph, inputLocation } = scopedGraph(state, await requestJson(request), "run request");
+    const { graph, inputLocation } = scopedGraph(state, await requestWorkflowJson(request), "run request");
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     try {
       const started = await state.runs.start(
@@ -1192,7 +1210,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     }
   }
   if (request.method === "POST" && url.pathname === "/api/validations/status") {
-    const { graph } = scopedGraph(state, await requestJson(request), "validation status request");
+    const { graph } = scopedGraph(state, await requestWorkflowJson(request), "validation status request");
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     try {
       return json(await state.runs.validationStatus(graph));

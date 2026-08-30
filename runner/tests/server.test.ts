@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { byteDigest } from "@somite/workflow/contentIdentity";
 import { operatorPorts, type Operator } from "@somite/workflow/catalog";
 import { startServer } from "../src/server.ts";
+import { MAX_WORKFLOW_REQUEST_BYTES } from "../src/workflowLimits.ts";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 
@@ -33,6 +34,47 @@ async function statusWithHost(port: number, host: string) {
     request.once("error", rejectPromise);
     request.end();
   });
+}
+
+async function postWithAnnouncedLength(port: number, path: string, length: number) {
+  return new Promise<number>((resolvePromise, rejectPromise) => {
+    const request = httpRequest({
+      hostname: "127.0.0.1",
+      port,
+      path,
+      method: "POST",
+      headers: {
+        host: `127.0.0.1:${port}`,
+        origin: "http://localhost:3000",
+        "content-type": "application/json",
+        "content-length": String(length),
+      },
+    }, (response) => {
+      response.resume();
+      response.once("end", () => resolvePromise(response.statusCode ?? 0));
+    });
+    request.once("error", rejectPromise);
+    request.end();
+  });
+}
+
+function largeValidGraph() {
+  const note = "x".repeat(5_000);
+  return {
+    schema_version: 3,
+    name: "Large visual workflow",
+    nodes: [],
+    edges: [],
+    annotations: Array.from({ length: 3_300 }, (_, index) => ({
+      id: `note-${index}`,
+      kind: "sticky",
+      text: note,
+      color: "yellow",
+      layout: { x: index % 50, y: Math.floor(index / 50) },
+      width: 180,
+      height: 100,
+    })),
+  };
 }
 
 test("the TypeScript runner serves the browser session, streaming uploads, and generic local-project import", { skip: process.platform === "win32" }, async () => {
@@ -107,6 +149,59 @@ test("the TypeScript runner serves the browser session, streaming uploads, and g
   } finally {
     child.kill("SIGTERM");
     await once(child, "close").catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("workflow document routes retain the 64 MiB compatibility envelope without widening Agent bodies", async () => {
+  const root = await mkdtemp(join(tmpdir(), "somite-runner-large-graph-"));
+  const port = await unusedPort();
+  const graphPath = join(root, "large.somite.json");
+  const paddedDocument = `${" ".repeat(16 * 1024 * 1024)}${JSON.stringify({ schema_version: 3, name: "Large document", nodes: [], edges: [] })}`;
+  await writeFile(graphPath, paddedDocument);
+  let running: Awaited<ReturnType<typeof startServer>> | undefined;
+  try {
+    running = await startServer({ projectRoot: root, graph: "large.somite.json", port });
+    const session = await fetch(`${running.url}/api/session`).then((response) => response.json()) as { graph: { name?: string }; state_revision: string };
+    assert.equal(session.graph.name, "Large document");
+
+    const body = JSON.stringify({ base_state_revision: session.state_revision, graph: largeValidGraph() });
+    assert.ok(Buffer.byteLength(body) > 16 * 1024 * 1024);
+    assert.ok(Buffer.byteLength(body) < 64 * 1024 * 1024);
+    const saved = await fetch(`${running.url}/api/graph/autosave`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", origin: "http://localhost:3000" },
+      body,
+    });
+    assert.equal(saved.status, 200, await saved.clone().text());
+
+    const agent = await fetch(`${running.url}/api/agent/prompt`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "http://localhost:3000" },
+      body,
+    });
+    assert.equal(agent.status, 413, await agent.clone().text());
+    const config = await fetch(`${running.url}/api/agent/config`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "http://localhost:3000" },
+      body,
+    });
+    assert.equal(config.status, 413, await config.clone().text());
+    assert.equal(await postWithAnnouncedLength(port, "/api/graph/validate", MAX_WORKFLOW_REQUEST_BYTES + 1), 413);
+
+    const autosave = join(root, "large.somite.autosave.somite.json");
+    assert.ok((await stat(autosave)).size > 16 * 1024 * 1024);
+    await running.close();
+    running = undefined;
+    running = await startServer({ projectRoot: root, graph: "large.somite.json", port });
+    const recovered = await fetch(`${running.url}/api/session`).then((response) => response.json()) as {
+      recovered_autosave: boolean;
+      graph: { annotations?: unknown[] };
+    };
+    assert.equal(recovered.recovered_autosave, true);
+    assert.equal(recovered.graph.annotations?.length, 3_300);
+  } finally {
+    await running?.close().catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   }
 });

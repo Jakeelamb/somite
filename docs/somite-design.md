@@ -230,6 +230,11 @@ persist under `.somite/agent-transcripts/`.
   agent-transcripts/    redacted normalized turns
 ```
 
+Portable Somite documents are bounded at 64 MiB. Only routes whose primary
+payload is a Graph receive that compatibility envelope (plus 64 KiB for scoped
+metadata); Agent prompts, transactions, configuration, and other JSON requests
+retain the 16 MiB generic limit.
+
 ## Interaction invariants
 
 - The canvas is the primary surface; temporary panels never become alternate
