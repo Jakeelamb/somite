@@ -87,7 +87,7 @@ test("NCBI search performs ESearch then ESummary and preserves the user query", 
   assert.match(urls[0]?.searchParams.get("term") ?? "", /SRR12345678/);
 });
 
-test("Ensembl gene lookup is tolerant of provider misses", async () => {
+test("Ensembl lookup is tolerant only of authoritative provider misses", async () => {
   const result = await searchEnsembl("human BRCA1", async (input) => {
     const url = new URL(String(input));
     assert.match(url.pathname, /lookup\/symbol\/human\/BRCA1$/);
@@ -102,4 +102,39 @@ test("Ensembl gene lookup is tolerant of provider misses", async () => {
 
   const missing = await searchEnsembl("human BRCA2", async () => new Response("missing", { status: 404 }));
   assert.deepEqual(missing, []);
+
+  const missingGenome = await searchEnsembl("unknown species", async () => new Response("missing", { status: 404 }));
+  assert.deepEqual(missingGenome, []);
+  const emptyTaxonomy = await searchEnsembl("unknown species", async () => Response.json([]));
+  assert.deepEqual(emptyTaxonomy, []);
+});
+
+test("Ensembl search propagates provider and transport failures", async (context) => {
+  const failures: readonly [string, typeof fetch, RegExp][] = [
+    ["server failure", async () => new Response("unavailable", { status: 503, statusText: "Service Unavailable" }), /503 Service Unavailable/],
+    ["malformed JSON", async () => new Response("{broken", { headers: { "content-type": "application/json" } }), /JSON|Unexpected|position/i],
+    ["aborted request", async () => { throw new DOMException("search cancelled", "AbortError"); }, /search cancelled/],
+    ["timed-out request", async () => { throw new DOMException("search timed out", "TimeoutError"); }, /search timed out/],
+  ];
+
+  for (const [name, fetcher, message] of failures) {
+    await context.test(name, async () => {
+      await assert.rejects(searchEnsembl("human BRCA1", fetcher), message);
+    });
+  }
+});
+
+test("Ensembl search rejects successful responses with malformed schemas", async (context) => {
+  await context.test("gene lookup", async () => {
+    await assert.rejects(
+      searchEnsembl("human BRCA1", async () => Response.json({ display_name: "BRCA1" })),
+      /malformed Ensembl gene lookup response/i,
+    );
+  });
+  await context.test("genome taxonomy lookup", async () => {
+    await assert.rejects(
+      searchEnsembl("Ambystoma mexicanum", async () => Response.json({ genomes: [] })),
+      /malformed Ensembl genome lookup response/i,
+    );
+  });
 });

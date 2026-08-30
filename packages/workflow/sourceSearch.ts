@@ -30,6 +30,16 @@ const ENSEMBL = "https://rest.ensembl.org";
 
 type JsonRecord = Record<string, unknown>;
 
+class HttpResponseError extends Error {
+  readonly status: number;
+
+  constructor(response: Response) {
+    super(`${response.status}${response.statusText ? ` ${response.statusText}` : ""}`);
+    this.name = "HttpResponseError";
+    this.status = response.status;
+  }
+}
+
 function record(value: unknown): JsonRecord | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? value as JsonRecord : undefined;
 }
@@ -222,8 +232,12 @@ async function fetchJson(fetcher: typeof fetch, url: URL, signal?: AbortSignal) 
     headers: { accept: "application/json" },
     signal: signal ?? AbortSignal.timeout(7_000),
   });
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  if (!response.ok) throw new HttpResponseError(response);
   return response.json() as Promise<unknown>;
+}
+
+function isNotFound(error: unknown) {
+  return error instanceof HttpResponseError && error.status === 404;
 }
 
 async function esearch(fetcher: typeof fetch, database: string, term: string, limit: number, signal?: AbortSignal) {
@@ -275,20 +289,28 @@ export async function searchEnsembl(query: string, fetcher: typeof fetch = fetch
     url.searchParams.set("content-type", "application/json");
     try {
       const result = ensemblFeatureResult(await fetchJson(fetcher, url, signal));
-      return result ? [result] : [];
-    } catch {
-      return [];
+      if (!result) throw new Error("malformed Ensembl gene lookup response");
+      return [result];
+    } catch (error) {
+      if (isNotFound(error)) return [];
+      throw error;
     }
   }
   const url = new URL(`${ENSEMBL}/info/genomes/taxonomy/${encodeURIComponent(query)}`);
   url.searchParams.set("content-type", "application/json");
   try {
     const values = await fetchJson(fetcher, url, signal);
-    return Array.isArray(values)
-      ? values.map(ensemblGenomeResult).filter((result): result is SourceSearchResult => result !== undefined).slice(0, 3)
-      : [];
-  } catch {
-    return [];
+    if (!Array.isArray(values)) throw new Error("malformed Ensembl genome lookup response");
+    const results: SourceSearchResult[] = [];
+    for (const value of values) {
+      const result = ensemblGenomeResult(value);
+      if (!result) throw new Error("malformed Ensembl genome lookup response");
+      results.push(result);
+    }
+    return results.slice(0, 3);
+  } catch (error) {
+    if (isNotFound(error)) return [];
+    throw error;
   }
 }
 
