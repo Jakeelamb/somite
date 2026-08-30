@@ -83,11 +83,15 @@ insufficient.
 | `somite.workflow.get` | Read the current typed graph, full state revision, and semantic revision. |
 | `somite.readiness.get` | Read the shared Workflow assessment: ordered requirements, Node support, input controls, known resolutions, recipes, and escalation eligibility for the current graph revision. |
 | `somite.catalog.search` | Search exact operator contracts, ports, parameters, Pixi packages, and revisions with deterministic ranking and opaque pagination. |
+| `somite.source_workflow.search_nfcore` | Search the official nf-core catalog for exact repository and release pairs. |
+| `somite.source_workflow.resolve_nfcore` | Resolve one exact nf-core release onto an unchanged empty canvas as a pinned source workflow. |
+| `somite.source_workflow.edit` | Apply typed parameter or invocation-replacement edits to a pinned source workflow. |
+| `somite.source_workflow.promote` | Promote one selected source invocation replacement into an ordinary editable typed node. |
 | `somite.source.search` | Search current NCBI or Ensembl reads, reference assemblies, organisms, accessions, and genes with structured provenance and ordered native source-recipe operators. |
 | `somite.graph.apply_transaction` | Apply up to 64 graph operations atomically against a compare-and-swap base revision. |
 | `somite.workflow.compile` | Freeze the current graph through the production Pixi/Nextflow compiler into a content-addressed package. |
-| `somite.validation.start` | Start the production runner with a supported representative fixture binding. |
 | `somite.run.start` | Start the production runner with configured inputs. |
+| `somite.validation.start` | Start the production runner with a supported representative fixture binding. |
 | `somite.run.status` | Read lifecycle, graph-node state, closure identity, and evidence. |
 | `somite.run.cancel` | Cancel one active run or validation. |
 | `somite.evidence.lookup` | Read immutable receipts for a graph revision. |
@@ -98,10 +102,10 @@ search is explicitly open-world because it queries NCBI or Ensembl through
 Somite's existing provider boundary. The server instructions require an agent
 to inspect the graph, search rather than invent contracts, prefer native source
 search over a generic browser, make small edits, and validate.
-Every tool has a concrete output schema. Expected catalog, edit, compile, run,
-and validation failures return structured `isError: true` tool results with a
-stable code and a recovery action instead of being disguised as transport
-failures.
+Every call returns MCP-compatible text plus structured content. Expected
+catalog, edit, compile, run, and validation failures return structured
+`isError: true` tool results with a stable code and a recovery action instead
+of being disguised as transport failures.
 
 Catalog matches include the immutable catalog revision, a deterministic score,
 the terms that matched, and an opaque continuation cursor. A cursor is valid

@@ -3,20 +3,20 @@
 ## Verdict
 
 Somite's MCP surface passed the fixed paired-end workflow task with four model
-configurations and a forced concurrent-edit scenario. It now also passes two
-natural-language routing cases that contain no instructions about MCP, shell,
-filesystem, or tool choice: one complete paired-read QC build and one current
-NCBI human-reference request. A third natural request now reproduces the
-metagenomics case that originally failed: the agent builds the useful Kraken2
-branch, identifies its required local database input, and stops before
-validation because no database path is available. The current evidence is
-strong for these bounded paths, not for every possible workflow, operator,
-model provider, or MCP transport.
+configurations and a forced concurrent-edit scenario. It also passed three
+natural-language routing cases that contained no instructions about MCP,
+shell, filesystem, or tool choice: one complete paired-read QC build, one NCBI
+human-reference request, and one metagenomics request. The metagenomics case
+reproduced the failure that motivated it: the agent built the useful Kraken2
+branch, identified its required local database input, and stopped before
+validation because no database path was available. These are historical
+2026-08-26 results for bounded paths, not current evidence for every workflow,
+operator, model provider, or MCP transport.
 
-The final baseline needs five to seven MCP calls: exact catalog discovery,
+The recorded baseline needed five to seven MCP calls: exact catalog discovery,
 state inspection, one atomic edit, one idempotent validation start, and one
-bounded status wait. Each run produced a real passing Pixi/Nextflow validation
-receipt for both nodes and both edges.
+bounded status wait. Each validated QC run produced a real passing
+Pixi/Nextflow validation receipt for both nodes and both edges.
 
 | Agent configuration | Scenario | Calls | Catalog calls | Status calls | Wall time | Result |
 | --- | --- | ---: | ---: | ---: | ---: | --- |
@@ -84,9 +84,11 @@ scripts/mcp-agent-eval gpt-5.6-luna low 7396 metagenomics
 
 Each run writes its prompt, configuration snapshots, raw events, redacted
 normalized transcript, initial/final workflows, server log, and machine-readable
-score under `.somite/mcp-agent-evals/`. The harness auto-approves only permission
-titles in the exact `somite.*` namespace and refuses every other agent action.
-It does not record or claim access to hidden model reasoning.
+score under `.somite/mcp-agent-evals/`. The runtime automatically approves only
+calls whose structured server, tool, and presented identities agree on one
+canonical advertised Somite tool. The harness consumes that shared tool list to
+verify the recorded structured calls and refuses every remaining interactive
+request. It does not record or claim access to hidden model reasoning.
 
 ## Failures found by agents and the resulting changes
 
@@ -101,9 +103,9 @@ runs:
 | A verbose reference query returned no assembly and caused repeated source searches. | Generic query words were incorrectly treated as part of the NCBI organism name, and every query searched both SRA and Assembly. | Source intent now routes assembly and read queries directly and normalizes phrases such as `latest human reference genome` to the organism subject. |
 | Luna used `graph_revision` as the transaction base and received a stale error. | The workflow tool description contradicted the transaction contract. | Tools and server instructions now distinguish full `state_revision` from semantic `graph_revision`; the stale error includes exact recovery fields. |
 | A natural paired-read query needed seven searches. | Search indexed too little metadata and returned weak partial matches beside complete matches. | Search now indexes ports, artifact types, aliases, labels, Pixi packages, and outputs; complete multi-term matches suppress partial matches. The Inspector query now returns one exact match. |
-| Validation approval briefly appeared as generic `agent action`. | ACP delivered the permission request before the matching tool update. | Permission handling waits up to 200 ms for the update keyed by `tool_call_id`, then emits the exact tool name and edit summary. |
+| Validation approval briefly appeared as generic `agent action`. | ACP could deliver the permission request before the matching tool update. | Permission identity now comes directly from the request's structured server, tool, and presented names; the visible event and transcript remain correlated by `tool_call_id`. |
 | A metagenomics pipeline reached validation with `class.kraken2 argv: unbound input db`. | The Kraken2 contract incorrectly marked `db` optional even though its command always expands `--db {input.db}`. The agent also attempted validation before resolving all required local resources. | The database port is required, the agent contract checks all required inputs before editing and validating, and the regression scenario stops once it needs the user's local database path. |
-| Repeated Somite permission clicks interrupted native tool use. | Every canvas mutation and validation start surfaced the ACP permission prompt even though these tools are constrained to Somite's local session. | Exact `somite.*` permissions are automatically allowed for the current session. Shell and other external actions remain interactive. |
+| Repeated Somite permission clicks interrupted native tool use. | Every canvas mutation and validation start surfaced the ACP permission prompt even though these tools are constrained to Somite's local session. | Calls with a consistent Somite server identity and one exact advertised tool name are automatically allowed for the current session. Prefix-shaped labels, conflicting identities, shell calls, and other tools remain interactive. |
 | A successful Luna run used nine repeated status calls. | Status had no bounded wait contract. | `somite.run.status.wait_ms` long-polls for up to 25 seconds. Final agents used one status call. |
 | Terra observed `phase: completed` with no receipt, then found the receipt through evidence lookup. | The runner exposed its process terminal state before evidence finalization. | Validation remains `finalizing` until its receipt is persisted; terminal completion and evidence now become visible atomically. |
 | A compile blocker marked every unexecuted node failed. | Preparation failure was projected onto units that never ran. | Running units fail; queued units become skipped and evidence-inconclusive. |
@@ -112,20 +114,26 @@ runs:
 ## Protocol and Inspector evidence
 
 The official MCP Inspector enumerated ten tools from Somite's real stdio
-process. Every tool had an object input schema, a concrete output schema, and
-all four security-relevant annotations. No output property remained an
-unconstrained `true` schema. A real Inspector call for
+process during the recorded evaluation. A real Inspector call for
 `paired local FASTQ source` returned only `files.import_paired`, its exact
-revision, contract, score, and matched terms.
+revision, contract, score, and matched terms. The Inspector run has not been
+repeated against the current implementation, so it is retained as historical
+evidence only.
 
-The RMCP integration test explicitly negotiates MCP `2026-07-28`, spawns the
-production stdio process, checks all schemas and annotations, applies and
-replays an atomic edit, verifies a structured stale error, and reads the result
-back. The MCP-to-runtime HTTP hop is loopback-only and requires a per-process
-cryptographic bearer capability that is passed through the child environment,
-not its arguments. MCP-only runtime routes enforce the capability independently
-of the activity header. This authenticates the intended proxy hop; it does not
-claim to isolate arbitrary same-user processes from the human-facing local web
+The current TypeScript surface has fifteen tools after adding Workflow
+assessment and the four typed source-workflow tools. Its integration test
+spawns the production stdio Adapter, negotiates modern discovery and legacy
+initialization, compares `tools/list` to the canonical shared list, and checks a
+structured call through the capability-authenticated loopback hop. Every tool
+advertises an object input schema and all four security-relevant annotations;
+call results contain compatibility text and structured content. This test does
+not replace a current third-party Inspector or conformance run.
+
+The MCP-to-runtime HTTP hop is loopback-only and requires a per-process
+cryptographic bearer capability passed through the child environment, not its
+arguments. MCP-only runtime routes enforce the capability independently of the
+activity header. This authenticates the intended proxy hop; it does not claim
+to isolate arbitrary same-user processes from the human-facing local web
 application.
 
 The official conformance runner currently accepts a Streamable HTTP URL, while
@@ -153,8 +161,4 @@ real external-client requirement.
   consensus contracts.
 - MCP call results contain both compatibility text and structured content, so
   large catalog contracts still consume substantial transcript space.
-- JSON Schema validators may warn about Schemars' nonstandard `uint` format
-  annotations. Inspector validation succeeds, but removing those warnings would
-  improve portability.
-
 The reusable harness makes these extensions incremental rather than ad hoc.

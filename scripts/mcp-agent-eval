@@ -28,6 +28,14 @@ for command in curl jq node npx openssl; do
   }
 done
 
+canonical_tools=$(
+  cd "$project_root"
+  node --experimental-strip-types --input-type=module --eval \
+    'import { SOMITE_MCP_TOOL_NAMES } from "./runner/src/mcpTools.ts"; process.stdout.write(JSON.stringify(SOMITE_MCP_TOOL_NAMES));'
+)
+jq -e 'length > 0 and (length == (unique | length)) and all(.[]; type == "string")' \
+  <<<"$canonical_tools" >/dev/null
+
 if ! [[ "$port" =~ ^[0-9]+$ ]] || ((port < 1024 || port > 65535)); then
   echo "port must be an integer from 1024 through 65535" >&2
   exit 1
@@ -146,32 +154,19 @@ if [[ "$scenario" == stale ]]; then
   fi
 fi
 
-handled_permissions='[]'
 finished=false
 for _ in $(seq 1 900); do
   curl --fail --silent "$server_url/api/agent/events" >"$output_dir/events.json"
-  while IFS=$'\t' read -r permission_id option_id title; do
+  while IFS=$'\t' read -r permission_id tool_call_id title; do
     [[ -n "$permission_id" ]] || continue
-    if jq -e --arg id "$permission_id" 'index($id) != null' <<<"$handled_permissions" >/dev/null; then
-      continue
-    fi
-    if [[ "$title" != Approve\ somite.* ]]; then
-      echo "refusing to auto-approve non-Somite permission: $title" >&2
-      exit 1
-    fi
-    jq -n --arg option_id "$option_id" '{option_id: $option_id}' \
-      >"$output_dir/permission-request.json"
-    curl --fail --silent --request POST \
-      "$server_url/api/agent/permissions/$permission_id" \
-      --header 'content-type: application/json' \
-      --data-binary @"$output_dir/permission-request.json" >/dev/null
-    handled_permissions=$(jq -c --arg id "$permission_id" '. + [$id]' <<<"$handled_permissions")
+    echo "refusing interactive permission $permission_id for $tool_call_id: $title" >&2
+    exit 1
   done < <(
     jq -r '.events[]
       | select(.kind == "permission" and .permission_id != null and
           (((.permission_choices // []) | length) > 0))
       | [.permission_id,
-         (((.permission_choices // [])[] | select(.kind == "allow_once") | .option_id) // ""),
+         (.tool_call_id // "unknown tool call"),
          .title]
       | @tsv' "$output_dir/events.json"
   )
@@ -199,6 +194,7 @@ jq -n \
   --arg effort "$effort" \
   --arg scenario "$scenario" \
   --arg output_dir "$output_dir" \
+  --argjson canonical_tools "$canonical_tools" \
   --slurpfile transcript "$output_dir/transcript.json" \
   --slurpfile workflow "$output_dir/final-workflow.json" '
   ($workflow[0].graph.nodes | map(select(.operator == "files.import_paired"))) as $sources |
@@ -323,6 +319,13 @@ jq -n \
           ((.title // "") == "Read file '/home/jake/Projects/agent-scripts/AGENTS.MD'"))
       }
     else . end
+  | .checks.exact_automatic_permission_identity = all($transcript[0].tool_calls[]?;
+      . as $call |
+      all($call.permissions[]?;
+        if ((.choices // []) | length) == 0 then
+          ($call.input.server == "Somite" and
+           any($canonical_tools[]; . == $call.input.tool))
+        else true end))
   | .passed = ([.checks[]] | all)
   ' >"$output_dir/score.json"
 
