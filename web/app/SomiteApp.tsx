@@ -78,7 +78,7 @@ import {
 import { CanvasAnnotations } from "./CanvasAnnotations";
 import type { SourceRequest, SourceSearchResult } from "./sourceBuilder";
 import { preventBrowserZoomOutsideCanvas } from "./canvasGestures";
-import { nextPaperReadSlot, paperCanvasUpdate, paperResolutionAgentPrompt, replacePaperReadSlot } from "./paperResolution";
+import { nextPaperReadSlot, paperCandidateDocument, paperCanvasUpdate, paperResolutionAgentPrompt, replacePaperReadSlot } from "./paperResolution";
 import {
   createPaperIntakeCoordinator,
   paperCandidateCanApply,
@@ -2128,17 +2128,15 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       return;
     }
     remember();
-    const graphNodes = normalizeImportedNodeLayouts(candidate.graph.nodes);
-    const nextNodes = graphNodes.map((node) => flowNode(node, operatorMap));
-    setNodes(nextNodes.map((node, nodeIndex) => ({ ...node, selected: nodeIndex === 0 })));
-    setEdges(candidate.graph.edges.map((edge) => flowEdge(edge, graphNodes)));
-    setSelectedIds(nextNodes[0] ? [nextNodes[0].id] : []);
+    const document = paperCandidateDocument(candidate);
+    restoreGraph(document, true, true, inputOriginIdRef.current, false);
+    const firstNodeId = document.nodes[0]?.id;
+    setNodes((current) => current.map((node, nodeIndex) => ({ ...node, selected: nodeIndex === 0 })));
+    setSelectedIds(firstNodeId ? [firstNodeId] : []);
     setActivePaperCandidate(index);
     setAppliedPaperCandidate(index);
-    setDirty(true);
     setStatus(`Rebuilt ${candidate.name} · ${candidate.graph.nodes.length} nodes · review evidence before running`);
-    window.setTimeout(() => void flow?.fitView({ padding: .24, duration: 280, maxZoom: 1 }), 0);
-  }, [flow, operatorMap, paperBusy, paperReview, remember, setEdges, setNodes]);
+  }, [paperBusy, paperReview, remember, restoreGraph, setNodes]);
 
   const openPaperIntakeSurface = useCallback(() => {
     setPaperVisible(true);

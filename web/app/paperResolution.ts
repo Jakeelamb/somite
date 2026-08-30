@@ -1,4 +1,5 @@
 import type { PaperCandidate, ReadinessItem, SomiteGraph, SomiteGraphNode } from "./types";
+import { normalizeImportedNodeLayouts } from "./graphInteractions.ts";
 
 export function paperAttentionItems(candidate: PaperCandidate | null | undefined) {
   return candidate?.assessment.items ?? [];
@@ -24,6 +25,17 @@ export function nextPaperReadSlot(candidate: PaperCandidate | null | undefined) 
 
 export function paperResourceApplied(candidate: PaperCandidate | null | undefined, accession: string) {
   return candidate?.graph.nodes.some((node) => node.operator === "sra.prefetch" && node.params?.accession === accession) ?? false;
+}
+
+/** Install a paper draft as a complete document, never as a partial canvas overlay. */
+export function paperCandidateDocument(candidate: PaperCandidate): SomiteGraph {
+  return {
+    ...candidate.graph,
+    name: candidate.name,
+    nodes: normalizeImportedNodeLayouts(candidate.graph.nodes),
+    annotations: candidate.graph.annotations ?? [],
+    variant_origin: candidate.graph.variant_origin,
+  };
 }
 
 function sameGraphValue(left: unknown, right: unknown) {

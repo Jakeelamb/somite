@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { nextPaperReadSlot, paperAttentionItems, paperCanvasOwnsCandidate, paperCanvasUpdate, paperResolutionAgentPrompt, paperResourceApplied, paperSupportedCount, replacePaperReadSlot } from "../app/paperResolution.ts";
+import { nextPaperReadSlot, paperAttentionItems, paperCandidateDocument, paperCanvasOwnsCandidate, paperCanvasUpdate, paperResolutionAgentPrompt, paperResourceApplied, paperSupportedCount, replacePaperReadSlot } from "../app/paperResolution.ts";
 import type { PaperCandidate, SomiteGraph } from "../app/types.ts";
 
 const candidate: PaperCandidate = {
@@ -54,6 +54,24 @@ test("paper escalation carries exact evidence, location, choices, and recipes", 
   assert.match(prompt, /Review details/);
   assert.match(prompt, /Read supplement/);
   assert.match(prompt, /do not make an unsupported scientific substitution/);
+});
+
+test("installing a paper candidate replaces the complete workflow document", () => {
+  const document = paperCandidateDocument({
+    ...candidate,
+    name: "Recovered methods workflow",
+    graph: {
+      ...candidate.graph,
+      name: "Extractor draft",
+      nodes: [{ id: "fastp", operator: "qc.fastp", operator_revision: "r1", ports: [], params: {}, layout: { x: 0, y: 0 } }],
+      annotations: undefined,
+      variant_origin: undefined,
+    },
+  });
+  assert.equal(document.name, "Recovered methods workflow");
+  assert.deepEqual(document.annotations, []);
+  assert.equal(document.variant_origin, undefined);
+  assert.deepEqual(document.nodes[0]?.layout, { x: 0, y: 0 });
 });
 
 test("a cited run replaces the next local read placeholder without disturbing its consumers", () => {
