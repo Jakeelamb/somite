@@ -31,6 +31,7 @@ import { NfcoreGateway } from "./nfcoreGateway.ts";
 import { extractPaper, PaperExtractionError } from "./paperExtractor.ts";
 import { PaperManager } from "./paperManager.ts";
 import { PaperStoreError } from "./paperStore.ts";
+import { PaperToolchainError } from "./paperToolchain.ts";
 import { ProjectGateway, ProjectGatewayError } from "./projectGateway.ts";
 import { SnakemakeGateway } from "./snakemakeGateway.ts";
 import { SourceSearchGateway } from "./sourceSearchGateway.ts";
@@ -725,13 +726,14 @@ async function resolvePaperResources(state: ProjectState, value: unknown) {
 }
 
 async function systemProfile(state: ProjectState) {
-  const [hardware, pixi, prefetch, datasets, nextflow, snakemake] = await Promise.all([
+  const [hardware, pixi, prefetch, datasets, nextflow, snakemake, paperExtraction] = await Promise.all([
     detectHardwareProfile(),
     executablePath(state.root, "pixi"),
     executablePath(state.root, "prefetch"),
     executablePath(state.root, "datasets"),
     executablePath(state.root, "nextflow"),
     executablePath(state.root, "snakemake"),
+    state.papers.paperTools.preflight(),
   ]);
   return {
     ...hardware,
@@ -743,15 +745,7 @@ async function systemProfile(state: ProjectState) {
       nextflow: Boolean(nextflow),
       snakemake: Boolean(snakemake),
     },
-    paper_extraction: {
-      native_pdf_text: true,
-      scanned_pdf_ocr: false,
-      tools: [{
-        name: "PDF.js",
-        available: true,
-        detail: "Native PDF text is read by Somite's TypeScript runner; no Poppler installation is required.",
-      }],
-    },
+    paper_extraction: paperExtraction,
   };
 }
 
@@ -870,6 +864,11 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     return json(await state.runs.evidence(subject));
   }
   if (request.method === "GET" && url.pathname === "/api/system") return json(await systemProfile(state));
+  if (request.method === "POST" && url.pathname === "/api/paper-tools/ocr/install") {
+    const body = object(await requestJson(request), "paper OCR setup request");
+    knownFields(body, "paper OCR setup request", []);
+    return json(await state.papers.paperTools.installManaged());
+  }
   if (request.method === "GET" && url.pathname === "/api/storage") return json(await state.runs.storage());
   if (request.method === "POST" && url.pathname === "/api/storage/dehydrate-runs") {
     const body = object(await requestJson(request), "run cleanup request");
@@ -1002,7 +1001,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     knownFields(body, "paper request", ["path"]);
     const source = await state.papers.store.resolveProjectPath(requiredString(body.path, "path"));
     try {
-      const extracted = await extractPaper(source.bytes, source.mediaKind);
+      const extracted = await extractPaper(source.bytes, source.mediaKind, { ocr: { toolchain: state.papers.paperTools } });
       return json(reconstructPaper(state.catalog, extracted.text, extracted.extractedVia));
     } catch (error) {
       if (error instanceof PaperExtractionError) throw new HttpError(422, error.message, { code: error.code, retryable: error.retryable });
@@ -1247,6 +1246,13 @@ export async function startServer(options: ServerOptions = {}) {
           ? errorResponse(error.code === "already_connected" || error.code === "busy" ? 409 : error.code === "not_connected" ? 404 : 400, error.message, { code: error.code })
         : error instanceof PaperStoreError
           ? errorResponse(error.status, error.message, { code: error.code })
+        : error instanceof PaperToolchainError
+          ? errorResponse(
+            error.code === "paper_tool_install_busy" ? 409
+              : error.code === "paper_command_invalid" || error.code === "paper_directory_unavailable" ? 400 : 422,
+            error.message,
+            { code: error.code, retryable: error.retryable },
+          )
         : error instanceof UploadError
           ? errorResponse(error.status, error.message)
           : errorResponse(500, error instanceof Error ? error.message : String(error));

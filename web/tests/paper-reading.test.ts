@@ -8,8 +8,9 @@ function readyPreflight(): PaperExtractionPreflight {
   return {
     native_pdf_text: true,
     scanned_pdf_ocr: true,
+    missing: [],
     tools: [
-      { name: "pdftotext", available: true, path: "/managed/bin/pdftotext", source: "managed_pixi", detail: "Native PDF text extraction is available." },
+      { name: "PDF.js", available: true, source: "built_in", detail: "Native PDF text extraction is available." },
       { name: "pdfinfo", available: true, path: "/project/bin/pdfinfo", source: "project_pixi", detail: "PDF page counting for bounded OCR is available." },
       { name: "pdftoppm", available: true, path: "/usr/bin/pdftoppm", source: "system_path", detail: "PDF page rendering for OCR is available." },
       { name: "tesseract", available: true, path: "/usr/bin/tesseract", source: "system_path", detail: "Scanned-page text recognition is available." },
@@ -32,7 +33,7 @@ test("paper-reading tool provenance is translated without losing server detail",
   const presentation = paperReadingPresentation(readyPreflight());
 
   assert.deepEqual(presentation.tools.map((tool) => ({ name: tool.name, source: tool.source, detail: tool.detail })), [
-    { name: "pdftotext", source: "Somite managed Pixi", detail: "Native PDF text extraction is available." },
+    { name: "PDF.js", source: "Built into Somite", detail: "Native PDF text extraction is available." },
     { name: "pdfinfo", source: "Project Pixi", detail: "PDF page counting for bounded OCR is available." },
     { name: "pdftoppm", source: "System PATH", detail: "PDF page rendering for OCR is available." },
     { name: "tesseract", source: "System PATH", detail: "Scanned-page text recognition is available." },
@@ -42,6 +43,7 @@ test("paper-reading tool provenance is translated without losing server detail",
 test("missing paper tools produce deterministic, actionable guidance", () => {
   const preflight = readyPreflight();
   preflight.scanned_pdf_ocr = false;
+  preflight.missing = ["tesseract"];
   preflight.tools = preflight.tools.map((tool) => tool.name === "tesseract" ? {
     name: "tesseract",
     available: false,
@@ -54,9 +56,8 @@ test("missing paper tools produce deterministic, actionable guidance", () => {
   assert.equal(presentation.capabilities[1]?.status, "Needs setup");
   assert.deepEqual(presentation.missingToolNames, ["tesseract"]);
   assert.match(presentation.guidance ?? "", /Scanned PDFs need tesseract/);
-  assert.match(presentation.guidance ?? "", /managed or project Pixi environment/);
-  assert.match(presentation.guidance ?? "", /PATH/);
-  assert.match(presentation.guidance ?? "", /Restart Somite to recheck/);
+  assert.match(presentation.guidance ?? "", /install and pin the verified OCR tools/);
+  assert.doesNotMatch(presentation.guidance ?? "", /Restart Somite/);
   assert.equal(presentation.tools.at(-1)?.source, "Missing");
   assert.match(presentation.tools.at(-1)?.detail ?? "", /conda-forge::tesseract/);
 });

@@ -310,3 +310,57 @@ test("paper resource resolution rejects accession-kind mismatches before network
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("paper OCR setup installs a verified managed toolchain and refreshes machine readiness", { skip: process.platform === "win32" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "somite-runner-paper-tools-"));
+  const bin = join(root, ".pixi", "envs", "default", "bin");
+  await mkdir(bin, { recursive: true });
+  const pixi = join(bin, "pixi");
+  await writeFile(pixi, `#!${process.execPath}
+const fs = require("node:fs");
+const path = require("node:path");
+const args = process.argv.slice(2);
+const manifest = args[args.indexOf("--manifest-path") + 1];
+const directory = path.dirname(manifest);
+fs.writeFileSync(path.join(directory, "pixi.lock"), "version = 1\\n");
+const bin = path.join(directory, ".pixi", "envs", "default", "bin");
+fs.mkdirSync(bin, { recursive: true });
+const bodies = {
+  pdfinfo: 'process.stderr.write("pdfinfo version 25.01.0\\\\n");',
+  pdftoppm: 'process.stderr.write("pdftoppm version 25.01.0\\\\n");',
+  tesseract: 'if (process.argv.includes("--version")) process.stdout.write("tesseract 5.5.0\\\\n"); else process.stdout.write("List of available languages (1):\\\\neng\\\\n");',
+};
+for (const [name, body] of Object.entries(bodies)) {
+  const target = path.join(bin, name);
+  fs.writeFileSync(target, "#!${process.execPath}\\n" + body + "\\n", { mode: 0o700 });
+  fs.chmodSync(target, 0o700);
+}
+`, { mode: 0o700 });
+  await chmod(pixi, 0o700);
+  const running = await startServer({ projectRoot: root, port: await unusedPort() });
+  try {
+    const setup = await fetch(`${running.url}/api/paper-tools/ocr/install`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "http://localhost:3000" },
+      body: "{}",
+    });
+    assert.equal(setup.status, 200, await setup.clone().text());
+    const installed = await setup.json() as { receipt_id: string; preflight: { scanned_pdf_ocr: boolean; missing: string[]; tools: Array<{ name: string; source?: string }> } };
+    assert.match(installed.receipt_id, /^[a-f0-9]{64}$/);
+    assert.equal(installed.preflight.scanned_pdf_ocr, true);
+    assert.deepEqual(installed.preflight.missing, []);
+    assert.ok(installed.preflight.tools.filter((tool) => tool.name !== "PDF.js").every((tool) => tool.source === "managed_pixi"));
+
+    const system = await fetch(`${running.url}/api/system`).then((response) => response.json()) as {
+      paper_extraction: { native_pdf_text: boolean; scanned_pdf_ocr: boolean; missing: string[] };
+    };
+    assert.equal(system.paper_extraction.native_pdf_text, true);
+    assert.equal(system.paper_extraction.scanned_pdf_ocr, true);
+    assert.deepEqual(system.paper_extraction.missing, []);
+    const storage = await fetch(`${running.url}/api/storage`).then((response) => response.json()) as { shared_environments: { bytes: number } };
+    assert.ok(storage.shared_environments.bytes > 0, "managed paper tools must be included in local storage accounting");
+  } finally {
+    await running.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

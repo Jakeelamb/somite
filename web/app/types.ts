@@ -350,13 +350,16 @@ export type UploadResult = {
   filename: string;
 };
 
-export type PaperToolSource = "managed_pixi" | "project_pixi" | "system_path";
+export type PaperToolSource = "built_in" | "managed_pixi" | "project_pixi" | "system_path";
 
 export type PaperExtractionToolReadiness = {
   name: string;
   available: boolean;
   path?: string;
   source?: PaperToolSource;
+  package?: "poppler" | "tesseract";
+  version?: string;
+  identity?: string;
   detail: string;
 };
 
@@ -364,6 +367,7 @@ export type PaperExtractionPreflight = {
   native_pdf_text: boolean;
   scanned_pdf_ocr: boolean;
   tools: PaperExtractionToolReadiness[];
+  missing: Array<"pdfinfo" | "pdftoppm" | "tesseract">;
 };
 
 export type SystemProfile = {

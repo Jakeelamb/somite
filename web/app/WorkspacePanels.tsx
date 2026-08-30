@@ -748,8 +748,11 @@ export function MachinePanel({
   storageLoading,
   storageReclaiming,
   storageError,
+  paperToolsInstalling,
+  paperToolsError,
   onRefreshStorage,
   onReclaimRunWork,
+  onInstallPaperTools,
   onClose,
 }: {
   profile: SystemProfile | null;
@@ -757,8 +760,11 @@ export function MachinePanel({
   storageLoading: boolean;
   storageReclaiming: boolean;
   storageError: string | null;
+  paperToolsInstalling: boolean;
+  paperToolsError: string | null;
   onRefreshStorage: () => Promise<void>;
   onReclaimRunWork: () => Promise<void>;
+  onInstallPaperTools: () => Promise<void>;
   onClose: () => void;
 }) {
   const memory = profile ? `${(profile.memory_bytes / 1024 ** 3).toFixed(1)} GiB` : "Detecting…";
@@ -793,6 +799,15 @@ export function MachinePanel({
           ))}
         </div>
         {paperReading?.guidance && <p className="paper-reading-guidance"><CircleAlert size={14} aria-hidden="true" /><span>{paperReading.guidance}</span></p>}
+        {paperReading && !profile?.paper_extraction.scanned_pdf_ocr && <div className="paper-reading-setup">
+          <button type="button" disabled={paperToolsInstalling || !profile?.tools.pixi} onClick={() => void onInstallPaperTools()}>
+            {paperToolsInstalling
+              ? <><LoaderCircle className="spin" size={13} aria-hidden="true" />Installing verified OCR tools…</>
+              : <><Download size={13} aria-hidden="true" />Enable scanned PDF OCR</>}
+          </button>
+          {!profile?.tools.pixi && <small>Pixi is required for the managed setup.</small>}
+        </div>}
+        {paperToolsError && <p className="paper-reading-error" role="alert">{paperToolsError}</p>}
         {paperReading && <details className="paper-reading-tools">
           <summary><span>Tool details</span><small>{paperReading.missingToolNames.length ? `${paperReading.missingToolNames.length} missing` : "All available"}</small><ChevronDown size={13} aria-hidden="true" /></summary>
           <div>

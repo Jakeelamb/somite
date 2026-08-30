@@ -556,6 +556,8 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const [storageLoading, setStorageLoading] = useState(false);
   const [storageReclaiming, setStorageReclaiming] = useState(false);
   const [storageError, setStorageError] = useState<string | null>(null);
+  const [paperToolsInstalling, setPaperToolsInstalling] = useState(false);
+  const [paperToolsError, setPaperToolsError] = useState<string | null>(null);
   const [nodes, setNodes, onNodesChange] = useNodesState<SomiteFlowNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<SomiteFlowEdge>([]);
   const [flow, setFlow] = useState<ReactFlowInstance<SomiteFlowNode, SomiteFlowEdge> | null>(null);
@@ -1162,6 +1164,29 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       setStorageReclaiming(false);
     }
   }, [refreshStorage, storage?.runs.reclaimable_run_ids, storageReclaiming]);
+
+  const installPaperTools = useCallback(async () => {
+    if (paperToolsInstalling) return;
+    setPaperToolsInstalling(true);
+    setPaperToolsError(null);
+    setStatus("Installing and verifying scanned-PDF OCR tools with Pixi…");
+    try {
+      const installed = await jsonRequest<{ preflight: SystemProfile["paper_extraction"] }>("/api/paper-tools/ocr/install", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      setSystem((current) => current ? { ...current, paper_extraction: installed.preflight } : current);
+      setStatus("Scanned PDF OCR is ready · Poppler and Tesseract were verified and pinned locally");
+      await refreshStorage();
+    } catch (error) {
+      const detail = errorMessage(error);
+      setPaperToolsError(detail);
+      setStatus(`Scanned PDF OCR setup failed — ${detail}`);
+    } finally {
+      setPaperToolsInstalling(false);
+    }
+  }, [paperToolsInstalling, refreshStorage]);
 
   useEffect(() => {
     if (!flow || !session || nodes.length === 0 || initialViewportFitRef.current) return;
@@ -2835,7 +2860,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
 
         {selectedNode && selectedOperator && <div className="inspector-layer" onPointerDown={(event) => event.stopPropagation()}><InspectorPanel key={selectedNode.id} node={selectedNode.data.graphNode} selectedCount={selectedIds.length} operator={selectedOperator} hiddenViewerCount={selectedHiddenCount} setupCount={selectedNode.data.readinessItems.length} updateParam={updateParam} updateSourceBinding={updateSourceWorkflowBinding} browseSourceBinding={browseSourceWorkflowBinding} pendingSourceFile={pendingSourceFile?.nodeId === selectedNode.id ? pendingSourceFile : undefined} bindPendingSourceFile={bindPendingSourceFile} dismissPendingSourceFile={() => setPendingSourceFile(null)} beginParamEdit={beginParamEdit} browseParam={browseParam} rename={renameSelected} toggleViewers={toggleSelectedViewers} exploreSource={() => exploreSourceWorkflow(selectedNode.id)} close={() => { setSelectedIds([]); flow?.setNodes((current) => current.map((node) => ({ ...node, selected: false }))); }} /></div>}
 
-        {machineVisible && <div className="machine-layer" onPointerDown={(event) => event.stopPropagation()}><MachinePanel profile={system} storage={storage} storageLoading={storageLoading} storageReclaiming={storageReclaiming} storageError={storageError} onRefreshStorage={refreshStorage} onReclaimRunWork={reclaimFinishedRunWork} onClose={() => setMachineVisible(false)} /></div>}
+        {machineVisible && <div className="machine-layer" onPointerDown={(event) => event.stopPropagation()}><MachinePanel profile={system} storage={storage} storageLoading={storageLoading} storageReclaiming={storageReclaiming} storageError={storageError} paperToolsInstalling={paperToolsInstalling} paperToolsError={paperToolsError} onRefreshStorage={refreshStorage} onReclaimRunWork={reclaimFinishedRunWork} onInstallPaperTools={installPaperTools} onClose={() => setMachineVisible(false)} /></div>}
 
         {toolchainVisible && <div className="toolchain-layer" onPointerDown={(event) => event.stopPropagation()}><ToolchainPanel plan={exportPlan} pixiReady={system?.tools.pixi} loading={exportLoading} downloading={exportDownloading} onDownload={downloadBundle} onClose={() => setToolchainVisible(false)} /></div>}
 

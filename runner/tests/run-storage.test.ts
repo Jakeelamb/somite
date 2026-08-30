@@ -32,6 +32,8 @@ test("run storage profiles reclaimable bytes without treating scientific records
     const active = await terminalRun(root, "run-active");
     await mkdir(join(root, ".somite", "pixi", "environments", "linux-64", "cache"), { recursive: true });
     await writeFile(join(root, ".somite", "pixi", "environments", "linux-64", "cache", "tool.bin"), Buffer.alloc(512, 3));
+    await mkdir(join(root, ".somite", "tools", "paper"), { recursive: true });
+    await writeFile(join(root, ".somite", "tools", "paper", "ocr.bin"), Buffer.alloc(128, 4));
     const storage = new RunStorage(root);
 
     const profile = await storage.profile(new Set(["run-active"]));
@@ -39,7 +41,7 @@ test("run storage profiles reclaimable bytes without treating scientific records
     assert.equal(profile.runs.terminal_count, 2);
     assert.equal(profile.runs.reclaimable_bytes, 384);
     assert.deepEqual(profile.runs.reclaimable_run_ids, ["run-complete"]);
-    assert.equal(profile.shared_environments.bytes, 512);
+    assert.equal(profile.shared_environments.bytes, 640);
     assert.ok(profile.retained_scientific_state.bytes >= Buffer.byteLength("retain me\nretain log\nretain lock\n"));
 
     await assert.rejects(storage.dehydrateRuns(["run-active"], new Set(["run-active"])), /still active/);

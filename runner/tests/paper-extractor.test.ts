@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 
 import { byteDigest } from "@somite/workflow/contentIdentity";
 import { extractPaper, extractPaperPath, PaperExtractionError, PDF_EXTRACTION_CONCURRENCY } from "../src/paperExtractor.ts";
-import { pdfWithText } from "./pdfFixture.ts";
+import { pdfWithPages, pdfWithText } from "./pdfFixture.ts";
 
 const execute = promisify(execFile);
 
@@ -27,7 +27,17 @@ test("image-only PDFs stop with an explicit OCR capability message", async () =>
     () => extractPaper(pdfWithText(""), "pdf"),
     (error: unknown) => error instanceof PaperExtractionError
       && error.code === "paper_ocr_unavailable"
-      && /OCR is not installed/i.test(error.message),
+      && /page 1 needs OCR/i.test(error.message),
+  );
+});
+
+test("mixed PDFs identify unreadable pages instead of silently accepting partial text", async () => {
+  const readable = "Methods RNA-seq reads were quality checked with FastQC and aligned with STAR. ".repeat(20);
+  await assert.rejects(
+    () => extractPaper(pdfWithPages([readable, ""]), "pdf"),
+    (error: unknown) => error instanceof PaperExtractionError
+      && error.code === "paper_ocr_unavailable"
+      && /page 2 needs OCR/i.test(error.message),
   );
 });
 
@@ -74,6 +84,14 @@ test("PDF child extraction is single-concurrency and cancellable through progres
       onProgress: () => controller.abort(),
     }),
     (error: unknown) => error instanceof PaperExtractionError && error.code === "paper_extraction_cancelled",
+  );
+});
+
+test("PDF child extraction has a wall-clock deadline", async () => {
+  const bytes = pdfWithText("Methods FastQC and STAR were used. ".repeat(100));
+  await assert.rejects(
+    () => extractPaper(bytes, "pdf", { pdfTimeoutMs: 1 }),
+    (error: unknown) => error instanceof PaperExtractionError && error.code === "paper_extraction_timeout",
   );
 });
 

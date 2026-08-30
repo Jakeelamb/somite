@@ -168,10 +168,14 @@ scientific tradeoffs belong in deterministic Requirements and Resolutions.
 
 ## Paper reconstruction
 
-Paper intake stores bounded content-addressed PDF/text objects. PDF.js extracts
-native text page by page with cancellation and progress; image-only PDFs return
-an explicit `paper_ocr_unavailable` result until a reviewed OCR Adapter exists.
-Extraction and deterministic reconstruction use separate cache identities.
+Paper intake stores bounded content-addressed PDF/text objects. An isolated
+PDF.js worker extracts native text page by page with cancellation and progress.
+Only unreadable pages in scanned or mixed PDFs enter bounded OCR. Somite can
+install Poppler and Tesseract into a project-local, Pixi-locked environment,
+then verifies versions and English trained data before publishing an atomic
+receipt. Missing capability returns `paper_ocr_unavailable`; it never produces
+a partial-paper reconstruction. Extraction caches retain the exact PDF.js/OCR
+tool identity and options separately from deterministic reconstruction caches.
 
 Reconstruction retains exact method surfaces, nearby evidence, PDF pages,
 unsupported identities, and cited resources. Parallel analyses and alternative

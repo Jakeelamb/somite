@@ -110,9 +110,11 @@ through the same data search used by the canvas. Collections remain collections
 until the user chooses an exact run. Supported methods, unsupported methods,
 missing inputs, and extraction failures remain distinct outcomes.
 
-Image-only PDFs currently stop with an explicit OCR capability message; Somite
-does not silently treat a scanned paper as empty or blame the user for choosing
-the full paper.
+For scanned or mixed PDFs, Somite identifies the exact pages that need OCR. The
+Machine panel can install a project-local, Pixi-locked Poppler and Tesseract
+toolchain in one click, verifies executable identities and English trained data,
+and refreshes readiness immediately. Missing OCR capability remains an explicit
+actionable result; Somite never silently treats scanned pages as empty.
 
 ### Work with an Agent
 

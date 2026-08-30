@@ -1,6 +1,7 @@
 import type { PaperExtractionPreflight, PaperExtractionToolReadiness, PaperToolSource } from "./types";
 
 const PAPER_TOOL_SOURCE_LABELS: Record<PaperToolSource, string> = {
+  built_in: "Built into Somite",
   managed_pixi: "Somite managed Pixi",
   project_pixi: "Project Pixi",
   system_path: "System PATH",
@@ -35,7 +36,7 @@ function missingGuidance(preflight: PaperExtractionPreflight, missingToolNames: 
     : preflight.native_pdf_text
       ? "Scanned PDFs"
       : "Native PDFs";
-  return `${capability} need ${readableList(missingToolNames)}. Install the missing tools in Somite's managed or project Pixi environment, or provide them on PATH. Restart Somite to recheck.`;
+  return `${capability} need ${readableList(missingToolNames)}. Somite can install and pin the verified OCR tools in this project with Pixi, or use compatible tools already provided by the project or system.`;
 }
 
 export function paperReadingPresentation(preflight: PaperExtractionPreflight): PaperReadingPresentation {

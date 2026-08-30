@@ -147,8 +147,9 @@ export class RunStorage {
       "catalog",
       "agent-transcripts",
     ];
-    const [environments, paperCache, ...retainedSizes] = await Promise.all([
+    const [pixiEnvironments, paperTools, paperCache, ...retainedSizes] = await Promise.all([
       treeBytes(join(state, "pixi", "environments")),
+      treeBytes(join(state, "tools")),
       treeBytes(join(state, "papers", "cache")),
       ...retainedPaths.map((path) => treeBytes(join(state, path))),
     ]);
@@ -165,7 +166,7 @@ export class RunStorage {
         uncertified_count: uncertifiedCount,
         uncertified_bytes: uncertifiedBytes,
       },
-      shared_environments: { bytes: environments, recreatable: true },
+      shared_environments: { bytes: pixiEnvironments + paperTools, recreatable: true },
       paper_cache: { bytes: paperCache, recreatable: true },
       retained_scientific_state: { bytes: retained },
     };

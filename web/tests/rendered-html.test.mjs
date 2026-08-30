@@ -52,7 +52,7 @@ test("starter preview is removed and the real canvas is wired", async () => {
   assert.doesNotMatch(app, /api\/readiness/);
   assert.match(app, /api\/agent\/discover/);
   assert.match(app, /api\/agent\/config/);
-  assert.match(app, /api\/workflows\/snakemake\/import/);
+  assert.match(app, /api\/projects\/open/);
   assert.match(app, /planAgentTransactions/);
   assert.match(panels, /Compatible Tools/);
   assert.match(panels, /Choose your Agent/);
@@ -88,7 +88,9 @@ test("starter preview is removed and the real canvas is wired", async () => {
   assert.match(panels, /Scanned PDF OCR/);
   assert.match(panels, /no agent required/);
   assert.match(paperReading, /Somite managed Pixi/);
-  assert.match(paperReading, /Restart Somite to recheck/);
+  assert.doesNotMatch(paperReading, /Restart Somite to recheck/);
+  assert.match(panels, /Enable scanned PDF OCR/);
+  assert.match(app, /\/api\/paper-tools\/ocr\/install/);
   assert.match(css, /\.paper-reading-guidance \{[^}]*font-size: 10px/);
   assert.match(css, /\.paper-reading-tools article p \{[^}]*font-size: 10px/);
   assert.match(css, /\.paper-job > p \{[^}]*font-size: 10px/);

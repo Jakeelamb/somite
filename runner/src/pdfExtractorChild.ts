@@ -1,13 +1,19 @@
 import { lstat, readFile, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 
 import { byteDigest } from "@somite/workflow/contentIdentity";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 
 import { MAX_PAGES, MAX_PDF_BYTES, MAX_TEXT_BYTES, PaperExtractionError, type PaperExtractionProgress } from "./paperExtractor.ts";
 
-const MAX_PDF_RESULT_BYTES = MAX_TEXT_BYTES * 4;
+const MAX_PDF_RESULT_BYTES = MAX_TEXT_BYTES;
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const encoder = new TextEncoder();
+const require = createRequire(import.meta.url);
+const pdfjsVersion = (require("pdfjs-dist/package.json") as { version?: unknown }).version;
+const pdfjsIdentity = typeof pdfjsVersion === "string" && /^[0-9A-Za-z.+-]{1,80}$/.test(pdfjsVersion)
+  ? `pdfjs@${pdfjsVersion}`
+  : "pdfjs";
 
 function emit(value: unknown) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -42,11 +48,10 @@ function normalizePage(items: readonly unknown[]) {
     .trim();
 }
 
-function nativeTextIsReadable(text: string, pages: number) {
-  const requiredLetters = Math.min(400, Math.max(40, pages * 40));
+function pageNeedsOcr(text: string) {
   let letters = 0;
-  for (const character of text) if (/[A-Za-z]/.test(character) && ++letters >= requiredLetters) return true;
-  return false;
+  for (const character of text) if (/\p{L}/u.test(character) && ++letters >= 20) return false;
+  return true;
 }
 
 function progress(value: PaperExtractionProgress) {
@@ -81,27 +86,37 @@ async function extract(path: string, outputPath: string, digest: string, expecte
     document = await loading.promise;
     if (document.numPages > MAX_PAGES) throw new PaperExtractionError("paper_extraction_limit", `PDF has ${document.numPages} pages; the limit is ${MAX_PAGES}.`);
     const pages: string[] = [];
+    const pageTextBytes: number[] = [];
+    const ocrPages: number[] = [];
+    let accumulatedTextBytes = 0;
     for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
       progress({ completed: pageNumber - 1, total: document.numPages, unit: "pages", message: `Reading PDF page ${pageNumber} of ${document.numPages}` });
       const page = await document.getPage(pageNumber);
       const content = await page.getTextContent({ includeMarkedContent: false, disableNormalization: false });
-      pages.push(normalizePage(content.items));
+      const pageText = normalizePage(content.items);
       page.cleanup();
-      const currentBytes = pages.reduce((total, value) => total + value.length, 0);
-      if (currentBytes > MAX_TEXT_BYTES) throw new PaperExtractionError("paper_extraction_limit", `Extracted PDF text exceeds the ${MAX_TEXT_BYTES} byte limit.`);
+      const pageBytes = encoder.encode(pageText).byteLength;
+      const separatorBytes = pageNumber === 1 ? 0 : 3;
+      accumulatedTextBytes += separatorBytes + pageBytes;
+      if (accumulatedTextBytes > MAX_TEXT_BYTES) throw new PaperExtractionError("paper_extraction_limit", `Extracted PDF text exceeds the ${MAX_TEXT_BYTES} byte limit.`);
+      pages.push(pageText);
+      pageTextBytes.push(pageBytes);
+      if (pageNeedsOcr(pageText)) ocrPages.push(pageNumber);
       progress({ completed: pageNumber, total: document.numPages, unit: "pages", message: `Read PDF page ${pageNumber} of ${document.numPages}` });
     }
     const text = pages.join("\n\f\n");
-    if (!nativeTextIsReadable(text, document.numPages)) {
-      throw new PaperExtractionError(
-        "paper_ocr_unavailable",
-        "This PDF appears to be scanned or has no readable text layer. OCR is not installed in this web runner yet; upload a text-accessible PDF or extracted text while the OCR adapter is added.",
-      );
-    }
     const textBytes = encoder.encode(text);
     if (textBytes.byteLength > MAX_PDF_RESULT_BYTES) throw new PaperExtractionError("paper_extraction_limit", "Extracted PDF text exceeds the bounded worker-output limit.");
     await writeFile(outputPath, textBytes, { flag: "wx", mode: 0o600 });
-    emit({ type: "result", pages: document.numPages, text_bytes: textBytes.byteLength, text_digest: byteDigest(textBytes) });
+    emit({
+      type: "result",
+      pages: document.numPages,
+      text_bytes: textBytes.byteLength,
+      text_digest: byteDigest(textBytes),
+      extractor_identity: pdfjsIdentity,
+      page_text_bytes: pageTextBytes,
+      ocr_pages: ocrPages,
+    });
   } catch (error) {
     if (error instanceof PaperExtractionError) throw error;
     throw new PaperExtractionError("paper_extraction_failed", `PDF.js could not read this paper: ${error instanceof Error ? error.message : String(error)}`, true);

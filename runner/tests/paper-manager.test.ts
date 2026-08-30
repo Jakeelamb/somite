@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, stat, truncate, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -17,6 +17,12 @@ function uploadRequest(filename: string, contents: BlobPart, type = "text/plain"
   const form = new FormData();
   form.set("file", new File([contents], filename, { type }));
   return new Request("http://localhost/api/papers/uploads", { method: "POST", body: form });
+}
+
+async function fakeExecutable(target: string, body: string) {
+  await mkdir(path.dirname(target), { recursive: true });
+  await writeFile(target, `#!${process.execPath}\n${body}\n`, { mode: 0o700 });
+  await chmod(target, 0o700);
 }
 
 async function completed(manager: PaperManager, jobId: string) {
@@ -70,6 +76,46 @@ test("content-addressed PDF intake extracts through the isolated worker", async 
     assert.equal(status.phase, "completed");
     assert.equal(status.cache.extraction, false);
     assert.equal(status.result?.outcome, "drafts_ready");
+    const cachePath = path.join(root, ".somite", "papers", "cache", "extracted", `${artifact.digest.slice("blake3:".length)}-pdfjs-ocr-v3.json`);
+    const cache = JSON.parse(await readFile(cachePath, "utf8")) as { schema_version: number; extractor_identity: string };
+    assert.equal(cache.schema_version, 2);
+    assert.match(cache.extractor_identity, /^blake3:[0-9a-f]{64}$/);
+    await writeFile(cachePath, `${JSON.stringify({ ...cache, extractor_identity: `blake3:${"0".repeat(64)}` })}\n`);
+    const rerun = await completed(manager, (await manager.start(artifact.digest)).job_id);
+    assert.equal(rerun.phase, "completed");
+    assert.equal(rerun.cache.extraction, false, "a cache from another PDF.js identity must be recomputed");
+    await manager.shutdown();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("paper intake automatically uses an available project-local OCR toolchain", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "somite-paper-manager-ocr-"));
+  try {
+    const bin = path.join(root, ".somite", "tools", "paper", ".pixi", "envs", "default", "bin");
+    await fakeExecutable(path.join(bin, "pdfinfo"), `
+      if (process.argv.includes("-v")) process.stderr.write("pdfinfo version 25.01.0\\n");
+      else process.stdout.write("Pages: 1\\n");
+    `);
+    await fakeExecutable(path.join(bin, "pdftoppm"), `
+      if (process.argv.includes("-v")) process.stderr.write("pdftoppm version 25.01.0\\n");
+      else {
+        const fs = require("node:fs");
+        fs.writeFileSync(process.argv.at(-1) + ".png", "fake raster");
+      }
+    `);
+    await fakeExecutable(path.join(bin, "tesseract"), `
+      if (process.argv.includes("--version")) process.stdout.write("tesseract 5.5.0\\n");
+      else if (process.argv.includes("--list-langs")) process.stdout.write("List of available languages (1):\\neng\\n");
+      else process.stdout.write("Methods RNA sequencing reads were checked with FastQC and aligned with STAR for expression analysis.\\n");
+    `);
+    const manager = new PaperManager(root, loaded.catalog, loaded.revision);
+    const artifact = await manager.store.upload(uploadRequest("scan.pdf", pdfWithText(""), "application/pdf"));
+    const status = await completed(manager, (await manager.start(artifact.digest)).job_id);
+    assert.equal(status.phase, "completed");
+    assert.equal(status.result?.extracted_via, "ocr");
+    assert.equal(status.result?.outcome, "drafts_ready");
     await manager.shutdown();
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -84,7 +130,7 @@ test("oversized extraction caches are ignored and replaced within the byte bound
     const artifact = await manager.store.upload(uploadRequest("methods.txt", methods));
     const cacheDirectory = path.join(root, ".somite", "papers", "cache", "extracted");
     await mkdir(cacheDirectory, { recursive: true });
-    const cachePath = path.join(cacheDirectory, `${artifact.digest.slice("blake3:".length)}-pdfjs-v1.json`);
+    const cachePath = path.join(cacheDirectory, `${artifact.digest.slice("blake3:".length)}-pdfjs-ocr-v3.json`);
     await writeFile(cachePath, "");
     await truncate(cachePath, 72 * 1024 * 1024 + 1);
 
