@@ -15,7 +15,7 @@ Nextflow aliases, and immutable upstream process sources.
 Run:
 
 ```bash
-/home/jake/.pixi/bin/pixi run \
+pixi run \
   --manifest-path spikes/nextflow-identity/pixi.toml \
   --locked verify
 ```

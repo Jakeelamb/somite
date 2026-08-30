@@ -9,5 +9,4 @@
 *.pdf binary
 *.zip binary
 
-Cargo.lock linguist-generated=true
-web/package-lock.json linguist-generated=true
+/spikes/** export-ignore
