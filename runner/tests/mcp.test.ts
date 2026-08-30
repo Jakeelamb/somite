@@ -10,11 +10,30 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { SOMITE_VERSION } from "@somite/workflow/version";
-import { SOMITE_MCP_TOOL_NAMES } from "../src/mcpTools.ts";
+import { MCP_OUTPUT_SCHEMAS } from "../src/mcpSchemas.ts";
+import { SOMITE_MCP_TOOL_NAMES, type SomiteMcpToolName } from "../src/mcpTools.ts";
 import { startServer } from "../src/server.ts";
 
 type RpcResponse = { id: number; result?: Record<string, unknown>; error?: Record<string, unknown> };
 type JsonSchema = Record<string, unknown>;
+
+const REQUIRED_SUCCESS_FIELDS = {
+  "somite.workflow.get": ["state_revision", "graph_revision", "graph"],
+  "somite.readiness.get": ["graph_revision", "state", "required_count", "items", "nodes"],
+  "somite.catalog.search": ["query", "catalog_revision", "total_matches", "matches"],
+  "somite.source_workflow.search_nfcore": ["query", "provenance", "total_matches", "entries"],
+  "somite.source_workflow.resolve_nfcore": ["transaction_id", "previous_state_revision", "state_revision", "graph_revision", "graph", "replayed"],
+  "somite.source_workflow.edit": ["transaction_id", "previous_state_revision", "state_revision", "graph_revision", "graph", "replayed"],
+  "somite.source_workflow.promote": ["transaction_id", "previous_state_revision", "state_revision", "graph_revision", "graph", "replayed"],
+  "somite.source.search": ["query", "provider", "results"],
+  "somite.graph.apply_transaction": ["transaction_id", "previous_state_revision", "state_revision", "graph_revision", "graph", "replayed"],
+  "somite.workflow.compile": ["source_graph_revision", "closure_digest", "compiled_graph_revision", "output_path"],
+  "somite.run.start": ["run_id", "phase", "replayed"],
+  "somite.validation.start": ["run_id", "phase", "replayed"],
+  "somite.run.status": ["run_id", "phase", "states", "progress"],
+  "somite.run.cancel": ["run_id", "phase", "states", "progress"],
+  "somite.evidence.lookup": ["subject_digest", "receipts"],
+} as const satisfies Record<SomiteMcpToolName, readonly string[]>;
 
 async function unusedPort() {
   const reservation = createServer();
@@ -78,6 +97,30 @@ function validationErrors(schema: JsonSchema, value: unknown, path = "$"): strin
 function assertValid(schema: JsonSchema, value: unknown, label: string) {
   assert.deepEqual(validationErrors(schema, value), [], `${label} must conform to its advertised outputSchema`);
 }
+
+test("MCP output schemas stay compact, exhaustive, and identity-bearing", () => {
+  assert.deepEqual(Object.keys(MCP_OUTPUT_SCHEMAS), SOMITE_MCP_TOOL_NAMES);
+  const serializedBytes = Buffer.byteLength(JSON.stringify(MCP_OUTPUT_SCHEMAS));
+  assert.ok(serializedBytes < 25_000, `MCP output schemas use ${serializedBytes} bytes; budget is under 25000`);
+
+  for (const name of SOMITE_MCP_TOOL_NAMES) {
+    const schema = MCP_OUTPUT_SCHEMAS[name] as JsonSchema;
+    const branches = schema.oneOf as JsonSchema[];
+    assert.equal(branches.length, 2, `${name} must describe success and structured failure results`);
+    const success = branches[0]!;
+    assert.equal(success.type, "object", `${name} success must be a concrete object`);
+    const properties = success.properties as Record<string, unknown>;
+    const required = new Set(success.required as string[]);
+    for (const field of REQUIRED_SUCCESS_FIELDS[name]) {
+      assert.ok(properties[field], `${name} must describe success field ${field}`);
+      assert.ok(required.has(field), `${name} must require success identity ${field}`);
+    }
+
+    const failure = branches[1]!;
+    assertValid(failure, { error: { code: "stale_state_revision", message: "Refresh state.", retryable: false, status: 409, detail: { code: "stale_transaction" } } }, `${name} failure`);
+    assert.notDeepEqual(validationErrors(failure, { error: { code: "forged", message: "missing retryability" } }), [], `${name} must reject incomplete structured failures`);
+  }
+});
 
 class McpClient {
   readonly child: ChildProcess;
@@ -182,6 +225,13 @@ test("stdio MCP advertises concrete result contracts and preserves atomic transa
   assert.equal(((edited.graph as Record<string, unknown>).nodes as Array<Record<string, unknown>>)[0]?.id, "reads");
   assert.equal(edited.replayed, false);
   assert.notEqual(edited.state_revision, baseRevision);
+  const transactionWithoutNodeIdentity = structuredClone(edited);
+  delete (((transactionWithoutNodeIdentity.graph as Record<string, unknown>).nodes as Array<Record<string, unknown>>)[0]!).id;
+  assert.notDeepEqual(
+    validationErrors(outputSchemas.get("somite.graph.apply_transaction")!, transactionWithoutNodeIdentity),
+    [],
+    "transaction schema must reject a graph node without its identity",
+  );
 
   const replayCall = await client.request(8, "tools/call", {
     name: "somite.graph.apply_transaction",
@@ -212,6 +262,13 @@ test("stdio MCP advertises concrete result contracts and preserves atomic transa
   assertValid(outputSchemas.get("somite.readiness.get")!, blocked, "blocked readiness.get response");
   assert.equal(blocked.state, "building");
   assert.equal(blocked.required_count, 1);
+  const readinessWithoutItemIdentity = structuredClone(blocked);
+  delete ((readinessWithoutItemIdentity.items as Array<Record<string, unknown>>)[0]!).id;
+  assert.notDeepEqual(
+    validationErrors(outputSchemas.get("somite.readiness.get")!, readinessWithoutItemIdentity),
+    [],
+    "readiness schema must reject an action without its identity",
+  );
 
   const configuredCall = await client.request(12, "tools/call", {
     name: "somite.graph.apply_transaction",
