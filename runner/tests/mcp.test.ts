@@ -1,15 +1,83 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:http";
+import { mkdtemp, rm } from "node:fs/promises";
 import { once } from "node:events";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { SOMITE_VERSION } from "@somite/workflow/version";
 import { SOMITE_MCP_TOOL_NAMES } from "../src/mcpTools.ts";
+import { startServer } from "../src/server.ts";
 
 type RpcResponse = { id: number; result?: Record<string, unknown>; error?: Record<string, unknown> };
+type JsonSchema = Record<string, unknown>;
+
+async function unusedPort() {
+  const reservation = createServer();
+  reservation.listen(0, "127.0.0.1");
+  await once(reservation, "listening");
+  const address = reservation.address();
+  assert.ok(address && typeof address !== "string");
+  await new Promise<void>((resolvePromise, rejectPromise) => reservation.close((error) => error ? rejectPromise(error) : resolvePromise()));
+  return address.port;
+}
+
+function valueType(value: unknown) {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  if (typeof value === "number" && Number.isInteger(value)) return "integer";
+  return typeof value;
+}
+
+function validationErrors(schema: JsonSchema, value: unknown, path = "$"): string[] {
+  if (Array.isArray(schema.oneOf)) {
+    const matches = schema.oneOf.filter((candidate) => validationErrors(candidate as JsonSchema, value, path).length === 0);
+    return matches.length === 1 ? [] : [`${path} matched ${matches.length} oneOf branches`];
+  }
+  if (Array.isArray(schema.anyOf)) {
+    return schema.anyOf.some((candidate) => validationErrors(candidate as JsonSchema, value, path).length === 0)
+      ? []
+      : [`${path} did not match anyOf`];
+  }
+  if (Object.hasOwn(schema, "const") && value !== schema.const) return [`${path} must equal ${JSON.stringify(schema.const)}`];
+  if (Array.isArray(schema.enum) && !schema.enum.some((candidate) => candidate === value)) return [`${path} is outside the enum`];
+
+  const acceptedTypes = typeof schema.type === "string" ? [schema.type] : Array.isArray(schema.type) ? schema.type : [];
+  if (acceptedTypes.length) {
+    const actual = valueType(value);
+    const matches = acceptedTypes.some((expected) => expected === actual || (expected === "number" && actual === "integer"));
+    if (!matches) return [`${path} expected ${acceptedTypes.join(" or ")}, received ${actual}`];
+  }
+
+  if (acceptedTypes.includes("array") && Array.isArray(value) && schema.items && typeof schema.items === "object") {
+    return value.flatMap((item, index) => validationErrors(schema.items as JsonSchema, item, `${path}[${index}]`));
+  }
+  if (acceptedTypes.includes("object") && value && typeof value === "object" && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    const properties = schema.properties && typeof schema.properties === "object" && !Array.isArray(schema.properties)
+      ? schema.properties as Record<string, JsonSchema>
+      : {};
+    const required = Array.isArray(schema.required) ? schema.required.filter((field): field is string => typeof field === "string") : [];
+    const errors = required.filter((field) => !Object.hasOwn(record, field)).map((field) => `${path}.${field} is required`);
+    for (const [field, candidate] of Object.entries(record)) {
+      if (properties[field]) errors.push(...validationErrors(properties[field]!, candidate, `${path}.${field}`));
+      else if (schema.additionalProperties === false) errors.push(`${path}.${field} is not allowed`);
+      else if (schema.additionalProperties && typeof schema.additionalProperties === "object") {
+        errors.push(...validationErrors(schema.additionalProperties as JsonSchema, candidate, `${path}.${field}`));
+      }
+    }
+    return errors;
+  }
+  return [];
+}
+
+function assertValid(schema: JsonSchema, value: unknown, label: string) {
+  assert.deepEqual(validationErrors(schema, value), [], `${label} must conform to its advertised outputSchema`);
+}
 
 class McpClient {
   readonly child: ChildProcess;
@@ -41,23 +109,15 @@ class McpClient {
   }
 }
 
-test("thin MCP adapter supports modern discovery, legacy initialization, and structured Somite tools", async (context) => {
+test("stdio MCP advertises concrete result contracts and preserves atomic transaction semantics", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "somite-mcp-ts-"));
   const capability = "a".repeat(64);
-  const seen: string[] = [];
-  const server = createServer((request, response) => {
-    assert.equal(request.headers["x-somite-mcp-capability"], capability);
-    seen.push(request.url ?? "");
-    response.setHeader("content-type", "application/json");
-    response.end(JSON.stringify({ state_revision: "blake3:state", graph_revision: "blake3:graph", graph: { schema_version: 3, nodes: [], edges: [] } }));
-  });
-  server.listen(0, "127.0.0.1");
-  await once(server, "listening");
-  const address = server.address();
-  assert.ok(address && typeof address !== "string");
-  const client = new McpClient(`http://127.0.0.1:${address.port}`, capability);
-  context.after(() => {
+  const server = await startServer({ projectRoot: root, port: await unusedPort(), agentCapability: capability });
+  const client = new McpClient(server.url, capability);
+  context.after(async () => {
     client.close();
-    server.close();
+    await server.close();
+    await rm(root, { recursive: true, force: true });
   });
 
   const discovered = await client.request(1, "server/discover");
@@ -66,12 +126,109 @@ test("thin MCP adapter supports modern discovery, legacy initialization, and str
   assert.equal(initialized.result?.protocolVersion, "2025-06-18");
   assert.deepEqual(initialized.result?.serverInfo, { name: "somite", title: "Somite", version: SOMITE_VERSION });
   const listed = await client.request(3, "tools/list");
-  const tools = listed.result?.tools as Array<{ name: string }>;
+  const tools = listed.result?.tools as Array<{ name: string; outputSchema?: JsonSchema }>;
   assert.deepEqual(tools.map((tool) => tool.name), SOMITE_MCP_TOOL_NAMES);
   assert.ok(tools.some((tool) => tool.name === "somite.graph.apply_transaction"));
   assert.ok(tools.some((tool) => tool.name === "somite.validation.start"));
-  const called = await client.request(4, "tools/call", { name: "somite.workflow.get", arguments: {} });
-  const structured = called.result?.structuredContent as Record<string, unknown>;
-  assert.equal(structured.state_revision, "blake3:state");
-  assert.deepEqual(seen, ["/api/agent/graph"]);
+  const outputSchemas = new Map(tools.map((tool) => {
+    assert.ok(tool.outputSchema, `${tool.name} must advertise outputSchema`);
+    const branches = tool.outputSchema.oneOf as JsonSchema[];
+    assert.equal(branches.length, 2, `${tool.name} must describe success and structured failure results`);
+    assert.equal(branches[0]?.type, "object", `${tool.name} success schema must be a concrete object`);
+    assert.ok(Object.keys(branches[0]?.properties as Record<string, unknown>).length > 0, `${tool.name} success schema must name its fields`);
+    assert.ok((branches[0]?.required as unknown[]).length > 0, `${tool.name} success schema must require its identity fields`);
+    return [tool.name, tool.outputSchema] as const;
+  }));
+
+  const workflowCall = await client.request(4, "tools/call", { name: "somite.workflow.get", arguments: {} });
+  const workflow = workflowCall.result?.structuredContent as Record<string, unknown>;
+  assertValid(outputSchemas.get("somite.workflow.get")!, workflow, "workflow.get response");
+  const baseRevision = workflow.state_revision as string;
+  assert.match(baseRevision, /^blake3:/);
+  assert.deepEqual((workflow.graph as Record<string, unknown>).nodes, []);
+
+  const readinessCall = await client.request(5, "tools/call", { name: "somite.readiness.get", arguments: {} });
+  const emptyReadiness = readinessCall.result?.structuredContent as Record<string, unknown>;
+  assertValid(outputSchemas.get("somite.readiness.get")!, emptyReadiness, "readiness.get response");
+  assert.equal(emptyReadiness.state, "empty");
+
+  const catalogCall = await client.request(6, "tools/call", {
+    name: "somite.catalog.search",
+    arguments: { query: "paired FASTQ", limit: 5 },
+  });
+  const catalog = catalogCall.result?.structuredContent as Record<string, unknown>;
+  assertValid(outputSchemas.get("somite.catalog.search")!, catalog, "catalog.search response");
+  assert.ok((catalog.matches as unknown[]).length > 0);
+
+  const transactionArguments = {
+    base_state_revision: baseRevision,
+    idempotency_key: "mcp-atomic-edit-1",
+    summary: "Add a local FASTQ source",
+    operations: [{
+      op: "add_operator",
+      node_id: "reads",
+      operator_id: "files.import",
+      x: 80,
+      y: 120,
+    }],
+  };
+  const editedCall = await client.request(7, "tools/call", {
+    name: "somite.graph.apply_transaction",
+    arguments: transactionArguments,
+  });
+  assert.equal(editedCall.result?.isError, undefined);
+  const edited = editedCall.result?.structuredContent as Record<string, unknown>;
+  assertValid(outputSchemas.get("somite.graph.apply_transaction")!, edited, "transaction response");
+  assert.equal(((edited.graph as Record<string, unknown>).nodes as Array<Record<string, unknown>>)[0]?.id, "reads");
+  assert.equal(edited.replayed, false);
+  assert.notEqual(edited.state_revision, baseRevision);
+
+  const replayCall = await client.request(8, "tools/call", {
+    name: "somite.graph.apply_transaction",
+    arguments: transactionArguments,
+  });
+  const replay = replayCall.result?.structuredContent as Record<string, unknown>;
+  assertValid(outputSchemas.get("somite.graph.apply_transaction")!, replay, "transaction replay response");
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.transaction_id, edited.transaction_id);
+
+  const staleCall = await client.request(9, "tools/call", {
+    name: "somite.graph.apply_transaction",
+    arguments: { ...transactionArguments, idempotency_key: "mcp-atomic-edit-2" },
+  });
+  assert.equal(staleCall.result?.isError, true);
+  const stale = staleCall.result?.structuredContent as Record<string, unknown>;
+  assertValid(outputSchemas.get("somite.graph.apply_transaction")!, stale, "stale transaction response");
+  assert.equal((stale.error as Record<string, unknown>).status, 409);
+  assert.equal(((stale.error as Record<string, unknown>).detail as Record<string, unknown>).code, "stale_transaction");
+
+  const currentCall = await client.request(10, "tools/call", { name: "somite.workflow.get", arguments: {} });
+  const current = currentCall.result?.structuredContent as Record<string, unknown>;
+  assertValid(outputSchemas.get("somite.workflow.get")!, current, "updated workflow.get response");
+  assert.equal(((current.graph as Record<string, unknown>).nodes as Array<Record<string, unknown>>)[0]?.id, "reads");
+
+  const blockedCall = await client.request(11, "tools/call", { name: "somite.readiness.get", arguments: {} });
+  const blocked = blockedCall.result?.structuredContent as Record<string, unknown>;
+  assertValid(outputSchemas.get("somite.readiness.get")!, blocked, "blocked readiness.get response");
+  assert.equal(blocked.state, "building");
+  assert.equal(blocked.required_count, 1);
+
+  const configuredCall = await client.request(12, "tools/call", {
+    name: "somite.graph.apply_transaction",
+    arguments: {
+      base_state_revision: edited.state_revision,
+      idempotency_key: "mcp-set-input-1",
+      summary: "Choose the local FASTQ",
+      operations: [{ op: "set_param", node_id: "reads", parameter: "path", value: "reads.fastq" }],
+    },
+  });
+  const configured = configuredCall.result?.structuredContent as Record<string, unknown>;
+  assertValid(outputSchemas.get("somite.graph.apply_transaction")!, configured, "configuration transaction response");
+  assert.equal(configured.replayed, false);
+
+  const readyCall = await client.request(13, "tools/call", { name: "somite.readiness.get", arguments: {} });
+  const ready = readyCall.result?.structuredContent as Record<string, unknown>;
+  assertValid(outputSchemas.get("somite.readiness.get")!, ready, "ready readiness.get response");
+  assert.equal(ready.state, "ready");
+  assert.equal(ready.required_count, 0);
 });

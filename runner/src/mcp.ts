@@ -1,7 +1,8 @@
 import { URL } from "node:url";
 
 import { SOMITE_VERSION } from "@somite/workflow/version";
-import { SOMITE_MCP_TOOL } from "./mcpTools.ts";
+import { MCP_OUTPUT_SCHEMAS } from "./mcpSchemas.ts";
+import { SOMITE_MCP_TOOL, type SomiteMcpToolName } from "./mcpTools.ts";
 
 const MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
 const LEGACY_PROTOCOLS = new Set(["2024-10-07", "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]);
@@ -15,6 +16,7 @@ type Tool = {
   title: string;
   description: string;
   inputSchema: JsonObject;
+  outputSchema: JsonObject;
   annotations: { title: string; readOnlyHint: boolean; destructiveHint: boolean; idempotentHint: boolean; openWorldHint: boolean };
 };
 
@@ -30,7 +32,7 @@ const stateSchema = stringSchema("Exact state_revision returned by somite.workfl
 const summarySchema = stringSchema("Short user-facing description of this canvas edit.", { minLength: 1, maxLength: 240 });
 
 function tool(
-  name: string,
+  name: SomiteMcpToolName,
   title: string,
   description: string,
   inputSchema: JsonObject,
@@ -41,6 +43,7 @@ function tool(
     title,
     description,
     inputSchema,
+    outputSchema: MCP_OUTPUT_SCHEMAS[name],
     annotations: {
       title,
       readOnlyHint: true,

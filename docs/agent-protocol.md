@@ -106,6 +106,9 @@ Every call returns MCP-compatible text plus structured content. Expected
 catalog, edit, compile, run, and validation failures return structured
 `isError: true` tool results with a stable code and a recovery action instead
 of being disguised as transport failures.
+Every advertised tool also declares a concrete `outputSchema` for both its
+typed success result and Somite's structured failure envelope, so MCP clients
+can validate results without reconstructing the runner's HTTP contracts.
 
 Catalog matches include the immutable catalog revision, a deterministic score,
 the terms that matched, and an opaque continuation cursor. A cursor is valid
