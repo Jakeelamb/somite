@@ -7,9 +7,10 @@ requirements for one node.
 
 Every Graph Node stores the Operator's stable ID and an immutable revision
 digest. The digest covers execution-semantic fields and excludes human title
-and palette placement. Loading, saving, compiling, and executing a schema-v2
+and palette placement. Loading, saving, compiling, and executing a schema-v3
 Graph reject a revision that does not match the supplied Operator manifest.
-Schema-v1 Graphs are upgraded through the exact catalog before further use.
+Schema-v1 and schema-v2 Graphs are upgraded through the exact catalog before
+further use.
 
 Package metadata is not an Operator. A Conda package can reveal that a binary
 exists; it does not define safe arguments, input cardinality, artifact types,
@@ -17,7 +18,8 @@ or outputs.
 
 ## Artifact ports
 
-Ports use the closed `PortType` enum in `somite-ir`. Equal types connect. An
+Ports use the closed `PortType` union in the shared TypeScript workflow model.
+Equal types connect. An
 input may declare an explicit union such as `Fastq | FastqGz`. A scalar input
 accepts at most one edge. Paired reads remain separate `r1` and `r2` ports.
 
@@ -32,8 +34,8 @@ remains usable by a generic `Directory` input because it still has that physical
 artifact type.
 
 Collections, scatter/gather, tuple metadata, and streaming channels are not in
-Graph schema v1. An Operator that requires them is an adapter gap, not a reason
-to hide semantics in a shell command.
+the current Graph schema. An Operator that requires them is an adapter gap, not
+a reason to hide semantics in a shell command.
 
 ## JSON shape
 

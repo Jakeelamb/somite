@@ -84,6 +84,12 @@ execution path and bioinformatics package set target a POSIX environment.
   Promoting a supported invocation creates a normal editable Somite node; any
   missing connections become ordinary readiness requirements.
 
+Whole source-backed nf-core imports are currently inspect-and-bind workflows:
+Somite cannot yet freeze their complete task environments, so Run, Validate,
+Export, and Agent compile stop with that explicit requirement. Promoting
+reviewed invocations creates an editable native partial variant; it does not
+claim to convert the entire imported pipeline into an executable Somite graph.
+
 The canvas supports magnetic alignment, deep zoom, undo/redo, multi-selection,
 editable document titles, light and dark themes, sticky notes, stage boxes, pen
 strokes, and labeled node colors. Presentation edits travel with the graph but
@@ -152,8 +158,20 @@ workspace, and attaches a capability-scoped stdio MCP server. Somite-owned tool
 calls are automatically allowed for that session; shell and non-Somite tools
 are not.
 
+ACP children receive only a portable runtime/configuration allowlist, not the
+runner's ambient secrets. If an agent authenticates through an environment
+credential, opt in to its existing variable by name before launch:
+
+```bash
+SOMITE_AGENT_CREDENTIAL_ENV_NAMES=OPENAI_API_KEY pixi run start
+```
+
+Somite forwards the named value only to the selected Agent process. This is
+explicit environment forwarding, not a credential vault or operating-system
+sandbox.
+
 The agent can inspect the graph, search exact operator and data contracts,
-apply atomic compare-and-swap graph transactions, read readiness, compile,
+apply validated compare-and-swap graph transactions, read readiness, compile,
 validate, run, cancel, and inspect evidence. Every successful graph transaction
 is one normal undoable canvas edit. Activity stays available behind progressive
 disclosure, and redacted turn transcripts are stored under
@@ -207,6 +225,11 @@ does not depend on UI code. Pixi and Nextflow remain external execution tools,
 and scientific Python belongs inside frozen workflow environments rather than
 the Somite application.
 
+The browser uses one client whose normalized runner origin and transport are
+fixed at construction. JSON responses are size-bounded and runtime-validated at
+their endpoint before they can enter browser state; TypeScript types alone are
+not treated as network validation.
+
 The current source release binds the browser to a loopback runner. Windows users
 run that local stack inside WSL2. The execution Interface already accepts a
 frozen job and emits ordered events, allowing a
@@ -229,10 +252,27 @@ Generated state lives under `.somite/` and is ignored by Git:
   catalog/
   fixtures/
   compiled/
+  pixi/locks/
   runs/
   evidence/
   agent-transcripts/
 ```
+
+Frozen Pixi manifests and locks remain project-local under
+`.somite/pixi/locks/`. Installed environments are reused across projects from a
+short private user cache (`$XDG_CACHE_HOME/somite/pixi` on Linux or
+`~/Library/Caches/Somite/pixi` on macOS), keyed by the exact platform, manifest,
+and lock content. Set `SOMITE_PIXI_CACHE_DIR` to an absolute private directory
+when the default user-cache path is unsuitable; durable environments never use
+a temporary directory.
+
+Interactive graph writes use a full state-revision compare-and-swap. The
+canonical graph, recovery autosave, and input-origin sidecar are each published
+with a durable temporary file and atomic rename; they are not one crash-atomic
+multi-file commit. If a recovered graph no longer matches its saved input
+origin, Somite blocks graph persistence, Run, Validate, Export, and Agent
+compilation until the user explicitly rebinds the original workflow location
+or confirms the project folder.
 
 ## Verify a checkout
 

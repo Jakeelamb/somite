@@ -52,6 +52,23 @@ also supports registry adapters such as
 native ACP support such as [OpenCode](https://dev.opencode.ai/docs/acp/). A
 custom command is still available for any compatible bring-your-own agent.
 
+The Agent child does not inherit the runner's complete environment. Somite
+constructs an explicit portable allowlist for executable discovery, home and
+XDG configuration, temporary directories, certificate bundles, locale, and
+Windows/WSL process basics. Ambient proxy settings, application configuration,
+and secret-shaped values are excluded. An Agent that requires an existing
+environment credential must be opted in by name when starting Somite:
+
+```bash
+SOMITE_AGENT_CREDENTIAL_ENV_NAMES=OPENAI_API_KEY,ANTHROPIC_API_KEY pixi run start
+```
+
+The list accepts at most 32 credential-shaped environment names in 4 KiB; the
+values must already exist in the runner environment. The Somite MCP runtime
+capability can never be forwarded this way. This boundary prevents accidental
+inheritance, but the Agent still runs as the same operating-system user and is
+not a security sandbox.
+
 After `session/new`, Somite renders the session configuration advertised by the
 agent. Models, modes, and boolean options are changed through ACP's stable
 [`session/set_config_option`](https://agentclientprotocol.com/rfds/session-config-options)
@@ -88,7 +105,7 @@ insufficient.
 | `somite.source_workflow.edit` | Apply typed parameter or invocation-replacement edits to a pinned source workflow. |
 | `somite.source_workflow.promote` | Promote one selected source invocation replacement into an ordinary editable typed node. |
 | `somite.source.search` | Search current NCBI or Ensembl reads, reference assemblies, organisms, accessions, and genes with structured provenance and ordered native source-recipe operators. |
-| `somite.graph.apply_transaction` | Apply up to 64 graph operations atomically against a compare-and-swap base revision. |
+| `somite.graph.apply_transaction` | Apply up to 64 graph operations as one validated compare-and-swap transaction. |
 | `somite.workflow.compile` | Freeze the current graph through the production Pixi/Nextflow compiler into a content-addressed package. |
 | `somite.run.start` | Start the production runner with configured inputs. |
 | `somite.validation.start` | Start the production runner with a supported representative fixture binding. |
@@ -114,7 +131,7 @@ Catalog matches include the immutable catalog revision, a deterministic score,
 the terms that matched, and an opaque continuation cursor. A cursor is valid
 only for the query and catalog revision that created it.
 
-## Atomic graph edits
+## Compare-and-swap graph edits
 
 An edit is one `GraphTransaction`:
 
@@ -152,6 +169,12 @@ also fail safely.
 with the same key returns its original result without applying the edit again;
 reusing the key for different content is rejected.
 
+Success is returned only after each required durable file publication completes.
+Those publications are not one crash-atomic multi-file commit. If restart cannot
+match the recovered Graph to its input-origin sidecar, graph edits, compilation,
+Run, Validate, and Export fail with `input_origin_recovery_required` until the
+user explicitly rebinds the workflow location.
+
 Run and validation starts use the same rule. The start tool requires a fresh
 key for one intended launch. Retrying an identical launch with that key returns
 the original `run_id` with `replayed: true`; using it for a different launch is
@@ -175,6 +198,10 @@ one history entry for each, so normal Undo reverses them individually.
 
 - The command is parsed and launched as a local subprocess in the disposable
   agent workspace; Somite does not pass it through a shell.
+- Agent and MCP standard output is byte-framed before protocol decoding. One
+  unterminated or complete control frame cannot exceed the shared workflow
+  transaction envelope; an oversized frame terminates the session instead of
+  accumulating unbounded memory.
 - Discovered launch commands come from the official ACP Registry, are checked
   against a conservative token allowlist, and remain visible before launch.
 - The agent command is not saved in the project.

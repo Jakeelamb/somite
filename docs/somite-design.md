@@ -35,6 +35,7 @@ Somite application.
 ```text
 web/
   app/                 browser interaction and presentation
+  app/api.ts           fixed-origin, runtime-validated runner client
 
 packages/workflow/     @somite/workflow
   model.ts             persisted Graph vocabulary
@@ -65,6 +66,10 @@ hashing, graph invariants, catalog identity, readiness, compilation, and bundle
 layout behind small deterministic Interfaces. Both browser and runner depend on
 it directly; the runner never imports UI code. Host, process, filesystem, and
 network effects remain local to runner Adapters.
+
+The browser's runner Adapter is configured once per client instance; it has no
+mutable global origin. Every JSON result crosses a byte limit, fatal UTF-8 and
+JSON decoding, and an endpoint-specific runtime decoder before UI state sees it.
 
 ## Core contracts
 
@@ -198,7 +203,12 @@ Reconstruction retains exact method surfaces, nearby evidence, PDF pages,
 unsupported identities, and cited resources. Parallel analyses and alternative
 methods stay in separate Candidate graphs. A Candidate crosses the Interface
 only when it is non-empty and valid against the current Graph and Catalog
-contracts. The canvas changes only after explicit acceptance.
+contracts. Accession recognition uses bounded identifier shapes and a linear
+page cursor, retaining at most 4,096 unique cited resources with an explicit
+truncation warning. Every completed reconstruction fits a 16 MiB review
+envelope, and paper-job status reserves a separate metadata allowance, so a
+completed job is always receivable by the browser. The canvas changes only
+after explicit acceptance.
 
 ## Agent collaboration
 
@@ -207,14 +217,22 @@ Somite launches it without a shell in a disposable workspace and supplies a
 capability-scoped stdio MCP server. MCP exposes the same graph, catalog,
 assessment, compiler, runner, and evidence Modules used by humans.
 
-Agent edits are short atomic transactions against a Graph state revision. Somite
-applies them to a clone, validates the complete result, atomically persists all
-or none, and presents each successful transaction as one undoable canvas edit.
+Agent edits are short compare-and-swap transactions against a Graph state
+revision. Somite applies them to a clone, validates the complete result,
+serializes persistence, and presents each successful transaction as one
+undoable canvas edit.
 Only requests whose structured server and tool identities match the Somite MCP
 boundary and one of its exact advertised tool names are automatically allowed
 for the session. Prefix-shaped labels, conflicting identities, shell actions,
 and all other tools remain user-approved. Redacted normalized transcripts
 persist under `.somite/agent-transcripts/`.
+
+The launched Agent receives an explicit portable environment allowlist rather
+than `process.env`. Credential-shaped variables cross only when named through
+`SOMITE_AGENT_CREDENTIAL_ENV_NAMES`; the private Somite MCP capability never
+crosses that boundary. ACP and MCP newline-delimited streams are byte-framed
+before protocol parsing. Loopback MCP HTTP refuses redirects and streams every
+response through the same bounded workflow envelope.
 
 ## Project data
 
@@ -228,15 +246,33 @@ persist under `.somite/agent-transcripts/`.
   papers/               content-addressed artifacts and derived caches
   fixtures/             content-addressed representative data
   compiled/             reusable frozen Agent compilation output
+  pixi/locks/           project-local frozen environment provenance
   runs/                 packages, logs, traces, work, and results
   evidence/             append-only receipts and index
   agent-transcripts/    redacted normalized turns
 ```
 
+Pixi lock provenance remains project-local under `.somite/pixi/locks/`.
+Installed prefixes live in a separate, short, private, content-addressed user
+cache so deeply nested projects do not exceed package relocation placeholders
+and identical frozen environments are reused across projects. The cache root is
+configurable with the absolute `SOMITE_PIXI_CACHE_DIR` path; temporary storage
+is not a durable environment adapter.
+
 Portable Somite documents are bounded at 64 MiB. Only routes whose primary
 payload is a Graph receive that compatibility envelope (plus 64 KiB for scoped
 metadata); Agent prompts, transactions, configuration, and other JSON requests
 retain the 16 MiB generic limit.
+
+Interactive saves, autosaves, and Agent edits require the current full state
+revision. The canonical Graph, recovery autosave, and input-origin sidecar each
+use a durable temporary file and atomic rename, but the three publications are
+not one crash-atomic commit. If startup cannot prove that a recovered Graph and
+its input-origin sidecar match, all Graph persistence and local-input
+materialization fail with `input_origin_recovery_required`. Run, Validate,
+Export, and Agent compilation therefore cannot use the fallback project path.
+Only an explicit, compare-and-swap-protected rebind clears the warning after the
+replacement sidecar is durably published.
 
 ## Interaction invariants
 
@@ -250,7 +286,8 @@ retain the 16 MiB generic limit.
   collapsed, closed, and reopened without ending the session.
 - Search and paper reconstruction never mutate the Graph; insertion and
   acceptance are explicit transactions.
-- Saves and autosaves are server-validated and compare-and-swap protected.
+- Saves and autosaves are server-validated, compare-and-swap protected, and
+  refuse an unresolved input origin.
 
 ## Non-goals
 

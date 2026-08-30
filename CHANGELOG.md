@@ -50,6 +50,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now share graph contracts, catalog loading, assessment, compilation, Pixi
   freezing, source-workflow handling, and paper reconstruction through
   `@somite/workflow`.
+- Browser-to-runner calls now use a per-instance client with fixed transport
+  configuration, bounded response bodies, and runtime validation for every JSON
+  result before it enters UI state.
+- Agent subprocesses now receive an explicit portable environment allowlist,
+  credential variables require named opt-in, and ACP/MCP streams are bounded
+  before protocol parsing.
+- Paper reconstruction now bounds accession shapes and cardinality, scans PDF
+  pages linearly, reports resource truncation, and guarantees that every
+  completed review fits the browser's paper-status envelope.
 - Removed the Cargo workspace, Rust toolchain, native-executor spike, duplicate
   web lockfile, and obsolete implementation documents. Accepted output fixtures
   remain as language-independent regression contracts.
@@ -96,6 +105,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   verified engine-authored rule graph.
 - Production-browser export now starts the generated ZIP download and reports
   its filename instead of stopping after bundle creation.
+- Recovered workflows with an uncertain local input origin now fail closed:
+  graph persistence, Run, Validate, Export, and Agent compilation remain blocked
+  until a compare-and-swap-protected explicit rebind succeeds.
 - Launcher shutdown now cancels active workflow, paper, and Agent process trees
   without leaving the local runner behind. Module paths and Pixi executable
   discovery use platform-appropriate layouts on supported direct platforms.

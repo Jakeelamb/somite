@@ -96,6 +96,12 @@ isolated run.
 
 **Project** — a directory containing graphs and local `.somite/` state.
 
+**Input origin** — the runner-owned canonical base and relative-path search
+order for one portable Graph. Its sidecar is scoped to the exact recovered Graph.
+If that association cannot be restored, persistence and local-input
+materialization fail until the user explicitly rebinds the original workflow
+location or confirms the project folder.
+
 **Run** — one request to realize a graph or a node cone, with timestamps and
 provenance.
 
@@ -224,8 +230,8 @@ without giving the agent a second internal data model.
 
 **Graph transaction** — a short ordered list of graph operations with one Graph
 state base revision and one user-facing summary. Somite applies it to a
-clone, validates the complete result, and persists all or none. A successful
-transaction is one undoable browser history entry.
+clone, validates the complete result, and accepts it under one compare-and-swap.
+A successful transaction is one undoable browser history entry.
 
 ## Paper reconstruction
 
@@ -281,7 +287,10 @@ separators. It is optional for plain text and JATS sources and never fabricated.
 
 **Resource citation** — an accession-shaped paper claim retained with its
 accession family, inferred scientific role, nearby paper text, and optional
-Source location. A citation is evidence, not yet an executable input.
+Source location. A citation is evidence, not yet an executable input. A Paper
+review retains at most 4,096 unique citations and explicitly warns when later
+citations are omitted; accession shapes and the complete review response are
+independently bounded.
 
 **Resolved resource group** — the current provider records returned for one
 Resource citation through Somite's NCBI or Ensembl source boundary. Study,
@@ -315,6 +324,12 @@ downloadable run or silently chooses the first member of a collection.
   duplicate scientific bytes.
 - All persisted graph writes are runtime-validated by the canonical Graph
   Module; static TypeScript types alone never admit persisted or network data.
+- Interactive Graph writes use the full state revision for compare-and-swap.
+  Graph, autosave, and input-origin files are each published atomically and
+  durably, but do not form one crash-atomic multi-file commit.
+- An unproven recovered Input origin blocks Graph persistence and every operation
+  that materializes local inputs until an explicit compare-and-swap rebind
+  durably replaces its sidecar.
 - Generated engine syntax never introduces an unmapped executable node.
 - Workflow name, presentation-only layout, notes, Canvas annotations, and Node
   colors never alter the semantic Graph revision; all remain part of the
