@@ -583,6 +583,12 @@ button:disabled { cursor: default; opacity: .42; }
 .nextflow-browse small { margin-top: 3px; color: var(--muted); font-size: 7px; }
 .nextflow-browse em { min-width: 21px; padding: 2px 5px; border-radius: 9px; background: var(--surface-active); color: var(--accent); font: normal 8px var(--font-readout), monospace; text-align: center; }
 .nextflow-browse svg { color: var(--muted); transform: rotate(-90deg); }
+.workflow-catalog-loading { width: calc(100% - 20px); min-height: 43px; margin: 0 10px 8px; padding: 7px 9px; display: flex; align-items: center; gap: 9px; border: 1px solid var(--border); border-radius: 7px; background: var(--control); color: var(--text); }
+.workflow-catalog-loading > svg { flex: 0 0 auto; color: var(--accent); }
+.workflow-catalog-loading strong, .workflow-catalog-loading small { display: block; }
+.workflow-catalog-loading strong { font-size: 8px; }
+.workflow-catalog-loading small { margin-top: 3px; color: var(--muted); font-size: 7px; }
+.workflow-catalog-retry svg { transform: none; }
 .continuation-banner { min-height: 30px; margin: -2px 0 8px; padding: 6px 8px; display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 7px; border: 1px solid rgb(111 212 137 / 34%); border-radius: 6px; background: rgb(111 212 137 / 7%); }
 .continuation-banner span { color: var(--muted); font-size: 8px; }
 .continuation-banner strong { overflow: hidden; color: var(--text); font: 9px var(--font-readout), monospace; text-overflow: ellipsis; white-space: nowrap; }

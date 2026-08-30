@@ -135,6 +135,7 @@ import type { CatalogExpansionActivity } from "./catalogExpansion";
 import { editableRequiredSourceFileParameters, mergeCanonicalSourceWorkflow, opaqueNfcoreFallback, sourceScopeTitle, sourceSpanLabel, sourceWorkflowCanAppendGraph, sourceWorkflowCanvasIsEmpty, sourceWorkflowProvider, sourceWorkflowReplacementCandidate, sourceWorkflowRevision, sourceWorkflowSetupLabel, sourceWorkflowTitle } from "./sourceWorkflowPresentation";
 import { projectSourceNetwork, sourceNetworkEnterPath, sourceNetworkExitPath } from "./sourceWorkflowNetwork";
 import { canonicalRefreshAccepted, canonicalRefreshDisposition, captureGraphWrite, commitIfCanonicalEpochCurrent, enqueueGraphWrite, graphNodeSetChanged, type GraphWritePath, type GraphWriteSnapshot } from "./graphPersistence";
+import { validationEvidenceRequestPath, workflowCatalogRequestPaths, type WorkflowCatalogLoadState } from "./backgroundRequests";
 import { assessWorkflow } from "@somite/workflow/assessment";
 import { OperatorCatalog } from "@somite/workflow/catalog";
 
@@ -587,6 +588,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const [paperPreparingField, setPaperPreparingField] = useState<string | null>(null);
   const [nfcoreCatalog, setNfcoreCatalog] = useState<NfcoreCatalog | null>(null);
   const [snakemakeCatalog, setSnakemakeCatalog] = useState<SnakemakeCatalog | null>(null);
+  const [workflowCatalogState, setWorkflowCatalogState] = useState<WorkflowCatalogLoadState>("idle");
   const [categoryOpen, setCategoryOpen] = useState<Record<string, boolean>>({});
   const [favorites, setFavorites] = useState<Set<string>>(new Set());
   const [recent, setRecent] = useState<string[]>([]);
@@ -630,6 +632,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const titleEditStartRef = useRef<{ graph: SomiteGraph; dirty: boolean; title: string } | null>(null);
   const titleEditCancelledRef = useRef(false);
   const initialViewportFitRef = useRef(false);
+  const workflowCatalogLoadInFlightRef = useRef(false);
   const running = activeIntent !== null;
 
   const availableOperators = useMemo(() => {
@@ -680,11 +683,17 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   }, [semanticKey, setEdges, setNodes]);
 
   useEffect(() => {
-    if (!session || activeIntent) return;
-    const requestedKey = semanticKey;
     const graph = graphSnapshotRef.current;
+    const requestPath = validationEvidenceRequestPath({
+      sessionReady: Boolean(session),
+      activeIntent: Boolean(activeIntent),
+      workflowReady: readiness?.state === "ready",
+      graph,
+    });
+    if (!requestPath) return;
+    const requestedKey = semanticKey;
     const timeout = window.setTimeout(() => {
-      void jsonRequest<ValidationEvidenceResponse>("/api/validations/status", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(graph) })
+      void jsonRequest<ValidationEvidenceResponse>(requestPath, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(graph) })
         .then((evidence) => {
           if (semanticKeyRef.current !== requestedKey) return;
           setValidationEvidence(evidence);
@@ -700,7 +709,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
         .catch(() => undefined);
     }, 240);
     return () => window.clearTimeout(timeout);
-  }, [activeIntent, semanticKey, session, setEdges, setNodes]);
+  }, [activeIntent, readiness?.state, semanticKey, session, setEdges, setNodes]);
 
   useEffect(() => {
     if (!workflowCatalog || activeIntent) return;
@@ -1082,16 +1091,32 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       })
       .catch((error) => setStatus(`Project engine is not running — ${errorMessage(error)}`));
     jsonRequest<SystemProfile>("/api/system").then(setSystem).catch(() => undefined);
-    jsonRequest<NfcoreCatalog>("/api/catalog/nfcore")
-      .then(setNfcoreCatalog)
-      .catch(() => undefined);
-    jsonRequest<SnakemakeCatalog>("/api/catalog/snakemake")
-      .then(setSnakemakeCatalog)
-      .catch(() => undefined);
   // The React Flow state helpers are not part of this effect's lifecycle.
   // Loading must happen exactly once or a setter identity change can turn the
   // project bootstrap into a fetch -> set state -> fetch render loop.
   // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const requestPaths = workflowCatalogRequestPaths({
+      sessionReady: Boolean(session),
+      libraryVisible,
+      loadState: workflowCatalogState,
+    });
+    if (requestPaths.length === 0 || workflowCatalogLoadInFlightRef.current) return;
+    workflowCatalogLoadInFlightRef.current = true;
+    setWorkflowCatalogState("loading");
+    const requests = requestPaths.map((requestPath) => requestPath === "/api/catalog/nfcore"
+      ? jsonRequest<NfcoreCatalog>(requestPath).then(setNfcoreCatalog)
+      : jsonRequest<SnakemakeCatalog>(requestPath).then(setSnakemakeCatalog));
+    void Promise.allSettled(requests).then((results) => {
+      workflowCatalogLoadInFlightRef.current = false;
+      setWorkflowCatalogState(results.every((result) => result.status === "fulfilled") ? "loaded" : "failed");
+    });
+  }, [libraryVisible, session, workflowCatalogState]);
+
+  const retryWorkflowCatalogs = useCallback(() => {
+    if (!workflowCatalogLoadInFlightRef.current) setWorkflowCatalogState("idle");
   }, []);
 
   useEffect(() => {
@@ -2756,7 +2781,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
           <button type="button" aria-label={allViewersHidden ? "Show All Viewers" : "Hide All Viewers"} title={allViewersHidden ? "Show all viewers" : "Hide all viewers"} disabled={!nodes.length} onClick={toggleAllViewers}>{allViewersHidden ? <Eye size={16} aria-hidden="true" /> : <EyeOff size={16} aria-hidden="true" />}</button>
         </div>}
 
-        {libraryVisible && <div className="panel-layer" onPointerDown={(event) => event.stopPropagation()}><LibraryPanel operators={availableOperators} query={query} filterQuery={deferredQuery} favorites={favorites} recent={recent} categoryOpen={categoryOpen} searchInputRef={searchInputRef} continuation={pendingConnection} catalogExpansion={catalogExpansion} onQuery={setQuery} onClose={() => { setLibraryVisible(false); setPendingConnection(null); setCatalogExpansion(null); }} onAddOperator={addOperator} onAddSource={addSource} onImportFiles={(files) => addDroppedFiles(files, canvasCenter())} onToggleFavorite={(id) => setFavorites((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; })} onToggleCategory={(title, open) => setCategoryOpen((current) => ({ ...current, [title]: open }))} onDismissCatalogExpansion={() => { setStatus(`${catalogExpansion?.title ?? "Workflow"} was not added · canvas unchanged`); setCatalogExpansion(null); }} /></div>}
+        {libraryVisible && <div className="panel-layer" onPointerDown={(event) => event.stopPropagation()}><LibraryPanel operators={availableOperators} query={query} filterQuery={deferredQuery} favorites={favorites} recent={recent} categoryOpen={categoryOpen} searchInputRef={searchInputRef} continuation={pendingConnection} catalogExpansion={catalogExpansion} workflowCatalogState={workflowCatalogState} onQuery={setQuery} onClose={() => { setLibraryVisible(false); setPendingConnection(null); setCatalogExpansion(null); }} onAddOperator={addOperator} onAddSource={addSource} onImportFiles={(files) => addDroppedFiles(files, canvasCenter())} onToggleFavorite={(id) => setFavorites((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; })} onToggleCategory={(title, open) => setCategoryOpen((current) => ({ ...current, [title]: open }))} onRetryWorkflowCatalogs={retryWorkflowCatalogs} onDismissCatalogExpansion={() => { setStatus(`${catalogExpansion?.title ?? "Workflow"} was not added · canvas unchanged`); setCatalogExpansion(null); }} /></div>}
 
         {projectVisible && <div className="project-layer" onPointerDown={(event) => event.stopPropagation()}><ProjectPanel projectName={session.project_name} graphPath={session.graph_path} onImportProject={importLocalProject} onClose={() => setProjectVisible(false)} /></div>}
 

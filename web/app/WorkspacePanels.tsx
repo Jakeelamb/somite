@@ -61,6 +61,7 @@ import { nextPaperReadSlot, paperAttentionItems, paperParameterValue, paperResou
 import { formatPaperElapsed, paperCandidateCanApply, paperIntakeIsBusy, paperIntakePresentation, paperUnsupportedMentions, type PaperIntakeState } from "./paperIntake";
 import { paperReadingPresentation } from "./paperReading";
 import { catalogExpansionPresentation, type CatalogExpansionActivity } from "./catalogExpansion";
+import type { WorkflowCatalogLoadState } from "./backgroundRequests";
 import {
   groupedWorkflowParameters,
   hiddenRequiredWorkflowParameters,
@@ -482,6 +483,7 @@ export function LibraryPanel({
   searchInputRef,
   continuation,
   catalogExpansion,
+  workflowCatalogState,
   onQuery,
   onClose,
   onAddOperator,
@@ -489,6 +491,7 @@ export function LibraryPanel({
   onImportFiles,
   onToggleFavorite,
   onToggleCategory,
+  onRetryWorkflowCatalogs,
   onDismissCatalogExpansion,
 }: {
   operators: Operator[];
@@ -500,6 +503,7 @@ export function LibraryPanel({
   searchInputRef: RefObject<HTMLInputElement | null>;
   continuation?: PendingConnection | null;
   catalogExpansion: CatalogExpansionActivity | null;
+  workflowCatalogState: WorkflowCatalogLoadState;
   onQuery: (query: string) => void;
   onClose: () => void;
   onAddOperator: (operator: Operator) => void;
@@ -507,6 +511,7 @@ export function LibraryPanel({
   onImportFiles: (files: File[]) => Promise<void>;
   onToggleFavorite: (id: string) => void;
   onToggleCategory: (title: string, open: boolean) => void;
+  onRetryWorkflowCatalogs: () => void;
   onDismissCatalogExpansion: () => void;
 }) {
   const request = classifySource(query);
@@ -603,6 +608,15 @@ export function LibraryPanel({
           <button type="button" onClick={() => searchInputRef.current?.focus()}><Database size={16} aria-hidden="true" /><span><strong>NCBI & Ensembl</strong><small>Search by organism, name, or accession</small></span></button>
         </div>
       </section>}
+
+      {!continuation && !query.trim() && workflowCatalogState === "loading" && <div className="workflow-catalog-loading" role="status" aria-live="polite">
+        <LoaderCircle className="spin" size={14} aria-hidden="true" />
+        <span><strong>Loading workflow catalogs…</strong><small>nf-core + Snakemake</small></span>
+      </div>}
+
+      {!continuation && !query.trim() && workflowCatalogState === "failed" && <button type="button" className="nextflow-browse workflow-catalog-retry" onClick={onRetryWorkflowCatalogs}>
+        <span><strong>Some workflow catalogs are unavailable</strong><small>Loaded results remain available</small></span><em>Retry</em><CircleAlert size={13} aria-hidden="true" />
+      </button>}
 
       {!continuation && !query.trim() && nextflowCount > 0 && <button type="button" className="nextflow-browse" onClick={() => {
         onToggleCategory("Nextflow Workflows", true);
