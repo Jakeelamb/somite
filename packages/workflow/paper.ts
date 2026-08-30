@@ -504,8 +504,23 @@ function knownGenome(text: string) {
   return undefined;
 }
 
-function exactRun(resources: readonly PaperResourceCitation[]) {
-  return resources.find((resource) => resource.kind === "sra_run")?.accession;
+function exactReadRuns(resources: readonly PaperResourceCitation[]) {
+  return resources
+    .filter((resource) => resource.kind === "sra_run" && resource.role === "reads")
+    .map((resource) => resource.accession);
+}
+
+function unresolvedReadNote(runs: readonly string[], independentReadSlots: number) {
+  if (runs.length > 1) {
+    const design = independentReadSlots > 1
+      ? ` across ${independentReadSlots} independent read roles`
+      : " in the biological sample design";
+    return `The paper cites multiple exact SRA runs (${runs.join(", ")}). Assign every run${design} before adding fetch nodes; no run was selected automatically.`;
+  }
+  if (runs.length === 1 && independentReadSlots > 1) {
+    return `The paper cites exact SRA run ${runs[0]}, but this reconstruction has ${independentReadSlots} independent read roles. Choose which role the run belongs to before adding a fetch node; no run was selected automatically.`;
+  }
+  return "Reads are described, but no exact run accession was selected. Choose local reads or use a cited online resource.";
 }
 
 function graphEvidence(graph: SomiteGraph, extractedVia: PaperExtractVia): PaperEvidence[] {
@@ -636,7 +651,14 @@ function buildCandidate(
     if (mention.support === "unsupported") return mention.ports?.input === "Fastq";
     return catalog.get(mention.operator_id!)?.ports.in.some((port) => port.type === "Fastq" || port.union?.includes("Fastq") || port.type === "FastqGz") ?? false;
   });
-  const run = exactRun(resources);
+  const runs = exactReadRuns(resources);
+  const independentReadSlots = Number(needsReads) + Number(linkageWorkflow);
+  const run = runs.length === 1 && independentReadSlots === 1 ? runs[0] : undefined;
+  const readResolutionWarning = independentReadSlots > 0 && runs.length > 1
+    ? `The paper cites ${runs.length} exact SRA runs; assign every run to its biological sample or read role before adding fetch nodes.`
+    : runs.length === 1 && independentReadSlots > 1
+      ? `The paper cites ${runs[0]} for a design with ${independentReadSlots} independent read roles; choose its role before adding a fetch node.`
+      : undefined;
   let reads: SomiteGraphNode | undefined;
   if (needsReads && run) {
     const prefetch = addOperatorNode(graph, catalog, "sra.prefetch", `Exact run cited in the paper: ${run}`, { accession: run });
@@ -644,7 +666,7 @@ function buildCandidate(
     connectSpecific(graph, prefetch, reads);
   } else if (needsReads) {
     const paired = /paired[- ]end|paired reads/i.test(text);
-    reads = addOperatorNode(graph, catalog, paired ? "files.import_paired" : "files.import", "Reads are described, but no exact run accession was selected. Choose local reads or use a cited online resource.");
+    reads = addOperatorNode(graph, catalog, paired ? "files.import_paired" : "files.import", unresolvedReadNote(runs, independentReadSlots));
   }
   const genome = knownGenome(text);
   const needsReference = filtered.some((mention) => mention.support === "operator" && catalog.get(mention.operator_id!)?.ports.in.some((port) => port.type === "Fasta" || port.type === "FastaGz"));
@@ -684,9 +706,12 @@ function buildCandidate(
   const catalogValidation = catalog.verifyGraph(graph);
   if (!graphValidation.ok || !catalogValidation.ok) return undefined;
   const assessment = assessWorkflow(graph, catalog);
-  const warnings = assessment.required_count
-    ? [`Draft reconstructed from paper evidence; ${assessment.required_count} item${assessment.required_count === 1 ? "" : "s"} still need review or input before it can run.`]
-    : [];
+  const warnings = [
+    ...(assessment.required_count
+      ? [`Draft reconstructed from paper evidence; ${assessment.required_count} item${assessment.required_count === 1 ? "" : "s"} still need review or input before it can run.`]
+      : []),
+    ...(readResolutionWarning ? [readResolutionWarning] : []),
+  ];
   return {
     name: assemblyChoice ? `${assemblyChoice.display_name} assembly` : candidateName(assay),
     role,

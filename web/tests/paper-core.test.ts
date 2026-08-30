@@ -182,3 +182,44 @@ test("paper resources retain collections until an exact run is selected", async 
   assert.ok(review.resources.every((resource) => resource.source_location === "PDF page 1"));
   assert.ok(review.candidates[0]?.graph.nodes.every((node) => node.operator !== "sra.prefetch"));
 });
+
+test("paper reconstruction never collapses multiple exact runs into the first read source", () => {
+  const review = reconstructPaper(catalog, [
+    "Methods",
+    "RNA-seq libraries from biological replicates SRR12345678 and SRR12345679 were paired-end.",
+    "Raw reads were quality-checked with FastQC, trimmed with fastp, and aligned with STAR.",
+    "The reads are deposited under BioProject PRJNA300706; alignment used reference assembly GCF_000001405.40.",
+  ].join("\n"), "pdfjs");
+
+  assert.deepEqual(review.resources.map((resource) => resource.accession), ["SRR12345678", "SRR12345679", "PRJNA300706", "GCF_000001405.40"]);
+  const candidate = review.candidates[0];
+  assert.ok(candidate);
+  assert.equal(candidate.graph.nodes.some((node) => node.operator === "sra.prefetch"), false);
+  const readSlots = candidate.graph.nodes.filter((node) => node.operator === "files.import_paired");
+  assert.equal(readSlots.length, 1);
+  assert.match(readSlots[0]?.note ?? "", /SRR12345678.*SRR12345679/);
+  assert.match(readSlots[0]?.note ?? "", /no run was selected automatically/i);
+  assert.notEqual(candidate.assessment.state, "ready");
+  assert.ok(candidate.assessment.required_count > 0);
+  assert.ok(candidate.assessment.items.some((item) => item.node_id === readSlots[0]?.id));
+  assert.ok(candidate.evidence.some((entry) => entry.target_id === readSlots[0]?.id && /SRR12345678.*SRR12345679/.test(entry.detail)));
+});
+
+test("one cited run stays unresolved when the paper has multiple independent read roles", () => {
+  const review = reconstructPaper(catalog, [
+    "Methods",
+    "A draft genome assembly was ordered and oriented with ALLMAPS using a linkage map.",
+    "Paired-end DNA-seq and RNA-seq reads from SRR12345678 were aligned with BWA-MEM.",
+    "GATK 3.5 and Rascaf were used for scaffolding.",
+  ].join("\n"), "pdfjs");
+
+  const candidate = review.candidates[0];
+  assert.ok(candidate);
+  assert.deepEqual(review.resources.map((resource) => resource.accession), ["SRR12345678"]);
+  assert.equal(candidate.graph.nodes.some((node) => node.operator === "sra.prefetch"), false);
+  const readSlots = candidate.graph.nodes.filter((node) => node.operator === "files.import_paired");
+  assert.equal(readSlots.length, 2);
+  assert.ok(readSlots.some((node) => /independent read roles/i.test(node.note ?? "")));
+  assert.ok(candidate.assessment.items.some((item) => readSlots.some((node) => node.id === item.node_id)));
+  assert.notEqual(candidate.assessment.state, "ready");
+});
