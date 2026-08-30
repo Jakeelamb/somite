@@ -45,11 +45,18 @@ git tag -a "v${release_version}" -m "Somite v${release_version}"
 git push origin "v${release_version}"
 ```
 
-`.github/workflows/release.yml` repeats the locked TypeScript and production
-browser gates, rejects a tag that does not match the workspace versions, runs
-the real execution smoke, and creates a GitHub release with generated notes.
-GitHub's generated source archives are the only release artifacts; do not
-attach build directories or partially installable bundles.
+`.github/workflows/release.yml` accepts only an annotated tag whose commit is
+reachable from `main`, repeats the locked TypeScript and production-browser
+gates, rejects a tag that does not match the workspace versions, and runs the
+real execution smoke. A separate minimal job receives `contents: write` only
+after verification and creates the release without checking out or executing
+tagged source. GitHub's generated source archives are the only release
+artifacts; do not attach build directories or partially installable bundles.
+
+Repository administrators should protect `main` and release tags with required
+CI checks and restrict the release environment to maintainers. Those GitHub
+settings are part of the publication boundary and cannot be enforced by the
+source workflow alone.
 
 After publication, verify the release page, source archives, rendered README,
 license detection, and installation instructions from a fresh directory. Fix

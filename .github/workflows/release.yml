@@ -6,11 +6,11 @@ on:
       - "v[0-9]*.[0-9]*.[0-9]*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    name: Verify and publish
+  verify:
+    name: Verify tagged source
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -18,6 +18,20 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
+      - name: Verify annotated tag is on main
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          test "$(git cat-file -t "$RELEASE_TAG")" = tag || {
+            echo "Release tags must be annotated."
+            exit 1
+          }
+          git merge-base --is-ancestor "$RELEASE_COMMIT" refs/remotes/origin/main || {
+            echo "Release commit must be reachable from origin/main."
+            exit 1
+          }
       - name: Set up locked Pixi environment
         uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
         with:
@@ -42,7 +56,18 @@ jobs:
         run: npm run smoke:browser
       - name: Exercise production startup and real workflow execution
         run: pixi run smoke
-      # GitHub's generated source archives are the only release artifacts.
+
+  publish:
+    name: Publish verified source
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      # GitHub's generated source archives are the only release artifacts. This
+      # job intentionally has no checkout or third-party executable step.
       - name: Create source-only GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
