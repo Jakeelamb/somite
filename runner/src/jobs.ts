@@ -34,8 +34,10 @@ import type { SomiteGraph } from "@somite/workflow/model";
 import { compileNextflow, PINNED_NEXTFLOW_VERSION, PINNED_OPENJDK_VERSION } from "@somite/workflow/nextflow";
 import { semanticGraphRevision } from "@somite/workflow/workflow";
 import { EvidenceStore } from "./evidenceStore.ts";
+import { atomicWrite } from "./files.ts";
 import { PixiCache } from "./pixiCache.ts";
 import { terminateProcessTree } from "./process.ts";
+import { RunStorage } from "./runStorage.ts";
 import { executablePath, pixiPlatform } from "./system.ts";
 
 export type RunPhase = "preparing" | "running" | "finalizing" | "completed" | "failed" | "cancelling" | "cancelled";
@@ -219,6 +221,7 @@ export class RunManager {
   readonly #catalog: OperatorCatalog;
   readonly #evidence: EvidenceStore;
   readonly #pixi: PixiCache;
+  readonly #storage: RunStorage;
   readonly #jobs = new Map<string, RunJob>();
   readonly #startReplays = new Map<string, { request: string; result: RunStart }>();
   readonly #executions = new Set<Promise<void>>();
@@ -229,6 +232,7 @@ export class RunManager {
     this.#catalog = catalog;
     this.#evidence = new EvidenceStore(projectRoot);
     this.#pixi = new PixiCache(projectRoot);
+    this.#storage = new RunStorage(projectRoot);
   }
 
   async start(graph: SomiteGraph, intent: "run" | "validation", idempotencyKey?: string): Promise<RunStart> {
@@ -378,6 +382,14 @@ export class RunManager {
     return { subject_digest: subjectDigest, receipts: await this.#evidence.forSubject(subjectDigest) };
   }
 
+  async storage() {
+    return this.#storage.profile(this.#activeRunIds());
+  }
+
+  async dehydrateRuns(runIds: readonly string[]) {
+    return this.#storage.dehydrateRuns(runIds, this.#activeRunIds());
+  }
+
   async export(graph: SomiteGraph, target: ExportTarget) {
     const assessment = assessWorkflow(graph, this.#catalog);
     if (assessment.state !== "ready") throw new Error("workflow is not ready to export");
@@ -408,6 +420,10 @@ export class RunManager {
     job.revision += 1;
     for (const wake of job.waiters) wake();
     job.waiters.clear();
+  }
+
+  #activeRunIds() {
+    return new Set([...this.#jobs.values()].filter((job) => !terminal(job.status.phase)).map((job) => job.id));
   }
 
   async #execute(job: RunJob) {
@@ -452,14 +468,22 @@ export class RunManager {
         if (job.abort.signal.aborted) return this.#finishCancelled(job);
         await this.#refreshStates(job);
         if (result.code === 0) {
-          this.#update(job, { phase: job.validation ? "finalizing" : "completed", exit_code: result.code });
-          if (job.validation) await this.#recordEvidence(job, frozen, "completed");
+          if (job.validation) {
+            this.#update(job, { phase: "finalizing", exit_code: result.code });
+            await this.#recordEvidence(job, frozen, "completed");
+          } else {
+            await this.#terminalUpdate(job, { phase: "completed", exit_code: result.code });
+          }
         } else {
           const error = await this.#logTail(join(job.packagePath, "run.stderr.log"))
             ?? `Nextflow exited with ${result.code ?? result.signal ?? "unknown status"}`;
           this.#markFailureStates(job);
-          this.#update(job, { phase: job.validation ? "finalizing" : "failed", exit_code: result.code ?? undefined, error });
-          if (job.validation) await this.#recordEvidence(job, frozen, "failed");
+          if (job.validation) {
+            this.#update(job, { phase: "finalizing", exit_code: result.code ?? undefined, error });
+            await this.#recordEvidence(job, frozen, "failed");
+          } else {
+            await this.#terminalUpdate(job, { phase: "failed", exit_code: result.code ?? undefined, error });
+          }
         }
       } finally {
         await Promise.all([stdout.close(), stderr.close()]);
@@ -467,8 +491,25 @@ export class RunManager {
     } catch (error) {
       if (job.abort.signal.aborted) return this.#finishCancelled(job);
       this.#markFailureStates(job);
-      this.#update(job, { phase: "failed", error: error instanceof Error ? error.message : String(error) });
+      await this.#terminalUpdate(job, { phase: "failed", error: error instanceof Error ? error.message : String(error) });
     }
+  }
+
+  async #terminalUpdate(job: RunJob, patch: Partial<RunStatus> & { phase: "completed" | "failed" | "cancelled" }) {
+    await this.#persistTerminalStatus(job, patch).catch(() => undefined);
+    this.#update(job, patch);
+  }
+
+  async #persistTerminalStatus(job: RunJob, patch: Partial<RunStatus> & { phase: "completed" | "failed" | "cancelled" }) {
+    const status = { ...job.status, ...patch };
+    await atomicWrite(join(job.packagePath, "run-status.json"), `${JSON.stringify({
+      schema_version: 1,
+      run_id: job.id,
+      phase: status.phase,
+      finished_at_unix_ms: Date.now(),
+      ...(status.closure_digest ? { closure_digest: status.closure_digest } : {}),
+      ...(status.evidence_receipt ? { evidence_receipt_digest: status.evidence_receipt.receipt_digest } : {}),
+    }, null, 2)}\n`);
   }
 
   async #refreshStates(job: RunJob) {
@@ -508,11 +549,11 @@ export class RunManager {
     }
   }
 
-  #finishCancelled(job: RunJob) {
+  async #finishCancelled(job: RunJob) {
     for (const [node, state] of Object.entries(job.status.states)) {
       job.status.states[node] = state === "done" || state === "cached" ? state : state === "running" ? "cancelled" : "skipped";
     }
-    this.#update(job, { phase: "cancelled" });
+    await this.#terminalUpdate(job, { phase: "cancelled" });
   }
 
   async #recordEvidence(job: RunJob, frozen: FrozenPackage, terminalPhase: "completed" | "failed") {
@@ -544,7 +585,7 @@ export class RunManager {
       log_digests: await digestsForPaths(logFiles),
     });
     await this.#evidence.append(receipt, join(job.packagePath, "evidence"));
-    this.#update(job, { phase: terminalPhase, evidence_receipt: receipt });
+    await this.#terminalUpdate(job, { phase: terminalPhase, evidence_receipt: receipt });
   }
 
   async #logTail(path: string) {

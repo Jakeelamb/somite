@@ -76,12 +76,17 @@ test("TypeScript runner freezes, executes, traces, validates, and exports one pa
     assert.equal(run.states.input1, "done");
     assert.equal(run.states.fastqc1, "done");
     assert.match(run.closure_digest ?? "", /^blake3:/);
+    const runMarker = JSON.parse(await readFile(join(project.root, ".somite", "runs", started.run_id, "run-status.json"), "utf8"));
+    assert.equal(runMarker.phase, "completed");
+    assert.equal(runMarker.closure_digest, run.closure_digest);
 
     const validationStarted = await manager.start(graph, "validation");
     const validation = await terminalStatus(manager, validationStarted.run_id);
     assert.equal(validation.phase, "completed", validation.error);
     assert.equal(validation.evidence_receipt?.result, "passed");
     assert.equal(validation.evidence_receipt?.fixture_digests.length, 1);
+    const validationMarker = JSON.parse(await readFile(join(project.root, ".somite", "runs", validationStarted.run_id, "run-status.json"), "utf8"));
+    assert.equal(validationMarker.evidence_receipt_digest, validation.evidence_receipt?.receipt_digest);
     const evidence = await manager.validationStatus(graph);
     assert.equal(evidence.receipt?.receipt_digest, validation.evidence_receipt?.receipt_digest);
     const receiptPath = join(
