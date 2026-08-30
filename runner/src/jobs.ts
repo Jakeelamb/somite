@@ -34,6 +34,8 @@ import type { SomiteGraph } from "@somite/workflow/model";
 import { compileNextflow, PINNED_NEXTFLOW_VERSION, PINNED_OPENJDK_VERSION } from "@somite/workflow/nextflow";
 import { semanticGraphRevision } from "@somite/workflow/workflow";
 import { EvidenceStore } from "./evidenceStore.ts";
+import { PixiCache } from "./pixiCache.ts";
+import { terminateProcessTree } from "./process.ts";
 import { executablePath, pixiPlatform } from "./system.ts";
 
 export type RunPhase = "preparing" | "running" | "finalizing" | "completed" | "failed" | "cancelling" | "cancelled";
@@ -70,72 +72,10 @@ type RunJob = {
   waiters: Set<() => void>;
 };
 
-type CapturedCommand = Readonly<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }>;
-
-const MAX_CAPTURE_BYTES = 512 * 1024;
 const encoder = new TextEncoder();
 
 function terminal(phase: RunPhase) {
   return phase === "completed" || phase === "failed" || phase === "cancelled";
-}
-
-function boundedAppend(current: string, chunk: Buffer) {
-  const next = current + chunk.toString("utf8");
-  return next.length <= MAX_CAPTURE_BYTES ? next : next.slice(next.length - MAX_CAPTURE_BYTES);
-}
-
-function terminateChild(child: ChildProcess) {
-  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
-  if (process.platform === "win32") {
-    spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true, stdio: "ignore" });
-  } else {
-    try {
-      process.kill(-child.pid, "SIGTERM");
-    } catch {
-      child.kill("SIGTERM");
-    }
-    const timer = setTimeout(() => {
-      try {
-        process.kill(-child.pid!, "SIGKILL");
-      } catch {
-        child.kill("SIGKILL");
-      }
-    }, 3_000);
-    timer.unref();
-  }
-}
-
-async function runCaptured(command: string, args: readonly string[], cwd: string, signal?: AbortSignal): Promise<CapturedCommand> {
-  if (signal?.aborted) throw new Error("operation cancelled");
-  const child = spawn(command, args, {
-    cwd,
-    detached: process.platform !== "win32",
-    windowsHide: true,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let stdout = "";
-  let stderr = "";
-  child.stdout!.on("data", (chunk: Buffer) => { stdout = boundedAppend(stdout, chunk); });
-  child.stderr!.on("data", (chunk: Buffer) => { stderr = boundedAppend(stderr, chunk); });
-  const cancel = () => terminateChild(child);
-  signal?.addEventListener("abort", cancel, { once: true });
-  try {
-    const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolvePromise, rejectPromise) => {
-      child.once("error", rejectPromise);
-      child.once("close", (code, closeSignal) => resolvePromise({ code, signal: closeSignal }));
-    });
-    if (signal?.aborted) throw new Error("operation cancelled");
-    return { ...result, stdout, stderr };
-  } finally {
-    signal?.removeEventListener("abort", cancel);
-  }
-}
-
-function commandFailure(command: string, result: CapturedCommand) {
-  const detail = result.stderr.split("\n").reverse().find((line) => line.trim())
-    ?? result.stdout.split("\n").reverse().find((line) => line.trim())
-    ?? `${command} exited with ${result.code ?? result.signal ?? "unknown status"}`;
-  return detail.trim();
 }
 
 async function writePackageFiles(directory: string, packageFiles: ReadonlyMap<string, Uint8Array>) {
@@ -152,10 +92,9 @@ async function prepareFrozenPackage(
   target: ExportTarget,
   directory: string,
   projectRoot: string,
+  cache: PixiCache,
   signal?: AbortSignal,
 ) {
-  const pixi = await executablePath(projectRoot, "pixi");
-  if (!pixi) throw new Error("Pixi is required to freeze and run this workflow");
   await mkdir(directory, { recursive: false });
   const compiled = compileNextflow(graph, catalog, {
     workflowName: "somite-workflow",
@@ -164,22 +103,15 @@ async function prepareFrozenPackage(
     nextflowVersion: PINNED_NEXTFLOW_VERSION,
     openjdkVersion: PINNED_OPENJDK_VERSION,
   });
-  await writeFile(join(directory, "pixi.toml"), compiled.pixiToml);
-  const locked = await runCaptured(
-    pixi,
-    ["lock", "--no-install", "--no-progress", "--manifest-path", join(directory, "pixi.toml")],
-    directory,
-    signal,
-  );
-  if (locked.code !== 0) throw new Error(`Pixi lock failed: ${commandFailure("pixi lock", locked)}`);
-  const lock = await readFile(join(directory, "pixi.lock"));
+  const locked = await cache.lock(compiled.pixiToml, target.platform, signal);
+  const lock = locked.lock;
   const binaries = new Set<string>();
   for (const operator of catalog.values()) {
     if (operator.bin && await executablePath(projectRoot, operator.bin)) binaries.add(operator.bin);
   }
   const frozen = createFrozenPackageFiles(graph, catalog, target, lock, (binary) => binaries.has(binary));
   await writePackageFiles(directory, frozen.files);
-  return { frozen, pixi };
+  return { frozen, locked };
 }
 
 async function readOptional(path: string) {
@@ -286,6 +218,7 @@ export class RunManager {
   readonly #repositoryRoot: string;
   readonly #catalog: OperatorCatalog;
   readonly #evidence: EvidenceStore;
+  readonly #pixi: PixiCache;
   readonly #jobs = new Map<string, RunJob>();
   readonly #startReplays = new Map<string, { request: string; result: RunStart }>();
   readonly #executions = new Set<Promise<void>>();
@@ -295,6 +228,7 @@ export class RunManager {
     this.#repositoryRoot = repositoryRoot;
     this.#catalog = catalog;
     this.#evidence = new EvidenceStore(projectRoot);
+    this.#pixi = new PixiCache(projectRoot);
   }
 
   async start(graph: SomiteGraph, intent: "run" | "validation", idempotencyKey?: string): Promise<RunStart> {
@@ -373,7 +307,7 @@ export class RunManager {
     if (!terminal(job.status.phase)) {
       this.#update(job, { phase: "cancelling" });
       job.abort.abort();
-      if (job.child) terminateChild(job.child);
+      if (job.child) terminateProcessTree(job.child);
     }
     return copyStatus(job.status);
   }
@@ -383,7 +317,7 @@ export class RunManager {
       if (terminal(job.status.phase)) continue;
       this.#update(job, { phase: "cancelling" });
       job.abort.abort();
-      if (job.child) terminateChild(job.child);
+      if (job.child) terminateProcessTree(job.child);
     }
     await Promise.allSettled([...this.#executions]);
   }
@@ -407,7 +341,7 @@ export class RunManager {
     const temporary = join(parent, `.compile-${randomUUID()}.partial`);
     await mkdir(parent, { recursive: true });
     try {
-      const { frozen } = await prepareFrozenPackage(graph, this.#catalog, target, temporary, this.#projectRoot);
+      const { frozen } = await prepareFrozenPackage(graph, this.#catalog, target, temporary, this.#projectRoot, this.#pixi);
       const destination = join(parent, frozen.closure.closure_digest.replace(/^blake3:/, ""));
       let reused = false;
       try {
@@ -450,7 +384,7 @@ export class RunManager {
     const directory = join(this.#projectRoot, ".somite", "exports", `export-${randomUUID()}`);
     await mkdir(join(directory, ".."), { recursive: true });
     try {
-      const { frozen } = await prepareFrozenPackage(graph, this.#catalog, target, directory, this.#projectRoot);
+      const { frozen } = await prepareFrozenPackage(graph, this.#catalog, target, directory, this.#projectRoot, this.#pixi);
       return { filename: frozen.plan.filename, bytes: archiveFrozenPackage(frozen.files) };
     } finally {
       await rm(directory, { recursive: true, force: true });
@@ -480,22 +414,25 @@ export class RunManager {
     try {
       await mkdir(join(job.packagePath, ".."), { recursive: true });
       const target = { archiveName: job.graph.name ?? "somite-workflow", platform: pixiPlatform() };
-      const { frozen, pixi } = await prepareFrozenPackage(
+      const { frozen, locked } = await prepareFrozenPackage(
         job.graph,
         this.#catalog,
         target,
         job.packagePath,
         this.#projectRoot,
+        this.#pixi,
         job.abort.signal,
       );
+      if (job.abort.signal.aborted) return this.#finishCancelled(job);
+      const environmentManifest = await this.#pixi.environment(locked, target.platform, job.abort.signal);
       if (job.abort.signal.aborted) return this.#finishCancelled(job);
       this.#update(job, { closure_digest: frozen.closure.closure_digest, phase: "running" });
       const stdout = await open(join(job.packagePath, "run.stdout.log"), "w");
       const stderr = await open(join(job.packagePath, "run.stderr.log"), "w");
       try {
         const child = spawn(
-          pixi,
-          ["run", "--frozen", "--manifest-path", join(job.packagePath, "pixi.toml"), "run"],
+          locked.pixi,
+          ["run", "--frozen", "--manifest-path", environmentManifest, "--", "nextflow", "run", "main.nf", "-params-file", "params.json", "-resume"],
           {
             cwd: job.packagePath,
             detached: process.platform !== "win32",
@@ -504,7 +441,7 @@ export class RunManager {
           },
         );
         job.child = child;
-        const cancel = () => terminateChild(child);
+        const cancel = () => terminateProcessTree(child);
         job.abort.signal.addEventListener("abort", cancel, { once: true });
         const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolvePromise, rejectPromise) => {
           child.once("error", rejectPromise);

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import test from "node:test";
@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
 import type { SomiteGraph } from "@somite/workflow/model";
 import { RunManager } from "../src/jobs.ts";
+import { PixiCache } from "../src/pixiCache.ts";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 
@@ -22,12 +23,20 @@ async function mockProject() {
   await import("node:fs/promises").then(({ mkdir }) => mkdir(bin));
   const pixi = join(bin, "pixi");
   await writeFile(pixi, `#!/usr/bin/env node
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 const args = process.argv.slice(2);
+await appendFile(join(dirname(process.argv[1]), "invocations.log"), args[0] + "\\n");
 if (args[0] === "lock") {
   const manifest = args[args.indexOf("--manifest-path") + 1];
+  const delay = Number(process.env.SOMITE_MOCK_LOCK_DELAY_MS ?? 0);
+  if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
   await writeFile(join(dirname(manifest), "pixi.lock"), "version: 6\\n");
+  process.exit(0);
+}
+if (args[0] === "install") {
+  const manifest = args[args.indexOf("--manifest-path") + 1];
+  await mkdir(join(dirname(manifest), ".pixi", "envs", "default"), { recursive: true });
   process.exit(0);
 }
 const delay = Number(process.env.SOMITE_MOCK_RUN_DELAY_MS ?? 0);
@@ -40,7 +49,7 @@ await mkdir(join(process.cwd(), "results"), { recursive: true });
 await writeFile(join(process.cwd(), "results", "output.txt"), "ok\\n");
 `, "utf8");
   await chmod(pixi, 0o755);
-  return { root, path: `${bin}${delimiter}${process.env.PATH ?? ""}` };
+  return { root, path: `${bin}${delimiter}${process.env.PATH ?? ""}`, log: join(bin, "invocations.log") };
 }
 
 async function terminalStatus(manager: RunManager, id: string) {
@@ -83,10 +92,17 @@ test("TypeScript runner freezes, executes, traces, validates, and exports one pa
       `${validation.evidence_receipt!.receipt_digest.slice("blake3:".length)}.json`,
     );
     assert.equal(JSON.parse(await readFile(receiptPath, "utf8")).receipt_digest, validation.evidence_receipt?.receipt_digest);
+    const environmentRoot = join(project.root, ".somite", "pixi", "environments");
+    const platforms = await readdir(environmentRoot);
+    assert.equal(platforms.length, 1);
+    assert.equal((await readdir(join(environmentRoot, platforms[0]!))).length, 1, "one exact lock must reuse one Pixi environment");
+    await assert.rejects(lstat(join(project.root, ".somite", "runs", started.run_id, ".pixi")), { code: "ENOENT" });
+    await assert.rejects(lstat(join(project.root, ".somite", "runs", validationStarted.run_id, ".pixi")), { code: "ENOENT" });
 
     const exported = await manager.export(graph, { archiveName: "RNA seq", platform: "linux-64" });
     assert.equal(exported.filename, "RNA-seq.somite-run.zip");
     assert.deepEqual([...exported.bytes.slice(0, 4)], [0x50, 0x4b, 0x03, 0x04]);
+    assert.deepEqual((await readFile(project.log, "utf8")).trim().split("\n").sort(), ["install", "lock", "run", "run"]);
   } finally {
     process.env.PATH = previousPath;
     await rm(project.root, { recursive: true, force: true });
@@ -152,6 +168,37 @@ test("evidence lookup fails closed when its durable index is malformed", async (
       /evidence index is malformed/,
     );
   } finally {
+    await rm(project.root, { recursive: true, force: true });
+  }
+});
+
+test("cancelling one Pixi cache waiter does not cancel another", async () => {
+  const project = await mockProject();
+  const previousPath = process.env.PATH;
+  process.env.PATH = project.path;
+  process.env.SOMITE_MOCK_LOCK_DELAY_MS = "100";
+  try {
+    const cache = new PixiCache(project.root);
+    const firstAbort = new AbortController();
+    const first = cache.lock("[workspace]\nname='one'\n", "linux-64", firstAbort.signal);
+    const survivor = cache.lock("[workspace]\nname='one'\n", "linux-64");
+    const firstRejected = assert.rejects(first, /operation cancelled/);
+    firstAbort.abort();
+    await firstRejected;
+    assert.match((await survivor).lock_digest, /^blake3:/);
+
+    const kept = cache.lock("[workspace]\nname='two'\n", "linux-64");
+    const lateAbort = new AbortController();
+    const cancelled = cache.lock("[workspace]\nname='two'\n", "linux-64", lateAbort.signal);
+    const cancelledRejected = assert.rejects(cancelled, /operation cancelled/);
+    lateAbort.abort();
+    await cancelledRejected;
+    assert.match((await kept).lock_digest, /^blake3:/);
+
+    assert.equal((await readFile(project.log, "utf8")).trim().split("\n").filter((command) => command === "lock").length, 2);
+  } finally {
+    delete process.env.SOMITE_MOCK_LOCK_DELAY_MS;
+    process.env.PATH = previousPath;
     await rm(project.root, { recursive: true, force: true });
   }
 });
