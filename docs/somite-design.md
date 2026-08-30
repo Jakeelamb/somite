@@ -183,9 +183,12 @@ reconstruction caches.
 
 One server-owned Paper configuration is parsed before the project opens and is
 passed unchanged to upload storage, the isolated PDF worker, OCR, toolchain
-preflight, and extraction-cache policy. `SOMITE_PAPER_MAX_UPLOAD_BYTES`,
+preflight, extraction-cache policy, and the bounded intake scheduler.
+`SOMITE_PAPER_MAX_UPLOAD_BYTES`,
 `SOMITE_PAPER_MAX_TEXT_BYTES`, `SOMITE_PAPER_MAX_PAGES`, and
-`SOMITE_PAPER_MAX_OCR_PAGES` are bounded numeric overrides. `SOMITE_OCR_LANGS`
+`SOMITE_PAPER_MAX_OCR_PAGES` bound input work;
+`SOMITE_PAPER_COMMAND_TIMEOUT_SECONDS` and `SOMITE_PAPER_MAX_ACTIVE_JOBS`
+bound extraction command time and concurrent jobs. `SOMITE_OCR_LANGS`
 selects a validated Tesseract language list; `OMARCHY_OCR_LANGS` is consulted
 only as a compatibility fallback. Invalid settings fail startup with recovery
 guidance, and a policy or language change cannot reuse an extraction cache from

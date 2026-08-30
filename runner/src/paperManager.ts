@@ -15,7 +15,10 @@ import {
   type PaperExtractionProgress,
   type PaperMediaKind,
 } from "./paperExtractor.ts";
-import { DEFAULT_PAPER_INTAKE_CONFIG, type PaperIntakeConfig } from "./paperConfig.ts";
+import {
+  DEFAULT_PAPER_INTAKE_CONFIG,
+  type PaperIntakeConfig,
+} from "./paperConfig.ts";
 import { PaperStore } from "./paperStore.ts";
 import { PaperToolchain } from "./paperToolchain.ts";
 
@@ -68,7 +71,7 @@ type ExtractionCache = Readonly<{
 const EXTRACTOR_REVISION = "pdfjs-ocr-v4";
 const LEGACY_EXTRACTOR_REVISIONS = ["pdfjs-ocr-v2", "pdfjs-ocr-v3"] as const;
 const RECONSTRUCTOR_REVISION = "typed-paper-v1";
-const MAX_JOBS = 8;
+const DEFAULT_MAX_RETAINED_JOBS = 8;
 const MAX_EXTRACTION_CACHE_BYTES = 72 * 1024 * 1024;
 const MAX_RECONSTRUCTION_CACHE_ENTRIES = 16;
 const MAX_RECONSTRUCTION_CACHE_BYTES = 16 * 1024 * 1024;
@@ -151,10 +154,12 @@ export class PaperManager {
       maxSourceBytes: this.configuration.maxUploadBytes,
       maxTextBytes: this.configuration.maxTextBytes,
       maxPdfPages: this.configuration.maxPdfPages,
+      pdfTimeoutMs: this.configuration.paperCommandTimeoutMs,
       ocr: {
         toolchain: this.paperTools,
         maxPages: this.configuration.maxOcrPages,
         maxTextBytes: this.configuration.maxTextBytes,
+        commandTimeoutMs: this.configuration.paperCommandTimeoutMs,
         languages: this.configuration.ocrLanguages,
       },
     } as const;
@@ -173,7 +178,8 @@ export class PaperManager {
     }
     const artifact = await this.store.resolveDigestPath(digest);
     this.#prune();
-    if (this.#jobs.size >= MAX_JOBS && ![...this.#jobs.values()].some((job) => terminal.has(job.status.phase))) throw new Error("paper intake capacity is busy");
+    const jobCapacity = Math.max(DEFAULT_MAX_RETAINED_JOBS, this.configuration.maxActiveJobs);
+    if (this.#jobs.size >= jobCapacity && ![...this.#jobs.values()].some((job) => terminal.has(job.status.phase))) throw new Error("paper intake capacity is busy");
     const jobId = `paper-${randomUUID()}`;
     const job: PaperJob = {
       status: {
@@ -239,7 +245,8 @@ export class PaperManager {
   }
 
   #prune() {
-    while (this.#jobs.size >= MAX_JOBS) {
+    const jobCapacity = Math.max(DEFAULT_MAX_RETAINED_JOBS, this.configuration.maxActiveJobs);
+    while (this.#jobs.size >= jobCapacity) {
       const completed = [...this.#jobs.values()].find((job) => terminal.has(job.status.phase));
       if (!completed) break;
       this.#jobs.delete(completed.status.job_id);
@@ -288,7 +295,7 @@ export class PaperManager {
   }
 
   #pump() {
-    while (this.#active < 2 && this.#pending.length) {
+    while (this.#active < this.configuration.maxActiveJobs && this.#pending.length) {
       const job = this.#pending.shift()!;
       this.#active += 1;
       const execution = this.#execute(job).finally(() => {

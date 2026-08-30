@@ -124,6 +124,63 @@ test("paper intake automatically uses an available project-local OCR toolchain",
   }
 });
 
+test("paper intake applies the configured active-job ceiling and extraction-command timeout", {
+  skip: process.platform === "win32",
+  timeout: 12_000,
+}, async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "somite-paper-manager-limits-"));
+  let manager: PaperManager | undefined;
+  const jobIds: string[] = [];
+  try {
+    const bin = path.join(root, ".somite", "tools", "paper", ".pixi", "envs", "default", "bin");
+    await fakeExecutable(path.join(bin, "pdfinfo"), `
+      if (process.argv.includes("-v")) process.stderr.write("pdfinfo version 25.01.0\\n");
+      else process.stdout.write("Pages: 1\\n");
+    `);
+    await fakeExecutable(path.join(bin, "pdftoppm"), `
+      if (process.argv.includes("-v")) process.stderr.write("pdftoppm version 25.01.0\\n");
+      else require("node:fs").writeFileSync(process.argv.at(-1) + ".png", "fake raster");
+    `);
+    await fakeExecutable(path.join(bin, "tesseract"), `
+      if (process.argv.includes("--version")) process.stdout.write("tesseract 5.5.0\\n");
+      else if (process.argv.includes("--list-langs")) process.stdout.write("List of available languages (1):\\neng\\n");
+      else setInterval(() => undefined, 1_000);
+    `);
+    const configuration = paperIntakeConfigFromEnvironment({
+      SOMITE_PAPER_COMMAND_TIMEOUT_SECONDS: "2",
+      SOMITE_PAPER_MAX_ACTIVE_JOBS: "1",
+    });
+    manager = new PaperManager(root, loaded.catalog, loaded.revision, configuration);
+    assert.equal(manager.configuration.paperCommandTimeoutMs, 2_000);
+    assert.equal(manager.configuration.maxActiveJobs, 1);
+
+    const artifact = await manager.store.upload(uploadRequest("scan.pdf", pdfWithText(""), "application/pdf"));
+    const first = await manager.start(artifact.digest);
+    const second = await manager.start(artifact.digest);
+    jobIds.push(first.job_id, second.job_id);
+
+    let firstStatus = await manager.status(first.job_id, 250);
+    for (let attempt = 0; attempt < 8 && firstStatus.phase === "queued"; attempt += 1) {
+      firstStatus = await manager.status(first.job_id, 250);
+    }
+    assert.equal(firstStatus.phase, "extracting");
+    assert.equal((await manager.status(second.job_id)).phase, "queued", "the second job must wait behind the configured one-job ceiling");
+
+    const firstCompleted = await completed(manager, first.job_id);
+    assert.equal(firstCompleted.phase, "failed");
+    assert.equal(firstCompleted.failure?.code, "paper_extraction_timeout");
+    assert.match(firstCompleted.failure?.message ?? "", /tesseract.*SOMITE_PAPER_COMMAND_TIMEOUT_SECONDS/i);
+    await manager.cancel(second.job_id);
+    assert.equal((await completed(manager, second.job_id)).phase, "cancelled");
+  } finally {
+    if (manager) {
+      await Promise.all(jobIds.map((jobId) => manager!.cancel(jobId).catch(() => undefined)));
+      await manager.shutdown();
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("paper intake verifies and invokes the configured OCR languages", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "somite-paper-manager-languages-"));
   const argumentsPath = path.join(root, "tesseract-arguments.json");

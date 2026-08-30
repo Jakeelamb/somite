@@ -135,6 +135,8 @@ the setting to change:
 | `SOMITE_PAPER_MAX_TEXT_BYTES` | 64 MiB | 1 byte–1 GiB |
 | `SOMITE_PAPER_MAX_PAGES` | 200 | 1–10,000 PDF pages |
 | `SOMITE_PAPER_MAX_OCR_PAGES` | 200 | 1–10,000 and no greater than the PDF-page limit |
+| `SOMITE_PAPER_COMMAND_TIMEOUT_SECONDS` | 120 | 1–3,600 seconds per extraction command |
+| `SOMITE_PAPER_MAX_ACTIVE_JOBS` | 2 | 1–32 concurrent paper jobs |
 | `SOMITE_OCR_LANGS` | `eng` | Tesseract list such as `eng` or `eng+deu` |
 
 `OMARCHY_OCR_LANGS` remains a compatibility fallback when

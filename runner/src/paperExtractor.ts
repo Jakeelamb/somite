@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { byteDigest, canonicalJsonDigest, createByteDigester } from "@somite/workflow/contentIdentity";
 import {
   DEFAULT_PAPER_INTAKE_CONFIG,
+  MAX_CONFIGURED_PAPER_COMMAND_TIMEOUT_SECONDS,
   MAX_CONFIGURED_PAPER_PAGES,
   MAX_CONFIGURED_PAPER_TEXT_BYTES,
   MAX_CONFIGURED_PAPER_UPLOAD_BYTES,
@@ -52,9 +53,10 @@ export const MAX_TEXT_BYTES = MAX_CONFIGURED_PAPER_TEXT_BYTES;
 export const MAX_PAGES = MAX_CONFIGURED_PAPER_PAGES;
 export const MAX_OCR_PAGES = MAX_CONFIGURED_PAPER_PAGES;
 export const DEFAULT_OCR_PAGES = DEFAULT_PAPER_INTAKE_CONFIG.maxOcrPages;
-export const DEFAULT_PAPER_COMMAND_TIMEOUT_MS = 120_000;
-export const DEFAULT_PDF_TIMEOUT_MS = 120_000;
+export const DEFAULT_PAPER_COMMAND_TIMEOUT_MS = DEFAULT_PAPER_INTAKE_CONFIG.paperCommandTimeoutMs;
+export const DEFAULT_PDF_TIMEOUT_MS = DEFAULT_PAPER_INTAKE_CONFIG.paperCommandTimeoutMs;
 export const DEFAULT_OCR_TOTAL_TIMEOUT_MS = 15 * 60 * 1_000;
+export const MAX_PAPER_COMMAND_TIMEOUT_MS = MAX_CONFIGURED_PAPER_COMMAND_TIMEOUT_SECONDS * 1_000;
 export const PDF_EXTRACTION_CONCURRENCY = 1;
 
 const MAX_COMMAND_DIAGNOSTIC_BYTES = 1024 * 1024;
@@ -352,8 +354,8 @@ function nativePageTexts(bytes: Uint8Array, result: PdfResultMessage) {
 
 function boundedPdfTimeout(value: number | undefined) {
   const timeout = value ?? DEFAULT_PDF_TIMEOUT_MS;
-  if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 15 * 60 * 1_000) {
-    throw new PaperExtractionError("paper_extraction_limit", "PDF extraction timeout must be between 1 ms and 15 minutes.");
+  if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > MAX_PAPER_COMMAND_TIMEOUT_MS) {
+    throw new PaperExtractionError("paper_extraction_limit", "PDF extraction timeout must be between 1 ms and 60 minutes.");
   }
   return timeout;
 }
@@ -463,7 +465,7 @@ async function extractPdfChild(source: PaperPathSource, options: PaperExtraction
     });
     if (protocolBuffer) handleLine(protocolBuffer);
     if (aborted || options.signal?.aborted) throw new PaperExtractionError("paper_extraction_cancelled", "Paper extraction was cancelled.", true);
-    if (timedOut) throw new PaperExtractionError("paper_extraction_timeout", "PDF text extraction exceeded its bounded wall-clock timeout.", true);
+    if (timedOut) throw new PaperExtractionError("paper_extraction_timeout", "PDF text extraction exceeded SOMITE_PAPER_COMMAND_TIMEOUT_SECONDS. Raise it and restart Somite, or inspect a stalled extractor.", true);
     if (protocolFailure) throw protocolFailure;
     if (failure) throw new PaperExtractionError(failure.code, failure.message, failure.retryable);
     if (outcome.code !== 0 || !result) {
@@ -500,7 +502,7 @@ function boundedOcrOptions(options: PaperOcrOptions) {
   const maxPages = options.maxPages ?? DEFAULT_OCR_PAGES;
   const maxTextBytes = options.maxTextBytes ?? DEFAULT_PAPER_INTAKE_CONFIG.maxTextBytes;
   const commandTimeoutMs = options.commandTimeoutMs ?? DEFAULT_PAPER_COMMAND_TIMEOUT_MS;
-  const totalTimeoutMs = options.totalTimeoutMs ?? DEFAULT_OCR_TOTAL_TIMEOUT_MS;
+  const totalTimeoutMs = options.totalTimeoutMs ?? Math.max(DEFAULT_OCR_TOTAL_TIMEOUT_MS, commandTimeoutMs);
   let languages: string;
   try {
     languages = ocrLanguageCodes(options.languages ?? DEFAULT_PAPER_INTAKE_CONFIG.ocrLanguages).join("+");
@@ -513,8 +515,8 @@ function boundedOcrOptions(options: PaperOcrOptions) {
   if (!Number.isSafeInteger(maxTextBytes) || maxTextBytes < 1 || maxTextBytes > MAX_TEXT_BYTES) {
     throw new PaperExtractionError("paper_extraction_limit", `OCR text limit must be between 1 and ${MAX_TEXT_BYTES} bytes.`);
   }
-  if (!Number.isSafeInteger(commandTimeoutMs) || commandTimeoutMs < 1 || commandTimeoutMs > 15 * 60 * 1_000) {
-    throw new PaperExtractionError("paper_extraction_limit", "OCR command timeout must be between 1 ms and 15 minutes.");
+  if (!Number.isSafeInteger(commandTimeoutMs) || commandTimeoutMs < 1 || commandTimeoutMs > MAX_PAPER_COMMAND_TIMEOUT_MS) {
+    throw new PaperExtractionError("paper_extraction_limit", "OCR command timeout must be between 1 ms and 60 minutes.");
   }
   if (!Number.isSafeInteger(totalTimeoutMs) || totalTimeoutMs < 1 || totalTimeoutMs > 60 * 60 * 1_000) {
     throw new PaperExtractionError("paper_extraction_limit", "OCR total timeout must be between 1 ms and 60 minutes.");
@@ -534,7 +536,7 @@ function commandError(error: unknown, tool: string): PaperExtractionError {
   if (error instanceof PaperExtractionError) return error;
   if (error instanceof PaperToolchainError) {
     if (error.code === "paper_command_cancelled") return new PaperExtractionError("paper_extraction_cancelled", "Paper extraction was cancelled.", true);
-    if (error.code === "paper_command_timeout") return new PaperExtractionError("paper_extraction_timeout", `${tool} exceeded the configured OCR command timeout.`, true);
+    if (error.code === "paper_command_timeout") return new PaperExtractionError("paper_extraction_timeout", `${tool} exceeded SOMITE_PAPER_COMMAND_TIMEOUT_SECONDS. Raise it and restart Somite, or inspect the stalled OCR command.`, true);
     if (error.code === "paper_command_output_limit") return new PaperExtractionError("paper_extraction_limit", `${tool} exceeded its bounded output limit.`);
     if (error.code === "paper_tool_unavailable") return new PaperExtractionError("paper_ocr_unavailable", `${tool} disappeared after OCR preflight; refresh the paper toolchain and try again.`, true);
     return new PaperExtractionError("paper_ocr_failed", `${tool} could not run: ${error.message}`, error.retryable);

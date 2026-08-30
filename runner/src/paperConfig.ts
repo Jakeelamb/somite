@@ -3,12 +3,16 @@ const MEBIBYTE = 1024 * 1024;
 export const MAX_CONFIGURED_PAPER_UPLOAD_BYTES = 1024 * MEBIBYTE;
 export const MAX_CONFIGURED_PAPER_TEXT_BYTES = 1024 * MEBIBYTE;
 export const MAX_CONFIGURED_PAPER_PAGES = 10_000;
+export const MAX_CONFIGURED_PAPER_COMMAND_TIMEOUT_SECONDS = 3_600;
+export const MAX_CONFIGURED_PAPER_ACTIVE_JOBS = 32;
 
 export type PaperIntakeConfig = Readonly<{
   maxUploadBytes: number;
   maxTextBytes: number;
   maxPdfPages: number;
   maxOcrPages: number;
+  paperCommandTimeoutMs: number;
+  maxActiveJobs: number;
   ocrLanguages: string;
 }>;
 
@@ -17,6 +21,8 @@ export const DEFAULT_PAPER_INTAKE_CONFIG: PaperIntakeConfig = Object.freeze({
   maxTextBytes: 64 * MEBIBYTE,
   maxPdfPages: 200,
   maxOcrPages: 200,
+  paperCommandTimeoutMs: 120_000,
+  maxActiveJobs: 2,
   ocrLanguages: "eng",
 });
 
@@ -95,6 +101,18 @@ export function paperIntakeConfigFromEnvironment(
   if (maxOcrPages > maxPdfPages) {
     throw new PaperConfigurationError(`SOMITE_PAPER_MAX_OCR_PAGES (${maxOcrPages}) cannot exceed SOMITE_PAPER_MAX_PAGES (${maxPdfPages}). Raise SOMITE_PAPER_MAX_PAGES or lower SOMITE_PAPER_MAX_OCR_PAGES.`);
   }
+  const paperCommandTimeoutSeconds = configuredInteger(
+    environment,
+    "SOMITE_PAPER_COMMAND_TIMEOUT_SECONDS",
+    DEFAULT_PAPER_INTAKE_CONFIG.paperCommandTimeoutMs / 1_000,
+    MAX_CONFIGURED_PAPER_COMMAND_TIMEOUT_SECONDS,
+  );
+  const maxActiveJobs = configuredInteger(
+    environment,
+    "SOMITE_PAPER_MAX_ACTIVE_JOBS",
+    DEFAULT_PAPER_INTAKE_CONFIG.maxActiveJobs,
+    MAX_CONFIGURED_PAPER_ACTIVE_JOBS,
+  );
   const languageVariable = environment.SOMITE_OCR_LANGS !== undefined
     ? "SOMITE_OCR_LANGS"
     : environment.OMARCHY_OCR_LANGS !== undefined
@@ -102,5 +120,13 @@ export function paperIntakeConfigFromEnvironment(
       : undefined;
   const configuredLanguages = languageVariable ? environment[languageVariable]! : DEFAULT_PAPER_INTAKE_CONFIG.ocrLanguages;
   const ocrLanguages = ocrLanguageCodes(configuredLanguages, languageVariable ?? "OCR languages").join("+");
-  return Object.freeze({ maxUploadBytes, maxTextBytes, maxPdfPages, maxOcrPages, ocrLanguages });
+  return Object.freeze({
+    maxUploadBytes,
+    maxTextBytes,
+    maxPdfPages,
+    maxOcrPages,
+    paperCommandTimeoutMs: paperCommandTimeoutSeconds * 1_000,
+    maxActiveJobs,
+    ocrLanguages,
+  });
 }
