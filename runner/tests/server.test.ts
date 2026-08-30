@@ -174,6 +174,8 @@ test("workflow document routes retain the 64 MiB compatibility envelope without 
       body,
     });
     assert.equal(saved.status, 200, await saved.clone().text());
+    const activeSession = await fetch(`${running.url}/api/session`).then((response) => response.json()) as { recovered_autosave: boolean };
+    assert.equal(activeSession.recovered_autosave, false, "writing an autosave is not the same as recovering one at startup");
 
     const agent = await fetch(`${running.url}/api/agent/prompt`, {
       method: "POST",

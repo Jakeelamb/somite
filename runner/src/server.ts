@@ -414,7 +414,6 @@ async function commitAutosavedGraph(
   await atomicWrite(state.autosavePath, encoded);
   await state.inputOrigins.record(inputOriginId, graph);
   state.graph = graph;
-  state.recoveredAutosave = true;
 }
 
 function parseSourceWorkflowEdits(value: unknown): SourceWorkflowEdit[] {
