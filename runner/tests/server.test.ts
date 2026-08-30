@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { createServer } from "node:http";
+import { createServer, request as httpRequest } from "node:http";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+
+import { startServer } from "../src/server.ts";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 
@@ -18,6 +20,17 @@ async function unusedPort() {
   if (!address || typeof address === "string") throw new Error("could not reserve test port");
   await new Promise<void>((resolvePromise, rejectPromise) => reservation.close((error) => error ? rejectPromise(error) : resolvePromise()));
   return address.port;
+}
+
+async function statusWithHost(port: number, host: string) {
+  return new Promise<number>((resolvePromise, rejectPromise) => {
+    const request = httpRequest({ hostname: "127.0.0.1", port, path: "/api/session", headers: { host } }, (response) => {
+      response.resume();
+      response.once("end", () => resolvePromise(response.statusCode ?? 0));
+    });
+    request.once("error", rejectPromise);
+    request.end();
+  });
 }
 
 test("the TypeScript runner serves the browser session, streaming uploads, and local Snakemake import", { skip: process.platform === "win32" }, async () => {
@@ -64,6 +77,22 @@ test("the TypeScript runner serves the browser session, streaming uploads, and l
     hostile.set("file", new Blob(["hostile\n"]), "hostile.fastq");
     assert.equal((await fetch(`${base}/api/files`, { method: "POST", headers: { origin: "https://attacker.example" }, body: hostile })).status, 403);
 
+    const originlessMutation = await fetch(`${base}/api/workflows/snakemake/import`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: root, targets: ["all"] }),
+    });
+    assert.equal(originlessMutation.status, 403);
+
+    const otherLoopbackOrigin = await fetch(`${base}/api/workflows/snakemake/import`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "http://localhost:3999" },
+      body: JSON.stringify({ path: root, targets: ["all"] }),
+    });
+    assert.equal(otherLoopbackOrigin.status, 403);
+
+    assert.equal(await statusWithHost(port, "attacker.example:7310"), 403);
+
     const imported = await fetch(`${base}/api/workflows/snakemake/import`, {
       method: "POST",
       headers: { "content-type": "application/json", origin: "http://localhost:3000" },
@@ -77,5 +106,35 @@ test("the TypeScript runner serves the browser session, streaming uploads, and l
     child.kill("SIGTERM");
     await once(child, "close").catch(() => undefined);
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("project startup rejects graph paths and state directories outside the canonical project", { skip: process.platform === "win32" }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "somite-runner-path-"));
+  const outside = await mkdtemp(join(tmpdir(), "somite-runner-outside-"));
+  try {
+    const outsideGraph = join(outside, "outside.somite.json");
+    const outsideAttempt = await startServer({ projectRoot: root, graph: outsideGraph, port: await unusedPort() })
+      .then(async (running) => {
+        await running.close();
+        return null;
+      })
+      .catch((error: unknown) => error);
+    assert.match(outsideAttempt instanceof Error ? outsideAttempt.message : "", /inside|within|escapes|project root/i);
+    await assert.rejects(readFile(outsideGraph), /ENOENT/);
+
+    await rm(join(root, ".somite"), { recursive: true, force: true });
+    await import("node:fs/promises").then(({ symlink }) => symlink(outside, join(root, ".somite")));
+    const symlinkAttempt = await startServer({ projectRoot: root, port: await unusedPort() })
+      .then(async (running) => {
+        await running.close();
+        return null;
+      })
+      .catch((error: unknown) => error);
+    assert.match(symlinkAttempt instanceof Error ? symlinkAttempt.message : "", /regular directory|symbolic link|symlink/i);
+    await assert.rejects(readFile(join(outside, "web.somite.json")), /ENOENT/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
   }
 });

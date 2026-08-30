@@ -1,7 +1,7 @@
-import { readFile, stat } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { availableParallelism, cpus, hostname, platform, totalmem } from "node:os";
-import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
 import { randomBytes, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
@@ -23,7 +23,7 @@ import {
   type SourceWorkflowEdit,
 } from "@somite/workflow/sourceWorkflow";
 import { graphStateRevision, semanticGraphRevision } from "@somite/workflow/workflow";
-import { atomicWrite } from "./files.ts";
+import { atomicWrite, containedPath, ensurePrivateDirectory, pathExists, regularDirectory, regularFile } from "./files.ts";
 import { discoverAgents } from "./agentDiscovery.ts";
 import { AgentManager, AgentManagerError } from "./agentManager.ts";
 import { RunManager } from "./jobs.ts";
@@ -60,6 +60,7 @@ type ProjectState = {
   graph: SomiteGraph;
   recoveredAutosave: boolean;
   writeChain: Promise<void>;
+  allowedOrigin: string;
   agentCapability: string;
   agent: AgentManager;
   transactionReplays: Map<string, { requestDigest: string; result: AgentTransactionResult; sequence: number }>;
@@ -91,23 +92,25 @@ function errorResponse(status: number, message: string, extra: Record<string, un
   return json({ error: message, ...extra }, { status });
 }
 
-function allowedOrigin(origin: string | null) {
-  if (!origin) return null;
-  const configured = process.env.SOMITE_ALLOWED_ORIGIN;
-  if (configured && origin === configured) return origin;
+function normalizedAllowedOrigin(origin: string) {
   try {
     const url = new URL(origin);
-    if ((url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]")
-      && (url.protocol === "http:" || url.protocol === "https:")) return origin;
+    if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("origin must use HTTP or HTTPS");
+    if (url.username || url.password || url.pathname !== "/" || url.search || url.hash) throw new Error("origin must not contain credentials, a path, query, or fragment");
+    return url.origin;
   } catch {
-    return null;
+    throw new Error("SOMITE_ALLOWED_ORIGIN must be one exact HTTP or HTTPS origin");
   }
-  return null;
 }
 
-function withCors(request: Request, response: Response) {
-  const origin = allowedOrigin(request.headers.get("origin"));
-  if (!origin) return response;
+function allowedOrigin(request: Request, state: ProjectState) {
+  const origin = request.headers.get("origin");
+  return origin && origin === state.allowedOrigin ? origin : null;
+}
+
+function withCors(request: Request, response: Response, state: ProjectState) {
+  const origin = allowedOrigin(request, state);
+  if (origin === null) return response;
   const headers = new Headers(response.headers);
   headers.set("access-control-allow-origin", origin);
   headers.set("access-control-allow-methods", "GET, POST, PUT, OPTIONS");
@@ -196,24 +199,17 @@ function migrateGraph(value: unknown, catalog: OperatorCatalog) {
 }
 
 async function readGraph(path: string, catalog: OperatorCatalog) {
-  const bytes = await readFile(path, "utf8");
-  return migrateGraph(JSON.parse(bytes), catalog);
-}
-
-async function exists(path: string) {
-  try {
-    await stat(path);
-    return true;
-  } catch {
-    return false;
-  }
+  const bytes = await regularFile(path, MAX_REQUEST_BYTES, "workflow graph");
+  return migrateGraph(JSON.parse(new TextDecoder().decode(bytes)), catalog);
 }
 
 function autosavePath(root: string, graphPath: string) {
   const defaultGraph = join(root, ".somite", "web.somite.json");
   if (resolve(graphPath) === resolve(defaultGraph)) return join(root, ".somite", "autosave.somite.json");
   const suffix = extname(graphPath);
-  return `${graphPath.slice(0, -suffix.length)}.autosave.somite.json`;
+  return suffix
+    ? `${graphPath.slice(0, -suffix.length)}.autosave.somite.json`
+    : `${graphPath}.autosave.somite.json`;
 }
 
 export type ServerOptions = {
@@ -221,24 +217,43 @@ export type ServerOptions = {
   graph?: string;
   port?: number;
   host?: string;
+  allowedOrigin?: string;
   agentCapability?: string;
 };
 
+async function projectGraphPath(root: string, path: string, label: string) {
+  const destination = containedPath(root, path);
+  const parent = dirname(destination);
+  await regularDirectory(parent, `${label} parent`);
+  const canonicalParent = await realpath(parent);
+  if (canonicalParent !== resolve(parent)) throw new Error(`${label} parent must not contain a symbolic link`);
+  const fromRoot = relative(root, canonicalParent);
+  if (fromRoot === ".." || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) {
+    throw new Error(`${label} must stay inside the canonical project root`);
+  }
+  if (await pathExists(destination)) {
+    const metadata = await lstat(destination);
+    if (metadata.isSymbolicLink() || !metadata.isFile()) throw new Error(`${label} must be a regular non-symlink file`);
+  }
+  return destination;
+}
+
 async function initializeProject(serverUrl: string, options: ServerOptions): Promise<ProjectState> {
   const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-  const root = resolve(options.projectRoot ?? process.env.SOMITE_PROJECT_ROOT ?? repositoryRoot);
+  const requestedRoot = resolve(options.projectRoot ?? process.env.SOMITE_PROJECT_ROOT ?? repositoryRoot);
+  const root = await realpath(requestedRoot);
+  await regularDirectory(root, "project root");
+  const projectState = await ensurePrivateDirectory(root, ".somite");
   const configuredGraph = options.graph ?? process.env.SOMITE_GRAPH ?? process.argv[2];
-  const graphPath = configuredGraph
-    ? resolve(root, configuredGraph)
-    : join(root, ".somite", "web.somite.json");
+  const graphPath = await projectGraphPath(root, configuredGraph ?? join(projectState, "web.somite.json"), "workflow graph");
   const catalogLoaded = await loadOperatorCatalog(join(repositoryRoot, "operators"));
-  const recovery = autosavePath(root, graphPath);
+  const recovery = await projectGraphPath(root, autosavePath(root, graphPath), "workflow autosave");
   let graph: SomiteGraph;
   let recoveredAutosave = false;
-  if (await exists(recovery)) {
+  if (await pathExists(recovery)) {
     graph = await readGraph(recovery, catalogLoaded.catalog);
     recoveredAutosave = true;
-  } else if (await exists(graphPath)) {
+  } else if (await pathExists(graphPath)) {
     graph = await readGraph(graphPath, catalogLoaded.catalog);
   } else {
     graph = { schema_version: 3, name: "Untitled workflow", nodes: [], edges: [] };
@@ -274,6 +289,7 @@ async function initializeProject(serverUrl: string, options: ServerOptions): Pro
     graph,
     recoveredAutosave,
     writeChain: Promise.resolve(),
+    allowedOrigin: normalizedAllowedOrigin(options.allowedOrigin ?? process.env.SOMITE_ALLOWED_ORIGIN ?? "http://localhost:3000"),
     agentCapability,
     agent: new AgentManager(serverUrl, agentCapability, undefined, root),
     transactionReplays: new Map(),
@@ -700,9 +716,6 @@ async function systemProfile(state: ProjectState) {
 async function route(request: Request, state: ProjectState): Promise<Response> {
   const url = new URL(request.url);
   if (request.method === "OPTIONS") return new Response(null, { status: 204 });
-  if (requestIsMutation(request) && request.headers.has("origin") && !allowedOrigin(request.headers.get("origin"))) {
-    throw new HttpError(403, "cross-origin mutation is not allowed");
-  }
   if (request.method === "GET" && url.pathname === "/api/health") {
     return json({ ok: true, runtime: "typescript", version: "0.1.0" });
   }
@@ -1098,11 +1111,14 @@ function loopbackAuthority(authority: string | null) {
   }
 }
 
-function authorizeUpload(request: Request) {
-  if (!loopbackAuthority(request.headers.get("host"))) throw new HttpError(403, "file upload requires the local Somite runner");
+function authorizeRequest(request: Request, state: ProjectState) {
+  if (!loopbackAuthority(request.headers.get("host"))) throw new HttpError(403, "Somite accepts requests only through its loopback runner");
   const origin = request.headers.get("origin");
-  if (origin ? !allowedOrigin(origin) : request.headers.get("x-somite-request") !== "local") {
-    throw new HttpError(403, "file upload requires the Somite browser or an explicit local request");
+  if (origin && origin !== state.allowedOrigin) throw new HttpError(403, "request origin is not the Somite browser");
+  if (request.method === "OPTIONS" && origin === null) throw new HttpError(403, "browser preflight requires the Somite origin");
+  const authenticatedMcp = request.headers.get("x-somite-mcp-capability") === state.agentCapability;
+  if (requestIsMutation(request) && origin === null && request.headers.get("x-somite-request") !== "local" && !authenticatedMcp) {
+    throw new HttpError(403, "originless mutations require an explicit local capability");
   }
 }
 
@@ -1126,15 +1142,16 @@ export async function startServer(options: ServerOptions = {}) {
   const port = options.port ?? Number(process.env.SOMITE_PORT ?? DEFAULT_PORT);
   const host = options.host ?? process.env.SOMITE_HOST ?? "127.0.0.1";
   if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) throw new Error("Somite runner port must be an integer from 1 to 65535");
-  const loopbackHost = host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host === "::1" ? "[::1]" : host;
+  if (!new Set(["127.0.0.1", "localhost", "::1", "[::1]"]).has(host)) throw new Error("Somite runner must bind to a loopback host");
+  const loopbackHost = host === "::1" ? "[::1]" : host;
   const state = await initializeProject(`http://${loopbackHost}:${port}`, options);
   const server = createServer(async (incoming, outgoing) => {
     const isFileUpload = incoming.method === "POST" && new URL(incoming.url ?? "/", `http://${incoming.headers.host ?? `127.0.0.1:${port}`}`).pathname === "/api/files";
     const request = isFileUpload ? uploadRequest(incoming) : nodeRequest(incoming);
     let response: Response;
     try {
+      authorizeRequest(request, state);
       if (isFileUpload) {
-        authorizeUpload(request);
         response = json(await state.uploads.receive(incoming));
       } else response = await route(request, state);
     } catch (error) {
@@ -1148,7 +1165,7 @@ export async function startServer(options: ServerOptions = {}) {
           ? errorResponse(error.status, error.message)
           : errorResponse(500, error instanceof Error ? error.message : String(error));
     }
-    await send(withCors(request, response), outgoing).catch(() => outgoing.destroy());
+    await send(withCors(request, response, state), outgoing).catch(() => outgoing.destroy());
   });
   await new Promise<void>((resolvePromise, rejectPromise) => {
     server.once("error", rejectPromise);

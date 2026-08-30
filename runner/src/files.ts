@@ -1,5 +1,5 @@
-import { lstat, mkdir, readFile, realpath, rename, writeFile } from "node:fs/promises";
-import { basename, dirname, join, resolve } from "node:path";
+import { lstat, mkdir, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 
 export async function pathExists(path: string) {
@@ -45,24 +45,31 @@ export async function ensurePrivateDirectory(root: string, relativePath: string)
 }
 
 export async function atomicWrite(path: string, contents: string | Uint8Array) {
-  await mkdir(dirname(path), { recursive: true });
+  const parent = dirname(path);
+  await regularDirectory(parent, `parent of ${path}`);
+  const canonicalParent = await realpath(parent);
+  if (canonicalParent !== resolve(parent)) throw new Error(`parent of ${path} must not contain a symbolic link`);
   if (await pathExists(path)) {
     const metadata = await lstat(path);
     if (metadata.isSymbolicLink() || !metadata.isFile()) throw new Error(`${path} must be a regular file`);
   }
-  const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
+  const temporary = join(parent, `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
   await writeFile(temporary, contents, { flag: "wx" });
   try {
+    if (await realpath(parent) !== canonicalParent) throw new Error(`parent of ${path} changed during the write`);
     await rename(temporary, path);
   } catch (error) {
-    await import("node:fs/promises").then(({ rm }) => rm(temporary, { force: true })).catch(() => undefined);
+    await rm(temporary, { force: true }).catch(() => undefined);
     throw error;
   }
 }
 
 export function containedPath(root: string, relativePath: string) {
-  const destination = resolve(root, relativePath);
-  const prefix = `${resolve(root)}/`;
-  if (!destination.startsWith(prefix)) throw new Error(`path ${relativePath} escapes its root`);
+  const canonicalRoot = resolve(root);
+  const destination = resolve(canonicalRoot, relativePath);
+  const fromRoot = relative(canonicalRoot, destination);
+  if (!fromRoot || fromRoot === ".." || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) {
+    throw new Error(`path ${relativePath} escapes its root`);
+  }
   return destination;
 }
