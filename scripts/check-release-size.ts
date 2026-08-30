@@ -16,7 +16,13 @@ const limits = {
 
 const repository = fileURLToPath(new URL("../", import.meta.url));
 const client = join(repository, "web", "dist", "client");
-const generatedPath = /^(?:node_modules|target|coverage|\.somite|web\/dist)(?:\/|$)|\/(?:node_modules|target|coverage|\.somite)(?:\/|$)/;
+const generatedPath = /^(?:node_modules|target|coverage|\.somite|\.pixi|\.nextflow|\.next|\.vinext|\.wrangler|\.turbo|output|web\/dist)(?:\/|$)|\/(?:node_modules|target|coverage|\.somite|\.pixi|\.nextflow|\.next|\.vinext|\.wrangler|\.turbo)(?:\/|$)/;
+const MAX_SOURCE_FILES = 10_000;
+const argumentsList = process.argv.slice(2);
+if (argumentsList.some((argument) => argument !== "--source-only") || new Set(argumentsList).size !== argumentsList.length) {
+  throw new Error("usage: check-release-size.ts [--source-only]");
+}
+const sourceOnly = argumentsList.includes("--source-only");
 
 function formatBytes(bytes: number) {
   return bytes < MIB ? `${(bytes / KIB).toFixed(1)} KiB` : `${(bytes / MIB).toFixed(2)} MiB`;
@@ -28,13 +34,42 @@ function enforce(label: string, actual: number, maximum: number) {
   }
 }
 
-async function trackedSourceProfile() {
+async function archiveSourcePaths(strict: boolean, directory = repository, prefix = ""): Promise<string[]> {
+  const paths: string[] = [];
+  const entries = await readdir(directory, { withFileTypes: true });
+  entries.sort((left, right) => left.name.localeCompare(right.name));
+  for (const entry of entries) {
+    const path = prefix ? `${prefix}/${entry.name}` : entry.name;
+    if (generatedPath.test(path)) {
+      if (strict) throw new Error(`generated install or runtime state is present in release source: ${path}`);
+      continue;
+    }
+    if (entry.isDirectory()) paths.push(...await archiveSourcePaths(strict, join(directory, entry.name), path));
+    else if (entry.isFile()) paths.push(path);
+    else throw new Error(`release source contains a non-regular entry: ${path}`);
+    if (paths.length > MAX_SOURCE_FILES) throw new Error(`release source exceeds ${MAX_SOURCE_FILES} files`);
+  }
+  return paths;
+}
+
+async function sourcePaths(strictArchive: boolean) {
+  const hasGitMetadata = await lstat(join(repository, ".git"))
+    .then(() => true)
+    .catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    });
+  if (!hasGitMetadata) return archiveSourcePaths(strictArchive);
   const output = execFileSync("git", ["ls-files", "-z"], {
     cwd: repository,
     encoding: "utf8",
     maxBuffer: 8 * MIB,
   });
-  const paths = output.split("\0").filter(Boolean);
+  return output.split("\0").filter(Boolean);
+}
+
+async function releaseSourceProfile(strictArchive = false) {
+  const paths = await sourcePaths(strictArchive);
   const generated = paths.filter((path) => generatedPath.test(path));
   if (generated.length) throw new Error(`generated runtime state is tracked: ${generated.slice(0, 5).join(", ")}`);
   const files = await Promise.all(paths.map(async (path) => ({ path, bytes: (await lstat(join(repository, path))).size })));
@@ -73,9 +108,14 @@ async function clientBundleProfile() {
   return { files: files.length, bytes, javascriptBytes, cssBytes };
 }
 
-const [source, bundle] = await Promise.all([trackedSourceProfile(), clientBundleProfile()]);
-process.stdout.write([
-  `Release size contract passed: ${source.files} tracked files / ${formatBytes(source.bytes)}`,
-  `${bundle.files} client files / ${formatBytes(bundle.bytes)}`,
-  `${formatBytes(bundle.javascriptBytes)} JavaScript / ${formatBytes(bundle.cssBytes)} CSS`,
-].join("; ") + "\n");
+if (sourceOnly) {
+  const source = await releaseSourceProfile(true);
+  process.stdout.write(`Release source size contract passed: ${source.files} source files / ${formatBytes(source.bytes)}\n`);
+} else {
+  const [source, bundle] = await Promise.all([releaseSourceProfile(), clientBundleProfile()]);
+  process.stdout.write([
+    `Release size contract passed: ${source.files} source files / ${formatBytes(source.bytes)}`,
+    `${bundle.files} client files / ${formatBytes(bundle.bytes)}`,
+    `${formatBytes(bundle.javascriptBytes)} JavaScript / ${formatBytes(bundle.cssBytes)} CSS`,
+  ].join("; ") + "\n");
+}

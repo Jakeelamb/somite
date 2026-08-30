@@ -52,6 +52,14 @@ jobs:
         run: npm run lint
       - name: Build and test product
         run: npm test
+      - name: Verify unpacked source archive contract
+        run: |
+          archive_root="$RUNNER_TEMP/somite-source"
+          mkdir "$archive_root"
+          git archive HEAD | tar -x -C "$archive_root"
+          node --experimental-strip-types "$archive_root/scripts/check-release-size.ts" --source-only
+          cp -R web/dist "$archive_root/web/dist"
+          node --experimental-strip-types "$archive_root/scripts/check-release-size.ts"
       - name: Exercise production browser journeys
         run: npm run smoke:browser
       - name: Exercise production startup and real workflow execution

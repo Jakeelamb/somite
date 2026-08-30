@@ -48,11 +48,12 @@ git push origin "v${release_version}"
 
 `.github/workflows/release.yml` accepts only an annotated tag whose commit is
 reachable from `main`, repeats the locked TypeScript and production-browser
-gates, rejects a tag that does not match the workspace versions, and runs the
-real execution smoke. A separate minimal job receives `contents: write` only
-after verification and creates the release without checking out or executing
-tagged source. GitHub's generated source archives are the only release
-artifacts; do not attach build directories or partially installable bundles.
+gates, verifies the size contract from an unpacked `git archive`, rejects a tag
+that does not match the workspace versions, and runs the real execution smoke.
+A separate minimal job receives `contents: write` only after verification and
+creates the release without checking out or executing tagged source. GitHub's
+generated source archives are the only release artifacts; do not attach build
+directories or partially installable bundles.
 
 Repository administrators should protect `main` and release tags with required
 CI checks and restrict the release environment to maintainers. Those GitHub
