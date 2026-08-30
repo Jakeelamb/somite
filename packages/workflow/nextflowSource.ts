@@ -29,9 +29,78 @@ const decoder = new TextDecoder("utf-8", { fatal: true });
 const MAX_FILES = 20_000;
 const MAX_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_SOURCE_BYTES = 512 * 1024 * 1024;
-const MAX_TOKENS = 1_000_000;
-const MAX_SCOPES = 25_000;
-const MAX_INVOCATIONS = 50_000;
+const SOURCE_INDEX_LIMITS = {
+  tokens: 1_000_000,
+  scopes: 25_000,
+  include_bindings: 50_000,
+  invocations: 50_000,
+  diagnostics: 25_000,
+  derived_projection_bytes: 32 * 1024 * 1024,
+  identifier_bytes: 1024,
+} as const;
+
+type SourceIndexCardinality = "tokens" | "scopes" | "include_bindings" | "invocations" | "diagnostics";
+
+const SOURCE_INDEX_LABELS: Readonly<Record<SourceIndexCardinality, string>> = {
+  tokens: "tokens",
+  scopes: "scopes",
+  include_bindings: "include bindings",
+  invocations: "invocations",
+  diagnostics: "diagnostics",
+};
+
+function projectedJsonBytes(value: unknown) {
+  const json = JSON.stringify(value);
+  if (json === undefined) throw new Error("source outline projection could not be serialized");
+  // One extra byte accounts for the separator when the value is collected in
+  // an array. This makes the shared budget independent of batching by file.
+  return encoder.encode(json).byteLength + 1;
+}
+
+class SourceIndexBudget {
+  readonly #counts: Record<SourceIndexCardinality, number> = {
+    tokens: 0,
+    scopes: 0,
+    include_bindings: 0,
+    invocations: 0,
+    diagnostics: 0,
+  };
+
+  #projectionBytes = 0;
+
+  claim(kind: SourceIndexCardinality, projectionBytes = 0, projectionKind = SOURCE_INDEX_LABELS[kind]) {
+    const nextCount = this.#counts[kind] + 1;
+    const limit = SOURCE_INDEX_LIMITS[kind];
+    if (nextCount > limit) {
+      throw new Error(
+        `source outline exceeds ${limit} indexed ${SOURCE_INDEX_LABELS[kind]} across all Nextflow files; `
+        + "exclude generated .nf files or reduce generated declarations",
+      );
+    }
+    const nextProjectionBytes = this.#projectionBytes + projectionBytes;
+    if (!Number.isSafeInteger(nextProjectionBytes)) throw new Error("source outline derived projection byte count overflowed");
+    if (nextProjectionBytes > SOURCE_INDEX_LIMITS.derived_projection_bytes) {
+      throw new Error(
+        `source outline exceeds the ${SOURCE_INDEX_LIMITS.derived_projection_bytes}-byte derived projection budget `
+        + `while indexing ${projectionKind} across all Nextflow files; exclude generated .nf files or reduce generated declarations`,
+      );
+    }
+    this.#counts[kind] = nextCount;
+    this.#projectionBytes = nextProjectionBytes;
+  }
+
+  reserveProjection(bytes: number, kind: string) {
+    const nextProjectionBytes = this.#projectionBytes + bytes;
+    if (!Number.isSafeInteger(nextProjectionBytes)) throw new Error("source outline derived projection byte count overflowed");
+    if (nextProjectionBytes > SOURCE_INDEX_LIMITS.derived_projection_bytes) {
+      throw new Error(
+        `source outline exceeds the ${SOURCE_INDEX_LIMITS.derived_projection_bytes}-byte derived projection budget `
+        + `while indexing ${kind} across all Nextflow files; exclude generated .nf files or reduce generated declarations`,
+      );
+    }
+    this.#projectionBytes = nextProjectionBytes;
+  }
+}
 
 function less(left: string, right: string) {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -128,12 +197,12 @@ function text(bytes: Uint8Array, token: Token) {
   return decoder.decode(bytes.subarray(token.start, token.end));
 }
 
-export function tokenizeNextflow(bytes: Uint8Array): Token[] {
+function tokenizeNextflowWithBudget(bytes: Uint8Array, budget: SourceIndexBudget): Token[] {
   const tokens: Token[] = [];
   let index = 0;
   let line = 1;
   const push = (token: Token) => {
-    if (tokens.length >= MAX_TOKENS) throw new Error(`source outline exceeds ${MAX_TOKENS} tokens`);
+    budget.claim("tokens");
     tokens.push(token);
   };
   while (index < bytes.length) {
@@ -182,7 +251,9 @@ export function tokenizeNextflow(bytes: Uint8Array): Token[] {
     } else if (asciiAlpha(byte) || byte === 95) {
       const start = index++;
       while (index < bytes.length && (asciiAlpha(bytes[index]!) || asciiNumeric(bytes[index]!) || bytes[index] === 95)) index += 1;
-      if (index - start > 1024) throw new Error("Nextflow identifier exceeds 1024 bytes");
+      if (index - start > SOURCE_INDEX_LIMITS.identifier_bytes) {
+        throw new Error(`Nextflow identifier exceeds ${SOURCE_INDEX_LIMITS.identifier_bytes} bytes`);
+      }
       push({ kind: "ident", start, end: index, line, endLine: line, offset: start });
     } else {
       const kind: TokenKind | undefined = byte === 123 ? "left_brace"
@@ -197,6 +268,10 @@ export function tokenizeNextflow(bytes: Uint8Array): Token[] {
     }
   }
   return tokens;
+}
+
+export function tokenizeNextflow(bytes: Uint8Array): Token[] {
+  return tokenizeNextflowWithBudget(bytes, new SourceIndexBudget());
 }
 
 function tokenPairs(tokens: readonly Token[], open: TokenKind, close: TokenKind) {
@@ -243,8 +318,14 @@ function resolveInclude(current: string, requested: string, paths: ReadonlySet<s
   return [base, `${base}.nf`, `${base}/main.nf`].find((candidate) => paths.has(candidate));
 }
 
-function indexFile(file: FrozenSourceFile, entrypoint: string, sourceDigest: string, paths: ReadonlySet<string>): IndexedFile {
-  const tokens = tokenizeNextflow(file.bytes);
+function indexFile(
+  file: FrozenSourceFile,
+  entrypoint: string,
+  sourceDigest: string,
+  paths: ReadonlySet<string>,
+  budget: SourceIndexBudget,
+): IndexedFile {
+  const tokens = tokenizeNextflowWithBudget(file.bytes, budget);
   const braces = tokenPairs(tokens, "left_brace", "right_brace");
   const parens = tokenPairs(tokens, "left_paren", "right_paren");
   const scopes: IndexedScope[] = [];
@@ -268,7 +349,6 @@ function indexFile(file: FrozenSourceFile, entrypoint: string, sourceDigest: str
     } else return;
     const close = braces.get(open);
     if (close === undefined) return;
-    if (scopes.length >= MAX_SCOPES) throw new Error(`source outline exceeds ${MAX_SCOPES} scopes`);
     const value: SourceScope = {
       id: stableId("scope", [sourceDigest, file.path, kind, symbol ?? "<entry>", String(token.offset)]),
       title: symbol ?? "Entry workflow",
@@ -276,7 +356,9 @@ function indexFile(file: FrozenSourceFile, entrypoint: string, sourceDigest: str
       kind,
       span: { path: file.path, start_line: token.line, end_line: tokens[close]!.endLine },
     };
-    scopes.push({ value, open, close });
+    const indexedScope = { value, open, close } as const;
+    budget.claim("scopes", projectedJsonBytes(indexedScope));
+    scopes.push(indexedScope);
   });
 
   const includes: Include[] = [];
@@ -303,25 +385,33 @@ function indexFile(file: FrozenSourceFile, entrypoint: string, sourceDigest: str
         alias = text(file.bytes, tokens[cursor + 2]!);
         cursor += 2;
       }
-      includes.push({ alias, symbol, ...(target ? { target } : {}) });
+      const include = { alias, symbol, ...(target ? { target } : {}) };
+      budget.claim("include_bindings", projectedJsonBytes(include));
+      includes.push(include);
       cursor += 1;
     }
   });
+  budget.reserveProjection(projectedJsonBytes({ path: file.path }), "indexed files");
   return { path: file.path, bytes: file.bytes, tokens, scopes, includes, parens };
 }
 
 export function indexNextflowSource(files: readonly FrozenSourceFile[], entrypoint: string, sourceDigest: string) {
   const paths = new Set(files.map((file) => file.path));
+  const budget = new SourceIndexBudget();
   const diagnostics: SourceDiagnostic[] = [];
+  const pushDiagnostic = (diagnostic: SourceDiagnostic) => {
+    budget.claim("diagnostics", projectedJsonBytes(diagnostic), "outline diagnostics");
+    diagnostics.push(diagnostic);
+  };
   const indexed: IndexedFile[] = [];
   for (const file of [...files].sort((left, right) => less(left.path, right.path))) {
     if (!file.path.endsWith(".nf")) continue;
     try {
       decoder.decode(file.bytes);
-      indexed.push(indexFile(file, entrypoint, sourceDigest, paths));
+      indexed.push(indexFile(file, entrypoint, sourceDigest, paths, budget));
     } catch (error) {
       if (error instanceof TypeError) {
-        diagnostics.push({ code: "non_utf8_nextflow_source", message: `${file.path} is retained exactly but cannot be indexed as UTF-8.` });
+        pushDiagnostic({ code: "non_utf8_nextflow_source", message: `${file.path} is retained exactly but cannot be indexed as UTF-8.` });
       } else throw error;
     }
   }
@@ -356,22 +446,23 @@ export function indexNextflowSource(files: readonly FrozenSourceFile[], entrypoi
       const close = file.parens.get(tokenIndex + 1) ?? tokenIndex + 1;
       const span = { path: file.path, start_line: token.line, end_line: file.tokens[close]?.endLine ?? token.endLine };
       const id = stableId("invocation", [sourceDigest, scope.value.id, name, String(token.offset)]);
-      if (!callee) diagnostics.push({
+      if (!callee) pushDiagnostic({
         code: "source_only_invocation",
         message: `${name} is retained as an exact source invocation; no local workflow or process declaration was resolved.`,
         span,
       });
-      if (invocations.length >= MAX_INVOCATIONS) throw new Error(`source outline exceeds ${MAX_INVOCATIONS} invocations`);
-      invocations.push({ id, caller: scope.value.id, name, ...(callee ? { callee } : {}), span });
+      const invocation = { id, caller: scope.value.id, name, ...(callee ? { callee } : {}), span };
+      budget.claim("invocations", projectedJsonBytes(invocation));
+      invocations.push(invocation);
     }
   }
   const scopes = indexed.flatMap((file) => file.scopes.map((scope) => scope.value));
   scopes.sort((left, right) => less(left.span.path, right.span.path) || left.span.start_line - right.span.start_line || less(left.id, right.id));
   invocations.sort((left, right) => less(left.span.path, right.span.path) || left.span.start_line - right.span.start_line || less(left.id, right.id));
+  if (!scopes.length) pushDiagnostic({ code: "source_outline_empty", message: "No Nextflow workflow or process declarations were indexed." });
   diagnostics.sort((left, right) => less(left.span?.path ?? "", right.span?.path ?? "")
     || (left.span?.start_line ?? 0) - (right.span?.start_line ?? 0)
     || less(left.code, right.code)
     || less(left.message, right.message));
-  if (!scopes.length) diagnostics.push({ code: "source_outline_empty", message: "No Nextflow workflow or process declarations were indexed." });
   return { scopes, invocations, diagnostics };
 }
