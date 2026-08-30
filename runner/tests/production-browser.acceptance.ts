@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { copyFile, mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -169,6 +169,58 @@ test("production Nextflow catalog selection resolves into visible editable nodes
   const nestedText = await nested.textContent();
   assert.match(nestedText ?? "", /FASTQC/i);
   assert.match(nestedText ?? "", /Source invocations · not data wires/);
+  assertNoPageErrors();
+});
+
+test("production project controls render a local Snakemake graph and explain a failed environment", { timeout: 60_000, skip: process.platform === "win32" }, async (context) => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "somite-browser-snakemake-"));
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  const broken = join(projectRoot, "broken");
+  const working = join(projectRoot, "working");
+  for (const project of [broken, working]) {
+    const bin = join(project, ".pixi", "envs", "default", "bin");
+    await mkdir(bin, { recursive: true });
+    await writeFile(join(project, "Snakefile"), "rule all:\n    input: 'prepared.txt'\n");
+    await writeFile(join(project, "pixi.lock"), "browser fixture\n");
+  }
+  const brokenPixi = join(broken, ".pixi", "envs", "default", "bin", "pixi");
+  await writeFile(brokenPixi, "#!/bin/sh\nprintf '%s\\n' 'fixture environment is incomplete; run pixi install' >&2\nexit 17\n");
+  await chmod(brokenPixi, 0o755);
+  const workingPixi = join(working, ".pixi", "envs", "default", "bin", "pixi");
+  await writeFile(workingPixi, [
+    "#!/bin/sh",
+    "test \"$1\" = run && test \"$2\" = snakemake && test \"$3\" = --snakefile || exit 64",
+    "printf '%s\\n' 'digraph snakemake_dag {' '0[label = \"prepare\"];' '1[label = \"all\"];' '0 -> 1' '}'",
+    "",
+  ].join("\n"));
+  await chmod(workingPixi, 0o755);
+
+  const app = await startProductionApp({ projectRoot });
+  context.after(app.stop);
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+  context.after(() => page.close());
+  const assertNoPageErrors = watchPage(page);
+  await emptyCatalogs(page, app);
+
+  await page.goto(app.webUrl);
+  await page.getByRole("textbox", { name: "Workflow name" }).waitFor();
+  await page.getByRole("button", { name: "Project", exact: true }).click();
+  const panel = page.locator("section[aria-label='Project']");
+  const path = panel.getByLabel("Local project folder or workflow file");
+  await path.fill("broken");
+  await panel.getByRole("button", { name: "Open project" }).click();
+  await panel.getByRole("alert").getByText(/Snakemake project could not be visualized:.*run pixi install/).waitFor();
+  assert.equal(await page.locator(".react-flow__node").count(), 0);
+
+  await path.fill("working");
+  await panel.getByRole("button", { name: "Open project" }).click();
+  await page.locator(".react-flow__node").nth(1).waitFor();
+  assert.equal(await page.locator(".react-flow__node").count(), 2);
+  assert.equal(await page.locator(".react-flow__edge").count(), 1);
+  await page.locator(".react-flow__node", { hasText: "prepare" }).waitFor();
+  await page.locator(".react-flow__node", { hasText: "all" }).waitFor();
+  assert.equal(await page.locator(".node-collapsed-body").count(), 2);
+  await page.locator(".status-copy").getByText(/Opened working · Snakemake rules/).waitFor();
   assertNoPageErrors();
 });
 
