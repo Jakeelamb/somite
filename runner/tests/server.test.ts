@@ -137,6 +137,52 @@ test("paper upload streams past the global JSON body limit into content-addresse
   }
 });
 
+test("runtime cleanup is explicit and preserves scientific run records", async () => {
+  const root = await mkdtemp(join(tmpdir(), "somite-runner-storage-"));
+  const run = join(root, ".somite", "runs", "run-finished");
+  await mkdir(join(run, "work"), { recursive: true });
+  await mkdir(join(run, "results"), { recursive: true });
+  await writeFile(join(run, "work", "recreatable.bin"), Buffer.alloc(1024));
+  await writeFile(join(run, "results", "scientific.txt"), "retain me\n");
+  await writeFile(join(run, "run-status.json"), `${JSON.stringify({
+    schema_version: 1,
+    run_id: "run-finished",
+    phase: "completed",
+    finished_at_unix_ms: 1,
+  })}\n`);
+  const running = await startServer({ projectRoot: root, port: await unusedPort() });
+  try {
+    const profileResponse = await fetch(`${running.url}/api/storage`);
+    assert.equal(profileResponse.status, 200);
+    const profile = await profileResponse.json() as { runs: { reclaimable_bytes: number; reclaimable_run_ids: string[] } };
+    assert.equal(profile.runs.reclaimable_bytes, 1024);
+    assert.deepEqual(profile.runs.reclaimable_run_ids, ["run-finished"]);
+
+    const cleanupBody = JSON.stringify({ run_ids: profile.runs.reclaimable_run_ids });
+    assert.equal((await fetch(`${running.url}/api/storage/dehydrate-runs`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: cleanupBody,
+    })).status, 403);
+    const cleanupResponse = await fetch(`${running.url}/api/storage/dehydrate-runs`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "http://localhost:3000" },
+      body: cleanupBody,
+    });
+    assert.equal(cleanupResponse.status, 200, await cleanupResponse.clone().text());
+    assert.equal((await cleanupResponse.json() as { reclaimed_bytes: number }).reclaimed_bytes, 1024);
+    await assert.rejects(readFile(join(run, "work", "recreatable.bin")), /ENOENT/);
+    assert.equal(await readFile(join(run, "results", "scientific.txt"), "utf8"), "retain me\n");
+
+    const refreshed = await fetch(`${running.url}/api/storage`).then((response) => response.json()) as { runs: { reclaimable_bytes: number; reclaimable_run_ids: string[] } };
+    assert.equal(refreshed.runs.reclaimable_bytes, 0);
+    assert.deepEqual(refreshed.runs.reclaimable_run_ids, []);
+  } finally {
+    await running.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("project startup rejects graph paths and state directories outside the canonical project", { skip: process.platform === "win32" }, async () => {
   const root = await mkdtemp(join(tmpdir(), "somite-runner-path-"));
   const outside = await mkdtemp(join(tmpdir(), "somite-runner-outside-"));

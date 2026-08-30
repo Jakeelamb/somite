@@ -40,6 +40,7 @@ import type {
   AgentSnapshot,
   ReadinessItem,
   ReadinessSnapshot,
+  RunStorageProfile,
   SomiteGraphNode,
   Operator,
   ParamSpec,
@@ -741,9 +742,29 @@ export function ProjectPanel({ projectName, graphPath, onImportProject, onClose 
   );
 }
 
-export function MachinePanel({ profile, onClose }: { profile: SystemProfile | null; onClose: () => void }) {
+export function MachinePanel({
+  profile,
+  storage,
+  storageLoading,
+  storageReclaiming,
+  storageError,
+  onRefreshStorage,
+  onReclaimRunWork,
+  onClose,
+}: {
+  profile: SystemProfile | null;
+  storage: RunStorageProfile | null;
+  storageLoading: boolean;
+  storageReclaiming: boolean;
+  storageError: string | null;
+  onRefreshStorage: () => Promise<void>;
+  onReclaimRunWork: () => Promise<void>;
+  onClose: () => void;
+}) {
   const memory = profile ? `${(profile.memory_bytes / 1024 ** 3).toFixed(1)} GiB` : "Detecting…";
   const paperReading = profile ? paperReadingPresentation(profile.paper_extraction) : null;
+  const [cleanupArmed, setCleanupArmed] = useState(false);
+  const reclaimable = storage?.runs.reclaimable_bytes ?? 0;
   return (
     <section className="floating-panel machine-window" aria-label="This Machine">
       <header className="floating-panel-head"><div><strong>This Machine</strong><span>Detected locally</span></div><button type="button" aria-label="Close Machine Profile" onClick={onClose}><X size={15} /></button></header>
@@ -782,6 +803,31 @@ export function MachinePanel({ profile, onClose }: { profile: SystemProfile | nu
             </article>)}
           </div>
         </details>}
+      </section>
+      <section className="machine-storage" aria-label="Local storage">
+        <header className="machine-storage-head">
+          <span><strong>Local storage</strong><small>Measured on this project</small></span>
+          {storageLoading ? <LoaderCircle className="spin" size={13} aria-label="Measuring storage" /> : <button type="button" onClick={() => { setCleanupArmed(false); void onRefreshStorage(); }} aria-label="Refresh storage profile">Refresh</button>}
+        </header>
+        {storage && <div className="machine-storage-grid">
+          <div><span>Finished run work</span><strong>{formatResourceBytes(reclaimable)}</strong><small>{storage.runs.reclaimable_run_ids.length} run{storage.runs.reclaimable_run_ids.length === 1 ? "" : "s"} reclaimable</small></div>
+          <div><span>Shared tool environments</span><strong>{formatResourceBytes(storage.shared_environments.bytes)}</strong><small>Reused across exact locks</small></div>
+          <div><span>Paper extraction cache</span><strong>{formatResourceBytes(storage.paper_cache.bytes)}</strong><small>Recreatable</small></div>
+          <div><span>Retained records</span><strong>{formatResourceBytes(storage.retained_scientific_state.bytes)}</strong><small>Results, logs, inputs, evidence</small></div>
+        </div>}
+        {!storage && storageLoading && <p className="machine-storage-loading"><LoaderCircle className="spin" size={13} aria-hidden="true" />Measuring run and cache storage…</p>}
+        {storage && storage.runs.uncertified_count > 0 && <p className="machine-storage-notice"><CircleAlert size={13} aria-hidden="true" /><span><strong>{storage.runs.uncertified_count} earlier run{storage.runs.uncertified_count === 1 ? "" : "s"} retained · {formatResourceBytes(storage.runs.uncertified_bytes)}</strong><small>These predate durable terminal markers, so Somite will not guess that their work is safe to remove.</small></span></p>}
+        {storageError && <p className="machine-storage-error" role="alert">{storageError}</p>}
+        <p className="machine-storage-policy">Cleanup removes only recreatable <code>work</code>, <code>.nextflow</code>, and run-local <code>.pixi</code> directories from terminal runs. Results, logs, locks, inputs, and validation evidence stay.</p>
+        <button type="button" className={cleanupArmed ? "machine-storage-action armed" : "machine-storage-action"} disabled={!storage || reclaimable === 0 || storageLoading || storageReclaiming} onClick={() => {
+          if (!cleanupArmed) {
+            setCleanupArmed(true);
+            return;
+          }
+          void onReclaimRunWork().finally(() => setCleanupArmed(false));
+        }}>
+          {storageReclaiming ? <><LoaderCircle className="spin" size={13} aria-hidden="true" />Reclaiming finished work…</> : cleanupArmed ? "Confirm reclaim" : reclaimable > 0 ? `Reclaim ${formatResourceBytes(reclaimable)}` : "No finished work to reclaim"}
+        </button>
       </section>
     </section>
   );

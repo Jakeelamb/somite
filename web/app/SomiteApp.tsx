@@ -115,6 +115,8 @@ import type {
   ReadinessSnapshot,
   RunNodeState,
   RunStartResponse,
+  RunStorageCleanup,
+  RunStorageProfile,
   RunStatusResponse,
   SystemProfile,
   UploadResult,
@@ -549,6 +551,10 @@ function neighborAlignment(node: SomiteFlowNode, nodes: SomiteFlowNode[]) {
 function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const [session, setSession] = useState<ProjectSession | null>(null);
   const [system, setSystem] = useState<SystemProfile | null>(null);
+  const [storage, setStorage] = useState<RunStorageProfile | null>(null);
+  const [storageLoading, setStorageLoading] = useState(false);
+  const [storageReclaiming, setStorageReclaiming] = useState(false);
+  const [storageError, setStorageError] = useState<string | null>(null);
   const [nodes, setNodes, onNodesChange] = useNodesState<SomiteFlowNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<SomiteFlowEdge>([]);
   const [flow, setFlow] = useState<ReactFlowInstance<SomiteFlowNode, SomiteFlowEdge> | null>(null);
@@ -1118,6 +1124,40 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const retryWorkflowCatalogs = useCallback(() => {
     if (!workflowCatalogLoadInFlightRef.current) setWorkflowCatalogState("idle");
   }, []);
+
+  const refreshStorage = useCallback(async () => {
+    setStorageLoading(true);
+    setStorageError(null);
+    try {
+      setStorage(await jsonRequest<RunStorageProfile>("/api/storage"));
+    } catch (error) {
+      setStorageError(errorMessage(error));
+    } finally {
+      setStorageLoading(false);
+    }
+  }, []);
+
+  const reclaimFinishedRunWork = useCallback(async () => {
+    const runIds = storage?.runs.reclaimable_run_ids ?? [];
+    if (runIds.length === 0 || storageReclaiming) return;
+    setStorageReclaiming(true);
+    setStorageError(null);
+    try {
+      const result = await jsonRequest<RunStorageCleanup>("/api/storage/dehydrate-runs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ run_ids: runIds }),
+      });
+      setStatus(`Reclaimed ${result.reclaimed_bytes.toLocaleString()} bytes of finished-run work · results and evidence retained`);
+      await refreshStorage();
+    } catch (error) {
+      const detail = errorMessage(error);
+      setStorageError(detail);
+      setStatus(`Run work was not reclaimed — ${detail}`);
+    } finally {
+      setStorageReclaiming(false);
+    }
+  }, [refreshStorage, storage?.runs.reclaimable_run_ids, storageReclaiming]);
 
   useEffect(() => {
     if (!flow || !session || nodes.length === 0 || initialViewportFitRef.current) return;
@@ -2787,7 +2827,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
 
         {selectedNode && selectedOperator && <div className="inspector-layer" onPointerDown={(event) => event.stopPropagation()}><InspectorPanel key={selectedNode.id} node={selectedNode.data.graphNode} selectedCount={selectedIds.length} operator={selectedOperator} hiddenViewerCount={selectedHiddenCount} setupCount={selectedNode.data.readinessItems.length} updateParam={updateParam} updateSourceBinding={updateSourceWorkflowBinding} browseSourceBinding={browseSourceWorkflowBinding} pendingSourceFile={pendingSourceFile?.nodeId === selectedNode.id ? pendingSourceFile : undefined} bindPendingSourceFile={bindPendingSourceFile} dismissPendingSourceFile={() => setPendingSourceFile(null)} beginParamEdit={beginParamEdit} browseParam={browseParam} rename={renameSelected} toggleViewers={toggleSelectedViewers} exploreSource={() => exploreSourceWorkflow(selectedNode.id)} close={() => { setSelectedIds([]); flow?.setNodes((current) => current.map((node) => ({ ...node, selected: false }))); }} /></div>}
 
-        {machineVisible && <div className="machine-layer" onPointerDown={(event) => event.stopPropagation()}><MachinePanel profile={system} onClose={() => setMachineVisible(false)} /></div>}
+        {machineVisible && <div className="machine-layer" onPointerDown={(event) => event.stopPropagation()}><MachinePanel profile={system} storage={storage} storageLoading={storageLoading} storageReclaiming={storageReclaiming} storageError={storageError} onRefreshStorage={refreshStorage} onReclaimRunWork={reclaimFinishedRunWork} onClose={() => setMachineVisible(false)} /></div>}
 
         {toolchainVisible && <div className="toolchain-layer" onPointerDown={(event) => event.stopPropagation()}><ToolchainPanel plan={exportPlan} pixiReady={system?.tools.pixi} loading={exportLoading} downloading={exportDownloading} onDownload={downloadBundle} onClose={() => setToolchainVisible(false)} /></div>}
 
@@ -2807,7 +2847,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
           {sourceNetworkView && nestedSourceNode?.data.graphNode.source_workflow
             ? <><span>{countFormatter.format(projectSourceNetwork(nestedSourceNode.data.graphNode.source_workflow, sourceNetworkView.path).cards.length)} source calls</span><span>1 visible layer</span></>
             : <><span>{countFormatter.format(nodes.length)} nodes</span><span>{countFormatter.format(edges.length)} wires</span></>}
-          <button type="button" className={machineVisible ? "active" : ""} onClick={(event) => { event.stopPropagation(); setToolchainVisible(false); setProjectVisible(false); setMachineVisible((visible) => !visible); }}><Cpu size={12} aria-hidden="true" />Machine</button>
+          <button type="button" className={machineVisible ? "active" : ""} onClick={(event) => { event.stopPropagation(); setToolchainVisible(false); setProjectVisible(false); const opening = !machineVisible; setMachineVisible(opening); if (opening) void refreshStorage(); }}><Cpu size={12} aria-hidden="true" />Machine</button>
           {!sourceNetworkView && <div className="zoom-cluster">
             <button type="button" aria-label="Zoom Out" onClick={() => void flow?.zoomOut({ duration: 120 })}><Minus size={13} /></button>
             <button type="button" aria-label="Reset Zoom to 100%" onClick={() => void flow?.zoomTo(1, { duration: 160 })}>{Math.round(zoom * 100)}%</button>

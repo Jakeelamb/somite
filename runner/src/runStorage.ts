@@ -24,6 +24,9 @@ export type RunStorageProfile = Readonly<{
     terminal_count: number;
     bytes: number;
     reclaimable_bytes: number;
+    reclaimable_run_ids: string[];
+    uncertified_count: number;
+    uncertified_bytes: number;
   };
   shared_environments: { bytes: number; recreatable: true };
   paper_cache: { bytes: number; recreatable: true };
@@ -43,7 +46,11 @@ function status(value: unknown, expectedRunId: string): TerminalStatus {
 async function readTerminalStatus(directory: string, runId: string) {
   const path = join(directory, "run-status.json");
   if (!await pathExists(path)) return undefined;
-  return status(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(await regularFile(path, MAX_STATUS_BYTES, `run ${runId} status`))), runId);
+  try {
+    return status(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(await regularFile(path, MAX_STATUS_BYTES, `run ${runId} status`))), runId);
+  } catch {
+    throw new Error(`run ${runId} has invalid terminal status`);
+  }
 }
 
 async function treeBytes(root: string) {
@@ -77,6 +84,27 @@ async function regularChildren(root: string) {
   return children;
 }
 
+async function runProfile(run: { name: string; path: string }, activeRunIds: ReadonlySet<string>) {
+  let terminalStatus: TerminalStatus | undefined;
+  try {
+    terminalStatus = await readTerminalStatus(run.path, run.name);
+  } catch {
+    // Malformed status is retained and never considered safe to reclaim.
+  }
+  const reclaimable = Boolean(terminalStatus) && !activeRunIds.has(run.name);
+  let bytes = 0;
+  let reclaimableBytes = 0;
+  await Promise.all((await readdir(run.path)).map(async (name) => {
+    const path = join(run.path, name);
+    const size = await treeBytes(path);
+    bytes += size;
+    if (!reclaimable || !reclaimableNames.includes(name as typeof reclaimableNames[number])) return;
+    const metadata = await lstat(path);
+    if (!metadata.isSymbolicLink() && metadata.isDirectory()) reclaimableBytes += size;
+  }));
+  return { bytes, reclaimableBytes, terminal: Boolean(terminalStatus) };
+}
+
 export class RunStorage {
   readonly #root: string;
 
@@ -90,23 +118,23 @@ export class RunStorage {
     let runBytes = 0;
     let reclaimableBytes = 0;
     let terminalCount = 0;
+    let uncertifiedCount = 0;
+    let uncertifiedBytes = 0;
+    const reclaimableRunIds: string[] = [];
     const runs = await regularChildren(runsRoot);
-    for (const run of runs) {
-      runBytes += await treeBytes(run.path);
-      let terminalStatus: TerminalStatus | undefined;
-      try {
-        terminalStatus = await readTerminalStatus(run.path, run.name);
-      } catch {
-        // Malformed status is retained and never considered safe to reclaim.
+    const profiles = await Promise.all(runs.map((run) => runProfile(run, activeRunIds)));
+    for (let index = 0; index < runs.length; index += 1) {
+      const profile = profiles[index]!;
+      runBytes += profile.bytes;
+      reclaimableBytes += profile.reclaimableBytes;
+      if (profile.terminal) terminalCount += 1;
+      else {
+        uncertifiedCount += 1;
+        uncertifiedBytes += profile.bytes;
       }
-      if (!terminalStatus) continue;
-      terminalCount += 1;
-      if (activeRunIds.has(run.name)) continue;
-      for (const name of reclaimableNames) reclaimableBytes += await treeBytes(join(run.path, name));
+      if (profile.reclaimableBytes > 0) reclaimableRunIds.push(runs[index]!.name);
     }
 
-    const environments = await treeBytes(join(state, "pixi", "environments"));
-    const paperCache = await treeBytes(join(state, "papers", "cache"));
     const retainedPaths = [
       "uploads",
       "papers/objects",
@@ -119,12 +147,24 @@ export class RunStorage {
       "catalog",
       "agent-transcripts",
     ];
-    let retained = Math.max(0, runBytes - reclaimableBytes);
-    for (const path of retainedPaths) retained += await treeBytes(join(state, path));
+    const [environments, paperCache, ...retainedSizes] = await Promise.all([
+      treeBytes(join(state, "pixi", "environments")),
+      treeBytes(join(state, "papers", "cache")),
+      ...retainedPaths.map((path) => treeBytes(join(state, path))),
+    ]);
+    const retained = Math.max(0, runBytes - reclaimableBytes) + retainedSizes.reduce((total, size) => total + size, 0);
     return {
       schema_version: 1,
       generated_at_unix_ms: Date.now(),
-      runs: { count: runs.length, terminal_count: terminalCount, bytes: runBytes, reclaimable_bytes: reclaimableBytes },
+      runs: {
+        count: runs.length,
+        terminal_count: terminalCount,
+        bytes: runBytes,
+        reclaimable_bytes: reclaimableBytes,
+        reclaimable_run_ids: reclaimableRunIds,
+        uncertified_count: uncertifiedCount,
+        uncertified_bytes: uncertifiedBytes,
+      },
       shared_environments: { bytes: environments, recreatable: true },
       paper_cache: { bytes: paperCache, recreatable: true },
       retained_scientific_state: { bytes: retained },
@@ -136,7 +176,7 @@ export class RunStorage {
       throw new Error("run cleanup requires 1 to 256 unique run ids");
     }
     const runsRoot = join(this.#root, ".somite", "runs");
-    let reclaimedBytes = 0;
+    const targets: Array<{ runId: string; path: string; bytes: number }> = [];
     for (const runId of runIds) {
       if (!RUN_ID.test(runId)) throw new Error(`invalid run id ${runId}`);
       if (activeRunIds.has(runId)) throw new Error(`run ${runId} is still active`);
@@ -148,9 +188,15 @@ export class RunStorage {
         if (!await pathExists(path)) continue;
         const metadata = await lstat(path);
         if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new Error(`run ${runId} ${name} is not a regular directory`);
-        reclaimedBytes += await treeBytes(path);
-        await rm(path, { recursive: true });
+        targets.push({ runId, path, bytes: await treeBytes(path) });
       }
+    }
+    let reclaimedBytes = 0;
+    for (const target of targets) {
+      const metadata = await lstat(target.path);
+      if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new Error(`run ${target.runId} cleanup target changed during preflight`);
+      await rm(target.path, { recursive: true });
+      reclaimedBytes += target.bytes;
     }
     return { run_ids: [...runIds], reclaimed_bytes: reclaimedBytes };
   }

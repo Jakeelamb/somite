@@ -38,6 +38,7 @@ test("run storage profiles reclaimable bytes without treating scientific records
     assert.equal(profile.runs.count, 2);
     assert.equal(profile.runs.terminal_count, 2);
     assert.equal(profile.runs.reclaimable_bytes, 384);
+    assert.deepEqual(profile.runs.reclaimable_run_ids, ["run-complete"]);
     assert.equal(profile.shared_environments.bytes, 512);
     assert.ok(profile.retained_scientific_state.bytes >= Buffer.byteLength("retain me\nretain log\nretain lock\n"));
 
@@ -62,6 +63,9 @@ test("run storage refuses cleanup without a valid terminal marker", async () => 
     await mkdir(join(directory, "work"), { recursive: true });
     await writeFile(join(directory, "work", "preserve.bin"), Buffer.alloc(16));
     const storage = new RunStorage(root);
+    const profile = await storage.profile();
+    assert.equal(profile.runs.uncertified_count, 1);
+    assert.ok(profile.runs.uncertified_bytes >= 16);
     await assert.rejects(storage.dehydrateRuns(["run-unknown"]), /no valid terminal status/);
     assert.equal((await readFile(join(directory, "work", "preserve.bin"))).byteLength, 16);
   } finally {
@@ -82,6 +86,21 @@ test("run storage refuses symlinked reclaimable paths", async () => {
 
     await assert.rejects(storage.dehydrateRuns(["run-symlink"]), /not a regular directory/);
     assert.equal((await readFile(join(outside, "preserve.bin"))).byteLength, 32);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("run cleanup preflights every target before deleting any work", async () => {
+  const root = await mkdtemp(join(tmpdir(), "somite-run-storage-preflight-"));
+  try {
+    const valid = await terminalRun(root, "run-valid");
+    const invalid = await terminalRun(root, "run-invalid");
+    await writeFile(join(invalid, "run-status.json"), "{broken\n");
+    const storage = new RunStorage(root);
+
+    await assert.rejects(storage.dehydrateRuns(["run-valid", "run-invalid"]), /invalid terminal status/);
+    assert.equal((await readFile(join(valid, "work", "temporary.bin"))).byteLength, 128);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

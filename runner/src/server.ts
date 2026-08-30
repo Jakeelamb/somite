@@ -832,6 +832,20 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     return json(await state.runs.evidence(subject));
   }
   if (request.method === "GET" && url.pathname === "/api/system") return json(await systemProfile(state));
+  if (request.method === "GET" && url.pathname === "/api/storage") return json(await state.runs.storage());
+  if (request.method === "POST" && url.pathname === "/api/storage/dehydrate-runs") {
+    const body = object(await requestJson(request), "run cleanup request");
+    knownFields(body, "run cleanup request", ["run_ids"]);
+    if (!Array.isArray(body.run_ids) || body.run_ids.length < 1 || body.run_ids.length > 256
+      || body.run_ids.some((runId) => typeof runId !== "string")) {
+      throw new HttpError(400, "run_ids must contain between 1 and 256 run identifiers");
+    }
+    try {
+      return json(await state.runs.dehydrateRuns(body.run_ids as string[]));
+    } catch (error) {
+      throw new HttpError(409, error instanceof Error ? error.message : String(error));
+    }
+  }
   if (request.method === "GET" && url.pathname === "/api/catalog/nfcore") {
     try {
       return json(await state.nfcore.catalog());

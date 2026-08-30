@@ -342,7 +342,7 @@ button:disabled { cursor: default; opacity: .42; }
 .library-window { width: min(332px, calc(100vw - 92px)); height: min(700px, 100%); }
 .project-window { width: min(350px, calc(100vw - 92px)); }
 .inspector-window { width: min(326px, calc(100vw - 32px)); height: min(620px, 100%); }
-.machine-window { width: min(360px, calc(100vw - 28px)); }
+.machine-window { width: min(360px, calc(100vw - 28px)); max-height: calc(100vh - 82px); overflow-y: auto; }
 .toolchain-window { width: min(410px, calc(100vw - 32px)); height: min(720px, 100%); }
 .paper-window { position: relative; width: min(420px, calc(100vw - 92px)); height: min(760px, 100%); transition: border-color .12s ease, box-shadow .12s ease; }
 .paper-window.drop-ready { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent), var(--shadow); }
@@ -860,6 +860,31 @@ button:disabled { cursor: default; opacity: .42; }
 .paper-reading-tools article header span { color: var(--muted); font-size: 10px; line-height: 1.3; text-align: right; }
 .paper-reading-tools article p { margin: 5px 0 0; color: var(--text); font-size: 10px; line-height: 1.45; }
 .paper-reading-tools article > small { margin-top: 5px; display: block; overflow: hidden; color: var(--muted); font: 10px/1.3 var(--font-readout), monospace; text-overflow: ellipsis; white-space: nowrap; }
+.machine-storage { padding: 10px; display: grid; gap: 8px; border-top: 1px solid var(--border); }
+.machine-storage-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.machine-storage-head strong, .machine-storage-head small { display: block; }
+.machine-storage-head strong { font-size: 12px; }
+.machine-storage-head small { margin-top: 3px; color: var(--muted); font-size: 10px; }
+.machine-storage-head > svg { color: var(--accent); }
+.machine-storage-head button { padding: 3px 6px; border: 1px solid var(--border); border-radius: 5px; background: var(--control); color: var(--muted); font-size: 9px; cursor: pointer; }
+.machine-storage-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+.machine-storage-grid > div { min-width: 0; padding: 7px; border: 1px solid var(--border); border-radius: 6px; background: var(--control); }
+.machine-storage-grid span, .machine-storage-grid strong, .machine-storage-grid small { display: block; }
+.machine-storage-grid span { color: var(--muted); font-size: 8px; }
+.machine-storage-grid strong { margin-top: 4px; color: var(--text); font: 10px var(--font-readout), monospace; }
+.machine-storage-grid small { margin-top: 3px; color: var(--muted); font-size: 7px; line-height: 1.35; }
+.machine-storage-loading { min-height: 54px; margin: 0; display: flex; align-items: center; justify-content: center; gap: 7px; color: var(--muted); font-size: 9px; }
+.machine-storage-notice { margin: 0; padding: 7px; display: grid; grid-template-columns: 13px minmax(0, 1fr); gap: 6px; border-left: 2px solid var(--warning); background: color-mix(in srgb, var(--warning) 7%, transparent); }
+.machine-storage-notice > svg { margin-top: 1px; color: var(--warning); }
+.machine-storage-notice strong, .machine-storage-notice small { display: block; }
+.machine-storage-notice strong { color: var(--text); font-size: 8px; }
+.machine-storage-notice small { margin-top: 3px; color: var(--muted); font-size: 7px; line-height: 1.4; }
+.machine-storage-error { margin: 0; padding: 7px; border-left: 2px solid var(--danger); background: color-mix(in srgb, var(--danger) 7%, transparent); color: var(--text); font-size: 8px; line-height: 1.4; }
+.machine-storage-policy { margin: 0; color: var(--muted); font-size: 8px; line-height: 1.45; }
+.machine-storage-policy code { color: var(--text); font: 8px var(--font-readout), monospace; }
+.machine-storage-action { min-height: 32px; border: 1px solid var(--border); border-radius: 6px; background: var(--control); color: var(--text); font-size: 9px; font-weight: 700; cursor: pointer; }
+.machine-storage-action.armed { border-color: color-mix(in srgb, var(--warning) 55%, var(--border)); background: color-mix(in srgb, var(--warning) 9%, var(--control)); color: var(--warning); }
+.machine-storage-action:disabled { cursor: default; opacity: .5; }
 
 .toolchain-intro { padding: 13px; display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 9px; align-items: center; border-bottom: 1px solid var(--border); }
 .toolchain-intro strong, .toolchain-intro small { display: block; }

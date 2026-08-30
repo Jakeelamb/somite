@@ -368,3 +368,25 @@ export type SystemProfile = {
   };
   paper_extraction: PaperExtractionPreflight;
 };
+
+export type RunStorageProfile = {
+  schema_version: 1;
+  generated_at_unix_ms: number;
+  runs: {
+    count: number;
+    terminal_count: number;
+    bytes: number;
+    reclaimable_bytes: number;
+    reclaimable_run_ids: string[];
+    uncertified_count: number;
+    uncertified_bytes: number;
+  };
+  shared_environments: { bytes: number; recreatable: true };
+  paper_cache: { bytes: number; recreatable: true };
+  retained_scientific_state: { bytes: number };
+};
+
+export type RunStorageCleanup = {
+  run_ids: string[];
+  reclaimed_bytes: number;
+};
