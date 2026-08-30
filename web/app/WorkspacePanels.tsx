@@ -317,7 +317,7 @@ export function ReadinessPanel({ snapshot, evidence, validationCapability, onRes
   snapshot: ReadinessSnapshot;
   evidence: ValidationEvidenceResponse | null;
   validationCapability: RepresentativeValidationCapability;
-  onResolve: (item: ReadinessItem) => void;
+  onResolve: (item: ReadinessItem, resolution?: ReadinessItem["resolutions"][number]) => void;
   onFocus: (item: ReadinessItem) => void;
   onAttachFile: (item: ReadinessItem, field: string, file: File) => Promise<void>;
   onAskAssistant: (item: ReadinessItem) => void;
@@ -368,6 +368,7 @@ export function ReadinessPanel({ snapshot, evidence, validationCapability, onRes
                   <p>{resolution.detail}</p>
                   {(download || stored) && <small>{download && `${download} download`}{download && stored && " · "}{stored && `${stored} stored`}</small>}
                   {resolution.scientific_effect && <p className="scientific-effect">{resolution.scientific_effect}</p>}
+                  <button type="button" onClick={() => onResolve(current, resolution)}>{resolution.kind === "use_existing" ? "Choose existing" : "View guidance"}</button>
                 </div>;
               })}
             </div>}
@@ -379,7 +380,7 @@ export function ReadinessPanel({ snapshot, evidence, validationCapability, onRes
             </details>)}
             <div className="requirement-actions">
               {sourceBlocker && <small>This is an explicit source limitation, not an action Somite can complete silently.</small>}
-              {!sourceBlocker && !current.fields.some((field) => field.input_mode === "file") && <button type="button" onClick={() => onResolve(current)}>{current.resolutions[0]?.label ?? (current.kind === "parameter" ? "Configure" : current.kind === "managed_resource" ? "Connect existing" : "Connect input")}</button>}
+              {!sourceBlocker && current.kind !== "managed_resource" && !current.fields.some((field) => field.input_mode === "file") && <button type="button" onClick={() => onResolve(current)}>{current.resolutions[0]?.label ?? (current.kind === "parameter" ? "Configure" : "Connect input")}</button>}
               {current.escalatable && <button type="button" className="secondary" onClick={() => onAskAssistant(current)}><MessageSquare size={12} />Ask Agent</button>}
             </div>
           </article>
@@ -415,6 +416,10 @@ function isSource(operator: Operator) {
   );
 }
 
+function visibleSpecializedInput(operator: Operator) {
+  return operator.id === "files.import_kraken2_database";
+}
+
 function sectionTitle(operator: Operator) {
   if (isSource(operator)) return "Data & Inputs";
   if (operator.id.startsWith("nf.")) return "Nextflow Workflows";
@@ -441,7 +446,7 @@ function buildSections(
   continuation?: PendingConnection | null,
 ): LibrarySection[] {
   const normalized = query.trim().toLowerCase();
-  const matches = operators.filter((operator) => !isSource(operator)).filter((operator) => operator.kind !== "source" && !opaqueNfcoreFallback(operator)).filter((operator) => {
+  const matches = operators.filter((operator) => !isSource(operator) || visibleSpecializedInput(operator)).filter((operator) => operator.kind !== "source" && !opaqueNfcoreFallback(operator)).filter((operator) => {
     if (continuation && !operatorContinues(operator, continuation)) return false;
     if (normalized) {
       return `${operator.title} ${operator.id} ${operator.palette.join(" ")} ${operator.description ?? ""} ${(operator.topics ?? []).join(" ")}`
@@ -1483,6 +1488,7 @@ function OperatorInspectorPanel({
 }
 
 function isFileParameter(operator: string, key: string) {
+  if (operator === "files.import_kraken2_database") return false;
   return ((operator.startsWith("files.import") || operator.startsWith("manual.")) && (key === "path" || key.endsWith("_path")))
     || (operator === "files.import_paired" && (key === "r1" || key === "r2"));
 }
@@ -1513,6 +1519,7 @@ function ParameterControl({ node, name, spec, value, update, beginEdit, browse }
           event.target.value = "";
         }} /></label>}
       </div>
+      {node.operator === "files.import_kraken2_database" && name === "path" && <small className="parameter-help">Enter an existing local or mounted Kraken2 database directory. Somite keeps the database in place and verifies its contract before execution.</small>}
     </div>
   );
 }

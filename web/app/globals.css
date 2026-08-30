@@ -400,6 +400,8 @@ button:disabled { cursor: default; opacity: .42; }
 .resolution-list p { margin: 4px 0 0; color: var(--muted); font-size: 7px; line-height: 1.4; }
 .resolution-list small { display: block; margin-top: 5px; color: var(--text); font: 7px var(--font-readout), monospace; }
 .resolution-list .scientific-effect { color: color-mix(in srgb, var(--text) 76%, var(--muted)); }
+.resolution-list > div > button { width: 100%; min-height: 25px; margin-top: 7px; border: 1px solid var(--border-strong); border-radius: 5px; background: var(--control); color: var(--text); font-size: 8px; font-weight: 700; cursor: pointer; }
+.resolution-list > div > button:hover { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--control)); }
 .resolution-links { margin: 0 9px 8px; display: flex; gap: 6px; }
 .resolution-links a { display: inline-flex; align-items: center; gap: 4px; color: var(--accent); font: 8px var(--font-readout), monospace; text-decoration: none; }
 .requirement-actions { min-height: 36px; padding: 6px 9px 8px; display: flex; gap: 6px; border-top: 1px solid var(--border); }
@@ -709,6 +711,7 @@ button:disabled { cursor: default; opacity: .42; }
 .parameter-input-wrap > input { width: 100%; min-width: 0; height: 32px; padding: 0 8px; border: 1px solid var(--border); border-radius: 5px; outline: 2px solid transparent; background: var(--control); color: var(--text); font: 9px var(--font-readout), monospace; }
 .parameter-input-wrap > input:focus-visible { border-color: var(--accent); outline-color: transparent; }
 .parameter-input-wrap:has(.browse-button) > input { border-radius: 5px 0 0 5px; }
+.parameter-help { display: block; margin-top: 5px; color: var(--muted); font-size: 8px; line-height: 1.45; }
 .browse-button { height: 32px; padding: 0 8px; display: flex; align-items: center; gap: 5px; border: 1px solid var(--border); border-left: 0; border-radius: 0 5px 5px 0; background: var(--surface-raised); color: var(--muted); font-size: 8px; cursor: pointer; }
 .browse-button:hover { background: var(--surface-hover); color: var(--text); }
 .browse-button input { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }

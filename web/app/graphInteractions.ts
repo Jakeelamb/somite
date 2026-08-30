@@ -4,6 +4,8 @@ export type PendingConnection = {
   nodeId: string;
   port: SomitePort;
   position: { x: number; y: number };
+  /** Scientific resource contract required or provided by this endpoint. */
+  resourceProfile?: string;
 };
 
 const IMPORTED_COLUMN_PITCH = 360;
@@ -49,17 +51,23 @@ export function nextContinuationPosition(origin: { x: number; y: number }, direc
   return { x, y: origin.y + 540 };
 }
 
-function accepts(source: Pick<SomitePort, "ty"> | Pick<PortSpec, "type">, target: Pick<SomitePort, "ty" | "union"> | Pick<PortSpec, "type" | "union">) {
+function accepts(
+  source: Pick<SomitePort, "ty"> | Pick<PortSpec, "type">,
+  target: Pick<SomitePort, "ty" | "union"> | Pick<PortSpec, "type" | "union">,
+  providedProfile?: string,
+  requiredProfile?: string,
+) {
   const sourceType = "ty" in source ? source.ty : source.type;
   const targetType = "ty" in target ? target.ty : target.type;
-  return sourceType === targetType || target.union?.includes(sourceType) === true;
+  const physicalTypeMatches = sourceType === targetType || target.union?.includes(sourceType) === true;
+  return physicalTypeMatches && (!requiredProfile || providedProfile === requiredProfile);
 }
 
 export function compatibleOperatorPorts(operator: Operator, pending: PendingConnection): PortSpec[] {
   const candidates = pending.port.dir === "out" ? operator.ports.in : operator.ports.out;
   return candidates.filter((candidate) => pending.port.dir === "out"
-    ? accepts(pending.port, candidate)
-    : accepts(candidate, pending.port));
+    ? accepts(pending.port, candidate, pending.resourceProfile, candidate.resource?.profile)
+    : accepts(candidate, pending.port, candidate.resource_profile, pending.resourceProfile));
 }
 
 export function operatorContinues(operator: Operator, pending: PendingConnection) {

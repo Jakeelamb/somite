@@ -338,10 +338,10 @@ function stringParam(node: SomiteGraphNode, key: string) {
 
 function NodeViewer({ node, title }: { node: SomiteGraphNode; title: string }) {
   const operator = node.operator;
-  if (operator === "files.import" || operator === "files.import_directory") {
+  if (operator === "files.import" || operator === "files.import_directory" || operator === "files.import_kraken2_database") {
     const path = stringParam(node, "path");
     const filename = path.split(/[\\/]/).at(-1) || "Choose a file";
-    return <div className="viewer-file"><strong>{filename}</strong><span>{path ? "local source" : "file input"}</span><div className="sequence-strip" aria-hidden="true"><i>A</i><i>C</i><i>G</i><i>T</i><i>G</i><i>A</i><i>C</i><i>T</i></div></div>;
+    return <div className="viewer-file"><strong>{filename}</strong><span>{operator === "files.import_kraken2_database" ? "Kraken2 database directory" : path ? "local source" : "file input"}</span><div className="sequence-strip" aria-hidden="true"><i>A</i><i>C</i><i>G</i><i>T</i><i>G</i><i>A</i><i>C</i><i>T</i></div></div>;
   }
   if (operator === "files.import_paired") {
     return <div className="viewer-paired"><strong>R1 + R2</strong><span>{stringParam(node, "r1").split(/[\\/]/).at(-1) || "forward reads"}</span><span>{stringParam(node, "r2").split(/[\\/]/).at(-1) || "reverse reads"}</span><div aria-hidden="true"><i /><i /></div></div>;
@@ -1434,7 +1434,11 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     const node = nodes.find((candidate) => candidate.id === nodeId);
     if (!node) return;
     const position = nextContinuationPosition(node.position, port.dir, nodes.map((candidate) => candidate.position));
-    setPendingConnection({ nodeId, port, position });
+    const operator = operatorMap.get(node.data.graphNode.operator);
+    const contract = port.dir === "in"
+      ? operator?.ports.in.find((candidate) => candidate.name === port.name)?.resource?.profile
+      : operator?.ports.out.find((candidate) => candidate.name === port.name)?.resource_profile;
+    setPendingConnection({ nodeId, port, position, ...(contract ? { resourceProfile: contract } : {}) });
     setPendingAddPosition(position);
     setQuery("");
     setProjectVisible(false);
@@ -1442,7 +1446,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     setLibraryVisible(true);
     setStatus(`Choose a tool for ${nodeId}.${port.name} · ${port.ty}`);
     window.setTimeout(() => searchInputRef.current?.focus(), 0);
-  }, [edges, nodes]);
+  }, [edges, nodes, operatorMap]);
 
   const focusRequirement = useCallback((item: ReadinessItem) => {
     const node = nodes.find((candidate) => candidate.id === item.node_id);
@@ -1453,7 +1457,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     setStatus(`${item.title} · ${item.node_id}.${item.field}`);
   }, [flow, nodes, setNodes, zoom]);
 
-  const resolveRequirement = useCallback((item: ReadinessItem) => {
+  const resolveRequirement = useCallback((item: ReadinessItem, resolution?: ReadinessItem["resolutions"][number]) => {
     focusRequirement(item);
     const sourceNode = graphSnapshotRef.current.nodes.find((candidate) => candidate.id === item.node_id && candidate.source_workflow);
     if (sourceNode) {
@@ -1474,10 +1478,47 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     }
     const node = nodes.find((candidate) => candidate.id === item.node_id);
     const port = node?.data.graphNode.ports.find((candidate) => candidate.dir === "in" && candidate.name === item.field);
-    if (!port) return;
+    if (!node || !port) return;
+    if (item.kind === "managed_resource" && resolution && resolution.kind !== "use_existing") {
+      setStatus(`${resolution.label} is guidance only · Somite will not silently download or build a scientific database. Connect a reviewed existing database or ask Agent for setup help.`);
+      return;
+    }
+    if (item.resource_profile === "kraken2-database" && (!resolution || resolution.kind === "use_existing")) {
+      const databaseOperator = operatorMap.get("files.import_kraken2_database");
+      if (!databaseOperator) {
+        setStatus("The reviewed Kraken2 database input is unavailable from this operator catalog");
+        return;
+      }
+      const position = nextContinuationPosition(node.position, "in", nodes.map((candidate) => candidate.position));
+      const id = nextNodeId(databaseOperator, nodes);
+      const graphNode = makeGraphNode(databaseOperator, id, position, { path: "" });
+      const pending: PendingConnection = {
+        nodeId: item.node_id,
+        port,
+        position,
+        resourceProfile: item.resource_profile,
+      };
+      const connected = continuationEdge(databaseOperator, graphNode, pending);
+      if (!connected) {
+        setStatus("The reviewed Kraken2 database contract cannot connect to this requirement");
+        return;
+      }
+      remember();
+      const graphNodes = [...nodes.map((candidate) => candidate.data.graphNode), graphNode];
+      setNodes((current) => [
+        ...current.map((candidate) => ({ ...candidate, selected: false })),
+        { ...flowNode(graphNode, operatorMap), selected: true },
+      ]);
+      setEdges((current) => [...current, flowEdge(connected, graphNodes)]);
+      setSelectedIds([id]);
+      setReadinessVisible(false);
+      setDirty(true);
+      setStatus("Kraken2 database connected · enter the existing database directory path in the inspector");
+      return;
+    }
     setReadinessVisible(false);
     openContinuation(item.node_id, port);
-  }, [exploreSourceWorkflow, focusRequirement, nodes, openContinuation]);
+  }, [exploreSourceWorkflow, focusRequirement, nodes, openContinuation, operatorMap, remember, setEdges, setNodes]);
 
   const askAssistantAboutRequirement = useCallback((item: ReadinessItem) => {
     focusRequirement(item);

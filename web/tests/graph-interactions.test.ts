@@ -61,6 +61,39 @@ test("incompatible types never enter continuation results", () => {
   assert.equal(continuationEdge(fastp, node, pending), null);
 });
 
+test("managed-resource continuation requires the reviewed scientific profile", () => {
+  const pending: PendingConnection = {
+    nodeId: "kraken",
+    port: { name: "db", dir: "in", ty: "Directory" },
+    position: { x: 0, y: 0 },
+    resourceProfile: "kraken2-database",
+  };
+  const genericDirectory: Operator = {
+    ...fastp,
+    id: "files.import_directory",
+    ports: { in: [], out: [{ name: "directory", type: "Directory" }] },
+  };
+  const krakenDatabase: Operator = {
+    ...genericDirectory,
+    id: "files.import_kraken2_database",
+    ports: { in: [], out: [{ name: "database", type: "Directory", resource_profile: "kraken2-database" }] },
+  };
+  assert.equal(operatorContinues(genericDirectory, pending), false);
+  assert.equal(operatorContinues(krakenDatabase, pending), true);
+
+  const genericConsumer: Operator = {
+    ...fastp,
+    id: "utility.directory",
+    ports: { in: [{ name: "directory", type: "Directory" }], out: [] },
+  };
+  assert.equal(operatorContinues(genericConsumer, {
+    nodeId: "database",
+    port: { name: "database", dir: "out", ty: "Directory" },
+    position: { x: 0, y: 0 },
+    resourceProfile: "kraken2-database",
+  }), true, "a profiled directory remains usable by a generic directory consumer");
+});
+
 test("one-click continuation chooses the next clear vertical lane", () => {
   assert.deepEqual(nextContinuationPosition({ x: 100, y: 100 }, "out", [{ x: 340, y: 100 }]), { x: 340, y: 280 });
   assert.deepEqual(nextContinuationPosition({ x: 340, y: 100 }, "in", []), { x: 100, y: 100 });
