@@ -13,7 +13,8 @@
   ],
   "scripts": {
     "app": "npm start",
-    "build": "npm run build --workspace=somite-web",
+    "build": "npm run build --workspace=somite-web && npm run check:size",
+    "check:size": "node --experimental-strip-types scripts/check-release-size.ts",
     "check:version": "node --experimental-strip-types scripts/check-version-contract.ts",
     "check": "npm run typecheck && npm run lint && npm test",
     "dev": "node --experimental-strip-types scripts/somite-web.ts",
@@ -25,7 +26,7 @@
     "smoke:release": "npm run smoke:execution && npm run smoke:browser:execution",
     "start": "node --experimental-strip-types scripts/somite-web.ts --production",
     "start:runner": "npm run start --workspace=somite-runner",
-    "test": "npm run check:version && npm run test --workspace=@somite/workflow && npm run test --workspace=somite-runner && npm run test --workspace=somite-web",
+    "test": "npm run check:version && npm run test --workspace=@somite/workflow && npm run test --workspace=somite-runner && npm run test --workspace=somite-web && npm run check:size",
     "typecheck": "tsc --noEmit -p tsconfig.json && npm run typecheck --workspaces --if-present"
   },
   "devDependencies": {
