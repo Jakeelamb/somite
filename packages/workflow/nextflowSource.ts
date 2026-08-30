@@ -29,15 +29,29 @@ const decoder = new TextDecoder("utf-8", { fatal: true });
 const MAX_FILES = 20_000;
 const MAX_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_SOURCE_BYTES = 512 * 1024 * 1024;
+export const MAX_DERIVED_PROJECTION_BYTES = 32 * 1024 * 1024;
 const SOURCE_INDEX_LIMITS = {
   tokens: 1_000_000,
   scopes: 25_000,
   include_bindings: 50_000,
   invocations: 50_000,
   diagnostics: 25_000,
-  derived_projection_bytes: 32 * 1024 * 1024,
+  derived_projection_bytes: MAX_DERIVED_PROJECTION_BYTES,
   identifier_bytes: 1024,
 } as const;
+
+export class DerivedProjectionBudget {
+  #used = 0;
+
+  reserve(bytes: number): "accepted" | "limit" | "overflow" {
+    if (!Number.isSafeInteger(bytes) || bytes < 0) return "overflow";
+    const next = this.#used + bytes;
+    if (!Number.isSafeInteger(next)) return "overflow";
+    if (next > MAX_DERIVED_PROJECTION_BYTES) return "limit";
+    this.#used = next;
+    return "accepted";
+  }
+}
 
 type SourceIndexCardinality = "tokens" | "scopes" | "include_bindings" | "invocations" | "diagnostics";
 
@@ -66,7 +80,22 @@ class SourceIndexBudget {
     diagnostics: 0,
   };
 
-  #projectionBytes = 0;
+  readonly #projection: DerivedProjectionBudget;
+
+  constructor(projection: DerivedProjectionBudget = new DerivedProjectionBudget()) {
+    this.#projection = projection;
+  }
+
+  #reserveProjection(bytes: number, kind: string) {
+    const reservation = this.#projection.reserve(bytes);
+    if (reservation === "overflow") throw new Error("source outline derived projection byte count overflowed");
+    if (reservation === "limit") {
+      throw new Error(
+        `source outline exceeds the ${SOURCE_INDEX_LIMITS.derived_projection_bytes}-byte derived projection budget `
+        + `while indexing ${kind} across all Nextflow files; exclude generated .nf files or reduce generated declarations`,
+      );
+    }
+  }
 
   claim(kind: SourceIndexCardinality, projectionBytes = 0, projectionKind = SOURCE_INDEX_LABELS[kind]) {
     const nextCount = this.#counts[kind] + 1;
@@ -77,28 +106,12 @@ class SourceIndexBudget {
         + "exclude generated .nf files or reduce generated declarations",
       );
     }
-    const nextProjectionBytes = this.#projectionBytes + projectionBytes;
-    if (!Number.isSafeInteger(nextProjectionBytes)) throw new Error("source outline derived projection byte count overflowed");
-    if (nextProjectionBytes > SOURCE_INDEX_LIMITS.derived_projection_bytes) {
-      throw new Error(
-        `source outline exceeds the ${SOURCE_INDEX_LIMITS.derived_projection_bytes}-byte derived projection budget `
-        + `while indexing ${projectionKind} across all Nextflow files; exclude generated .nf files or reduce generated declarations`,
-      );
-    }
+    this.#reserveProjection(projectionBytes, projectionKind);
     this.#counts[kind] = nextCount;
-    this.#projectionBytes = nextProjectionBytes;
   }
 
   reserveProjection(bytes: number, kind: string) {
-    const nextProjectionBytes = this.#projectionBytes + bytes;
-    if (!Number.isSafeInteger(nextProjectionBytes)) throw new Error("source outline derived projection byte count overflowed");
-    if (nextProjectionBytes > SOURCE_INDEX_LIMITS.derived_projection_bytes) {
-      throw new Error(
-        `source outline exceeds the ${SOURCE_INDEX_LIMITS.derived_projection_bytes}-byte derived projection budget `
-        + `while indexing ${kind} across all Nextflow files; exclude generated .nf files or reduce generated declarations`,
-      );
-    }
-    this.#projectionBytes = nextProjectionBytes;
+    this.#reserveProjection(bytes, kind);
   }
 }
 
@@ -395,9 +408,14 @@ function indexFile(
   return { path: file.path, bytes: file.bytes, tokens, scopes, includes, parens };
 }
 
-export function indexNextflowSource(files: readonly FrozenSourceFile[], entrypoint: string, sourceDigest: string) {
+export function indexNextflowSource(
+  files: readonly FrozenSourceFile[],
+  entrypoint: string,
+  sourceDigest: string,
+  projectionBudget = new DerivedProjectionBudget(),
+) {
   const paths = new Set(files.map((file) => file.path));
-  const budget = new SourceIndexBudget();
+  const budget = new SourceIndexBudget(projectionBudget);
   const diagnostics: SourceDiagnostic[] = [];
   const pushDiagnostic = (diagnostic: SourceDiagnostic) => {
     budget.claim("diagnostics", projectedJsonBytes(diagnostic), "outline diagnostics");
