@@ -2,16 +2,21 @@
 
 This corpus has two layers:
 
-- Small, curated methods fixtures are committed for fast unit tests.
+- Small, curated methods fixtures are committed for the mandatory CI and
+  source-release gate.
 - Full primary-source papers are downloaded into gitignored `pdf/` and `raw/`
-  directories for end-to-end extraction and reconstruction tests.
+  directories for an optional, slower local extraction benchmark.
 
 `gold.tsv` is the versioned, machine-readable contract for every committed text
 fixture. Add or change a row only after reviewing the corresponding fixture;
 recognizer output must never rewrite the gold expectations automatically.
-Ordinary `npm test` fails if a committed `.txt` fixture has no
-gold row, an input cannot be extracted, a candidate is empty or invalid, or any
-annotated expectation fails.
+Ordinary `npm test` and every source release fail if fewer than 12 committed
+cases remain, RNA-seq, variant, assembly, and metagenome coverage is lost, a
+negative outcome class disappears, a committed `.txt` fixture has no gold row,
+an input cannot be extracted, a candidate is empty or invalid, or any annotated
+expectation fails. The runner test sends every committed fixture through the
+real UTF-8 extraction boundary before reconstruction; the web test enforces the
+deeper evidence and topology gold.
 
 ## Gold schema and metrics
 
@@ -72,9 +77,11 @@ This is deliberate: two early corpus files had valid PDFs with the wrong papers.
 The PMC assets come from the [current NLM PMC article dataset on
 AWS](https://pmc.ncbi.nlm.nih.gov/tools/pmcaws/), not scraped article pages.
 For the complex cases, the official PMC plain text is the canonical extraction
-input and the PDF remains the layout reference. The runner corpus test crosses
-real PDF.js extraction for the PDF cases and all ten reconstructions when the
-corpus is present; it requires the corpus to be complete once `pdf/` exists.
+input and the PDF remains the layout reference. The runner corpus test reports
+the optional full-source layer as skipped in a clean checkout. It crosses real
+PDF.js extraction for the PDF cases and all ten reconstructions when the corpus
+is installed, and requires that layer to be complete once `pdf/` exists or
+`SOMITE_PAPER_CORPUS=required` is set.
 
 ## Curated fixtures
 
@@ -96,7 +103,14 @@ corpus is present; it requires the corpus to be complete once `pdf/` exists.
 | `unsupported_statistics_methods.txt` | retain exact statistical methods without a fake draft |
 | `no_reconstructable_methods.txt` | deterministic no-method outcome with zero candidates |
 
-The fetched full-paper gate is intentionally explicit and all-or-nothing:
+The committed release gate runs as part of ordinary tests:
+
+```bash
+node --experimental-strip-types --test runner/tests/paper-corpus.test.ts
+```
+
+The fetched full-source benchmark is intentionally explicit and
+all-or-nothing:
 
 ```bash
 scripts/fetch-paper-corpus
