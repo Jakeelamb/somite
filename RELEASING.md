@@ -58,6 +58,11 @@ CI checks and restrict the release environment to maintainers. Those GitHub
 settings are part of the publication boundary and cannot be enforced by the
 source workflow alone.
 
+The execution matrix crosses Linux and macOS on x64 and arm64. Linux arm64 runs
+the real launcher/Pixi/Nextflow gate without the browser leg because GitHub's
+standard ARM image does not include Chrome; the other three matrix entries run
+both.
+
 After publication, verify the release page, source archives, rendered README,
 license detection, and installation instructions from a fresh directory. Fix
 forward with a new patch release; do not silently move an existing release tag.

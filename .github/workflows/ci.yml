@@ -22,6 +22,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Lint GitHub workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -47,10 +49,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Linux
+          - name: Linux x64
             runner: ubuntu-24.04
-          - name: macOS
+            smoke: smoke
+          - name: Linux arm64
+            runner: ubuntu-24.04-arm
+            smoke: smoke-execution
+          - name: macOS arm64
             runner: macos-15
+            smoke: smoke
+          - name: macOS x64
+            runner: macos-15-intel
+            smoke: smoke
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -66,4 +76,4 @@ jobs:
       - name: Install and build once
         run: pixi run setup
       - name: Exercise production startup and real workflow execution
-        run: pixi run smoke
+        run: pixi run ${{ matrix.smoke }}
