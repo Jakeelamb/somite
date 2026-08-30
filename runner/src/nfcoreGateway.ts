@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { gunzip } from "node:zlib";
@@ -14,14 +14,16 @@ import {
   type NfcorePipeline,
 } from "@somite/workflow/nfcore";
 import {
-  buildSourceManifest,
   safeSourcePath,
   type FrozenSourceFile,
   type SourceManifest,
 } from "@somite/workflow/nextflowSource";
 import { deriveSourceWorkflow, SOURCE_INDEXER_REVISION, sourceWorkflowRevision } from "@somite/workflow/sourceWorkflow";
 import { validateGraph } from "@somite/workflow/workflow";
-import { atomicWrite, containedPath, ensurePrivateDirectory, pathExists, regularDirectory, regularFile } from "./files.ts";
+import { atomicWrite, containedPath, ensurePrivateDirectory, pathExists, regularFile } from "./files.ts";
+import { readSourceObject, verifyGraphSourceWorkflowTrust } from "./sourceWorkflowTrust.ts";
+
+export { readSourceObject } from "./sourceWorkflowTrust.ts";
 
 const MAX_CATALOG_BYTES = 64 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES = 128 * 1024 * 1024;
@@ -176,27 +178,6 @@ async function writeSourceObject(root: string, manifest: SourceManifest, files: 
   }
 }
 
-export async function readSourceObject(root: string, sourceDigest: string) {
-  if (!/^blake3:[0-9a-f]{64}$/.test(sourceDigest)) throw new Error("source digest is malformed");
-  const objects = await ensurePrivateDirectory(root, ".somite/source-workflows/objects");
-  const directory = join(objects, sourceDigest.slice("blake3:".length));
-  await regularDirectory(directory, "source object");
-  const source = join(directory, "source");
-  await regularDirectory(source, "source object tree");
-  const manifest = JSON.parse(decoder.decode(await regularFile(join(directory, "source-manifest.json"), 16 * 1024 * 1024, "source manifest"))) as SourceManifest;
-  const files: FrozenSourceFile[] = [];
-  for (const entry of manifest.files) {
-    if (!safeSourcePath(entry.path)) throw new Error(`source manifest contains unsafe path ${entry.path}`);
-    const path = containedPath(source, entry.path);
-    const metadata = await lstat(path);
-    if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.size !== entry.bytes) throw new Error(`source file ${entry.path} does not match its manifest`);
-    files.push({ path: entry.path, mode: entry.mode, bytes: await readFile(path) });
-  }
-  const actual = buildSourceManifest(files);
-  if (JSON.stringify(actual) !== JSON.stringify(manifest) || actual.source_digest !== sourceDigest) throw new Error(`source object ${sourceDigest} failed exact verification`);
-  return { manifest: actual, files };
-}
-
 function requestKey(workflow: string, revision: string) {
   return byteDigest(encoder.encode(`somite-nfcore-source-request-ts-v1\0${SOURCE_INDEXER_REVISION}\0${workflow}\0${revision}`)).slice("blake3:".length);
 }
@@ -235,7 +216,6 @@ export class NfcoreGateway {
       if (sourceWorkflowRevision(cached.workflow) !== cached.workflow.workflow_revision
         || cached.workflow.source.requested_revision !== revision
         || cached.workflow.source.resolved_revision !== pipeline.resolvedRevision) throw new Error("cached nf-core source request has an invalid identity");
-      await readSourceObject(this.#root, cached.workflow.source.source_digest);
       return this.#response(workflow, revision, cached.workflow, true);
     }
 
@@ -258,15 +238,16 @@ export class NfcoreGateway {
     });
     if (!files.some((file) => file.path === "main.nf")) throw new Error(`${workflow}@${revision} has no main.nf entrypoint`);
     await writeSourceObject(this.#root, derived.manifest, files);
+    const response = await this.#response(workflow, revision, derived.workflow, false);
     await atomicWrite(requestPath, `${JSON.stringify({
       schema_version: 1,
       indexer_revision: SOURCE_INDEXER_REVISION,
       workflow: derived.workflow,
     }, null, 2)}\n`);
-    return this.#response(workflow, revision, derived.workflow, false);
+    return response;
   }
 
-  #response(workflow: string, revision: string, sourceWorkflow: SourceWorkflowInstance, cached: boolean) {
+  async #response(workflow: string, revision: string, sourceWorkflow: SourceWorkflowInstance, cached: boolean) {
     const sourceOperator = this.#catalog.get("workflow.source");
     if (!sourceOperator) throw new Error("workflow.source operator is missing");
     const graph: SomiteGraph = {
@@ -289,6 +270,7 @@ export class NfcoreGateway {
     if (!valid.ok) throw new Error(valid.issue.message);
     const verified = this.#catalog.verifyGraph(graph);
     if (!verified.ok) throw new Error(verified.issue.message);
+    await verifyGraphSourceWorkflowTrust(this.#root, this.#catalog, graph);
     return { engine: "nextflow", workflow, revision, graph, cached } as const;
   }
 

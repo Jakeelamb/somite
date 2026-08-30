@@ -34,6 +34,7 @@ import { PaperManager } from "./paperManager.ts";
 import { PaperStoreError } from "./paperStore.ts";
 import { SnakemakeGateway } from "./snakemakeGateway.ts";
 import { SourceSearchGateway } from "./sourceSearchGateway.ts";
+import { SourceWorkflowTrustError, verifyGraphSourceWorkflowTrust } from "./sourceWorkflowTrust.ts";
 import { executablePath, pixiPlatform } from "./system.ts";
 import { UploadError, UploadStore } from "./uploadStore.ts";
 
@@ -261,6 +262,7 @@ async function initializeProject(serverUrl: string, options: ServerOptions): Pro
   }
   const verified = catalogLoaded.catalog.verifyGraph(graph);
   if (!verified.ok) throw new Error(verified.issue.message);
+  await verifyGraphSourceWorkflowTrust(root, catalogLoaded.catalog, graph);
   const availableBinaries = new Set<string>();
   await Promise.all([...catalogLoaded.catalog.values()].map(async (operator) => {
     if (operator.bin && await executablePath(root, operator.bin)) availableBinaries.add(operator.bin);
@@ -358,6 +360,7 @@ async function mutateGraph(state: ProjectState, baseStateRevision: string, mutat
     const graph = mutate(structuredClone(state.graph));
     const verified = state.catalog.verifyGraph(graph);
     if (!verified.ok) throw new HttpError(400, verified.issue.message);
+    await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     const encoded = `${JSON.stringify(graph, null, 2)}\n`;
     await atomicWrite(state.autosavePath, encoded);
     state.graph = graph;
@@ -467,10 +470,12 @@ async function applyAgentGraphTransaction(state: ProjectState, value: unknown) {
     const replay = state.transactionReplays.get(request.idempotency_key);
     if (replay) {
       if (replay.requestDigest !== requestDigest) throw new HttpError(409, "idempotency key was already used for a different request");
+      await verifyGraphSourceWorkflowTrust(state.root, state.catalog, replay.result.graph);
       response = { ...replay.result, replayed: true };
       return;
     }
     const result = applyGraphTransaction(state.graph, state.catalog, request, `transaction-${randomUUID()}`);
+    await verifyGraphSourceWorkflowTrust(state.root, state.catalog, result.graph);
     await atomicWrite(state.autosavePath, `${JSON.stringify(result.graph, null, 2)}\n`);
     state.graph = result.graph;
     state.recoveredAutosave = true;
@@ -509,6 +514,7 @@ async function commitAgentMutation(
     const replay = state.transactionReplays.get(request.idempotencyKey);
     if (replay) {
       if (replay.requestDigest !== request.requestDigest) throw new HttpError(409, "idempotency key was already used for a different request");
+      await verifyGraphSourceWorkflowTrust(state.root, state.catalog, replay.result.graph);
       response = { ...replay.result, replayed: true };
       return;
     }
@@ -517,6 +523,7 @@ async function commitAgentMutation(
     const graph = mutate(structuredClone(state.graph));
     const verified = state.catalog.verifyGraph(graph);
     if (!verified.ok) throw new HttpError(422, verified.issue.message);
+    await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     const result: AgentTransactionResult = {
       transaction_id: `transaction-${randomUUID()}`,
       previous_state_revision: previousStateRevision,
@@ -548,6 +555,7 @@ async function resolveAgentNfcore(state: ProjectState, value: unknown) {
   const replay = state.transactionReplays.get(fields.idempotencyKey);
   if (replay) {
     if (replay.requestDigest !== requestDigest) throw new HttpError(409, "idempotency key was already used for a different request");
+    await verifyGraphSourceWorkflowTrust(state.root, state.catalog, replay.result.graph);
     return { ...replay.result, replayed: true };
   }
   const currentRevision = graphStateRevision(state.graph);
@@ -602,6 +610,7 @@ async function saveAgentPromptGraph(state: ProjectState, value: unknown) {
   const operation = state.writeChain.then(async () => {
     const currentRevision = graphStateRevision(state.graph);
     if (baseStateRevision !== currentRevision) throw new HttpError(409, "canvas changed since this prompt started", { state_revision: currentRevision });
+    await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     await atomicWrite(state.autosavePath, `${JSON.stringify(graph, null, 2)}\n`);
     state.graph = graph;
     state.recoveredAutosave = true;
@@ -625,6 +634,7 @@ async function saveGraph(state: ProjectState, request: Request, canonical: boole
     if (body.base_state_revision !== currentRevision) {
       throw new HttpError(409, "canvas changed since this edit started", { state_revision: currentRevision });
     }
+    await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     const encoded = `${JSON.stringify(graph, null, 2)}\n`;
     if (canonical) await atomicWrite(state.graphPath, encoded);
     await atomicWrite(state.autosavePath, encoded);
@@ -721,6 +731,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
   }
   if (request.method === "GET" && url.pathname === "/api/session") {
     await state.writeChain;
+    await verifyGraphSourceWorkflowTrust(state.root, state.catalog, state.graph);
     return json({
       project_name: basename(state.root) || "Somite project",
       graph_path: displayedPath(state.root, state.graphPath),
@@ -774,6 +785,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
   if (request.method === "GET" && url.pathname === "/api/agent/graph") {
     requireAgentCapability(request, state);
     await state.writeChain;
+    await verifyGraphSourceWorkflowTrust(state.root, state.catalog, state.graph);
     return json({
       state_revision: graphStateRevision(state.graph),
       graph_revision: semanticGraphRevision(state.graph),
@@ -808,11 +820,14 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
   if (request.method === "GET" && url.pathname === "/api/agent/readiness") {
     requireAgentCapability(request, state);
     await state.writeChain;
+    await verifyGraphSourceWorkflowTrust(state.root, state.catalog, state.graph);
     return json(assessWorkflow(state.graph, state.catalog));
   }
   if (request.method === "POST" && url.pathname === "/api/agent/compile") {
     requireAgentCapability(request, state);
     await requestJson(request);
+    await state.writeChain;
+    await verifyGraphSourceWorkflowTrust(state.root, state.catalog, state.graph);
     return json(await state.runs.compile(state.graph, { archiveName: state.graph.name ?? basename(state.root), platform: pixiPlatform() }));
   }
   if (request.method === "GET" && url.pathname === "/api/agent/evidence") {
@@ -857,6 +872,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
         requiredString(body.revision, "revision"),
       ));
     } catch (error) {
+      if (error instanceof SourceWorkflowTrustError) throw error;
       throw new HttpError(422, error instanceof Error ? error.message : String(error));
     }
   }
@@ -971,7 +987,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
         return { ...graph, nodes: [{ ...source, source_workflow: edited }] };
       }));
     } catch (error) {
-      if (error instanceof HttpError) throw error;
+      if (error instanceof HttpError || error instanceof SourceWorkflowTrustError) throw error;
       throw new HttpError(422, error instanceof Error ? error.message : String(error));
     }
   }
@@ -990,7 +1006,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
         ),
       ));
     } catch (error) {
-      if (error instanceof HttpError) throw error;
+      if (error instanceof HttpError || error instanceof SourceWorkflowTrustError) throw error;
       throw new HttpError(422, error instanceof Error ? error.message : String(error));
     }
   }
@@ -1004,7 +1020,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
         (graph) => restoreSourceWorkflow(graph, state.catalog),
       ));
     } catch (error) {
-      if (error instanceof HttpError) throw error;
+      if (error instanceof HttpError || error instanceof SourceWorkflowTrustError) throw error;
       throw new HttpError(422, error instanceof Error ? error.message : String(error));
     }
   }
@@ -1014,10 +1030,12 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     const graph = parseGraph(await requestJson(request));
     const verified = state.catalog.verifyGraph(graph);
     if (!verified.ok) throw new HttpError(400, verified.issue.message);
+    await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     return json({ valid: true });
   }
   if (request.method === "POST" && url.pathname === "/api/export/plan") {
     const graph = parseGraph(await requestJson(request));
+    await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     return json(planFrozenPackage(graph, state.catalog, {
       archiveName: graph.name ?? basename(state.root),
       platform: pixiPlatform(),
@@ -1025,6 +1043,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
   }
   if (request.method === "POST" && url.pathname === "/api/export") {
     const graph = parseGraph(await requestJson(request));
+    await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     const exported = await state.runs.export(graph, {
       archiveName: graph.name ?? basename(state.root),
       platform: pixiPlatform(),
@@ -1038,6 +1057,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
   }
   if (request.method === "POST" && (url.pathname === "/api/runs" || url.pathname === "/api/validations")) {
     const graph = parseGraph(await requestJson(request));
+    await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     try {
       const started = await state.runs.start(
         graph,
@@ -1051,6 +1071,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
   }
   if (request.method === "POST" && url.pathname === "/api/validations/status") {
     const graph = parseGraph(await requestJson(request));
+    await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     try {
       return json(await state.runs.validationStatus(graph));
     } catch (error) {
@@ -1157,6 +1178,8 @@ export async function startServer(options: ServerOptions = {}) {
     } catch (error) {
       response = error instanceof HttpError
         ? errorResponse(error.status, error.message, error.extra)
+        : error instanceof SourceWorkflowTrustError
+          ? errorResponse(422, error.message, { code: error.code })
         : error instanceof AgentManagerError
           ? errorResponse(error.code === "already_connected" || error.code === "busy" ? 409 : error.code === "not_connected" ? 404 : 400, error.message, { code: error.code })
         : error instanceof PaperStoreError
