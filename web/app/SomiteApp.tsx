@@ -122,7 +122,8 @@ import type {
   WorkflowBinding,
 } from "./types";
 import { portColor } from "./visual";
-import { edgeLifecycleState, evidenceNodeState, semanticGraphKey } from "./validationState";
+import { edgeLifecycleState, evidenceNodeState } from "./validationState";
+import { GraphProjectionClock, type GraphProjectionInput } from "./graphProjection";
 import { JsonRequestError, createSomiteClient, type SomiteClient } from "./api";
 import { AGENT_POLL_DEGRADED_AFTER, AGENT_POLL_INTERVAL_MS, agentBatchMatchesAuthoritativeState, agentPollCursorAfterSnapshot, agentPollFailureState, mergeAgentSnapshots, planAgentTransactions } from "./agentState";
 import { readinessAgentPrompt, readinessSummary } from "./readinessState";
@@ -635,7 +636,9 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
   const previousSemanticKeyRef = useRef("");
   const graphSnapshotRef = useRef<SomiteGraph>({ schema_version: 3, name: "Untitled workflow", nodes: [], edges: [], annotations: [] });
   const inputOriginIdRef = useRef("");
-  const graphSnapshotKeyRef = useRef("");
+  const graphProjectionClockRef = useRef<GraphProjectionClock | null>(null);
+  const graphProjectionInputRef = useRef<GraphProjectionInput | null>(null);
+  if (!graphProjectionClockRef.current) graphProjectionClockRef.current = new GraphProjectionClock();
   const graphEpochRef = useRef(0);
   const canonicalEpochRef = useRef(0);
   const stateRevisionRef = useRef("");
@@ -658,19 +661,18 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
   }, [nfcoreCatalog, session, snakemakeCatalog]);
   const operatorMap = useMemo(() => new Map(availableOperators.map((operator) => [operator.id, operator])), [availableOperators]);
   const workflowCatalog = useMemo(() => session ? new OperatorCatalog(session.operators) : null, [session]);
-  const snapshot = useCallback(() => somiteGraph(workflowTitle, nodes, edges, annotations, variantOrigin), [annotations, edges, nodes, variantOrigin, workflowTitle]);
+  const projectionInput: GraphProjectionInput = { name: workflowTitle, nodes, edges, annotations, variantOrigin };
+  graphProjectionInputRef.current = projectionInput;
+  const projection = graphProjectionClockRef.current.observe(projectionInput);
+  if (projection.graphChanged) graphEpochRef.current += 1;
+  graphSnapshotRef.current = projection.graph;
+  const snapshot = useCallback(() => graphSnapshotRef.current, []);
   const snapshotDocument = useCallback((graph = snapshot()) => workflowDocument(graph, inputOriginIdRef.current), [snapshot]);
   const graphRequest = useCallback((graph = snapshot()) => scopedGraphRequest(snapshotDocument(graph)), [snapshot, snapshotDocument]);
-  const renderedGraph = useMemo(() => somiteGraph(workflowTitle, nodes, edges, annotations, variantOrigin), [annotations, edges, nodes, variantOrigin, workflowTitle]);
-  const validationCapability = useMemo(() => representativeValidationCapability(renderedGraph), [renderedGraph]);
-  const semanticKey = useMemo(() => semanticGraphKey(renderedGraph), [renderedGraph]);
+  const renderedGraph = projection.graph;
+  const semanticKey = projection.semanticKey;
   semanticKeyRef.current = semanticKey;
-  const renderedGraphKey = useMemo(() => JSON.stringify(renderedGraph), [renderedGraph]);
-  if (renderedGraphKey !== graphSnapshotKeyRef.current) {
-    graphEpochRef.current += 1;
-    graphSnapshotKeyRef.current = renderedGraphKey;
-  }
-  graphSnapshotRef.current = renderedGraph;
+  const validationCapability = useMemo(() => representativeValidationCapability(renderedGraph), [renderedGraph]);
 
   useEffect(() => {
     return paperIntakeCoordinator.subscribe((next) => {
@@ -798,11 +800,15 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     );
   }, [client]);
 
-  const markCanonicalGraph = useCallback((graph: SomiteGraph) => {
+  const markCanonicalGraph = useCallback((graph: SomiteGraph, preserveCurrentProjection = false) => {
+    const primed = graphProjectionClockRef.current!.prime(
+      graph,
+      preserveCurrentProjection ? graphProjectionInputRef.current ?? undefined : undefined,
+    );
     graphEpochRef.current += 1;
     canonicalEpochRef.current = graphEpochRef.current;
-    graphSnapshotKeyRef.current = JSON.stringify(graph);
     graphSnapshotRef.current = graph;
+    semanticKeyRef.current = primed.semanticKey;
   }, []);
 
   const refreshCanonicalSession = useCallback(async () => {
@@ -841,7 +847,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
             future: [],
           }));
         }
-        markCanonicalGraph(localDraft);
+        markCanonicalGraph(localDraft, true);
         setDirty(localDiffers);
         return { disposition, loaded };
       }
@@ -1007,7 +1013,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
               past: [...current.past, ...transactions.map((transaction) => snapshotDocument(transaction.graph))].slice(-HISTORY_LIMIT),
               future: [],
             }));
-            markCanonicalGraph(localDraft);
+            markCanonicalGraph(localDraft, true);
             setDirty(true);
             setStatus(`Agent finished “${last.summary}” · kept your newer canvas edits · Agent result is available in Undo`);
           } else {
@@ -1134,7 +1140,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
             past: [...current.past, workflowDocument(loaded.graph, loaded.input_origin_id)].slice(-HISTORY_LIMIT),
             future: [],
           }));
-          markCanonicalGraph(localDraft);
+          markCanonicalGraph(localDraft, true);
           agentCursorRef.current = loaded.agent_cursor;
           setAgentSnapshot((current) => ({ ...current, cursor: loaded.agent_cursor }));
           setDirty(true);
