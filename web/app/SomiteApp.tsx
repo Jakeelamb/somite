@@ -148,13 +148,12 @@ import {
   type WorkflowDocumentHistory,
 } from "./projectDocument";
 import { validationEvidenceRequestPath, workflowCatalogRequestPaths, type WorkflowCatalogLoadState } from "./backgroundRequests";
+import { planLocalInputs } from "./localInputPlanning";
 import { assessWorkflow } from "@somite/workflow/assessment";
 import { OperatorCatalog } from "@somite/workflow/catalog";
 
 const SNAP: [number, number] = [20, 20];
 const HISTORY_LIMIT = 80;
-const READ_ONE_PATTERN = /(?:^|[_.])R?1(?:[_.]|$)/i;
-const READ_TWO_PATTERN = /(?:^|[_.])R?2(?:[_.]|$)/i;
 const countFormatter = new Intl.NumberFormat();
 const paperIntakeTransport = createPaperIntakeHttpTransport();
 
@@ -2172,22 +2171,65 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     }
     setStatus(`Importing ${files.length === 1 ? files[0].name : `${files.length} files`}…`);
     try {
-      const uploaded = await Promise.all(files.slice(0, 2).map(upload));
-      const paired = uploaded.length === 2 && files.some((file) => READ_ONE_PATTERN.test(file.name)) && files.some((file) => READ_TWO_PATTERN.test(file.name));
-      if (paired) {
-        const operator = operatorMap.get("files.import_paired");
-        if (!operator) throw new Error("Paired Reads operator is unavailable");
-        const ordered = [...uploaded].sort((a, b) => a.filename.localeCompare(b.filename));
-        addOperator(operator, position, { r1: ordered[0].path, r2: ordered[1].path });
-      } else {
-        const operator = operatorMap.get("files.import");
-        if (!operator) throw new Error("Import File operator is unavailable");
-        addOperator(operator, position, { path: uploaded[0].path });
+      const plan = planLocalInputs(files);
+      const requiredOperatorIds = new Set<string>(plan.map((entry) => entry.kind === "paired_fastq"
+        ? "files.import_paired"
+        : entry.kind === "fasta" ? "files.import_fasta" : "files.import"));
+      for (const operatorId of requiredOperatorIds) {
+        if (!operatorMap.has(operatorId)) throw new Error(`${operatorId} operator is unavailable; no files were imported`);
       }
+      const uploaded = new Array<UploadResult>(files.length);
+      let nextUpload = 0;
+      let completedUploads = 0;
+      const worker = async () => {
+        while (nextUpload < files.length) {
+          const index = nextUpload++;
+          uploaded[index] = await upload(files[index]!);
+          completedUploads += 1;
+          setStatus(`Imported ${completedUploads} of ${files.length} file${files.length === 1 ? "" : "s"}…`);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(4, files.length) }, worker));
+
+      const currentGraph = graphSnapshotRef.current;
+      if (currentGraph.nodes.some((node) => node.source_workflow)) {
+        throw new Error("the canvas became source-backed while files were uploading; uploaded objects were retained but no nodes were added");
+      }
+      const currentFlowNodes = currentGraph.nodes.map((node) => flowNode(node, operatorMap));
+      const created: SomiteGraphNode[] = [];
+      for (const [index, entry] of plan.entries()) {
+        const operatorId = entry.kind === "paired_fastq"
+          ? "files.import_paired"
+          : entry.kind === "fasta" ? "files.import_fasta" : "files.import";
+        const operator = operatorMap.get(operatorId)!;
+        const occupied = [...currentFlowNodes, ...created.map((node) => flowNode(node, operatorMap))];
+        const id = nextNodeId(operator, occupied);
+        const layout = { x: position.x + (index % 3) * 240, y: position.y + Math.floor(index / 3) * 170 };
+        const params: Record<string, ParamValue> = entry.kind === "paired_fastq"
+          ? { r1: uploaded[entry.r1]!.path, r2: uploaded[entry.r2]!.path }
+          : { path: uploaded[entry.file]!.path };
+        created.push(makeGraphNode(operator, id, layout, params));
+      }
+      remember(currentGraph);
+      setNodes((current) => [
+        ...current.map((node) => ({ ...node, selected: false })),
+        ...created.map((node) => ({ ...flowNode(node, operatorMap), selected: true })),
+      ]);
+      setSelectedIds(created.map((node) => node.id));
+      setRecent((current) => [
+        ...requiredOperatorIds,
+        ...current.filter((value) => !requiredOperatorIds.has(value)),
+      ].slice(0, 6));
+      setPendingAddPosition(null);
+      setPendingConnection(null);
+      setLibraryVisible(false);
+      setDirty(true);
+      const pairedCount = plan.filter((entry) => entry.kind === "paired_fastq").length;
+      setStatus(`Added ${created.length} input node${created.length === 1 ? "" : "s"} from all ${files.length} file${files.length === 1 ? "" : "s"}${pairedCount ? ` · ${pairedCount} verified R1/R2 pair${pairedCount === 1 ? "" : "s"}` : ""}`);
     } catch (error) {
-      setStatus(`Could not import file — ${errorMessage(error)}`);
+      setStatus(`Could not import files — ${errorMessage(error)}`);
     }
-  }, [addOperator, editSourceWorkflowBinding, operatorMap, remember, setNodes, upload]);
+  }, [editSourceWorkflowBinding, operatorMap, remember, setNodes, upload]);
 
   const onDrop = useCallback((event: React.DragEvent) => {
     event.preventDefault();
