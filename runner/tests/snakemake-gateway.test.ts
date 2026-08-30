@@ -37,6 +37,58 @@ test("Snakemake catalog keeps released standardized workflows and pins their ide
   }
 });
 
+test("Snakemake catalog streams the current large upstream shape into a compact cache", async () => {
+  const root = await mkdtemp(join(tmpdir(), "somite-snakemake-stream-ts-"));
+  try {
+    const record = Buffer.from(JSON.stringify({
+      full_name: "owner/streamed",
+      description: "braces and escaped quotes stay inside the rule graph",
+      standardized: true,
+      latest_release: "v3",
+      stargazers_count: 12,
+      topics: ["assembly"],
+      rulegraph: "digraph { 0[label=\"prepare\"]; }",
+    }));
+    const padding = new Uint8Array(1024 * 1024).fill(0x20);
+    const chunks: Uint8Array[] = [Buffer.from("[")];
+    for (let offset = 0; offset < record.byteLength; offset += 7) chunks.push(record.subarray(offset, offset + 7));
+    for (let count = 0; count < 33; count += 1) chunks.push(padding);
+    chunks.push(Buffer.from("]"));
+    const contentLength = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+    let cursor = 0;
+    const response = new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const chunk = chunks[cursor++];
+        if (chunk) controller.enqueue(chunk);
+        else controller.close();
+      },
+    }), { headers: { "content-length": String(contentLength), "content-type": "application/json" } });
+    const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+    const gateway = new SnakemakeGateway(root, catalog, async () => response);
+    const result = await gateway.catalogResponse();
+    assert.equal(result.cached, false);
+    assert.equal(result.entries.length, 1);
+    assert.equal(result.entries[0]?.operator.title, "owner/streamed");
+    const expanded = await gateway.expand("owner/streamed", "v3");
+    assert.equal(expanded.graph.nodes[0]?.params?.component, "prepare");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Snakemake catalog rejects an announced response beyond its wire budget", async () => {
+  const root = await mkdtemp(join(tmpdir(), "somite-snakemake-bound-ts-"));
+  try {
+    const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+    const gateway = new SnakemakeGateway(root, catalog, async () => new Response("[]", {
+      headers: { "content-length": String(97 * 1024 * 1024) },
+    }));
+    await assert.rejects(gateway.catalogResponse(), /Snakemake catalog is too large/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Snakemake catalog falls back to its validated project cache", async () => {
   const root = await mkdtemp(join(tmpdir(), "somite-snakemake-cache-ts-"));
   try {

@@ -10,8 +10,11 @@ import { atomicWrite, ensurePrivateDirectory, pathExists, regularFile } from "./
 import { executablePath } from "./system.ts";
 
 export const SNAKEMAKE_CATALOG_URL = "https://raw.githubusercontent.com/snakemake/snakemake-workflow-catalog/main/data.json";
-const MAX_CATALOG_BYTES = 32 * 1024 * 1024;
+const MAX_CATALOG_WIRE_BYTES = 96 * 1024 * 1024;
+const MAX_CATALOG_ENTRY_BYTES = 8 * 1024 * 1024;
+const MAX_CATALOG_CACHE_BYTES = 32 * 1024 * 1024;
 const MAX_GRAPH_BYTES = 5 * 1024 * 1024;
+const decoder = new TextDecoder("utf-8", { fatal: true });
 
 export type SnakemakeWorkflow = {
   fullName: string;
@@ -22,6 +25,21 @@ export type SnakemakeWorkflow = {
   rulegraph?: string;
 };
 
+function workflowFromCatalogEntry(candidate: unknown): SnakemakeWorkflow | undefined {
+  if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return undefined;
+  const raw = candidate as Record<string, unknown>;
+  if (raw.standardized !== true || typeof raw.latest_release !== "string" || !raw.latest_release
+    || typeof raw.full_name !== "string" || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(raw.full_name)) return undefined;
+  return {
+    fullName: raw.full_name,
+    description: typeof raw.description === "string" ? raw.description : "",
+    topics: Array.isArray(raw.topics) ? raw.topics.filter((topic): topic is string => typeof topic === "string") : [],
+    revision: raw.latest_release,
+    stars: typeof raw.stargazers_count === "number" && Number.isSafeInteger(raw.stargazers_count) && raw.stargazers_count >= 0 ? raw.stargazers_count : 0,
+    ...(typeof raw.rulegraph === "string" ? { rulegraph: raw.rulegraph } : {}),
+  };
+}
+
 function safeId(value: string) {
   return [...value].map((character) => /[A-Za-z0-9]/.test(character) ? character.toLowerCase() : "-")
     .join("").split("-").filter(Boolean).join("-");
@@ -30,18 +48,8 @@ function safeId(value: string) {
 export function parseSnakemakeCatalog(value: unknown): SnakemakeWorkflow[] {
   if (!Array.isArray(value)) throw new Error("Snakemake catalog is not an array");
   const workflows = value.flatMap((candidate): SnakemakeWorkflow[] => {
-    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return [];
-    const raw = candidate as Record<string, unknown>;
-    if (raw.standardized !== true || typeof raw.latest_release !== "string" || !raw.latest_release
-      || typeof raw.full_name !== "string" || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(raw.full_name)) return [];
-    return [{
-      fullName: raw.full_name,
-      description: typeof raw.description === "string" ? raw.description : "",
-      topics: Array.isArray(raw.topics) ? raw.topics.filter((topic): topic is string => typeof topic === "string") : [],
-      revision: raw.latest_release,
-      stars: typeof raw.stargazers_count === "number" && Number.isSafeInteger(raw.stargazers_count) && raw.stargazers_count >= 0 ? raw.stargazers_count : 0,
-      ...(typeof raw.rulegraph === "string" ? { rulegraph: raw.rulegraph } : {}),
-    }];
+    const workflow = workflowFromCatalogEntry(candidate);
+    return workflow ? [workflow] : [];
   });
   workflows.sort((left, right) => right.stars - left.stars || left.fullName.localeCompare(right.fullName));
   return workflows;
@@ -92,28 +100,96 @@ function dynamicOperator(workflow: SnakemakeWorkflow): PinnedOperator {
   return { ...operator, revision: operatorRevision(operator) };
 }
 
-async function boundedResponse(response: Response, maximum: number, label: string) {
+async function streamedCatalog(response: Response, label: string) {
   if (!response.ok || !response.body) throw new Error(`${label} returned HTTP ${response.status}`);
+  const announced = Number(response.headers.get("content-length") ?? 0);
+  if (Number.isFinite(announced) && announced > MAX_CATALOG_WIRE_BYTES) throw new Error(`${label} is too large`);
   const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
+  const workflows: SnakemakeWorkflow[] = [];
+  let state: "array" | "valueOrEnd" | "value" | "separator" | "done" = "array";
   let total = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > maximum) {
-      await reader.cancel();
-      throw new Error(`${label} is too large`);
+  let entryBytes = 0;
+  let entryChunks: Uint8Array[] = [];
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  let complete = false;
+
+  const appendEntry = (bytes: Uint8Array) => {
+    entryBytes += bytes.byteLength;
+    if (entryBytes > MAX_CATALOG_ENTRY_BYTES) throw new Error(`${label} contains an oversized entry`);
+    entryChunks.push(bytes);
+  };
+  const finishEntry = () => {
+    const bytes = new Uint8Array(entryBytes);
+    let offset = 0;
+    for (const chunk of entryChunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
     }
-    chunks.push(value);
+    const workflow = workflowFromCatalogEntry(JSON.parse(decoder.decode(bytes)));
+    if (workflow) workflows.push(workflow);
+    entryChunks = [];
+    entryBytes = 0;
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_CATALOG_WIRE_BYTES) throw new Error(`${label} is too large`);
+      let entryStart = depth > 0 ? 0 : -1;
+      for (let index = 0; index < value.byteLength; index += 1) {
+        const byte = value[index]!;
+        if (depth > 0) {
+          if (inString) {
+            if (escaped) escaped = false;
+            else if (byte === 0x5c) escaped = true;
+            else if (byte === 0x22) inString = false;
+          } else if (byte === 0x22) inString = true;
+          else if (byte === 0x7b || byte === 0x5b) depth += 1;
+          else if (byte === 0x7d || byte === 0x5d) depth -= 1;
+
+          if (depth === 0) {
+            appendEntry(value.subarray(entryStart, index + 1));
+            entryStart = -1;
+            finishEntry();
+            state = "separator";
+          }
+          continue;
+        }
+
+        if (byte === 0x20 || byte === 0x09 || byte === 0x0a || byte === 0x0d) continue;
+        if (state === "array") {
+          if (byte !== 0x5b) throw new Error(`${label} is not a JSON array`);
+          state = "valueOrEnd";
+        } else if (state === "valueOrEnd") {
+          if (byte === 0x5d) state = "done";
+          else if (byte === 0x7b) {
+            depth = 1;
+            entryStart = index;
+          } else throw new Error(`${label} contains a non-object entry`);
+        } else if (state === "value") {
+          if (byte === 0x7b) {
+            depth = 1;
+            entryStart = index;
+          } else throw new Error(`${label} contains a non-object entry`);
+        } else if (state === "separator") {
+          if (byte === 0x2c) state = "value";
+          else if (byte === 0x5d) state = "done";
+          else throw new Error(`${label} has an invalid array separator`);
+        } else throw new Error(`${label} has trailing data`);
+      }
+      if (entryStart >= 0) appendEntry(value.subarray(entryStart));
+    }
+    if (depth !== 0 || inString || state !== "done") throw new Error(`${label} ended before its JSON array was complete`);
+    complete = true;
+    workflows.sort((left, right) => right.stars - left.stars || left.fullName.localeCompare(right.fullName));
+    return workflows;
+  } finally {
+    if (!complete) await reader.cancel().catch(() => undefined);
   }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes;
 }
 
 function terminate(child: ChildProcess) {
@@ -273,14 +349,13 @@ export class SnakemakeGateway {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error("Snakemake catalog timed out")), 30_000);
     try {
-      const bytes = await boundedResponse(await this.#fetcher(SNAKEMAKE_CATALOG_URL, { signal: controller.signal, headers: { accept: "application/json" } }), MAX_CATALOG_BYTES, "Snakemake catalog");
-      const workflows = parseSnakemakeCatalog(JSON.parse(new TextDecoder().decode(bytes)));
+      const workflows = await streamedCatalog(await this.#fetcher(SNAKEMAKE_CATALOG_URL, { signal: controller.signal, headers: { accept: "application/json" } }), "Snakemake catalog");
       if (!workflows.length) throw new Error("Snakemake catalog did not contain any released standardized workflows");
       await atomicWrite(cache, `${JSON.stringify(workflows)}\n`);
       return { workflows, cached: false };
     } catch (fetchError) {
       if (!await pathExists(cache)) throw fetchError;
-      const compact = parseSnakemakeCache(JSON.parse(new TextDecoder().decode(await regularFile(cache, MAX_CATALOG_BYTES, "Snakemake catalog cache"))));
+      const compact = parseSnakemakeCache(JSON.parse(decoder.decode(await regularFile(cache, MAX_CATALOG_CACHE_BYTES, "Snakemake catalog cache"))));
       return { workflows: compact, cached: true };
     } finally {
       clearTimeout(timer);
