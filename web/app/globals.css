@@ -357,6 +357,7 @@ button:disabled { cursor: default; opacity: .42; }
 .agent-edge-launcher:hover { background: var(--surface-hover); }
 .agent-edge-launcher > i { width: 7px; height: 7px; border-radius: 50%; background: var(--success); }
 .agent-edge-launcher > i.busy { background: var(--warning); animation: agent-pulse 1.25s ease-in-out infinite; }
+.agent-edge-launcher > i.error { background: var(--danger); }
 @keyframes agent-pulse { 50% { opacity: .45; transform: scale(.75); } }
 
 .agent-window { position: absolute; min-width: 300px; max-width: min(720px, calc(100vw - 24px)); min-height: 320px; max-height: calc(100% - 16px); resize: both; }
@@ -370,6 +371,12 @@ button:disabled { cursor: default; opacity: .42; }
 .agent-presence { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--muted); }
 .agent-presence.ready { background: var(--success); }
 .agent-presence.busy { background: var(--warning); animation: agent-pulse 1.25s ease-in-out infinite; }
+.agent-presence.error { background: var(--danger); }
+.agent-transport-error { margin: 8px; padding: 8px; display: flex; gap: 7px; align-items: flex-start; border: 1px solid color-mix(in srgb, var(--danger) 42%, var(--border)); border-radius: 7px; background: color-mix(in srgb, var(--danger) 8%, var(--surface)); color: var(--text); }
+.agent-transport-error > svg { flex: none; color: var(--danger); }
+.agent-transport-error span { min-width: 0; display: grid; gap: 2px; }
+.agent-transport-error strong { font-size: 9px; }
+.agent-transport-error small { color: var(--muted); font-size: 8px; line-height: 1.4; overflow-wrap: anywhere; }
 .readiness-window { width: min(760px, calc(100vw - 136px)); max-height: min(620px, calc(100vh - 124px)); }
 .readiness-hero { min-height: 62px; padding: 12px 14px; display: grid; grid-template-columns: 20px minmax(0, 1fr); align-items: center; gap: 10px; border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--warning) 6%, var(--surface-raised)); color: var(--warning); }
 .readiness-hero.state-ready { background: color-mix(in srgb, var(--success) 6%, var(--surface-raised)); color: var(--success); }

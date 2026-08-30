@@ -125,8 +125,9 @@ function storedAgentFrame(): AgentFrame & { collapsed: boolean } {
   }
 }
 
-export function AgentPanel({ snapshot, discovery, discoveryLoading, draft, onRefreshDiscovery, onConnect, onConfig, onPrompt, onCancel, onDisconnect, onPermission, onClose }: {
+export function AgentPanel({ snapshot, transportError, discovery, discoveryLoading, draft, onRefreshDiscovery, onConnect, onConfig, onPrompt, onCancel, onDisconnect, onPermission, onClose }: {
   snapshot: AgentSnapshot;
+  transportError?: string | null;
   discovery: AgentDiscovery | null;
   discoveryLoading: boolean;
   draft?: { id: number; message: string } | null;
@@ -246,7 +247,7 @@ export function AgentPanel({ snapshot, discovery, discoveryLoading, draft, onRef
   return (
     <section ref={panelRef} className={`floating-panel agent-window ${collapsed ? "collapsed" : ""}`} style={frameStyle} aria-label="Agent">
       <header className="floating-panel-head agent-drag-handle" onPointerDown={beginDrag} onPointerMove={drag} onPointerUp={finishDrag} onPointerCancel={finishDrag}>
-        <div><i className={`agent-presence ${snapshot.busy ? "busy" : snapshot.connected ? "ready" : ""}`} /><strong>Agent</strong><span>{snapshot.busy ? "Working…" : snapshot.connected ? "Ready" : snapshot.connecting ? "Connecting…" : "Choose an assistant"}</span></div>
+        <div><i className={`agent-presence ${transportError ? "error" : snapshot.busy ? "busy" : snapshot.connected ? "ready" : ""}`} /><strong>Agent</strong><span>{transportError ? "Connection interrupted" : snapshot.busy ? "Working…" : snapshot.connected ? "Ready" : snapshot.connecting ? "Connecting…" : "Choose an assistant"}</span></div>
         <nav aria-label="Agent window controls">
           {snapshot.connected && <button type="button" aria-label="Agent settings" title="Settings" className={showSettings ? "active" : ""} onClick={() => { setCollapsed(false); setShowSettings((visible) => !visible); }}><Settings2 size={14} /></button>}
           <button type="button" aria-label={collapsed ? "Expand Agent" : "Collapse Agent"} title={collapsed ? "Expand" : "Collapse"} onClick={() => setCollapsed((value) => !value)}>{collapsed ? <PanelRightOpen size={14} /> : <PanelRightClose size={14} />}</button>
@@ -286,6 +287,7 @@ export function AgentPanel({ snapshot, discovery, discoveryLoading, draft, onRef
             </section>}
           </div>
         ) : <>
+          {transportError && <div className="agent-transport-error" role="status"><CircleAlert size={13} aria-hidden="true" /><span><strong>Agent updates are unavailable</strong><small>{transportError} · retrying automatically; canvas work is unaffected.</small></span></div>}
           {showSettings && <section className="agent-settings" aria-label="Agent settings">
             <header><strong>Settings</strong><button type="button" aria-label="Close Agent settings" onClick={() => setShowSettings(false)}><X size={13} /></button></header>
             {snapshot.config_options.length > 0 && <div className="agent-config-options">{snapshot.config_options.map((option) => option.type === "select" ? <label key={option.id} title={option.description}><span>{option.name}</span><select aria-label={option.name} value={option.currentValue} disabled={snapshot.busy} onChange={(event) => void onConfig(option.id, event.target.value)}>{configChoices(option).map((choice) => <option key={choice.value} value={choice.value}>{choice.name}</option>)}</select></label> : <label key={option.id} className="boolean" title={option.description}><span>{option.name}</span><input type="checkbox" checked={option.currentValue} disabled={snapshot.busy} onChange={(event) => void onConfig(option.id, event.target.checked)} /></label>)}</div>}
@@ -304,8 +306,8 @@ export function AgentPanel({ snapshot, discovery, discoveryLoading, draft, onRef
             {activity.length > 0 && <details className="agent-activity"><summary><MoreHorizontal size={13} />{snapshot.busy ? `${activity.length} step${activity.length === 1 ? "" : "s"} in progress` : `Completed ${activity.length} step${activity.length === 1 ? "" : "s"}`}</summary><ol>{activity.map((event) => <li key={event.cursor}>{event.title}</li>)}</ol></details>}
           </div>
           <div className="agent-composer">
-            <textarea aria-label="Message Agent" rows={3} value={message} disabled={!snapshot.connected} placeholder="Ask Agent to build, explain, or fix this workflow…" onChange={(event) => setMessage(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submitPrompt(); } }} />
-            <div><span>{snapshot.agent_name ?? "Agent"}</span>{snapshot.busy ? <button type="button" className="agent-stop" onClick={() => void onCancel()}><CircleStop size={13} />Stop</button> : <button type="button" aria-label="Send to Agent" disabled={!message.trim() || submitting} onClick={() => void submitPrompt()}><Send size={13} />Send</button>}</div>
+            <textarea aria-label="Message Agent" rows={3} value={message} disabled={!snapshot.connected || Boolean(transportError)} placeholder={transportError ? "Waiting for the Agent connection…" : "Ask Agent to build, explain, or fix this workflow…"} onChange={(event) => setMessage(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submitPrompt(); } }} />
+            <div><span>{snapshot.agent_name ?? "Agent"}</span>{snapshot.busy ? <button type="button" className="agent-stop" onClick={() => void onCancel()}><CircleStop size={13} />Stop</button> : <button type="button" aria-label="Send to Agent" disabled={!message.trim() || submitting || Boolean(transportError)} onClick={() => void submitPrompt()}><Send size={13} />Send</button>}</div>
           </div>
         </>}
       </div>}

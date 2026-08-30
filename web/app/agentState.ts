@@ -1,5 +1,18 @@
 import type { AgentEvent, AgentSnapshot, AgentTransaction } from "./types";
 
+export const AGENT_POLL_INTERVAL_MS = 450;
+export const AGENT_POLL_DEGRADED_AFTER = 3;
+
+export function agentPollFailureState(consecutiveFailures: number) {
+  const failures = Math.max(1, Math.trunc(consecutiveFailures));
+  return {
+    degraded: failures >= AGENT_POLL_DEGRADED_AFTER,
+    retryDelayMs: failures < AGENT_POLL_DEGRADED_AFTER
+      ? AGENT_POLL_INTERVAL_MS
+      : Math.min(5_000, AGENT_POLL_INTERVAL_MS * (2 ** (failures - AGENT_POLL_DEGRADED_AFTER + 1))),
+  };
+}
+
 export function mergeAgentSnapshots(current: AgentSnapshot, incoming: AgentSnapshot): AgentSnapshot {
   const events = new Map([...current.events, ...incoming.events].map((event) => [event.cursor, event]));
   return {

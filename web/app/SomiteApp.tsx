@@ -131,7 +131,7 @@ import type {
 import { portColor } from "./visual";
 import { edgeLifecycleState, evidenceNodeState, semanticGraphKey } from "./validationState";
 import { JsonRequestError, SOMITE_SERVER, jsonRequest } from "./api";
-import { agentBatchMatchesAuthoritativeState, agentPollCursorAfterSnapshot, mergeAgentSnapshots, planAgentTransactions } from "./agentState";
+import { AGENT_POLL_DEGRADED_AFTER, AGENT_POLL_INTERVAL_MS, agentBatchMatchesAuthoritativeState, agentPollCursorAfterSnapshot, agentPollFailureState, mergeAgentSnapshots, planAgentTransactions } from "./agentState";
 import { readinessAgentPrompt, readinessSummary } from "./readinessState";
 import { appendStrokePoint, canvasColor as getCanvasColor, canvasPalette, createCanvasAnnotation, nextAnnotationId } from "./canvasPresentation";
 import type { CatalogExpansionActivity } from "./catalogExpansion";
@@ -593,6 +593,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const [validationEvidence, setValidationEvidence] = useState<ValidationEvidenceResponse | null>(null);
   const [agentDraft, setAgentDraft] = useState<{ id: number; message: string } | null>(null);
   const [agentSnapshot, setAgentSnapshot] = useState<AgentSnapshot>({ connected: false, connecting: false, busy: false, config_options: [], cursor: 0, events: [] });
+  const [agentTransportError, setAgentTransportError] = useState<string | null>(null);
   const [agentDiscovery, setAgentDiscovery] = useState<AgentDiscovery | null>(null);
   const [agentDiscoveryLoading, setAgentDiscoveryLoading] = useState(false);
   const paperIntakeCoordinatorRef = useRef<PaperIntakeCoordinator | null>(null);
@@ -949,12 +950,25 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   useEffect(() => {
     if (!session || (!agentVisible && !agentSnapshot.connected && !agentSnapshot.connecting)) return;
     let stopped = false;
+    let timer: number | undefined;
+    let consecutiveFailures = 0;
+    const schedule = (delayMs: number) => {
+      if (!stopped) timer = window.setTimeout(() => void poll(), delayMs);
+    };
     const poll = async () => {
-      if (agentPollInFlightRef.current) return;
+      if (agentPollInFlightRef.current) {
+        schedule(AGENT_POLL_INTERVAL_MS);
+        return;
+      }
       agentPollInFlightRef.current = true;
+      let nextDelayMs = AGENT_POLL_INTERVAL_MS;
       try {
         const incoming = await jsonRequest<AgentSnapshot>(`/api/agent/events?after=${agentCursorRef.current}`);
         if (stopped) return;
+        const recovered = consecutiveFailures >= AGENT_POLL_DEGRADED_AFTER;
+        consecutiveFailures = 0;
+        setAgentTransportError(null);
+        if (recovered) setStatus("Agent connection restored");
         if (incoming.events.some((event) => event.kind === "status" && event.status === "ready")) {
           setStatus(`${incoming.agent_name ?? "Agent"} is ready`);
         }
@@ -1028,15 +1042,28 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
         } else if (needsAuthoritativeRefresh && !plan.apply.length) {
           setStatus("Canvas synchronized with the current server state");
         }
-      } catch {
-        // The agent boundary is optional; normal canvas work remains available.
+      } catch (error) {
+        if (stopped) return;
+        consecutiveFailures += 1;
+        const failure = agentPollFailureState(consecutiveFailures);
+        nextDelayMs = failure.retryDelayMs;
+        if (failure.degraded) {
+          const detail = errorMessage(error);
+          setAgentTransportError(detail);
+          if (consecutiveFailures === AGENT_POLL_DEGRADED_AFTER) {
+            setStatus(`Agent connection interrupted — ${detail} · canvas work remains available`);
+          }
+        }
       } finally {
         agentPollInFlightRef.current = false;
+        schedule(nextDelayMs);
       }
     };
     void poll();
-    const interval = window.setInterval(() => void poll(), 450);
-    return () => { stopped = true; window.clearInterval(interval); };
+    return () => {
+      stopped = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
   }, [agentSnapshot.connected, agentSnapshot.connecting, agentVisible, markCanonicalGraph, mergeAgentSnapshot, refreshCanonicalSession, restoreGraph, session, snapshotDocument]);
 
   const undo = useCallback(() => {
@@ -1236,6 +1263,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
 
   const connectAgent = useCallback(async (command: string) => {
     try {
+      setAgentTransportError(null);
       const connected = await jsonRequest<AgentSnapshot>("/api/agent/connect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1306,6 +1334,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const disconnectAgent = useCallback(async () => {
     try {
       await jsonRequest<void>("/api/agent/disconnect", { method: "POST" });
+      setAgentTransportError(null);
       setStatus("Disconnecting Agent…");
     } catch (error) {
       setStatus(`Could not disconnect agent — ${errorMessage(error)}`);
@@ -3000,7 +3029,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
           <button type="button" className={paperVisible ? "active" : ""} aria-label="Rebuild from a Paper" title="Paper Reconstruction" onClick={(event) => { event.stopPropagation(); const opening = !paperVisible; setPendingConnection(null); setLibraryVisible(false); setProjectVisible(false); setToolchainVisible(false); setPaperVisible(opening); }}><FileSearch size={16} aria-hidden="true" /></button>
         </aside>}
 
-        {!agentVisible && <button type="button" className="agent-edge-launcher" aria-label="Open Agent" title="Open Agent" onClick={(event) => { event.stopPropagation(); setAgentDraft(null); setAgentVisible(true); if (!agentSnapshot.connected && !agentDiscovery && !agentDiscoveryLoading) void refreshAgentDiscovery(); }}><Bot size={16} aria-hidden="true" /><span>Agent</span>{(agentSnapshot.connected || agentSnapshot.connecting) && <i className={agentSnapshot.busy ? "busy" : "ready"} />}</button>}
+        {!agentVisible && <button type="button" className="agent-edge-launcher" aria-label="Open Agent" title={agentTransportError ? "Agent connection interrupted" : "Open Agent"} onClick={(event) => { event.stopPropagation(); setAgentDraft(null); setAgentVisible(true); if (!agentSnapshot.connected && !agentDiscovery && !agentDiscoveryLoading) void refreshAgentDiscovery(); }}><Bot size={16} aria-hidden="true" /><span>Agent</span>{(agentSnapshot.connected || agentSnapshot.connecting) && <i className={agentTransportError ? "error" : agentSnapshot.busy ? "busy" : "ready"} />}</button>}
 
         {!sourceNetworkView && <div className="canvas-toolbar" aria-label="Canvas Tools" onPointerDown={(event) => event.stopPropagation()}>
           <button type="button" className={libraryVisible ? "primary active" : "primary"} aria-label="Add Anything" title="Add anything (Ctrl K)" onClick={() => { setProjectVisible(false); setPaperVisible(false); setToolchainVisible(false); setPendingConnection(null); setLibraryVisible(true); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}><Plus size={17} aria-hidden="true" /><span>Add</span></button>
@@ -3030,7 +3059,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
 
         {readinessVisible && readiness && <div className={`readiness-layer ${agentVisible ? "with-agent" : ""}`} onPointerDown={(event) => event.stopPropagation()}><ReadinessPanel snapshot={readiness} evidence={validationEvidence} validationCapability={validationCapability} onResolve={resolveRequirement} onFocus={focusRequirement} onAttachFile={attachRequirementFile} onAskAssistant={askAssistantAboutRequirement} onClose={() => setReadinessVisible(false)} /></div>}
 
-        {agentVisible && <div className="agent-layer" onPointerDown={(event) => event.stopPropagation()}><AgentPanel key={agentDraft?.id ?? "agent"} snapshot={agentSnapshot} discovery={agentDiscovery} discoveryLoading={agentDiscoveryLoading} draft={agentDraft} onRefreshDiscovery={refreshAgentDiscovery} onConnect={connectAgent} onConfig={configureAgent} onPrompt={promptAgent} onCancel={cancelAgent} onDisconnect={disconnectAgent} onPermission={answerAgentPermission} onClose={() => { setAgentVisible(false); setAgentDraft(null); }} /></div>}
+        {agentVisible && <div className="agent-layer" onPointerDown={(event) => event.stopPropagation()}><AgentPanel key={agentDraft?.id ?? "agent"} snapshot={agentSnapshot} transportError={agentTransportError} discovery={agentDiscovery} discoveryLoading={agentDiscoveryLoading} draft={agentDraft} onRefreshDiscovery={refreshAgentDiscovery} onConnect={connectAgent} onConfig={configureAgent} onPrompt={promptAgent} onCancel={cancelAgent} onDisconnect={disconnectAgent} onPermission={answerAgentPermission} onClose={() => { setAgentVisible(false); setAgentDraft(null); }} /></div>}
 
         <footer className="statusbar studio-statusbar" aria-live="polite">
           <span className={`engine-light ${statusError ? "error" : ""}`} />

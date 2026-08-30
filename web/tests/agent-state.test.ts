@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { agentBatchMatchesAuthoritativeState, agentPollCursorAfterSnapshot, mergeAgentSnapshots, planAgentTransactions, unseenAgentTransactions } from "../app/agentState.ts";
+import { agentBatchMatchesAuthoritativeState, agentPollCursorAfterSnapshot, agentPollFailureState, mergeAgentSnapshots, planAgentTransactions, unseenAgentTransactions } from "../app/agentState.ts";
 import type { AgentEvent, AgentSnapshot, AgentTransaction, SomiteGraph } from "../app/types.ts";
 
 const empty: SomiteGraph = { schema_version: 3, nodes: [], edges: [] };
@@ -53,6 +53,13 @@ test("only a canonically consumed event poll advances the transaction cursor", (
   assert.equal(agentPollCursorAfterSnapshot(4, 9, true), 9);
   assert.equal(agentPollCursorAfterSnapshot(4, 9, false), 4);
   assert.equal(agentPollCursorAfterSnapshot(9, 4, true), 9);
+});
+
+test("repeated Agent transport failures become visible and back off", () => {
+  assert.deepEqual(agentPollFailureState(1), { degraded: false, retryDelayMs: 450 });
+  assert.deepEqual(agentPollFailureState(2), { degraded: false, retryDelayMs: 450 });
+  assert.deepEqual(agentPollFailureState(3), { degraded: true, retryDelayMs: 900 });
+  assert.deepEqual(agentPollFailureState(6), { degraded: true, retryDelayMs: 5_000 });
 });
 
 test("each atomic graph transaction is offered to the canvas only once", () => {
