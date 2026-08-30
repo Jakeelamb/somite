@@ -1,8 +1,8 @@
 import { URL } from "node:url";
 
+import { SOMITE_VERSION } from "@somite/workflow/version";
 import { SOMITE_MCP_TOOL } from "./mcpTools.ts";
 
-const VERSION = "0.1.0";
 const MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
 const LEGACY_PROTOCOLS = new Set(["2024-10-07", "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]);
 const LATEST_LEGACY_PROTOCOL = "2025-11-25";
@@ -247,7 +247,7 @@ async function dispatch(method: string, params: unknown, signal: AbortSignal) {
     return {
       protocolVersion: typeof requested === "string" && LEGACY_PROTOCOLS.has(requested) ? requested : LATEST_LEGACY_PROTOCOL,
       capabilities: { tools: { listChanged: false } },
-      serverInfo: { name: "somite", title: "Somite", version: VERSION },
+      serverInfo: { name: "somite", title: "Somite", version: SOMITE_VERSION },
       instructions: "Inspect the current workflow before each edit. Use exact catalog contracts and current state revisions. Resolve readiness before compile, run, or validation.",
     };
   }

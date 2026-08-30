@@ -27,30 +27,7 @@ jobs:
           cache-write: false
           activate-environment: true
       - name: Verify tag and package versions
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag_version="${GITHUB_REF_NAME#v}"
-          root_version="$(node -p "require('./package.json').version")"
-          web_version="$(node -p "require('./web/package.json').version")"
-          runner_version="$(node -p "require('./runner/package.json').version")"
-          workflow_version="$(node -p "require('./packages/workflow/package.json').version")"
-          pixi_version="$(node -e "const fs=require('fs'); const text=fs.readFileSync('pixi.toml','utf8'); const match=text.match(/^version = \"([^\"]+)\"/m); if (!match) process.exit(1); process.stdout.write(match[1])")"
-          lock_version="$(node -p "require('./package-lock.json').version")"
-          lock_package_version="$(node -p "require('./package-lock.json').packages[''].version")"
-          lock_web_version="$(node -p "require('./package-lock.json').packages.web.version")"
-          lock_runner_version="$(node -p "require('./package-lock.json').packages.runner.version")"
-          lock_workflow_version="$(node -p "require('./package-lock.json').packages['packages/workflow'].version")"
-          test "$tag_version" = "$root_version"
-          test "$tag_version" = "$web_version"
-          test "$tag_version" = "$runner_version"
-          test "$tag_version" = "$workflow_version"
-          test "$tag_version" = "$pixi_version"
-          test "$tag_version" = "$lock_version"
-          test "$tag_version" = "$lock_package_version"
-          test "$tag_version" = "$lock_web_version"
-          test "$tag_version" = "$lock_runner_version"
-          test "$tag_version" = "$lock_workflow_version"
+        run: npm run check:version -- "$GITHUB_REF_NAME"
       - name: Install locked TypeScript dependencies
         run: npm ci
       - name: Typecheck product

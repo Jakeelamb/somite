@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
 import type { SomiteGraph } from "@somite/workflow/model";
+import { SOMITE_TYPESCRIPT_RUNNER_IDENTITY } from "@somite/workflow/version";
 import { RunManager } from "../src/jobs.ts";
 import { PixiCache } from "../src/pixiCache.ts";
 
@@ -88,6 +89,7 @@ test("TypeScript runner freezes, executes, traces, validates, and exports one pa
     const validation = await terminalStatus(manager, validationStarted.run_id);
     assert.equal(validation.phase, "completed", validation.error);
     assert.equal(validation.evidence_receipt?.result, "passed");
+    assert.equal(validation.evidence_receipt?.verifier, SOMITE_TYPESCRIPT_RUNNER_IDENTITY);
     assert.equal(validation.evidence_receipt?.fixture_digests.length, 1);
     const validationMarker = JSON.parse(await readFile(join(project.root, ".somite", "runs", validationStarted.run_id, "run-status.json"), "utf8"));
     assert.equal(validationMarker.evidence_receipt_digest, validation.evidence_receipt?.receipt_digest);

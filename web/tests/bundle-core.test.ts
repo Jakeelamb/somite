@@ -12,6 +12,7 @@ import {
 } from "@somite/workflow/bundle";
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
 import type { SomiteGraph } from "@somite/workflow/model";
+import { SOMITE_NEXTFLOW_COMPILER_IDENTITY } from "@somite/workflow/version";
 
 const encoder = new TextEncoder();
 
@@ -69,6 +70,7 @@ test("frozen package is complete and archives deterministically", async () => {
   const archived = unzipSync(first);
   assert.deepEqual(Object.keys(archived).sort(), [...frozen.files.keys()].sort());
   assert.equal(new TextDecoder().decode(archived["pixi.lock"]), "version: 6\n");
+  assert.equal(frozen.closure.compiler_identity, SOMITE_NEXTFLOW_COMPILER_IDENTITY);
 });
 
 test("archive names are safe and never empty", () => {

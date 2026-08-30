@@ -7,6 +7,8 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { SOMITE_VERSION } from "@somite/workflow/version";
+
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 
 async function reservePort() {
@@ -103,7 +105,7 @@ test("the production launcher serves the built app and runner without rebuilding
       closed.then(({ code, signal }) => Promise.reject(new Error(`production launcher exited during startup (${code ?? signal ?? "unknown status"})`))),
     ]);
     const runner = await runnerResponse.json() as { ok?: boolean; runtime?: string };
-    assert.deepEqual(runner, { ok: true, runtime: "typescript", version: "0.1.0" });
+    assert.deepEqual(runner, { ok: true, runtime: "typescript", version: SOMITE_VERSION });
     const html = await webResponse.text();
     assert.match(html, /Somite/);
     assert.doesNotMatch(output, /vinext build/);

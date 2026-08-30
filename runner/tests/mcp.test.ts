@@ -6,6 +6,7 @@ import { createInterface } from "node:readline";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { SOMITE_VERSION } from "@somite/workflow/version";
 import { SOMITE_MCP_TOOL_NAMES } from "../src/mcpTools.ts";
 
 type RpcResponse = { id: number; result?: Record<string, unknown>; error?: Record<string, unknown> };
@@ -63,6 +64,7 @@ test("thin MCP adapter supports modern discovery, legacy initialization, and str
   assert.deepEqual(discovered.result?.supportedVersions, ["2026-07-28", "2025-11-25"]);
   const initialized = await client.request(2, "initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "test", version: "1" } });
   assert.equal(initialized.result?.protocolVersion, "2025-06-18");
+  assert.deepEqual(initialized.result?.serverInfo, { name: "somite", title: "Somite", version: SOMITE_VERSION });
   const listed = await client.request(3, "tools/list");
   const tools = listed.result?.tools as Array<{ name: string }>;
   assert.deepEqual(tools.map((tool) => tool.name), SOMITE_MCP_TOOL_NAMES);

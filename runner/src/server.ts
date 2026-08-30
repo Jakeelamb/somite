@@ -23,6 +23,7 @@ import {
   type SourceWorkflowEdit,
 } from "@somite/workflow/sourceWorkflow";
 import { graphStateRevision, semanticGraphRevision } from "@somite/workflow/workflow";
+import { SOMITE_VERSION } from "@somite/workflow/version";
 import { atomicWrite, containedPath, ensurePrivateDirectory, pathExists, regularDirectory, regularFile } from "./files.ts";
 import { discoverAgents } from "./agentDiscovery.ts";
 import { AgentManager, AgentManagerError } from "./agentManager.ts";
@@ -814,7 +815,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
   const url = new URL(request.url);
   if (request.method === "OPTIONS") return new Response(null, { status: 204 });
   if (request.method === "GET" && url.pathname === "/api/health") {
-    return json({ ok: true, runtime: "typescript", version: "0.1.0" });
+    return json({ ok: true, runtime: "typescript", version: SOMITE_VERSION });
   }
   if (request.method === "GET" && url.pathname === "/api/session") {
     await state.writeChain;

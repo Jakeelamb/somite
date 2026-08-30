@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { SOMITE_VERSION } from "@somite/workflow/version";
 import { AgentManager, AgentManagerError, parseAgentCommand, trustedSomiteMcpPermissionTool } from "../src/agentManager.ts";
 import { SOMITE_MCP_TOOL_NAMES } from "../src/mcpTools.ts";
 
@@ -64,6 +65,7 @@ test("ACP manager streams events, configures the session, and auto-approves only
   await manager.prompt("Inspect the workflow");
   await until(() => !manager.snapshot().busy);
   const snapshot = manager.snapshot();
+  assert.ok(snapshot.events.some((event) => event.kind === "message" && event.detail === `client-version:${SOMITE_VERSION}`));
   assert.ok(snapshot.events.some((event) => event.kind === "message" && event.detail === "approved:allow-session"));
   assert.ok(snapshot.events.some((event) => event.kind === "permission" && event.status === "approved" && event.title === "Approve somite.workflow.get"));
   assert.ok(!snapshot.events.some((event) => event.kind === "permission" && event.status === "waiting"));

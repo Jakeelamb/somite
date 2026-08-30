@@ -14,6 +14,7 @@ import {
   PINNED_NEXTFLOW_VERSION,
   PINNED_OPENJDK_VERSION,
 } from "./nextflow.ts";
+import { SOMITE_NEXTFLOW_COMPILER_IDENTITY } from "./version.ts";
 import { validateGraph } from "./workflow.ts";
 
 export type ExportTarget = Readonly<{ archiveName: string; platform: string }>;
@@ -218,7 +219,7 @@ export function createFrozenPackageFiles(
   });
   const linked = linkRunClosure(graph, catalog, encoder.encode(compiled.pixiToml), {
     targetPlatform: target.platform,
-    compilerIdentity: "somite-nextflow@0.1.0",
+    compilerIdentity: SOMITE_NEXTFLOW_COMPILER_IDENTITY,
     nextflowIdentity: `nextflow@${PINNED_NEXTFLOW_VERSION}`,
     openjdkIdentity: `openjdk@${PINNED_OPENJDK_VERSION}`,
   });

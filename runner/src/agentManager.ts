@@ -7,6 +7,7 @@ import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import type { AgentTransactionResult } from "@somite/workflow/agentTransaction";
+import { SOMITE_VERSION } from "@somite/workflow/version";
 import { atomicWrite, ensurePrivateDirectory } from "./files.ts";
 import { isSomiteMcpToolName, type SomiteMcpToolName } from "./mcpTools.ts";
 
@@ -457,7 +458,7 @@ export class AgentManager {
     const initialized = await timeout(connection.agent.request(acp.methods.agent.initialize, {
       protocolVersion: acp.PROTOCOL_VERSION,
       clientCapabilities: { session: { configOptions: { boolean: {} } } },
-      clientInfo: { name: "somite", title: "Somite", version: "0.1.0" },
+      clientInfo: { name: "somite", title: "Somite", version: SOMITE_VERSION },
     }), 30_000, "ACP initialization");
     if (initialized.protocolVersion !== acp.PROTOCOL_VERSION) throw new Error(`Somite supports stable ACP protocol version ${acp.PROTOCOL_VERSION}`);
     const session = await timeout(connection.agent.request(acp.methods.agent.session.new, {

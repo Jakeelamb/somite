@@ -33,6 +33,7 @@ import {
 } from "@somite/workflow/linker";
 import type { SomiteGraph } from "@somite/workflow/model";
 import { compileNextflow, PINNED_NEXTFLOW_VERSION, PINNED_OPENJDK_VERSION } from "@somite/workflow/nextflow";
+import { SOMITE_TYPESCRIPT_RUNNER_IDENTITY } from "@somite/workflow/version";
 import { semanticGraphRevision } from "@somite/workflow/workflow";
 import { EvidenceStore } from "./evidenceStore.ts";
 import { atomicWrite } from "./files.ts";
@@ -588,7 +589,7 @@ export class RunManager {
       scope: "graph_e2e",
       configuration_digest: validation.binding.configuration_digest,
       fixture_digests: validation.binding.fixture_digests,
-      verifier: "somite-typescript-runner@0.1.0",
+      verifier: SOMITE_TYPESCRIPT_RUNNER_IDENTITY,
       result: terminalPhase === "completed" ? "passed" : "failed",
       node_results: nodeResults,
       edge_results: edgeResults,

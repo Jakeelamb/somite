@@ -14,6 +14,7 @@ import {
   LinkError,
 } from "@somite/workflow/linker";
 import type { SomiteGraph } from "@somite/workflow/model";
+import { SOMITE_NEXTFLOW_COMPILER_IDENTITY } from "@somite/workflow/version";
 
 const encoder = new TextEncoder();
 const graphCasesPath = new URL("../../testdata/assessment-parity-graphs.json", import.meta.url);
@@ -30,7 +31,7 @@ test("linking, Pixi freezing, evidence, and Operator manifests match the accepte
   const { graph, catalog } = await fixture();
   const plan = linkRunClosure(graph, catalog, encoder.encode("[workspace]\n"), {
     targetPlatform: "linux-64",
-    compilerIdentity: "somite-nextflow@0.1.0",
+    compilerIdentity: SOMITE_NEXTFLOW_COMPILER_IDENTITY,
     nextflowIdentity: "nextflow@26.04.6",
     openjdkIdentity: "openjdk@25.0.2",
   });
@@ -43,7 +44,7 @@ test("linking, Pixi freezing, evidence, and Operator manifests match the accepte
     scope: "graph_e2e",
     configuration_digest: "blake3:fixture-config",
     fixture_digests: ["blake3:b", "blake3:a", "blake3:a"],
-    verifier: "somite-nextflow@0.1.0",
+    verifier: SOMITE_NEXTFLOW_COMPILER_IDENTITY,
     result: "passed",
     node_results: { input1: "passed", fastqc1: "passed" },
     edge_results: { reads: "passed" },

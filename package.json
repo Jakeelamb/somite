@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=22.13.0"
+    "node": ">=22.13.0 <23"
   },
   "workspaces": [
     "web",
@@ -14,6 +14,7 @@
   "scripts": {
     "app": "npm start",
     "build": "npm run build --workspace=somite-web",
+    "check:version": "node --experimental-strip-types scripts/check-version-contract.ts",
     "check": "npm run typecheck && npm run lint && npm test",
     "dev": "node --experimental-strip-types scripts/somite-web.ts",
     "dev:web": "npm run dev --workspace=somite-web",
@@ -21,7 +22,7 @@
     "smoke:release": "node --experimental-strip-types --test --test-concurrency=1 runner/tests/production-launcher.smoke.ts runner/tests/pixi-nextflow.smoke.ts",
     "start": "node --experimental-strip-types scripts/somite-web.ts --production",
     "start:runner": "npm run start --workspace=somite-runner",
-    "test": "npm run test --workspace=@somite/workflow && npm run test --workspace=somite-runner && npm run test --workspace=somite-web",
+    "test": "npm run check:version && npm run test --workspace=@somite/workflow && npm run test --workspace=somite-runner && npm run test --workspace=somite-web",
     "typecheck": "tsc --noEmit -p tsconfig.json && npm run typecheck --workspaces --if-present"
   },
   "devDependencies": {

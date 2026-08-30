@@ -38,8 +38,10 @@ Linux and macOS; Windows verification runs inside WSL2, not native Windows.
 Create and push an annotated tag matching every package version:
 
 ```bash
-git tag -a v0.1.0 -m "Somite v0.1.0"
-git push origin v0.1.0
+release_version="$(node -p "require('./package.json').version")"
+npm run check:version -- "v${release_version}"
+git tag -a "v${release_version}" -m "Somite v${release_version}"
+git push origin "v${release_version}"
 ```
 
 `.github/workflows/release.yml` repeats the locked TypeScript gate, rejects a

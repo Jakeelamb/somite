@@ -35,7 +35,8 @@ pixi run start
 Later launches use the existing production bundle, so `pixi run start` does not
 rebuild it. After pulling application changes, run `pixi run setup` again.
 
-Or use Node.js 22.13 or newer directly and keep the same build-once flow:
+Or use Node.js 22.13.x directly and keep the same build-once flow. Somite pins
+the Node 22 runtime line so local and hosted builds use the same tested runtime:
 
 ```bash
 npm ci

@@ -11,6 +11,7 @@ let configOptions: acp.SessionConfigOption[] = [{
 }];
 
 let toolCallSequence = 0;
+let somiteClientVersion = "missing";
 
 function requestedTool(prompt: string) {
   if (prompt.includes("[test:unknown-somite-tool]")) {
@@ -35,11 +36,14 @@ function requestedTool(prompt: string) {
 }
 
 const application = acp.agent({ name: "Somite test agent" })
-  .onRequest(acp.methods.agent.initialize, ({ params }) => ({
-    protocolVersion: params.protocolVersion,
-    agentCapabilities: {},
-    agentInfo: { name: "somite-test-agent", title: "Somite Test Agent", version: "1.0.0" },
-  }))
+  .onRequest(acp.methods.agent.initialize, ({ params }) => {
+    somiteClientVersion = params.clientInfo?.version ?? "missing";
+    return {
+      protocolVersion: params.protocolVersion,
+      agentCapabilities: {},
+      agentInfo: { name: "somite-test-agent", title: "Somite Test Agent", version: "1.0.0" },
+    };
+  })
   .onRequest(acp.methods.agent.session.new, () => ({ sessionId: "test-session", configOptions }))
   .onRequest(acp.methods.agent.session.setConfigOption, ({ params }) => {
     configOptions = configOptions.map((option) => option.id === params.configId && option.type === "select" && typeof params.value === "string"
@@ -52,6 +56,13 @@ const application = acp.agent({ name: "Somite test agent" })
       .filter((content): content is Extract<typeof content, { type: "text" }> => content.type === "text")
       .map((content) => content.text)
       .join("\n");
+    await client.notify(acp.methods.client.session.update, {
+      sessionId: params.sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: `client-version:${somiteClientVersion}` },
+      },
+    });
     const requested = requestedTool(prompt);
     const toolCallId = `tool-${++toolCallSequence}`;
     await client.notify(acp.methods.client.session.update, {
