@@ -1,10 +1,17 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import test from "node:test";
 
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
-import { reconstructPaper } from "@somite/workflow/paper";
+import { MAX_PAPER_RESOURCE_CITATIONS, MAX_PAPER_REVIEW_BYTES } from "@somite/workflow/limits";
+import {
+  PaperReviewLimitError,
+  enforcePaperReviewSize,
+  paperResourceCitations,
+  reconstructPaper,
+} from "@somite/workflow/paper";
 
 const root = path.resolve(import.meta.dirname, "../..");
 const papers = path.join(root, "testdata/papers");
@@ -222,4 +229,102 @@ test("one cited run stays unresolved when the paper has multiple independent rea
   assert.ok(readSlots.some((node) => /independent read roles/i.test(node.note ?? "")));
   assert.ok(candidate.assessment.items.some((item) => readSlots.some((node) => node.id === item.node_id)));
   assert.notEqual(candidate.assessment.state, "ready");
+});
+
+test("paper resource extraction is bounded, explicit, and page-linear", () => {
+  const accessions = Array.from(
+    { length: MAX_PAPER_RESOURCE_CITATIONS + 1 },
+    (_, index) => `SRR${1_000_000 + index}`,
+  );
+  const review = reconstructPaper(catalog, [
+    "Methods",
+    "Reads were checked with FastQC.",
+    accessions.join("\f"),
+  ].join("\n"), "pdfjs");
+
+  assert.equal(review.resources.length, MAX_PAPER_RESOURCE_CITATIONS);
+  assert.equal(review.resources[0]?.accession, accessions[0]);
+  assert.equal(review.resources.at(-1)?.accession, accessions[MAX_PAPER_RESOURCE_CITATIONS - 1]);
+  assert.equal(review.resources[0]?.source_location, "PDF page 1");
+  assert.equal(review.resources.at(-1)?.source_location, `PDF page ${MAX_PAPER_RESOURCE_CITATIONS}`);
+  assert.ok(review.warnings.some((warning) => /retained the first 4,096.*omission explicitly/i.test(warning)));
+  assert.ok(Buffer.byteLength(JSON.stringify(review)) <= MAX_PAPER_REVIEW_BYTES);
+});
+
+test("paper method recognition stays bounded for repeated aliases and retains the exact PDF page", { timeout: 30_000 }, () => {
+  const script = String.raw`
+    import path from "node:path";
+    import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
+    import { reconstructPaper } from "@somite/workflow/paper";
+
+    const { catalog } = await loadOperatorCatalog(path.join(process.cwd(), "operators"));
+    const repeatedAlias = "FastQC. ".repeat(2 * 1024 * 1024);
+    const review = reconstructPaper(catalog, "Abstract\fMethods\n" + repeatedAlias, "pdfjs");
+    const mentions = review.mentions.filter((mention) => mention.operator_id === "qc.fastqc");
+    if (mentions.length !== 1 || mentions[0].source_location !== "PDF page 2") {
+      throw new Error("repeated FastQC evidence was not retained once on PDF page 2");
+    }
+
+    const negatedAlias = "without FastQC. ".repeat(64 * 1024);
+    const negated = reconstructPaper(catalog, "Abstract\fMethods\n" + negatedAlias, "pdfjs");
+    const negatedMentions = negated.mentions.filter((mention) => mention.operator_id === "qc.fastqc");
+    if (negatedMentions.length !== 1 || negatedMentions[0].source_location !== "PDF page 2" || negated.candidates.length !== 0) {
+      throw new Error("negated FastQC evidence changed reconstruction semantics");
+    }
+  `;
+  const child = spawnSync(process.execPath, [
+    "--max-old-space-size=128",
+    "--experimental-strip-types",
+    "--input-type=module",
+    "--eval",
+    script,
+  ], {
+    cwd: root,
+    encoding: "utf8",
+    timeout: 8_000,
+  });
+
+  assert.equal(child.status, 0, child.stderr || child.error?.message || "paper reconstruction subprocess failed");
+});
+
+test("paper method-window discovery does not retain a line array for a dense 64 MiB document", { timeout: 30_000 }, () => {
+  const script = String.raw`
+    import { paperMethodsWindow } from "@somite/workflow/paper";
+
+    const line = "x".repeat(63) + "\n";
+    const text = "Methods\n" + line.repeat(1024 * 1024);
+    const window = paperMethodsWindow(text);
+    if (window.offset !== 0 || window.text.length !== text.length) {
+      throw new Error("dense methods window changed heading semantics");
+    }
+  `;
+  const child = spawnSync(process.execPath, [
+    "--max-old-space-size=128",
+    "--experimental-strip-types",
+    "--input-type=module",
+    "--eval",
+    script,
+  ], {
+    cwd: root,
+    encoding: "utf8",
+    timeout: 20_000,
+  });
+
+  assert.equal(child.status, 0, child.stderr || child.error?.message || "dense paper reconstruction subprocess failed");
+});
+
+test("paper resource extraction rejects absurd identifier lengths without expanding them", () => {
+  const text = `SRR${"1".repeat(1024 * 1024)}`;
+  assert.deepEqual(paperResourceCitations(text, "text"), []);
+});
+
+test("paper review limits fail with a non-retryable typed error", () => {
+  const review = reconstructPaper(catalog, "Methods\nFastQC was used for read quality control.", "text");
+  assert.throws(
+    () => enforcePaperReviewSize(review, 1),
+    (error: unknown) => error instanceof PaperReviewLimitError
+      && error.code === "paper_reconstruction_limit"
+      && error.retryable === false
+      && error.sizeBytes > error.maximumBytes,
+  );
 });

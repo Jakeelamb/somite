@@ -6,6 +6,7 @@ import test from "node:test";
 
 import { chromium, type Browser, type Page, type Route } from "playwright-core";
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
+import { InputOrigins } from "../src/inputOrigins.ts";
 import { NfcoreGateway } from "../src/nfcoreGateway.ts";
 import { nfcoreCatalogFixture, nfcoreSourceArchive } from "./helpers/nfcoreFixture.ts";
 import { repositoryRoot, startProductionApp, type ProductionApp } from "./helpers/productionApp.ts";
@@ -38,6 +39,23 @@ async function emptyCatalogs(page: Page, app: ProductionApp) {
   await page.route(`${app.runnerUrl}/api/catalog/snakemake`, (route) => fulfillJson(route, app, { entries: [], cached: true }));
 }
 
+async function inputOriginRecoveryFixture(prefix: string) {
+  const projectRoot = await mkdtemp(join(tmpdir(), `somite-browser-${prefix}-`));
+  const externalRoot = await mkdtemp(join(tmpdir(), `somite-browser-${prefix}-external-`));
+  const graphPath = join(projectRoot, "saved.somite.json");
+  const autosavePath = join(projectRoot, "saved.somite.autosave.somite.json");
+  const originalPath = join(externalRoot, "original.somite.json");
+  const saved = { schema_version: 3 as const, name: "Saved workflow", nodes: [], edges: [] };
+  const recovered = { schema_version: 3 as const, name: "Recovered canvas", nodes: [], edges: [] };
+  await writeFile(graphPath, `${JSON.stringify(saved, null, 2)}\n`);
+  await writeFile(autosavePath, `${JSON.stringify(recovered, null, 2)}\n`);
+  await writeFile(originalPath, `${JSON.stringify({ ...saved, name: "Original file contents" }, null, 2)}\n`);
+  const origins = await InputOrigins.open(projectRoot, graphPath, projectRoot, saved);
+  const externalId = await origins.registerOpenedGraph(externalRoot);
+  await origins.record(externalId, saved);
+  return { projectRoot, externalRoot, graphPath, originalPath };
+}
+
 let browser: Browser;
 
 test.before(async () => {
@@ -48,7 +66,7 @@ test.after(async () => {
   await browser.close();
 });
 
-test("production workbench persists its name, restores Agent controls, and adds searched public reads", { timeout: 60_000 }, async (context) => {
+test("production workbench persists its name, applies one undoable Agent MCP edit, and adds searched public reads", { timeout: 90_000 }, async (context) => {
   const app = await startProductionApp();
   context.after(app.stop);
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
@@ -119,6 +137,22 @@ test("production workbench persists its name, restores Agent controls, and adds 
   const feed = agent.getByRole("log");
   await feed.getByText(/client-version:0\.1\.0/).waitFor({ timeout: 30_000 });
   await feed.getByText(/approved:allow-session/).waitFor({ timeout: 30_000 });
+  await message.fill("[test:mcp-canvas-transaction]");
+  await agent.getByRole("button", { name: "Send to Agent" }).click();
+  const agentFastqc = page.locator(".react-flow__node", { has: page.locator(".node-operator", { hasText: "qc.fastqc" }) });
+  await agentFastqc.waitFor({ timeout: 30_000 });
+  assert.equal(await page.locator(".react-flow__node").count(), 1);
+  await page.locator(".status-copy").getByText(/Agent applied .+Add a reviewed FastQC step.+Undo available/).waitFor();
+  assert.equal(await feed.locator(".agent-event.transaction").count(), 1);
+  await feed.locator(".agent-event.transaction").getByText("Saved as one undoable canvas change.", { exact: true }).waitFor();
+  const activity = feed.locator("details.agent-activity");
+  await activity.locator("summary").click();
+  await activity.locator("li", { hasText: "mcp.Somite.somite.workflow.get" }).last().waitFor();
+  await activity.locator("li", { hasText: "mcp.Somite.somite.graph.apply_transaction" }).waitFor();
+  await page.getByRole("button", { name: "Undo", exact: true }).click();
+  await agentFastqc.waitFor({ state: "detached" });
+  assert.equal(await page.locator(".react-flow__node").count(), 0);
+  await page.locator(".status-copy").getByText("Undid edit", { exact: true }).waitFor();
   await agent.getByRole("button", { name: "Disconnect Somite Test Agent" }).click();
   await agent.getByText("Choose an assistant", { exact: true }).waitFor();
   await page.getByRole("button", { name: "Close Agent" }).click();
@@ -158,6 +192,8 @@ test("production Nextflow catalog selection resolves into visible editable nodes
 
   await page.goto(app.webUrl);
   await page.getByRole("textbox", { name: "Workflow name" }).waitFor();
+  const library = page.locator("section[aria-label='Operator Library']");
+  if (!await library.isVisible()) await page.getByRole("button", { name: "Add to Canvas" }).click();
   await page.getByRole("button", { name: /Browse Nextflow workflows/ }).click();
   await page.locator("button.operator-add", { hasText: "nf-core/demo" }).click();
   const sourceNode = page.locator(".source-workflow-node");
@@ -215,12 +251,89 @@ test("production project controls render a local Snakemake graph and explain a f
   await path.fill("working");
   await panel.getByRole("button", { name: "Open project" }).click();
   await page.locator(".react-flow__node").nth(1).waitFor();
+  await page.locator(".react-flow__edge").waitFor({ state: "attached" });
   assert.equal(await page.locator(".react-flow__node").count(), 2);
   assert.equal(await page.locator(".react-flow__edge").count(), 1);
   await page.locator(".react-flow__node", { hasText: "prepare" }).waitFor();
   await page.locator(".react-flow__node", { hasText: "all" }).waitFor();
   assert.equal(await page.locator(".node-collapsed-body").count(), 2);
   await page.locator(".status-copy").getByText(/Opened working · Snakemake rules/).waitFor();
+  assertNoPageErrors();
+});
+
+test("production recovery keeps the recovered canvas while rebinding its input location", { timeout: 90_000 }, async (context) => {
+  const { projectRoot, externalRoot, graphPath, originalPath } = await inputOriginRecoveryFixture("origin-recovery");
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  context.after(() => rm(externalRoot, { recursive: true, force: true }));
+
+  const app = await startProductionApp({ projectRoot, graph: "saved.somite.json" });
+  context.after(app.stop);
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+  context.after(() => page.close());
+  const assertNoPageErrors = watchPage(page);
+  await emptyCatalogs(page, app);
+  let runRequests = 0;
+  await page.route(`${app.runnerUrl}/api/runs`, async (route) => {
+    runRequests += 1;
+    await fulfillJson(route, app, { run_id: "unexpected-recovery-run" }, 202);
+  });
+
+  await page.goto(app.webUrl);
+  const workflowName = page.getByRole("textbox", { name: "Workflow name" });
+  await workflowName.waitFor();
+  assert.equal(await workflowName.inputValue(), "Recovered canvas");
+  const recovery = page.getByRole("alert").filter({ hasText: "Confirm where this workflow's files live" });
+  await recovery.waitFor();
+  for (const buttonName of ["Paused", "Export", "Validate", "Run"]) {
+    assert.equal(await page.getByRole("button", { name: buttonName, exact: true }).isDisabled(), true, `${buttonName} should be blocked during recovery`);
+  }
+  await page.keyboard.press(process.platform === "darwin" ? "Meta+s" : "Control+s");
+  await page.keyboard.press("F5");
+  assert.equal(runRequests, 0);
+  assert.equal(JSON.parse(await readFile(graphPath, "utf8")).name, "Saved workflow");
+
+  await page.getByRole("button", { name: "Open Agent" }).click();
+  const agent = page.locator("section[aria-label='Agent']");
+  await agent.getByText("Canvas actions are paused", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "Close Agent" }).click();
+
+  await recovery.getByRole("button", { name: "Choose original workflow" }).click();
+  const project = page.locator("section[aria-label='Project']");
+  await project.getByLabel("Original Somite workflow file").fill(originalPath);
+  await project.getByRole("button", { name: "Use workflow location" }).click();
+  await recovery.waitFor({ state: "detached" });
+  assert.equal(await workflowName.inputValue(), "Recovered canvas", "rebinding must not replace the recovered canvas");
+  assert.equal(await page.getByRole("button", { name: "Save", exact: true }).isEnabled(), true);
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await page.getByRole("button", { name: "Saved", exact: true }).waitFor();
+  assert.equal(JSON.parse(await readFile(graphPath, "utf8")).name, "Recovered canvas");
+  assertNoPageErrors();
+});
+
+test("production recovery can explicitly adopt the current project folder", { timeout: 60_000 }, async (context) => {
+  const { projectRoot, externalRoot, graphPath } = await inputOriginRecoveryFixture("origin-current-project");
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  context.after(() => rm(externalRoot, { recursive: true, force: true }));
+  const app = await startProductionApp({ projectRoot, graph: "saved.somite.json" });
+  context.after(app.stop);
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+  context.after(() => page.close());
+  const assertNoPageErrors = watchPage(page);
+  await emptyCatalogs(page, app);
+
+  await page.goto(app.webUrl);
+  const workflowName = page.getByRole("textbox", { name: "Workflow name" });
+  await workflowName.waitFor();
+  assert.equal(await workflowName.inputValue(), "Recovered canvas");
+  const recovery = page.getByRole("alert").filter({ hasText: "Confirm where this workflow's files live" });
+  await recovery.getByRole("button", { name: "Use this project folder" }).click();
+  await recovery.waitFor({ state: "detached" });
+  assert.equal(await workflowName.inputValue(), "Recovered canvas");
+  const save = page.getByRole("button", { name: "Save", exact: true });
+  assert.equal(await save.isEnabled(), true);
+  await save.click();
+  await page.getByRole("button", { name: "Saved", exact: true }).waitFor();
+  assert.equal(JSON.parse(await readFile(graphPath, "utf8")).name, "Recovered canvas");
   assertNoPageErrors();
 });
 
@@ -276,16 +389,31 @@ test("production controls complete validation, run, and bundle download journeys
   context.after(() => page.close());
   const assertNoPageErrors = watchPage(page);
   await emptyCatalogs(page, app);
-  await page.route(`${app.runnerUrl}/api/validations`, (route) => fulfillJson(route, app, { run_id: "browser-validation" }, 202));
-  await page.route(`${app.runnerUrl}/api/runs`, (route) => fulfillJson(route, app, { run_id: "browser-run" }, 202));
+  await page.route(`${app.runnerUrl}/api/validations`, (route) => fulfillJson(route, app, { run_id: "browser-validation", phase: "preparing", replayed: false }, 202));
+  await page.route(`${app.runnerUrl}/api/runs`, (route) => fulfillJson(route, app, { run_id: "browser-run", phase: "preparing", replayed: false }, 202));
   await page.route(`${app.runnerUrl}/api/runs/*`, (route) => {
     const id = route.request().url().endsWith("browser-validation") ? "browser-validation" : "browser-run";
     return fulfillJson(route, app, {
       run_id: id,
       phase: "completed",
       states: { import1: "done", fastqc1: "done" },
+      progress: { completed: 2, total: 2, unit: "nodes", message: "Completed" },
       exit_code: 0,
-      ...(id === "browser-validation" ? { evidence_receipt: { result: "passed", scope: "representative", fixture_digests: ["blake3:browser"] } } : {}),
+      ...(id === "browser-validation" ? { evidence_receipt: {
+        receipt_digest: "blake3:browser-receipt",
+        recorded_at_unix_ms: 1,
+        subject_digest: "blake3:browser-subject",
+        kind: "representative_validation",
+        scope: "representative",
+        configuration_digest: "blake3:browser-configuration",
+        fixture_digests: ["blake3:browser-fixture"],
+        verifier: "somite-browser-test",
+        result: "passed",
+        node_results: { import1: "passed", fastqc1: "passed" },
+        edge_results: { e1: "passed" },
+        artifact_digests: [],
+        log_digests: [],
+      } } : {}),
     });
   });
   let exportRequests = 0;
@@ -321,5 +449,96 @@ test("production controls complete validation, run, and bundle download journeys
   assert.ok(downloadPath);
   assert.ok((await stat(downloadPath)).size > 4);
   await page.locator(".status-copy").getByText(/Exported .*\.somite-run\.zip/).waitFor();
+  assertNoPageErrors();
+});
+
+test("production flagship canvas builds, annotates, saves, and restores a ready native workflow", { timeout: 90_000 }, async (context) => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "somite-browser-flagship-"));
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  await mkdir(join(projectRoot, "testdata"));
+  await copyFile(join(repositoryRoot, "testdata", "tiny_R1.fastq"), join(projectRoot, "testdata", "tiny_R1.fastq"));
+  const app = await startProductionApp({ projectRoot });
+  context.after(app.stop);
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+  context.after(() => page.close());
+  const assertNoPageErrors = watchPage(page);
+  await emptyCatalogs(page, app);
+
+  await page.goto(app.webUrl);
+  await page.getByRole("textbox", { name: "Workflow name" }).waitFor();
+  const readiness = page.locator("footer .readiness-status");
+  await readiness.filter({ hasText: "Start building" }).waitFor();
+
+  const library = page.locator("section[aria-label='Operator Library']");
+  await library.getByRole("button", { name: "Close Library" }).click();
+  const pane = page.locator(".react-flow__pane");
+  await page.getByLabel("Import local files").setInputFiles(join(repositoryRoot, "testdata", "tiny_R1.fastq"));
+  const importNode = page.locator(".react-flow__node", { has: page.locator(".node-operator", { hasText: "files.import" }) });
+  await importNode.waitFor();
+  const inspector = page.locator("section[aria-label='Node Parameters']");
+  const path = inspector.getByRole("textbox", { name: "Path" });
+  await path.fill("");
+  await inspector.getByRole("button", { name: "Close Parameters" }).click();
+  await readiness.filter({ hasText: "Needs 1 item" }).waitFor();
+
+  await pane.dblclick({ position: { x: 900, y: 360 } });
+  const search = library.getByRole("textbox", { name: "Search everything" });
+  await search.fill("FastQC");
+  await library.locator("button.operator-add", { hasText: "FastQC" }).click();
+  await library.getByRole("button", { name: "Close Library" }).click();
+
+  const fastqcNode = page.locator(".react-flow__node", { has: page.locator(".node-operator", { hasText: "qc.fastqc" }) });
+  await fastqcNode.waitFor();
+  assert.equal(await page.locator(".react-flow__node").count(), 2);
+  await readiness.filter({ hasText: "Needs 2 items" }).waitFor();
+
+  await importNode.click();
+  await path.fill("testdata/tiny_R1.fastq");
+  assert.equal(await path.inputValue(), "testdata/tiny_R1.fastq");
+  await inspector.getByRole("button", { name: "Close Parameters" }).click();
+  await readiness.filter({ hasText: "Needs 1 item" }).waitFor();
+
+  const outputHandle = importNode.locator(".react-flow__handle.source[data-handleid='file']");
+  const inputHandle = fastqcNode.locator(".react-flow__handle.target[data-handleid='fastq']");
+  const outputBox = await outputHandle.boundingBox();
+  const inputBox = await inputHandle.boundingBox();
+  assert.ok(outputBox, "files.import.file output handle should be visible");
+  assert.ok(inputBox, "qc.fastqc.fastq input handle should be visible");
+  await page.mouse.move(outputBox.x + outputBox.width / 2, outputBox.y + outputBox.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(inputBox.x + inputBox.width / 2, inputBox.y + inputBox.height / 2, { steps: 12 });
+  await page.mouse.up();
+  await page.locator(".react-flow__edge").waitFor({ state: "attached" });
+  assert.equal(await page.locator(".react-flow__edge").count(), 1);
+  await page.locator(".status-copy").getByText("Connected file to fastq", { exact: true }).waitFor();
+  await readiness.filter({ hasText: "Ready" }).waitFor();
+
+  await page.getByRole("button", { name: "Sticky Note Tool" }).click();
+  await pane.click({ position: { x: 690, y: 650 } });
+  const note = page.locator(".canvas-annotation.sticky");
+  const noteText = page.getByRole("textbox", { name: "Sticky note note-1" });
+  await noteText.fill("Review FastQC evidence");
+  await page.getByRole("button", { name: "Use Analysis color" }).click();
+  assert.equal(await note.getAttribute("data-color"), "violet");
+  await readiness.filter({ hasText: "Ready" }).waitFor();
+
+  const undo = page.getByRole("button", { name: "Undo", exact: true });
+  const redo = page.getByRole("button", { name: "Redo", exact: true });
+  await undo.click();
+  assert.equal(await note.getAttribute("data-color"), "yellow");
+  await redo.click();
+  assert.equal(await note.getAttribute("data-color"), "violet");
+
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await page.getByRole("button", { name: "Saved", exact: true }).waitFor();
+  await page.reload();
+  await page.locator(".react-flow__node").nth(1).waitFor();
+  assert.equal(await page.locator(".react-flow__node").count(), 2);
+  assert.equal(await page.locator(".react-flow__edge").count(), 1);
+  assert.equal(await page.getByRole("textbox", { name: "Sticky note note-1" }).inputValue(), "Review FastQC evidence");
+  assert.equal(await page.locator(".canvas-annotation.sticky").getAttribute("data-color"), "violet");
+  await page.locator(".react-flow__node", { has: page.locator(".node-operator", { hasText: "files.import" }) }).click();
+  assert.equal(await page.locator("section[aria-label='Node Parameters']").getByRole("textbox", { name: "Path" }).inputValue(), "testdata/tiny_R1.fastq");
+  await readiness.filter({ hasText: "Ready" }).waitFor();
   assertNoPageErrors();
 });

@@ -2,6 +2,7 @@ import { join } from "node:path";
 import { gunzip } from "node:zlib";
 
 import type { OperatorCatalog } from "@somite/workflow/catalog";
+import { boundedResponseBytes } from "@somite/workflow/boundedResponse";
 import { byteDigest } from "@somite/workflow/contentIdentity";
 import type { SomiteGraph, SourceWorkflowInstance } from "@somite/workflow/model";
 import {
@@ -33,29 +34,7 @@ type CatalogSnapshot = Readonly<{ pipelines: readonly NfcorePipeline[]; cached: 
 
 async function boundedResponse(response: Response, maximumBytes: number, label: string) {
   if (!response.ok) throw new Error(`${label} returned ${response.status} ${response.statusText}`);
-  const announced = Number(response.headers.get("content-length") ?? 0);
-  if (Number.isFinite(announced) && announced > maximumBytes) throw new Error(`${label} exceeds ${maximumBytes} bytes`);
-  if (!response.body) return new Uint8Array();
-  const chunks: Uint8Array[] = [];
-  const reader = response.body.getReader();
-  let total = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > maximumBytes) {
-      await reader.cancel();
-      throw new Error(`${label} exceeds ${maximumBytes} bytes`);
-    }
-    chunks.push(value);
-  }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes;
+  return boundedResponseBytes(response, maximumBytes, label);
 }
 
 function unzip(bytes: Uint8Array) {

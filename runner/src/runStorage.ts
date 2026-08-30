@@ -2,6 +2,7 @@ import { lstat, readdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 
 import { pathExists, regularDirectory, regularFile } from "./files.ts";
+import { pixiEnvironmentCacheRoot } from "./pixiCache.ts";
 
 const MAX_STATUS_BYTES = 64 * 1024;
 const MAX_WALK_ENTRIES = 2_000_000;
@@ -107,9 +108,11 @@ async function runProfile(run: { name: string; path: string }, activeRunIds: Rea
 
 export class RunStorage {
   readonly #root: string;
+  readonly #environmentCacheRoot: string;
 
-  constructor(projectRoot: string) {
+  constructor(projectRoot: string, environmentCacheRoot = pixiEnvironmentCacheRoot()) {
     this.#root = projectRoot;
+    this.#environmentCacheRoot = environmentCacheRoot;
   }
 
   async profile(activeRunIds: ReadonlySet<string> = new Set()): Promise<RunStorageProfile> {
@@ -147,7 +150,8 @@ export class RunStorage {
       "catalog",
       "agent-transcripts",
     ];
-    const [pixiEnvironments, paperTools, paperCache, ...retainedSizes] = await Promise.all([
+    const [pixiEnvironments, legacyPixiEnvironments, paperTools, paperCache, ...retainedSizes] = await Promise.all([
+      treeBytes(this.#environmentCacheRoot),
       treeBytes(join(state, "pixi", "environments")),
       treeBytes(join(state, "tools")),
       treeBytes(join(state, "papers", "cache")),
@@ -166,7 +170,7 @@ export class RunStorage {
         uncertified_count: uncertifiedCount,
         uncertified_bytes: uncertifiedBytes,
       },
-      shared_environments: { bytes: pixiEnvironments + paperTools, recreatable: true },
+      shared_environments: { bytes: pixiEnvironments + legacyPixiEnvironments + paperTools, recreatable: true },
       paper_cache: { bytes: paperCache, recreatable: true },
       retained_scientific_state: { bytes: retained },
     };

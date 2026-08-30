@@ -2,6 +2,7 @@ import type { ParamValue, PortType } from "./model.ts";
 import { jsonDigest } from "./contentIdentity.ts";
 import type {
   Operator,
+  PinnedOperator,
   OperatorResolutionSpec,
   OutputSpec,
   PaperRecognitionSpec,
@@ -277,6 +278,17 @@ export function parseOperator(value: unknown, path = "operator"): Operator {
     ...(resolution ? { resolution } : {}),
     ...(paper ? { paper } : {}),
   };
+}
+
+/** Parse the runner's catalog response, whose content identity is already pinned. */
+export function parsePinnedOperator(value: unknown, path = "operator"): PinnedOperator {
+  const raw = object(value, path);
+  const revision = string(raw.revision, `${path}.revision`);
+  const { revision: _revision, ...operator } = raw;
+  const parsed = parseOperator(operator, path);
+  const expected = operatorRevision(parsed);
+  if (revision !== expected) throw new Error(`${path}.revision does not match the normalized operator contract`);
+  return { ...parsed, revision };
 }
 
 function sortedRecord<T, R>(record: Readonly<Record<string, T>>, map: (value: T) => R) {

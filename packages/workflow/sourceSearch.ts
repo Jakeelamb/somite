@@ -1,3 +1,5 @@
+import { boundedResponseBytes } from "./boundedResponse.ts";
+
 export type SourceSearchRequest = Readonly<{
   kind: string;
   value: string;
@@ -27,6 +29,8 @@ export type SourceSearchResponse = Readonly<{
 
 const EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils";
 const ENSEMBL = "https://rest.ensembl.org";
+const MAX_SOURCE_SEARCH_RESPONSE_BYTES = 8 * 1024 * 1024;
+const decoder = new TextDecoder("utf-8", { fatal: true });
 
 type JsonRecord = Record<string, unknown>;
 
@@ -233,7 +237,12 @@ async function fetchJson(fetcher: typeof fetch, url: URL, signal?: AbortSignal) 
     signal: signal ?? AbortSignal.timeout(7_000),
   });
   if (!response.ok) throw new HttpResponseError(response);
-  return response.json() as Promise<unknown>;
+  const bytes = await boundedResponseBytes(response, MAX_SOURCE_SEARCH_RESPONSE_BYTES, "Public data response");
+  try {
+    return JSON.parse(decoder.decode(bytes)) as unknown;
+  } catch {
+    throw new Error("public data service returned invalid JSON");
+  }
 }
 
 function isNotFound(error: unknown) {

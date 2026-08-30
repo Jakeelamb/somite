@@ -30,18 +30,21 @@ test("run storage profiles reclaimable bytes without treating scientific records
   try {
     const complete = await terminalRun(root, "run-complete");
     const active = await terminalRun(root, "run-active");
+    const environmentCache = join(root, "shared-environment-cache");
+    await mkdir(join(environmentCache, "v1", "linux-64", "cache"), { recursive: true });
+    await writeFile(join(environmentCache, "v1", "linux-64", "cache", "environment.bin"), Buffer.alloc(768, 5));
     await mkdir(join(root, ".somite", "pixi", "environments", "linux-64", "cache"), { recursive: true });
     await writeFile(join(root, ".somite", "pixi", "environments", "linux-64", "cache", "tool.bin"), Buffer.alloc(512, 3));
     await mkdir(join(root, ".somite", "tools", "paper"), { recursive: true });
     await writeFile(join(root, ".somite", "tools", "paper", "ocr.bin"), Buffer.alloc(128, 4));
-    const storage = new RunStorage(root);
+    const storage = new RunStorage(root, environmentCache);
 
     const profile = await storage.profile(new Set(["run-active"]));
     assert.equal(profile.runs.count, 2);
     assert.equal(profile.runs.terminal_count, 2);
     assert.equal(profile.runs.reclaimable_bytes, 384);
     assert.deepEqual(profile.runs.reclaimable_run_ids, ["run-complete"]);
-    assert.equal(profile.shared_environments.bytes, 640);
+    assert.equal(profile.shared_environments.bytes, 1_408);
     assert.ok(profile.retained_scientific_state.bytes >= Buffer.byteLength("retain me\nretain log\nretain lock\n"));
 
     await assert.rejects(storage.dehydrateRuns(["run-active"], new Set(["run-active"])), /still active/);
@@ -64,7 +67,7 @@ test("run storage refuses cleanup without a valid terminal marker", async () => 
     const directory = join(root, ".somite", "runs", "run-unknown");
     await mkdir(join(directory, "work"), { recursive: true });
     await writeFile(join(directory, "work", "preserve.bin"), Buffer.alloc(16));
-    const storage = new RunStorage(root);
+    const storage = new RunStorage(root, join(root, "environment-cache"));
     const profile = await storage.profile();
     assert.equal(profile.runs.uncertified_count, 1);
     assert.ok(profile.runs.uncertified_bytes >= 16);
@@ -84,7 +87,7 @@ test("run storage refuses symlinked reclaimable paths", async () => {
     await writeFile(join(outside, "preserve.bin"), Buffer.alloc(32));
     await rm(join(directory, "work"), { recursive: true });
     await symlink(outside, join(directory, "work"), "dir");
-    const storage = new RunStorage(root);
+    const storage = new RunStorage(root, join(root, "environment-cache"));
 
     await assert.rejects(storage.dehydrateRuns(["run-symlink"]), /not a regular directory/);
     assert.equal((await readFile(join(outside, "preserve.bin"))).byteLength, 32);
@@ -99,7 +102,7 @@ test("run cleanup preflights every target before deleting any work", async () =>
     const valid = await terminalRun(root, "run-valid");
     const invalid = await terminalRun(root, "run-invalid");
     await writeFile(join(invalid, "run-status.json"), "{broken\n");
-    const storage = new RunStorage(root);
+    const storage = new RunStorage(root, join(root, "environment-cache"));
 
     await assert.rejects(storage.dehydrateRuns(["run-valid", "run-invalid"]), /invalid terminal status/);
     assert.equal((await readFile(join(valid, "work", "temporary.bin"))).byteLength, 128);

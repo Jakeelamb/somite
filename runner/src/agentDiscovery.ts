@@ -1,5 +1,6 @@
 import { basename } from "node:path";
 
+import { boundedResponseBytes } from "@somite/workflow/boundedResponse";
 import { executablePath } from "./system.ts";
 
 export const ACP_REGISTRY_URL = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
@@ -149,26 +150,7 @@ function companion(id: string) {
 async function registryBytes() {
   const response = await fetch(ACP_REGISTRY_URL, { signal: AbortSignal.timeout(4_000), headers: { accept: "application/json" } });
   if (!response.ok || !response.body) throw new Error(`registry returned HTTP ${response.status}`);
-  const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > MAX_REGISTRY_BYTES) {
-      await reader.cancel();
-      throw new Error("registry is too large");
-    }
-    chunks.push(value);
-  }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes;
+  return boundedResponseBytes(response, MAX_REGISTRY_BYTES, "Agent registry");
 }
 
 async function registrySnapshot(): Promise<RegistrySnapshot> {

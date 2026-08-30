@@ -7,13 +7,26 @@ import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import type { AgentTransactionResult } from "@somite/workflow/agentTransaction";
+import {
+  MAX_ACP_CONTROL_FRAME_BYTES,
+  MAX_AGENT_CONFIG_BYTES,
+  MAX_AGENT_EVENT_DETAIL_BYTES,
+  MAX_AGENT_EVENT_LOG_BYTES,
+} from "@somite/workflow/limits";
 import { SOMITE_VERSION } from "@somite/workflow/version";
+import { agentChildEnvironment } from "./agentEnvironment.ts";
+import { boundedNdjsonStream } from "./boundedNdjson.ts";
 import { atomicWrite, ensurePrivateDirectory } from "./files.ts";
 import { isSomiteMcpToolName, type SomiteMcpToolName } from "./mcpTools.ts";
 
 const EVENT_LIMIT = 4_096;
 const TRANSACTION_EVENT_LIMIT = 32;
 const MAX_PROMPT_BYTES = 64 * 1024;
+const MAX_PERMISSION_CHOICES = 32;
+const MAX_PERMISSION_OPTION_ID_BYTES = 256;
+const MAX_PERMISSION_OPTION_NAME_BYTES = 1_024;
+const MAX_PERMISSION_TOOL_CORRELATIONS = 256;
+const MAX_PERMISSION_TOOL_CALL_ID_BYTES = 256;
 
 const WORKFLOW_AGENT_CONTRACT = `You are the Agent embedded in Somite. The current Somite canvas is the work product.
 
@@ -34,6 +47,53 @@ export type AgentPermissionChoice = {
   name: string;
   kind: "allow_once" | "allow_always" | "reject_once" | "reject_always" | "other";
 };
+
+type PermissionChoiceResult =
+  | { choices: AgentPermissionChoice[] }
+  | { reason: string };
+
+function boundedPermissionChoices(
+  options: acp.PermissionOption[],
+  maximumAggregateBytes: number,
+): PermissionChoiceResult {
+  if (options.length === 0 || options.length > MAX_PERMISSION_CHOICES) {
+    return { reason: `the agent sent ${options.length} choices; Somite accepts between 1 and ${MAX_PERMISSION_CHOICES}` };
+  }
+  const choices: AgentPermissionChoice[] = [];
+  const optionIds = new Set<string>();
+  let aggregateBytes = 2;
+  for (const option of options) {
+    if (typeof option.optionId !== "string" || !option.optionId.trim()) {
+      return { reason: "every permission choice must have a non-empty ID" };
+    }
+    if (typeof option.name !== "string" || !option.name.trim()) {
+      return { reason: "every permission choice must have a visible name" };
+    }
+    const optionIdBytes = Buffer.byteLength(option.optionId, "utf8");
+    if (optionIdBytes > MAX_PERMISSION_OPTION_ID_BYTES) {
+      return { reason: `a permission choice ID exceeded ${MAX_PERMISSION_OPTION_ID_BYTES} UTF-8 bytes` };
+    }
+    const nameBytes = Buffer.byteLength(option.name, "utf8");
+    if (nameBytes > MAX_PERMISSION_OPTION_NAME_BYTES) {
+      return { reason: `a permission choice name exceeded ${MAX_PERMISSION_OPTION_NAME_BYTES} UTF-8 bytes` };
+    }
+    if (optionIds.has(option.optionId)) {
+      return { reason: `the permission choice ID ${JSON.stringify(option.optionId)} was repeated` };
+    }
+    optionIds.add(option.optionId);
+    const choice: AgentPermissionChoice = {
+      option_id: option.optionId,
+      name: option.name,
+      kind: option.kind,
+    };
+    aggregateBytes += Buffer.byteLength(JSON.stringify(choice), "utf8") + (choices.length ? 1 : 0);
+    if (aggregateBytes > maximumAggregateBytes) {
+      return { reason: `the permission choices exceeded the ${maximumAggregateBytes}-byte visible event allowance` };
+    }
+    choices.push(choice);
+  }
+  return { choices };
+}
 
 export type AgentEvent = {
   cursor: number;
@@ -74,6 +134,13 @@ type Runtime = {
   shuttingDown: boolean;
   stderr: string;
 };
+
+export type AgentManagerLimits = Readonly<{
+  eventBytes?: number;
+  configBytes?: number;
+  detailBytes?: number;
+  acpFrameBytes?: number;
+}>;
 
 export class AgentManagerError extends Error {
   readonly code: string;
@@ -154,9 +221,45 @@ export function parseAgentCommand(command: string) {
   return { command: tokens[0]!, args: tokens.slice(1) };
 }
 
-function boundedDetail(value: unknown) {
-  const detail = typeof value === "string" ? value : value === undefined ? "" : JSON.stringify(value, null, 2);
-  return detail.length <= 64 * 1024 ? detail : `${detail.slice(0, 64 * 1024)}\n…`;
+function truncateUtf8(value: string, maximumBytes: number) {
+  if (Buffer.byteLength(value, "utf8") <= maximumBytes) return value;
+  const suffix = "\n…";
+  const suffixBytes = Buffer.byteLength(suffix, "utf8");
+  const includeSuffix = maximumBytes > suffixBytes;
+  const prefixBytes = includeSuffix ? maximumBytes - suffixBytes : maximumBytes;
+  let lower = 0;
+  let upper = value.length;
+  while (lower < upper) {
+    const middle = Math.ceil((lower + upper) / 2);
+    if (Buffer.byteLength(value.slice(0, middle), "utf8") <= prefixBytes) lower = middle;
+    else upper = middle - 1;
+  }
+  return `${value.slice(0, lower)}${includeSuffix ? suffix : ""}`;
+}
+
+export function boundedDetail(value: unknown, maximumBytes = MAX_AGENT_EVENT_DETAIL_BYTES) {
+  let detail: string;
+  try {
+    if (typeof value === "string") detail = value;
+    else if (value === undefined) detail = "";
+    else detail = JSON.stringify(value, null, 2) ?? String(value);
+  } catch {
+    detail = "[Agent detail could not be serialized]";
+  }
+  return truncateUtf8(detail, maximumBytes);
+}
+
+export function boundedAgentConfigOptions(
+  options: acp.SessionConfigOption[],
+  maximumBytes = MAX_AGENT_CONFIG_BYTES,
+): acp.SessionConfigOption[] | undefined {
+  try {
+    const copy = structuredClone(options);
+    const encoded = JSON.stringify(copy);
+    return encoded !== undefined && Buffer.byteLength(encoded, "utf8") <= maximumBytes ? copy : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function redactedValue(value: unknown): unknown {
@@ -203,6 +306,19 @@ export function trustedSomiteMcpPermissionTool(tool: acp.ToolCallUpdate): Somite
   return presented === input.tool ? input.tool : undefined;
 }
 
+function isCorrelationOnlyPermissionToolCall(tool: acp.ToolCallUpdate) {
+  const lifecycleOnly = (tool.kind == null && tool.status == null)
+    || (tool.kind === "execute" && tool.status === "pending");
+  return lifecycleOnly
+    && tool.title == null
+    && tool.name == null
+    && tool.content == null
+    && tool.locations == null
+    && tool.rawInput === undefined
+    && tool.rawOutput === undefined
+    && tool._meta == null;
+}
+
 function permissionDetail(request: acp.RequestPermissionRequest, action: string) {
   const input = request.toolCall.rawInput && typeof request.toolCall.rawInput === "object" && !Array.isArray(request.toolCall.rawInput)
     ? request.toolCall.rawInput as Record<string, unknown>
@@ -236,6 +352,13 @@ export class AgentManager {
   #generation = 0;
   #cursor = 0;
   #events: AgentEvent[] = [];
+  #eventSizes: number[] = [];
+  #retainedEventBytes = 0;
+  #retainedTransactionEvents = 0;
+  readonly #maximumEventBytes: number;
+  readonly #maximumConfigBytes: number;
+  readonly #maximumDetailBytes: number;
+  readonly #maximumAcpFrameBytes: number;
   #connected = false;
   #connecting = false;
   #busy = false;
@@ -243,12 +366,23 @@ export class AgentManager {
   #configOptions: acp.SessionConfigOption[] = [];
   #permissionSequence = 0;
   #permissions = new Map<string, PendingPermission>();
+  #trustedPermissionTools = new Map<string, SomiteMcpToolName>();
 
-  constructor(serverUrl: string, mcpCapability: string, mcpPath = fileURLToPath(new URL("./mcp.ts", import.meta.url)), projectRoot?: string) {
+  constructor(
+    serverUrl: string,
+    mcpCapability: string,
+    mcpPath = fileURLToPath(new URL("./mcp.ts", import.meta.url)),
+    projectRoot?: string,
+    limits: AgentManagerLimits = {},
+  ) {
     this.#serverUrl = serverUrl;
     this.#mcpCapability = mcpCapability;
     this.#mcpPath = mcpPath;
     this.#projectRoot = projectRoot;
+    this.#maximumEventBytes = limits.eventBytes ?? MAX_AGENT_EVENT_LOG_BYTES;
+    this.#maximumConfigBytes = limits.configBytes ?? MAX_AGENT_CONFIG_BYTES;
+    this.#maximumDetailBytes = limits.detailBytes ?? MAX_AGENT_EVENT_DETAIL_BYTES;
+    this.#maximumAcpFrameBytes = limits.acpFrameBytes ?? MAX_ACP_CONTROL_FRAME_BYTES;
   }
 
   snapshot(after = 0, authoritativeStateRevision?: string): AgentSnapshot {
@@ -354,6 +488,7 @@ export class AgentManager {
   async connect(displayCommand: string) {
     if (this.#runtime || this.#connecting || this.#connected) error("already_connected", "agent is already connected");
     const launch = parseAgentCommand(displayCommand);
+    const childEnvironment = agentChildEnvironment(process.env);
     const workspace = await mkdtemp(join(tmpdir(), "somite-workflow-agent-"));
     const generation = ++this.#generation;
     const child = spawn(launch.command, launch.args, {
@@ -361,7 +496,7 @@ export class AgentManager {
       detached: process.platform !== "win32",
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
-      env: process.env,
+      env: childEnvironment,
     });
     const runtime: Runtime = { generation, workspace, child, shuttingDown: false, stderr: "" };
     this.#runtime = runtime;
@@ -384,6 +519,7 @@ export class AgentManager {
   async prompt(message: string) {
     const trimmed = this.preflightPrompt(message);
     const runtime = this.#readyRuntime();
+    this.#trustedPermissionTools.clear();
     this.#busy = true;
     this.#push({ kind: "user", title: "You", detail: trimmed });
     void this.#runPrompt(runtime, `${WORKFLOW_AGENT_CONTRACT}\n\n${trimmed}`);
@@ -406,8 +542,11 @@ export class AgentManager {
     const response = await runtime.connection!.agent.request(acp.methods.agent.session.setConfigOption, typeof value === "boolean"
       ? { sessionId: runtime.sessionId!, configId, type: "boolean", value }
       : { sessionId: runtime.sessionId!, configId, value });
-    this.#configOptions = response.configOptions;
-    this.#push({ kind: "status", title: "Agent configuration updated", detail: configId, status: "ready" });
+    if (this.#setConfigOptions(response.configOptions)) {
+      this.#push({ kind: "status", title: "Agent configuration updated", detail: configId, status: "ready" });
+    } else {
+      this.#push({ kind: "error", title: "Agent configuration was not retained", detail: `The agent returned more than ${this.#maximumConfigBytes} bytes of configuration.`, status: "failed" });
+    }
     return this.snapshot(this.#cursor);
   }
 
@@ -450,11 +589,21 @@ export class AgentManager {
     const app = acp.client({ name: "Somite" })
       .onRequest(acp.methods.client.session.requestPermission, ({ params }) => this.#requestPermission(params))
       .onNotification(acp.methods.client.session.update, ({ params }) => this.#recordUpdate(params.update));
+    const framedStdout = stdout.pipe(boundedNdjsonStream(this.#maximumAcpFrameBytes));
+    framedStdout.once("error", (cause) => this.#finishRuntime(runtime, cause));
     const connection = app.connect(acp.ndJsonStream(
       Writable.toWeb(stdin) as WritableStream<Uint8Array>,
-      Readable.toWeb(stdout) as ReadableStream<Uint8Array>,
+      Readable.toWeb(framedStdout) as ReadableStream<Uint8Array>,
     ));
     runtime.connection = connection;
+    void connection.closed.then(
+      () => {
+        if (this.#runtime?.generation === runtime.generation) {
+          this.#finishRuntime(runtime, runtime.shuttingDown ? undefined : new Error(runtime.stderr.trim() || "ACP connection closed"));
+        }
+      },
+      (cause) => this.#finishRuntime(runtime, cause),
+    );
     const initialized = await timeout(connection.agent.request(acp.methods.agent.initialize, {
       protocolVersion: acp.PROTOCOL_VERSION,
       clientCapabilities: { session: { configOptions: { boolean: {} } } },
@@ -472,16 +621,13 @@ export class AgentManager {
     }), 45_000, "ACP session creation");
     if (this.#runtime?.generation !== runtime.generation) return;
     runtime.sessionId = session.sessionId;
-    this.#configOptions = session.configOptions ?? [];
-    this.#agentName = initialized.agentInfo?.title ?? initialized.agentInfo?.name ?? "ACP agent";
+    if (!this.#setConfigOptions(session.configOptions ?? [])) {
+      this.#push({ kind: "error", title: "Agent configuration was not retained", detail: `The agent returned more than ${this.#maximumConfigBytes} bytes of configuration.`, status: "failed" });
+    }
+    this.#agentName = boundedDetail(initialized.agentInfo?.title ?? initialized.agentInfo?.name ?? "ACP agent", this.#maximumDetailBytes);
     this.#connecting = false;
     this.#connected = true;
     this.#push({ kind: "status", title: `${this.#agentName} connected`, detail: "Stable ACP v1 · Somite tools attached over stdio", status: "ready" });
-    void connection.closed.then(() => {
-      if (this.#runtime?.generation === runtime.generation) {
-        this.#finishRuntime(runtime, runtime.shuttingDown ? undefined : new Error(runtime.stderr.trim() || "ACP connection closed"));
-      }
-    });
   }
 
   async #runPrompt(runtime: Runtime, prompt: string) {
@@ -494,7 +640,10 @@ export class AgentManager {
     } catch (cause) {
       this.#push({ kind: "error", title: "Agent turn failed", detail: cause instanceof Error ? cause.message : String(cause), status: "failed" });
     } finally {
-      if (this.#runtime?.generation === runtime.generation) this.#busy = false;
+      if (this.#runtime?.generation === runtime.generation) {
+        this.#busy = false;
+        this.#trustedPermissionTools.clear();
+      }
       void this.#persistTranscript().catch((cause) => this.#push({
         kind: "error",
         title: "Agent transcript could not be saved",
@@ -513,28 +662,46 @@ export class AgentManager {
 
   #recordUpdate(update: acp.SessionUpdate) {
     if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
-      this.#push({ kind: "message", title: "Agent", detail: update.content.text });
+      this.#push({ kind: "message", title: "Agent", detail: boundedDetail(update.content.text, this.#maximumDetailBytes) });
     } else if (update.sessionUpdate === "tool_call") {
+      this.#rememberTrustedPermissionTool(update);
       this.#push({ kind: "tool", title: update.title, detail: boundedDetail(update.rawInput), status: update.status ?? "pending", tool_call_id: update.toolCallId });
     } else if (update.sessionUpdate === "tool_call_update") {
+      if (update.status === "completed" || update.status === "failed") this.#trustedPermissionTools.delete(update.toolCallId);
       this.#push({ kind: "tool", title: update.title ?? `Tool ${update.toolCallId}`, detail: boundedDetail(update.rawOutput), ...(update.status ? { status: update.status } : {}), tool_call_id: update.toolCallId });
     } else if (update.sessionUpdate === "plan" || update.sessionUpdate === "plan_update") {
       this.#push({ kind: "status", title: "Agent plan updated", detail: boundedDetail(update), status: "planning" });
     } else if (update.sessionUpdate === "config_option_update") {
-      this.#configOptions = update.configOptions;
-      this.#push({ kind: "status", title: "Agent options refreshed", detail: "Models and session options were updated by the agent.", status: "ready" });
+      if (this.#setConfigOptions(update.configOptions)) {
+        this.#push({ kind: "status", title: "Agent options refreshed", detail: "Models and session options were updated by the agent.", status: "ready" });
+      } else {
+        this.#push({ kind: "error", title: "Agent options were not retained", detail: `The agent returned more than ${this.#maximumConfigBytes} bytes of configuration.`, status: "failed" });
+      }
     }
   }
 
   async #requestPermission(request: acp.RequestPermissionRequest): Promise<acp.RequestPermissionResponse> {
-    const action = toolAction(request.toolCall);
+    const correlatedTool = this.#trustedPermissionTools.get(request.toolCall.toolCallId);
+    this.#trustedPermissionTools.delete(request.toolCall.toolCallId);
+    const requestTool = trustedSomiteMcpPermissionTool(request.toolCall);
+    const trustedTool = correlatedTool && (isCorrelationOnlyPermissionToolCall(request.toolCall) || requestTool === correlatedTool)
+      ? correlatedTool
+      : undefined;
+    const maximumChoiceBytes = Math.max(0, Math.min(this.#maximumDetailBytes, this.#maximumEventBytes));
+    const bounded = boundedPermissionChoices(request.options, maximumChoiceBytes);
+    if ("reason" in bounded) {
+      this.#push({
+        kind: "error",
+        title: "Agent permission request cancelled",
+        detail: `${bounded.reason}. The agent must retry with a small set of unique, named permission choices.`,
+        status: "cancelled",
+      });
+      return { outcome: { outcome: "cancelled" } };
+    }
+    const action = trustedTool ?? toolAction(request.toolCall);
     const fields = permissionDetail(request, action);
-    const choices: AgentPermissionChoice[] = request.options.map((option) => ({
-      option_id: option.optionId,
-      name: option.name,
-      kind: option.kind,
-    }));
-    const automatic = trustedSomiteMcpPermissionTool(request.toolCall)
+    const choices = bounded.choices;
+    const automatic = trustedTool
       ? choices.find((choice) => choice.kind === "allow_always" && choice.name.toLowerCase().includes("session"))
         ?? choices.find((choice) => choice.kind === "allow_once")
       : undefined;
@@ -543,6 +710,16 @@ export class AgentManager {
       this.#push({ kind: "permission", ...fields, detail: `${fields.detail} · Automatically allowed for this Somite session`, status: "approved", permission_id: permissionId, permission_choices: [], tool_call_id: request.toolCall.toolCallId });
       return { outcome: { outcome: "selected", optionId: automatic.option_id } };
     }
+    const waitingEvent = { kind: "permission" as const, ...fields, status: "waiting", permission_id: permissionId, permission_choices: choices, tool_call_id: request.toolCall.toolCallId };
+    if (!this.#eventBodyFits(waitingEvent)) {
+      this.#push({
+        kind: "error",
+        title: "Agent permission request cancelled",
+        detail: "The permission choices could not fit in Somite's visible Agent event allowance. The agent must retry with fewer or shorter choices.",
+        status: "cancelled",
+      });
+      return { outcome: { outcome: "cancelled" } };
+    }
     const selected = await new Promise<string | undefined>((resolvePromise) => {
       const timer = setTimeout(() => {
         this.#permissions.delete(permissionId);
@@ -550,7 +727,7 @@ export class AgentManager {
       }, 300_000);
       timer.unref();
       this.#permissions.set(permissionId, { options: new Set(choices.map((choice) => choice.option_id)), resolve: resolvePromise, timer });
-      this.#push({ kind: "permission", ...fields, status: "waiting", permission_id: permissionId, permission_choices: choices, tool_call_id: request.toolCall.toolCallId });
+      this.#push(waitingEvent);
     });
     return selected ? { outcome: { outcome: "selected", optionId: selected } } : { outcome: { outcome: "cancelled" } };
   }
@@ -567,17 +744,105 @@ export class AgentManager {
       pending.resolve(undefined);
     }
     this.#permissions.clear();
+    this.#trustedPermissionTools.clear();
+  }
+
+  #rememberTrustedPermissionTool(toolCall: acp.ToolCallUpdate) {
+    const toolCallId = toolCall.toolCallId;
+    if (!this.#busy || !toolCallId || Buffer.byteLength(toolCallId, "utf8") > MAX_PERMISSION_TOOL_CALL_ID_BYTES) {
+      this.#trustedPermissionTools.delete(toolCallId);
+      return;
+    }
+    const trusted = trustedSomiteMcpPermissionTool(toolCall);
+    if (!trusted) {
+      this.#trustedPermissionTools.delete(toolCallId);
+      return;
+    }
+    if (!this.#trustedPermissionTools.has(toolCallId) && this.#trustedPermissionTools.size >= MAX_PERMISSION_TOOL_CORRELATIONS) {
+      const oldest = this.#trustedPermissionTools.keys().next().value;
+      if (oldest !== undefined) this.#trustedPermissionTools.delete(oldest);
+    }
+    this.#trustedPermissionTools.set(toolCallId, trusted);
+  }
+
+  #setConfigOptions(options: acp.SessionConfigOption[]) {
+    const bounded = boundedAgentConfigOptions(options, this.#maximumConfigBytes);
+    if (!bounded) return false;
+    this.#configOptions = bounded;
+    return true;
+  }
+
+  #removeEvent(index: number) {
+    if (index < 0 || index >= this.#events.length) return;
+    const [removed] = this.#events.splice(index, 1);
+    if (removed?.transaction) this.#retainedTransactionEvents -= 1;
+    this.#retainedEventBytes -= this.#eventSizes.splice(index, 1)[0] ?? 0;
+  }
+
+  #eventSize(event: AgentEvent) {
+    try {
+      return Buffer.byteLength(JSON.stringify(event), "utf8") + 1;
+    } catch {
+      return Number.POSITIVE_INFINITY;
+    }
+  }
+
+  #eventBodyFits(event: Omit<AgentEvent, "cursor" | "recorded_at_unix_ms">) {
+    const candidate: AgentEvent = {
+      cursor: this.#cursor + 1,
+      recorded_at_unix_ms: Date.now(),
+      ...event,
+      title: boundedDetail(event.title, this.#maximumDetailBytes),
+      ...(event.detail !== undefined ? { detail: boundedDetail(event.detail, this.#maximumDetailBytes) } : {}),
+      ...(event.status !== undefined ? { status: boundedDetail(event.status, this.#maximumDetailBytes) } : {}),
+    };
+    return this.#eventSize(candidate) + 1 <= this.#maximumEventBytes;
+  }
+
+  #graphlessEvent(event: AgentEvent): AgentEvent {
+    const reason = event.kind === "transaction"
+      ? "Canvas transaction body omitted because it exceeded Somite's bounded Agent event envelope. Refreshing the session restores the authoritative canvas."
+      : "Agent event body omitted because it exceeded Somite's bounded event envelope.";
+    return {
+      cursor: event.cursor,
+      recorded_at_unix_ms: event.recorded_at_unix_ms,
+      kind: event.kind,
+      title: boundedDetail(event.title, this.#maximumDetailBytes),
+      detail: boundedDetail(reason, this.#maximumDetailBytes),
+      ...(event.status ? { status: boundedDetail(event.status, this.#maximumDetailBytes) } : {}),
+      ...(event.permission_id ? { permission_id: boundedDetail(event.permission_id, this.#maximumDetailBytes) } : {}),
+      ...(event.tool_call_id ? { tool_call_id: boundedDetail(event.tool_call_id, this.#maximumDetailBytes) } : {}),
+    };
   }
 
   #push(event: Omit<AgentEvent, "cursor" | "recorded_at_unix_ms">) {
     this.#cursor += 1;
-    this.#events.push({ cursor: this.#cursor, recorded_at_unix_ms: Date.now(), ...event });
-    while (this.#events.filter((candidate) => candidate.transaction).length > TRANSACTION_EVENT_LIMIT) {
+    let retained: AgentEvent = {
+      cursor: this.#cursor,
+      recorded_at_unix_ms: Date.now(),
+      ...event,
+      title: boundedDetail(event.title, this.#maximumDetailBytes),
+      ...(event.detail !== undefined ? { detail: boundedDetail(event.detail, this.#maximumDetailBytes) } : {}),
+      ...(event.status !== undefined ? { status: boundedDetail(event.status, this.#maximumDetailBytes) } : {}),
+    };
+    let size = this.#eventSize(retained);
+    if (size + 1 > this.#maximumEventBytes) {
+      retained = this.#graphlessEvent(retained);
+      size = this.#eventSize(retained);
+    }
+    if (size + 1 <= this.#maximumEventBytes) {
+      this.#events.push(retained);
+      this.#eventSizes.push(size);
+      this.#retainedEventBytes += size;
+      if (retained.transaction) this.#retainedTransactionEvents += 1;
+    }
+    while (this.#retainedTransactionEvents > TRANSACTION_EVENT_LIMIT) {
       const index = this.#events.findIndex((candidate) => candidate.transaction);
       if (index < 0) break;
-      this.#events.splice(index, 1);
+      this.#removeEvent(index);
     }
-    if (this.#events.length > EVENT_LIMIT) this.#events.splice(0, this.#events.length - EVENT_LIMIT);
+    while (this.#events.length > EVENT_LIMIT) this.#removeEvent(0);
+    while (this.#events.length && this.#retainedEventBytes + 1 > this.#maximumEventBytes) this.#removeEvent(0);
   }
 
   #finishRuntime(runtime: Runtime, cause?: unknown) {

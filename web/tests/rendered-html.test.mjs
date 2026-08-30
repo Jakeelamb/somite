@@ -55,6 +55,13 @@ test("starter preview is removed and the real canvas is wired", async () => {
   assert.match(app, /client\.discoverAgents/);
   assert.match(app, /client\.configureAgent/);
   assert.match(app, /client\.openProject/);
+  assert.match(app, /client\.recoverInputOrigin/);
+  assert.match(app, /Confirm where this workflow&apos;s files live/);
+  assert.match(app, /input_origin_warning/);
+  assert.match(panels, /Original Somite workflow file/);
+  assert.match(panels, /The recovered canvas will stay open/);
+  assert.match(css, /\.input-origin-recovery/);
+  assert.match(css, /\.project-layer\.recovery/);
   assert.match(app, /planAgentTransactions/);
   assert.match(panels, /Compatible Tools/);
   assert.match(panels, /Choose your Agent/);

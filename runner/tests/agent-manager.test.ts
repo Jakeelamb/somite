@@ -2,11 +2,19 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { SOMITE_VERSION } from "@somite/workflow/version";
-import { AgentManager, AgentManagerError, parseAgentCommand, trustedSomiteMcpPermissionTool } from "../src/agentManager.ts";
+import type { AgentTransactionResult } from "@somite/workflow/agentTransaction";
+import {
+  AgentManager,
+  AgentManagerError,
+  boundedAgentConfigOptions,
+  boundedDetail,
+  parseAgentCommand,
+  trustedSomiteMcpPermissionTool,
+} from "../src/agentManager.ts";
 import { SOMITE_MCP_TOOL_NAMES } from "../src/mcpTools.ts";
 
 async function until(predicate: () => boolean | Promise<boolean>, timeoutMs = 5_000) {
@@ -31,6 +39,60 @@ test("agent command parsing never invokes a shell and preserves quoted arguments
     args: ["--mode", "fast"],
   });
   assert.throws(() => parseAgentCommand("agent 'unfinished"), AgentManagerError);
+});
+
+test("Agent details and configuration are bounded by UTF-8 bytes", () => {
+  const detail = boundedDetail("🧬".repeat(100), 64);
+  assert.ok(Buffer.byteLength(detail, "utf8") <= 64);
+  assert.ok(detail.endsWith("…"));
+  assert.deepEqual(boundedAgentConfigOptions([]), []);
+  assert.equal(boundedAgentConfigOptions([{ value: "x".repeat(64) }] as never[], 32), undefined);
+});
+
+function agentTransaction(sequence: number, graphName: string): AgentTransactionResult {
+  return {
+    transaction_id: `transaction-${sequence}`,
+    previous_state_revision: `state-${sequence - 1}`,
+    state_revision: `state-${sequence}`,
+    graph_revision: `graph-${sequence}`,
+    summary: `Transaction ${sequence}`,
+    graph: { schema_version: 3, name: graphName, nodes: [], edges: [], annotations: [] },
+  };
+}
+
+test("Agent event retention evicts complete oldest events within one byte envelope", () => {
+  const maximumEventBytes = 2_048;
+  const manager = new AgentManager("http://127.0.0.1:9", "test-capability", "unused", undefined, {
+    eventBytes: maximumEventBytes,
+  });
+  for (let sequence = 1; sequence <= 12; sequence += 1) {
+    manager.recordTransaction(agentTransaction(sequence, "g".repeat(400)));
+  }
+
+  const snapshot = manager.snapshot(0, "state-12");
+  assert.equal(snapshot.cursor, 12);
+  assert.equal(snapshot.authoritative_state_revision, "state-12");
+  assert.ok(snapshot.events.length < 12);
+  assert.equal(snapshot.events.at(-1)?.transaction?.transaction_id, "transaction-12");
+  assert.deepEqual(snapshot.events.map((event) => event.cursor), snapshot.events.map((event) => event.cursor).toSorted((left, right) => left - right));
+  assert.ok(Buffer.byteLength(JSON.stringify(snapshot.events), "utf8") <= maximumEventBytes);
+});
+
+test("one oversized Agent transaction becomes a graphless metadata event", () => {
+  const manager = new AgentManager("http://127.0.0.1:9", "test-capability", "unused", undefined, {
+    eventBytes: 768,
+    detailBytes: 256,
+  });
+  manager.recordTransaction(agentTransaction(1, "g".repeat(4_096)));
+
+  const snapshot = manager.snapshot(0, "state-1");
+  assert.equal(snapshot.cursor, 1);
+  assert.equal(snapshot.authoritative_state_revision, "state-1");
+  assert.equal(snapshot.events.length, 1);
+  assert.equal(snapshot.events[0]?.kind, "transaction");
+  assert.equal(snapshot.events[0]?.transaction, undefined);
+  assert.match(snapshot.events[0]?.detail ?? "", /authoritative canvas/);
+  assert.ok(Buffer.byteLength(JSON.stringify(snapshot.events), "utf8") <= 768);
 });
 
 test("every canonical Somite MCP tool has one exact trusted permission identity", () => {
@@ -97,6 +159,7 @@ test("ACP manager never auto-approves unknown Somite labels or shell actions", a
   for (const [prompt, title] of [
     ["[test:unknown-somite-tool]", "Approve somite.workflow.erase"],
     ["[test:shell-mislabeled-as-somite]", "Approve shell (claims somite.workflow.get)"],
+    ["[test:conflicting-correlated-permission]", "Approve shell"],
   ]) {
     const cursor = manager.snapshot().cursor;
     await manager.prompt(prompt);
@@ -111,4 +174,152 @@ test("ACP manager never auto-approves unknown Somite labels or shell actions", a
     manager.answerPermission(waiting.permission_id);
     await until(() => !manager.snapshot().busy);
   }
+});
+
+test("ACP manager correlates one canonical Somite update to Codex ACP's sparse permission request", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "somite-agent-minimal-permission-"));
+  const fixture = fileURLToPath(new URL("./fixtures/fake-acp-agent.ts", import.meta.url));
+  const manager = new AgentManager("http://127.0.0.1:9", "test-capability", fixture, root);
+  context.after(async () => {
+    await manager.disconnect().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  });
+  const command = `${JSON.stringify(process.execPath)} --experimental-strip-types ${JSON.stringify(fixture)}`;
+  await manager.connect(command);
+  await until(() => manager.snapshot().connected);
+
+  let cursor = manager.snapshot().cursor;
+  await manager.prompt("[test:minimal-correlated-somite-permission]");
+  await until(() => {
+    const snapshot = manager.snapshot(cursor);
+    return !snapshot.busy || snapshot.events.some((event) => event.kind === "permission" && event.status === "waiting");
+  });
+  let events = manager.snapshot(cursor).events;
+  assert.ok(!events.some((event) => event.kind === "permission" && event.status === "waiting"));
+  await until(() => !manager.snapshot().busy);
+  events = manager.snapshot(cursor).events;
+  assert.ok(events.some((event) => event.kind === "permission" && event.status === "approved" && event.title === "Approve somite.workflow.get"));
+  assert.ok(events.some((event) => event.kind === "message" && event.detail === "approved:allow-session"));
+
+  cursor = manager.snapshot().cursor;
+  await manager.prompt("[test:reused-minimal-somite-permission]");
+  await until(() => manager.snapshot(cursor).events.some((event) => event.kind === "permission" && event.status === "waiting"));
+  events = manager.snapshot(cursor).events;
+  assert.equal(events.filter((event) => event.kind === "permission" && event.status === "approved").length, 1);
+  const reused = events.find((event) => event.kind === "permission" && event.status === "waiting");
+  assert.ok(reused?.permission_id);
+  assert.equal(reused.title, `Approve Tool ${reused.tool_call_id}`);
+  manager.answerPermission(reused.permission_id);
+  await until(() => !manager.snapshot().busy);
+  assert.ok(manager.snapshot(cursor).events.some((event) => event.kind === "message" && event.detail === "reused:cancelled"));
+
+  await manager.prompt("[test:stage-stale-somite-tool]");
+  await until(() => !manager.snapshot().busy);
+  cursor = manager.snapshot().cursor;
+  await manager.prompt("[test:reuse-stale-somite-permission]");
+  await until(() => manager.snapshot(cursor).events.some((event) => event.kind === "permission" && event.status === "waiting"));
+  const stale = manager.snapshot(cursor).events.find((event) => event.kind === "permission" && event.status === "waiting");
+  assert.ok(stale?.permission_id);
+  assert.equal(stale.title, "Approve Tool tool-stale-correlation");
+  manager.answerPermission(stale.permission_id);
+  await until(() => !manager.snapshot().busy);
+  assert.ok(manager.snapshot(cursor).events.some((event) => event.kind === "message" && event.detail === "stale:cancelled"));
+});
+
+test("ACP manager cancels oversized permission choices without an invisible wait", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "somite-agent-hostile-permissions-"));
+  const fixture = fileURLToPath(new URL("./fixtures/fake-acp-agent.ts", import.meta.url));
+  const manager = new AgentManager("http://127.0.0.1:9", "test-capability", fixture, root, {
+    detailBytes: 4_096,
+    eventBytes: 16_384,
+  });
+  context.after(async () => {
+    await manager.disconnect().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  });
+  const command = `${JSON.stringify(process.execPath)} --experimental-strip-types ${JSON.stringify(fixture)}`;
+  await manager.connect(command);
+  await until(() => manager.snapshot().connected);
+
+  for (const [prompt, reason] of [
+    ["[test:empty-permission-choices]", /between 1 and 32/],
+    ["[test:duplicate-permission-choice-id]", /was repeated/],
+    ["[test:too-many-permission-choices]", /sent 40 choices/],
+    ["[test:oversized-permission-choice-id]", /ID exceeded 256 UTF-8 bytes/],
+    ["[test:oversized-permission-choice-name]", /name exceeded 1024 UTF-8 bytes/],
+    ["[test:oversized-permission-choice-aggregate]", /exceeded the 4096-byte visible event allowance/],
+  ] as const) {
+    const cursor = manager.snapshot().cursor;
+    const started = Date.now();
+    await manager.prompt(prompt);
+    await until(() => !manager.snapshot().busy, 3_000);
+    assert.ok(Date.now() - started < 3_000, "invalid permission request must settle promptly");
+    const events = manager.snapshot(cursor).events;
+    assert.ok(!events.some((event) => event.kind === "permission" && event.status === "waiting"));
+    const rejected = events.find((event) => event.title === "Agent permission request cancelled" && event.status === "cancelled");
+    assert.ok(rejected, `${prompt} must emit an actionable cancellation`);
+    assert.match(rejected.detail ?? "", reason);
+    assert.ok(Buffer.byteLength(rejected.detail ?? "", "utf8") <= 4_096);
+    assert.ok(events.some((event) => event.kind === "message" && event.detail === "cancelled"));
+  }
+
+  const cursor = manager.snapshot().cursor;
+  await manager.prompt("Inspect the workflow after a rejected permission request");
+  await until(() => !manager.snapshot().busy, 3_000);
+  const recoveryEvents = manager.snapshot(cursor).events;
+  assert.ok(recoveryEvents.some((event) => event.kind === "message" && event.detail === "approved:allow-session"));
+});
+
+function processIsAlive(pid: number) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function hostileStdoutSettles(context: TestContext, mode: "newline-free" | "oversized-frame") {
+  const root = await mkdtemp(join(tmpdir(), `somite-agent-${mode}-`));
+  const pidPath = join(root, "child.pid");
+  const fixture = fileURLToPath(new URL("./fixtures/hostile-acp-stdout.ts", import.meta.url));
+  const manager = new AgentManager("http://127.0.0.1:9", "test-capability", "unused", root, {
+    acpFrameBytes: 1_024,
+    detailBytes: 128,
+  });
+  context.after(async () => {
+    await manager.disconnect().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  });
+  const command = [
+    JSON.stringify(process.execPath),
+    "--experimental-strip-types",
+    JSON.stringify(fixture),
+    mode,
+    JSON.stringify(pidPath),
+    "2048",
+  ].join(" ");
+
+  await manager.connect(command);
+  await until(() => manager.snapshot().events.some((event) => event.kind === "error" && /ACP stdout frame exceeds/.test(event.detail ?? "")));
+  const pid = Number((await readFile(pidPath, "utf8")).trim());
+  assert.ok(Number.isSafeInteger(pid));
+  await until(() => !processIsAlive(pid));
+  const snapshot = manager.snapshot();
+  assert.equal(snapshot.connected, false);
+  assert.equal(snapshot.connecting, false);
+  assert.equal(snapshot.busy, false);
+  const stopped = snapshot.events.find((event) => event.title === "ACP agent stopped" && event.status === "failed");
+  assert.ok(stopped);
+  assert.match(stopped.detail ?? "", /acp_frame_too_large/);
+  assert.ok(Buffer.byteLength(stopped.detail ?? "", "utf8") <= 128);
+  await assert.rejects(manager.disconnect(), (error: unknown) => error instanceof AgentManagerError && error.code === "not_connected");
+}
+
+test("ACP manager terminates a child that floods stdout without an NDJSON newline", async (context) => {
+  await hostileStdoutSettles(context, "newline-free");
+});
+
+test("ACP manager terminates a child that emits one oversized NDJSON frame", async (context) => {
+  await hostileStdoutSettles(context, "oversized-frame");
 });

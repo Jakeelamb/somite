@@ -4,7 +4,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { OperatorCatalog, operatorPorts, renderArgv, renderPixiManifest, type PinnedOperator } from "@somite/workflow/catalog";
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
-import { catalogRevision, operatorRevision, parseOperator } from "@somite/workflow/catalogCodec";
+import { catalogRevision, operatorRevision, parseOperator, parsePinnedOperator } from "@somite/workflow/catalogCodec";
 import type { SomiteGraph, SomiteGraphNode } from "@somite/workflow/model";
 
 const operatorsDirectory = new URL("../../operators/", import.meta.url);
@@ -66,6 +66,17 @@ test("catalog codec rejects unknown contract fields before they become revisions
   assert.throws(
     () => parseOperator({ id: "bad", title: "Bad", kind: "external", typo: true }),
     /unknown field typo/,
+  );
+});
+
+test("pinned operator decoding verifies the advertised content identity", () => {
+  const raw = { id: "test.tool", title: "Test tool", kind: "external", ports: { in: [], out: [] } };
+  const operator = parseOperator(raw);
+  const revision = operatorRevision(operator);
+  assert.equal(parsePinnedOperator({ ...raw, revision }).revision, revision);
+  assert.throws(
+    () => parsePinnedOperator({ ...raw, revision: "blake3:forged" }),
+    /revision does not match/,
   );
 });
 

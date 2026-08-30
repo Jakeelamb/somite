@@ -34,6 +34,12 @@ import {
 import type { SomiteGraph } from "@somite/workflow/model";
 import { compileNextflow, PINNED_NEXTFLOW_VERSION, PINNED_OPENJDK_VERSION } from "@somite/workflow/nextflow";
 import { SOMITE_TYPESCRIPT_RUNNER_IDENTITY } from "@somite/workflow/version";
+import {
+  MAX_FROZEN_PACKAGE_BYTES,
+  MAX_GENERATED_PACKAGE_BYTES,
+  MAX_PIXI_LOCK_BYTES,
+  MAX_WORKFLOW_DOCUMENT_BYTES,
+} from "@somite/workflow/limits";
 import { semanticGraphRevision } from "@somite/workflow/workflow";
 import { EvidenceStore } from "./evidenceStore.ts";
 import { atomicWrite } from "./files.ts";
@@ -80,6 +86,69 @@ type RunJob = {
 
 const encoder = new TextEncoder();
 
+export type FrozenPackageComponent = "workflow_document" | "pixi_lock" | "generated_files" | "archive";
+
+export class FrozenPackageSizeError extends Error {
+  readonly code: string;
+  readonly component: FrozenPackageComponent;
+  readonly actual_bytes: number;
+  readonly maximum_bytes: number;
+
+  constructor(component: FrozenPackageComponent, actualBytes: number, maximumBytes: number) {
+    const code = component === "workflow_document" ? "workflow_document_too_large"
+      : component === "pixi_lock" ? "pixi_lock_too_large"
+        : component === "generated_files" ? "generated_package_too_large"
+          : "frozen_package_too_large";
+    super(`${component.replaceAll("_", " ")} is ${actualBytes} bytes; maximum is ${maximumBytes} bytes`);
+    this.name = "FrozenPackageSizeError";
+    this.code = code;
+    this.component = component;
+    this.actual_bytes = actualBytes;
+    this.maximum_bytes = maximumBytes;
+  }
+}
+
+export type FrozenPackageLimits = Readonly<{
+  workflowDocumentBytes: number;
+  pixiLockBytes: number;
+  generatedBytes: number;
+  archiveBytes: number;
+}>;
+
+const FROZEN_PACKAGE_LIMITS: FrozenPackageLimits = {
+  workflowDocumentBytes: MAX_WORKFLOW_DOCUMENT_BYTES,
+  pixiLockBytes: MAX_PIXI_LOCK_BYTES,
+  generatedBytes: MAX_GENERATED_PACKAGE_BYTES,
+  archiveBytes: MAX_FROZEN_PACKAGE_BYTES,
+};
+
+function enforceComponentSize(component: FrozenPackageComponent, actualBytes: number, maximumBytes: number) {
+  if (!Number.isSafeInteger(actualBytes) || actualBytes < 0 || actualBytes > maximumBytes) {
+    throw new FrozenPackageSizeError(component, actualBytes, maximumBytes);
+  }
+}
+
+/** Enforce every source envelope before allocating a second full ZIP representation. */
+export function enforceFrozenPackageFiles(
+  files: ReadonlyMap<string, Uint8Array>,
+  limits: FrozenPackageLimits = FROZEN_PACKAGE_LIMITS,
+) {
+  const workflowBytes = files.get("workflow.somite.json")?.byteLength ?? 0;
+  const pixiLockBytes = files.get("pixi.lock")?.byteLength ?? 0;
+  let totalBytes = 0;
+  for (const bytes of files.values()) totalBytes += bytes.byteLength;
+  const generatedBytes = totalBytes - workflowBytes - pixiLockBytes;
+  enforceComponentSize("workflow_document", workflowBytes, limits.workflowDocumentBytes);
+  enforceComponentSize("pixi_lock", pixiLockBytes, limits.pixiLockBytes);
+  enforceComponentSize("generated_files", generatedBytes, limits.generatedBytes);
+  enforceComponentSize("archive", totalBytes, limits.archiveBytes);
+  return totalBytes;
+}
+
+export function enforceFrozenArchiveSize(actualBytes: number, maximumBytes = MAX_FROZEN_PACKAGE_BYTES) {
+  enforceComponentSize("archive", actualBytes, maximumBytes);
+}
+
 function terminal(phase: RunPhase) {
   return phase === "completed" || phase === "failed" || phase === "cancelled";
 }
@@ -116,6 +185,7 @@ async function prepareFrozenPackage(
     if (operator.bin && await executablePath(projectRoot, operator.bin)) binaries.add(operator.bin);
   }
   const frozen = createFrozenPackageFiles(graph, catalog, target, lock, (binary) => binaries.has(binary));
+  enforceFrozenPackageFiles(frozen.files);
   await writePackageFiles(directory, frozen.files);
   return { frozen, locked };
 }
@@ -407,7 +477,9 @@ export class RunManager {
     try {
       const runnable = await materializeProductionGraph(graph, this.#catalog, this.#projectRoot, graphLocation);
       const { frozen } = await prepareFrozenPackage(runnable, this.#catalog, target, directory, this.#projectRoot, this.#pixi);
-      return { filename: frozen.plan.filename, bytes: archiveFrozenPackage(frozen.files) };
+      const bytes = archiveFrozenPackage(frozen.files);
+      enforceFrozenArchiveSize(bytes.byteLength);
+      return { filename: frozen.plan.filename, bytes };
     } finally {
       await rm(directory, { recursive: true, force: true });
     }

@@ -5,7 +5,13 @@ import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } 
 import { operatorPorts, type OperatorCatalog } from "@somite/workflow/catalog";
 import { parseGraph } from "@somite/workflow/graphCodec";
 import type { SomiteGraph } from "@somite/workflow/model";
-import { buildSourceManifest, type FrozenSourceFile } from "@somite/workflow/nextflowSource";
+import {
+  MAX_SOURCE_BYTES,
+  MAX_SOURCE_FILE_BYTES,
+  MAX_SOURCE_FILES,
+  buildSourceManifest,
+  type FrozenSourceFile,
+} from "@somite/workflow/nextflowSource";
 import { deriveSourceWorkflow } from "@somite/workflow/sourceWorkflow";
 import { validateGraph } from "@somite/workflow/workflow";
 
@@ -13,12 +19,9 @@ import { pathExists, regularDirectory } from "./files.ts";
 import { SnakemakeGateway } from "./snakemakeGateway.ts";
 import { persistSourceObject, readSourceObject } from "./sourceWorkflowStore.ts";
 import { verifyGraphSourceWorkflowTrust } from "./sourceWorkflowTrust.ts";
-import { MAX_WORKFLOW_DOCUMENT_BYTES } from "./workflowLimits.ts";
+import { MAX_WORKFLOW_DOCUMENT_BYTES } from "@somite/workflow/limits";
 
-const MAX_SOURCE_FILES = 20_000;
 const MAX_SOURCE_DIRECTORIES = 20_000;
-const MAX_SOURCE_FILE_BYTES = 64 * 1024 * 1024;
-const MAX_SOURCE_BYTES = 512 * 1024 * 1024;
 const MAX_EXCLUSION_EXAMPLES = 32;
 const SOURCE_STATE_ENTRIES = new Set([
   ".cache", ".git", ".nextflow", ".pixi", ".pytest_cache", ".snakemake", ".somite", ".venv",

@@ -1,12 +1,6 @@
 import type { Metadata, Viewport } from "next";
-import { Barlow_Condensed, IBM_Plex_Mono, IBM_Plex_Sans } from "next/font/google";
+import { IBM_Plex_Mono, IBM_Plex_Sans } from "next/font/google";
 import "./globals.css";
-
-const instrument = Barlow_Condensed({
-  variable: "--font-instrument",
-  subsets: ["latin"],
-  weight: ["500", "600", "700"],
-});
 
 const controls = IBM_Plex_Sans({
   variable: "--font-controls",
@@ -36,11 +30,7 @@ export default function RootLayout({
 }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en">
-      <head>
-        <link rel="preconnect" href="https://fonts.googleapis.com" />
-        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
-      </head>
-      <body className={`${instrument.variable} ${controls.variable} ${readout.variable}`}>
+      <body className={`${controls.variable} ${readout.variable}`}>
         {children}
       </body>
     </html>

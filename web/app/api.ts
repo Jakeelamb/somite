@@ -1,6 +1,14 @@
-import { parseOperator } from "@somite/workflow/catalogCodec";
+import { parsePinnedOperator } from "@somite/workflow/catalogCodec";
+import { ResponseHeaderError, ResponseSizeError, boundedResponseBytes } from "@somite/workflow/boundedResponse";
 import { parseGraph } from "@somite/workflow/graphCodec";
 import type { EvidenceReceipt, EvidenceResult } from "@somite/workflow/linker";
+import {
+  MAX_AGENT_SNAPSHOT_BYTES,
+  MAX_FROZEN_PACKAGE_BYTES,
+  MAX_PAPER_REVIEW_BYTES,
+  MAX_PAPER_STATUS_BYTES,
+  MAX_WORKFLOW_DOCUMENT_BYTES,
+} from "@somite/workflow/limits";
 import type { PaperCandidate, PaperEvidence, PaperMethodMention, PaperResourceCitation, PaperReview } from "@somite/workflow/paper";
 import type { SomiteGraph } from "@somite/workflow/model";
 
@@ -35,7 +43,7 @@ import type {
 
 const DEFAULT_SOMITE_SERVER = "http://localhost:7310";
 const MAX_JSON_RESPONSE_BYTES = 16 * 1024 * 1024;
-const MAX_DOCUMENT_RESPONSE_BYTES = 64 * 1024 * 1024;
+const MAX_DOCUMENT_RESPONSE_BYTES = MAX_WORKFLOW_DOCUMENT_BYTES;
 const MAX_ERROR_RESPONSE_BYTES = 64 * 1024;
 
 type Decoder<T> = (value: unknown, path: string) => T;
@@ -100,6 +108,24 @@ function text(value: unknown, path: string): string {
 
 function optionalText(value: unknown, path: string): string | undefined {
   return value === undefined || value === null ? undefined : text(value, path);
+}
+
+function httpUrl(value: unknown, path: string): string {
+  const candidate = text(value, path);
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    throw new Error(`${path} must be an absolute HTTP(S) URL`);
+  }
+  if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || parsed.username || parsed.password) {
+    throw new Error(`${path} must be an absolute HTTP(S) URL without credentials`);
+  }
+  return candidate;
+}
+
+function optionalHttpUrl(value: unknown, path: string): string | undefined {
+  return value === undefined || value === null ? undefined : httpUrl(value, path);
 }
 
 function nullableText(value: unknown, path: string): string | null {
@@ -331,7 +357,7 @@ function projectSession(value: unknown, path: string): ProjectSession {
     project_name: text(raw.project_name, `${path}.project_name`),
     graph_path: text(raw.graph_path, `${path}.graph_path`),
     graph: parseGraph(raw.graph, `${path}.graph`),
-    operators: list(raw.operators, `${path}.operators`, parseOperator),
+    operators: list(raw.operators, `${path}.operators`, parsePinnedOperator),
     recovered_autosave: bool(raw.recovered_autosave, `${path}.recovered_autosave`),
     autosave_recovery_warning: nullableText(raw.autosave_recovery_warning, `${path}.autosave_recovery_warning`),
     input_origin_warning: nullableText(raw.input_origin_warning, `${path}.input_origin_warning`),
@@ -357,24 +383,43 @@ function sourceWorkflowEdit(value: unknown, path: string): SourceWorkflowEditRes
 
 function agentEvent(value: unknown, path: string): AgentEvent {
   const raw = record(value, path);
-  nonnegative(raw.cursor, `${path}.cursor`);
-  nonnegative(raw.recorded_at_unix_ms, `${path}.recorded_at_unix_ms`);
-  oneOf(raw.kind, `${path}.kind`, ["status", "user", "message", "tool", "transaction", "permission", "error"] as const);
-  text(raw.title, `${path}.title`);
+  const cursor = nonnegative(raw.cursor, `${path}.cursor`);
+  const recordedAt = nonnegative(raw.recorded_at_unix_ms, `${path}.recorded_at_unix_ms`);
+  const kind = oneOf(raw.kind, `${path}.kind`, ["status", "user", "message", "tool", "transaction", "permission", "error"] as const);
+  const title = text(raw.title, `${path}.title`);
   for (const field of ["detail", "status", "permission_id", "tool_call_id"] as const) optionalText(raw[field], `${path}.${field}`);
+  let transaction: AgentEvent["transaction"];
   if (raw.transaction !== undefined) {
-    const transaction = record(raw.transaction, `${path}.transaction`);
-    for (const field of ["transaction_id", "previous_state_revision", "state_revision", "graph_revision", "summary"] as const) text(transaction[field], `${path}.transaction.${field}`);
-    parseGraph(transaction.graph, `${path}.transaction.graph`);
+    const entry = record(raw.transaction, `${path}.transaction`);
+    transaction = {
+      transaction_id: text(entry.transaction_id, `${path}.transaction.transaction_id`),
+      previous_state_revision: text(entry.previous_state_revision, `${path}.transaction.previous_state_revision`),
+      state_revision: text(entry.state_revision, `${path}.transaction.state_revision`),
+      graph_revision: text(entry.graph_revision, `${path}.transaction.graph_revision`),
+      summary: text(entry.summary, `${path}.transaction.summary`),
+      graph: parseGraph(entry.graph, `${path}.transaction.graph`),
+    };
   }
-  if (raw.permission_choices !== undefined) list(raw.permission_choices, `${path}.permission_choices`, (choice, choicePath) => {
+  const permissionChoices = raw.permission_choices === undefined ? undefined : list(raw.permission_choices, `${path}.permission_choices`, (choice, choicePath) => {
     const entry = record(choice, choicePath);
-    text(entry.option_id, `${choicePath}.option_id`);
-    text(entry.name, `${choicePath}.name`);
-    oneOf(entry.kind, `${choicePath}.kind`, ["allow_once", "allow_always", "reject_once", "reject_always", "other"] as const);
-    return choice;
+    return {
+      option_id: text(entry.option_id, `${choicePath}.option_id`),
+      name: text(entry.name, `${choicePath}.name`),
+      kind: oneOf(entry.kind, `${choicePath}.kind`, ["allow_once", "allow_always", "reject_once", "reject_always", "other"] as const),
+    };
   });
-  return value as AgentEvent;
+  return {
+    cursor,
+    recorded_at_unix_ms: recordedAt,
+    kind,
+    title,
+    ...(raw.detail !== undefined && raw.detail !== null ? { detail: raw.detail as string } : {}),
+    ...(raw.status !== undefined && raw.status !== null ? { status: raw.status as string } : {}),
+    ...(transaction ? { transaction } : {}),
+    ...(raw.permission_id !== undefined && raw.permission_id !== null ? { permission_id: raw.permission_id as string } : {}),
+    ...(raw.tool_call_id !== undefined && raw.tool_call_id !== null ? { tool_call_id: raw.tool_call_id as string } : {}),
+    ...(permissionChoices ? { permission_choices: permissionChoices } : {}),
+  };
 }
 
 function agentOption(value: unknown, path: string): AgentConfigOption {
@@ -411,28 +456,45 @@ function agentOption(value: unknown, path: string): AgentConfigOption {
 
 function agentSnapshot(value: unknown, path: string): AgentSnapshot {
   const raw = record(value, path);
-  bool(raw.connected, `${path}.connected`);
-  bool(raw.connecting, `${path}.connecting`);
-  bool(raw.busy, `${path}.busy`);
-  optionalText(raw.agent_name, `${path}.agent_name`);
-  optionalText(raw.authoritative_state_revision, `${path}.authoritative_state_revision`);
-  list(raw.config_options, `${path}.config_options`, agentOption);
-  nonnegative(raw.cursor, `${path}.cursor`);
-  list(raw.events, `${path}.events`, agentEvent);
-  return value as AgentSnapshot;
+  const agentName = optionalText(raw.agent_name, `${path}.agent_name`);
+  const authoritativeRevision = optionalText(raw.authoritative_state_revision, `${path}.authoritative_state_revision`);
+  return {
+    connected: bool(raw.connected, `${path}.connected`),
+    connecting: bool(raw.connecting, `${path}.connecting`),
+    busy: bool(raw.busy, `${path}.busy`),
+    ...(agentName !== undefined ? { agent_name: agentName } : {}),
+    config_options: list(raw.config_options, `${path}.config_options`, agentOption),
+    cursor: nonnegative(raw.cursor, `${path}.cursor`),
+    events: list(raw.events, `${path}.events`, agentEvent),
+    ...(authoritativeRevision !== undefined ? { authoritative_state_revision: authoritativeRevision } : {}),
+  };
 }
 
 function agentDiscovery(value: unknown, path: string): AgentDiscovery {
   const raw = record(value, path);
-  text(raw.registry_url, `${path}.registry_url`);
-  oneOf(raw.registry_status, `${path}.registry_status`, ["live", "offline_cache", "unavailable"] as const);
-  list(raw.agents, `${path}.agents`, (agent, agentPath) => {
+  return {
+    registry_url: httpUrl(raw.registry_url, `${path}.registry_url`),
+    registry_status: oneOf(raw.registry_status, `${path}.registry_status`, ["live", "offline_cache", "unavailable"] as const),
+    agents: list(raw.agents, `${path}.agents`, (agent, agentPath) => {
     const entry = record(agent, agentPath);
-    for (const field of ["id", "name", "version", "description", "availability_detail"] as const) text(entry[field], `${agentPath}.${field}`);
-    oneOf(entry.availability, `${agentPath}.availability`, ["installed", "ready", "unavailable"] as const);
-    return agent;
-  });
-  return value as AgentDiscovery;
+      const command = optionalText(entry.command, `${agentPath}.command`);
+      const repository = optionalHttpUrl(entry.repository, `${agentPath}.repository`);
+      const website = optionalHttpUrl(entry.website, `${agentPath}.website`);
+      const icon = optionalText(entry.icon, `${agentPath}.icon`);
+      return {
+        id: text(entry.id, `${agentPath}.id`),
+        name: text(entry.name, `${agentPath}.name`),
+        version: text(entry.version, `${agentPath}.version`),
+        description: text(entry.description, `${agentPath}.description`),
+        ...(command !== undefined ? { command } : {}),
+        availability: oneOf(entry.availability, `${agentPath}.availability`, ["installed", "ready", "unavailable"] as const),
+        availability_detail: text(entry.availability_detail, `${agentPath}.availability_detail`),
+        ...(repository !== undefined ? { repository } : {}),
+        ...(website !== undefined ? { website } : {}),
+        ...(icon !== undefined ? { icon } : {}),
+      };
+    }),
+  };
 }
 
 function paperPreflight(value: unknown, path: string): PaperExtractionPreflight {
@@ -473,7 +535,7 @@ function catalog(value: unknown, path: string, engine: "nfcore" | "snakemake"): 
   const entries = list(raw.entries, `${path}.entries`, (entry, entryPath) => {
     const item = record(entry, entryPath);
     const base = {
-      operator: parseOperator(item.operator, `${entryPath}.operator`),
+      operator: parsePinnedOperator(item.operator, `${entryPath}.operator`),
       description: text(item.description, `${entryPath}.description`),
       topics: texts(item.topics, `${entryPath}.topics`),
       revision: text(item.revision, `${entryPath}.revision`),
@@ -683,19 +745,40 @@ function errorPayload(value: unknown) {
   };
 }
 
-async function responseBytes(response: Response, endpoint: string, limit: number): Promise<Uint8Array> {
+async function responseBytes(response: Response, endpoint: string, limit: number): Promise<Uint8Array<ArrayBuffer>> {
+  try {
+    return await boundedResponseBytes(response, limit, "Somite response body") as Uint8Array<ArrayBuffer>;
+  } catch (error) {
+    if (error instanceof ResponseSizeError) {
+      throw new ResponseContractError(endpoint, `body exceeds ${limit} bytes`, { cause: error });
+    }
+    if (error instanceof ResponseHeaderError) {
+      throw new ResponseContractError(endpoint, "body has an invalid Content-Length header", { cause: error });
+    }
+    throw error;
+  }
+}
+
+export async function boundedZipBlob(response: Response, endpoint: string, limit = MAX_FROZEN_PACKAGE_BYTES) {
   const contentLength = response.headers.get("content-length");
   if (contentLength !== null) {
     const advertised = Number(contentLength);
-    if (Number.isFinite(advertised) && advertised > limit) {
+    if (!/^\d+$/.test(contentLength) || !Number.isSafeInteger(advertised)) {
+      await response.body?.cancel().catch(() => undefined);
+      throw new ResponseContractError(endpoint, "body has an invalid Content-Length header");
+    }
+    if (advertised > limit) {
       await response.body?.cancel().catch(() => undefined);
       throw new ResponseContractError(endpoint, `body exceeds ${limit} bytes`);
     }
   }
-  if (!response.body) return new Uint8Array();
+  if (!response.body) throw new ResponseContractError(endpoint, "body is empty");
 
   const reader = response.body.getReader();
-  const chunks: Uint8Array[] = [];
+  const chunks: Uint8Array<ArrayBuffer>[] = [];
+  const signature = new Uint8Array(4);
+  let signatureBytes = 0;
+  let signatureValidated = false;
   let total = 0;
   try {
     while (true) {
@@ -706,19 +789,31 @@ async function responseBytes(response: Response, endpoint: string, limit: number
         await reader.cancel().catch(() => undefined);
         throw new ResponseContractError(endpoint, `body exceeds ${limit} bytes`);
       }
+      if (signatureBytes < signature.byteLength) {
+        const copied = Math.min(signature.byteLength - signatureBytes, value.byteLength);
+        signature.set(value.subarray(0, copied), signatureBytes);
+        signatureBytes += copied;
+        if (signatureBytes === signature.byteLength) {
+          const localHeader = signature[0] === 0x50 && signature[1] === 0x4b && signature[2] === 0x03 && signature[3] === 0x04;
+          const emptyArchive = signature[0] === 0x50 && signature[1] === 0x4b && signature[2] === 0x05 && signature[3] === 0x06;
+          if (!localHeader && !emptyArchive) {
+            await reader.cancel().catch(() => undefined);
+            throw new ResponseContractError(endpoint, "body is not a ZIP archive");
+          }
+          signatureValidated = true;
+        }
+      }
       chunks.push(value);
     }
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
   } finally {
     reader.releaseLock();
   }
 
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes;
+  if (!signatureValidated) throw new ResponseContractError(endpoint, "body is not a ZIP archive");
+  return new Blob(chunks, { type: "application/zip" });
 }
 
 async function requireSuccess(response: Response, endpoint: string) {
@@ -769,12 +864,16 @@ export class SomiteClient {
     this.#fetch = fetcher;
   }
 
+  #request(endpoint: string, init?: RequestInit) {
+    return this.#fetch(`${this.origin}${endpoint}`, { ...init, redirect: "error" });
+  }
+
   async #json<T>(endpoint: string, decoder: Decoder<T>, init?: RequestInit, limit?: number): Promise<T> {
-    return decodedResponse(await this.#fetch(`${this.origin}${endpoint}`, init), endpoint, decoder, limit);
+    return decodedResponse(await this.#request(endpoint, init), endpoint, decoder, limit);
   }
 
   async #empty(endpoint: string, init: RequestInit): Promise<void> {
-    const response = await requireSuccess(await this.#fetch(`${this.origin}${endpoint}`, init), endpoint);
+    const response = await requireSuccess(await this.#request(endpoint, init), endpoint);
     const bytes = await responseBytes(response, endpoint, MAX_ERROR_RESPONSE_BYTES);
     if (bytes.byteLength) throw new ResponseContractError(endpoint, "expected an empty response body");
   }
@@ -812,10 +911,10 @@ export class SomiteClient {
   }
 
   discoverAgents() { return this.#json("/api/agent/discover", agentDiscovery); }
-  agentEvents(after: number) { return this.#json(`/api/agent/events?after=${encodeURIComponent(after)}`, agentSnapshot); }
-  connectAgent(command: string) { return this.#json("/api/agent/connect", agentSnapshot, jsonInit("POST", { command })); }
+  agentEvents(after: number) { return this.#json(`/api/agent/events?after=${encodeURIComponent(after)}`, agentSnapshot, undefined, MAX_AGENT_SNAPSHOT_BYTES); }
+  connectAgent(command: string) { return this.#json("/api/agent/connect", agentSnapshot, jsonInit("POST", { command }), MAX_AGENT_SNAPSHOT_BYTES); }
   promptAgent(request: GraphWriteRequest & { message: string }) { return this.#json("/api/agent/prompt", graphWrite, jsonInit("POST", request), MAX_DOCUMENT_RESPONSE_BYTES); }
-  configureAgent(configId: string, value: string | boolean) { return this.#json("/api/agent/config", agentSnapshot, jsonInit("POST", { config_id: configId, value })); }
+  configureAgent(configId: string, value: string | boolean) { return this.#json("/api/agent/config", agentSnapshot, jsonInit("POST", { config_id: configId, value }), MAX_AGENT_SNAPSHOT_BYTES); }
   cancelAgent() { return this.#empty("/api/agent/cancel", { method: "POST" }); }
   disconnectAgent() { return this.#empty("/api/agent/disconnect", { method: "POST" }); }
   answerAgentPermission(permissionId: string, optionId?: string) { return this.#empty(`/api/agent/permissions/${encodeURIComponent(permissionId)}`, jsonInit("POST", { option_id: optionId })); }
@@ -865,8 +964,13 @@ export class SomiteClient {
   exportPlan(request: GraphRequest) { return this.#json("/api/export/plan", exportPlan, jsonInit("POST", request), MAX_DOCUMENT_RESPONSE_BYTES); }
   async downloadExport(request: GraphRequest) {
     const endpoint = "/api/export";
-    const response = await requireSuccess(await this.#fetch(`${this.origin}${endpoint}`, jsonInit("POST", request)), endpoint);
-    return response.blob();
+    const response = await requireSuccess(await this.#request(endpoint, jsonInit("POST", request)), endpoint);
+    const contentType = response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase();
+    if (contentType !== "application/zip") {
+      await response.body?.cancel().catch(() => undefined);
+      throw new ResponseContractError(endpoint, "content-type must be application/zip");
+    }
+    return boundedZipBlob(response, endpoint);
   }
 
   startRun(intent: "run" | "validation", request: GraphRequest) { return this.#json(intent === "validation" ? "/api/validations" : "/api/runs", runStart, jsonInit("POST", request)); }
@@ -908,10 +1012,10 @@ export class SomiteClient {
     return this.#json("/api/papers/uploads", paperArtifact, { method: "POST", body, signal });
   }
   startPaperIntake(digest: string, attemptKey: string, signal?: AbortSignal) { return this.#json(`/api/papers/intakes?idempotency_key=${encodeURIComponent(attemptKey)}`, paperIntakeStart, jsonInit("POST", { digest }, signal)); }
-  paperIntakeStatus(jobId: string, signal?: AbortSignal) { return this.#json(`/api/papers/intakes/${encodeURIComponent(jobId)}?wait_ms=15000`, paperIntakeStatus, signal ? { signal } : undefined); }
-  cancelPaperIntake(jobId: string) { return this.#json(`/api/papers/intakes/${encodeURIComponent(jobId)}/cancel`, paperIntakeStatus, { method: "POST" }); }
-  reconstructBiorxiv(id: string, signal: AbortSignal) { return this.#json("/api/papers/biorxiv/reconstruct", paperReview, jsonInit("POST", { id }, signal), MAX_DOCUMENT_RESPONSE_BYTES); }
-  reconstructPaperPath(path: string, signal: AbortSignal) { return this.#json("/api/paper", paperReview, jsonInit("POST", { path }, signal), MAX_DOCUMENT_RESPONSE_BYTES); }
+  paperIntakeStatus(jobId: string, signal?: AbortSignal) { return this.#json(`/api/papers/intakes/${encodeURIComponent(jobId)}?wait_ms=15000`, paperIntakeStatus, signal ? { signal } : undefined, MAX_PAPER_STATUS_BYTES); }
+  cancelPaperIntake(jobId: string) { return this.#json(`/api/papers/intakes/${encodeURIComponent(jobId)}/cancel`, paperIntakeStatus, { method: "POST" }, MAX_PAPER_STATUS_BYTES); }
+  reconstructBiorxiv(id: string, signal: AbortSignal) { return this.#json("/api/papers/biorxiv/reconstruct", paperReview, jsonInit("POST", { id }, signal), MAX_PAPER_REVIEW_BYTES); }
+  reconstructPaperPath(path: string, signal: AbortSignal) { return this.#json("/api/paper", paperReview, jsonInit("POST", { path }, signal), MAX_PAPER_REVIEW_BYTES); }
 }
 
 export function createSomiteClient(origin?: string, fetcher?: typeof fetch) {

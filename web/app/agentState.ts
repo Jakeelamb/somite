@@ -2,6 +2,7 @@ import type { AgentEvent, AgentSnapshot, AgentTransaction } from "./types";
 
 export const AGENT_POLL_INTERVAL_MS = 450;
 export const AGENT_POLL_DEGRADED_AFTER = 3;
+export const AGENT_EVENT_RETENTION = 500;
 
 export function agentPollFailureState(consecutiveFailures: number) {
   const failures = Math.max(1, Math.trunc(consecutiveFailures));
@@ -20,8 +21,22 @@ export function mergeAgentSnapshots(current: AgentSnapshot, incoming: AgentSnaps
     cursor: Math.max(current.cursor, incoming.cursor),
     events: [...events.values()]
       .sort((left, right) => left.cursor - right.cursor)
-      .slice(-500),
+      .slice(-AGENT_EVENT_RETENTION),
   };
+}
+
+export function retainAppliedAgentTransactionIds(
+  current: ReadonlySet<string>,
+  consumed: readonly string[],
+  maximum = AGENT_EVENT_RETENTION,
+) {
+  const retained = new Set(current);
+  for (const id of consumed) {
+    retained.delete(id);
+    retained.add(id);
+  }
+  while (retained.size > maximum) retained.delete(retained.values().next().value!);
+  return retained;
 }
 
 export function agentPollCursorAfterSnapshot(
@@ -40,6 +55,19 @@ export function unseenAgentTransactions(events: AgentEvent[], applied: ReadonlyS
     .sort((left, right) => left.cursor - right.cursor)
     .flatMap((event) => event.transaction ? [event.transaction] : [])
     .filter((transaction) => !applied.has(transaction.transaction_id));
+}
+
+/** Drop already-consumed graph bodies while preserving the ordered event timeline. */
+export function compactConsumedAgentEvents(
+  events: readonly AgentEvent[],
+  consumedTransactionIds: ReadonlySet<string>,
+): AgentEvent[] {
+  return events.map((event) => {
+    if (!event.transaction || !consumedTransactionIds.has(event.transaction.transaction_id)) return event;
+    const metadata = { ...event };
+    delete metadata.transaction;
+    return metadata;
+  });
 }
 
 export type AgentTransactionPlan = {

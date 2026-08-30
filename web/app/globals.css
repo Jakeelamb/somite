@@ -1,5 +1,4 @@
 @import "@xyflow/react/dist/style.css";
-@import "tailwindcss";
 
 :root {
   --canvas: #050505;
@@ -107,8 +106,17 @@ button:disabled { cursor: default; opacity: .42; }
 .run-button:hover:not(:disabled) { background: var(--accent); }
 .run-button.is-running { background: var(--danger); }
 .run-button.is-running:hover:not(:disabled) { filter: brightness(1.08); }
+.run-button:disabled:not(.is-running) { border-color: var(--border); background: var(--surface-raised); color: var(--muted); }
 
 .canvas-wrap { position: relative; grid-row: 2; min-width: 0; min-height: 0; overflow: hidden; background: var(--canvas); scroll-margin-top: 60px; }
+.input-origin-recovery { position: absolute; top: calc(60px + env(safe-area-inset-top)); left: 50%; z-index: 50; width: min(780px, calc(100vw - 150px)); min-height: 58px; padding: 9px 10px; display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; align-items: center; gap: 10px; border: 1px solid color-mix(in srgb, var(--warning) 52%, var(--border)); border-radius: 12px; background: color-mix(in srgb, var(--warning) 7%, var(--surface)); box-shadow: var(--shadow); color: var(--warning); transform: translateX(-50%); }
+.input-origin-recovery > span { min-width: 0; display: grid; gap: 3px; }
+.input-origin-recovery strong { color: var(--text); font-size: 10px; }
+.input-origin-recovery small { color: var(--muted); font-size: 8px; line-height: 1.45; }
+.input-origin-recovery > div { display: flex; gap: 6px; }
+.input-origin-recovery button { min-height: 30px; padding: 0 9px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; border: 1px solid var(--border-strong); border-radius: 7px; background: var(--surface-raised); color: var(--text); font-size: 8px; font-weight: 700; cursor: pointer; white-space: nowrap; }
+.input-origin-recovery button.primary { border-color: color-mix(in srgb, var(--warning) 58%, var(--border)); background: color-mix(in srgb, var(--warning) 13%, var(--surface-raised)); color: var(--warning); }
+.input-origin-recovery button:hover:not(:disabled) { background: var(--surface-hover); }
 .react-flow { background: var(--canvas); }
 .react-flow__pane { cursor: default; }
 .react-flow__pane.draggable { cursor: grab; }
@@ -331,6 +339,7 @@ button:disabled { cursor: default; opacity: .42; }
 
 .panel-layer { position: absolute; top: calc(66px + env(safe-area-inset-top)); bottom: calc(36px + env(safe-area-inset-bottom)); left: 68px; z-index: 42; pointer-events: none; }
 .project-layer { position: absolute; top: calc(66px + env(safe-area-inset-top)); bottom: calc(36px + env(safe-area-inset-bottom)); left: 68px; z-index: 43; pointer-events: none; }
+.project-layer.recovery { top: calc(132px + env(safe-area-inset-top)); z-index: 53; }
 .inspector-layer { position: absolute; top: calc(66px + env(safe-area-inset-top)); right: 16px; bottom: calc(36px + env(safe-area-inset-bottom)); z-index: 41; pointer-events: none; }
 .machine-layer { position: absolute; right: 14px; bottom: calc(34px + env(safe-area-inset-bottom)); z-index: 48; pointer-events: none; }
 .toolchain-layer { position: absolute; top: calc(66px + env(safe-area-inset-top)); right: 16px; bottom: calc(36px + env(safe-area-inset-bottom)); z-index: 49; pointer-events: none; }
@@ -353,7 +362,7 @@ button:disabled { cursor: default; opacity: .42; }
 .floating-panel-head button, .inspector-studio-head > button { width: 26px; height: 26px; display: grid; place-items: center; border: 0; border-radius: 5px; background: transparent; color: var(--muted); cursor: pointer; }
 .floating-panel-head button:hover, .floating-panel-head button.active, .inspector-studio-head > button:hover { background: var(--surface-hover); color: var(--text); }
 
-.agent-edge-launcher { position: absolute; top: calc(70px + env(safe-area-inset-top)); right: 0; z-index: 47; min-width: 42px; height: 38px; padding: 0 9px 0 8px; display: flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-right: 0; border-radius: 11px 0 0 11px; background: color-mix(in srgb, var(--surface) 96%, transparent); box-shadow: 0 8px 28px rgb(0 0 0 / 28%); color: var(--text); font-size: 9px; font-weight: 700; cursor: pointer; backdrop-filter: blur(12px); }
+.agent-edge-launcher { position: absolute; top: calc(70px + env(safe-area-inset-top)); right: 0; z-index: 40; min-width: 42px; height: 38px; padding: 0 9px 0 8px; display: flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-right: 0; border-radius: 11px 0 0 11px; background: color-mix(in srgb, var(--surface) 96%, transparent); box-shadow: 0 8px 28px rgb(0 0 0 / 28%); color: var(--text); font-size: 9px; font-weight: 700; cursor: pointer; backdrop-filter: blur(12px); }
 .agent-edge-launcher:hover { background: var(--surface-hover); }
 .agent-edge-launcher > i { width: 7px; height: 7px; border-radius: 50%; background: var(--success); }
 .agent-edge-launcher > i.busy { background: var(--warning); animation: agent-pulse 1.25s ease-in-out infinite; }
@@ -377,6 +386,11 @@ button:disabled { cursor: default; opacity: .42; }
 .agent-transport-error span { min-width: 0; display: grid; gap: 2px; }
 .agent-transport-error strong { font-size: 9px; }
 .agent-transport-error small { color: var(--muted); font-size: 8px; line-height: 1.4; overflow-wrap: anywhere; }
+.agent-blocked-notice { margin: 8px; padding: 8px; display: flex; gap: 7px; align-items: flex-start; border: 1px solid color-mix(in srgb, var(--warning) 42%, var(--border)); border-radius: 7px; background: color-mix(in srgb, var(--warning) 8%, var(--surface)); color: var(--text); }
+.agent-blocked-notice > svg { flex: none; color: var(--warning); }
+.agent-blocked-notice span { min-width: 0; display: grid; gap: 2px; }
+.agent-blocked-notice strong { font-size: 9px; }
+.agent-blocked-notice small { color: var(--muted); font-size: 8px; line-height: 1.4; overflow-wrap: anywhere; }
 .readiness-window { width: min(760px, calc(100vw - 136px)); max-height: min(620px, calc(100vh - 124px)); }
 .readiness-hero { min-height: 62px; padding: 12px 14px; display: grid; grid-template-columns: 20px minmax(0, 1fr); align-items: center; gap: 10px; border-bottom: 1px solid var(--border); background: color-mix(in srgb, var(--warning) 6%, var(--surface-raised)); color: var(--warning); }
 .readiness-hero.state-ready { background: color-mix(in srgb, var(--success) 6%, var(--surface-raised)); color: var(--success); }
@@ -1212,9 +1226,12 @@ button:disabled { cursor: default; opacity: .42; }
   .workflow-identity { margin-left: 0; }
   .workflow-title-input { min-width: 110px; max-width: 34vw; }
   .top-actions .studio-button:nth-child(-n+3) { display: none; }
+  .input-origin-recovery { top: calc(56px + env(safe-area-inset-top)); width: calc(100vw - 24px); grid-template-columns: 18px minmax(0, 1fr); }
+  .input-origin-recovery > div { grid-column: 1 / -1; display: grid; grid-template-columns: 1fr 1fr; }
   .panel-layer { right: 12px; left: 68px; }
   .library-window { width: 100%; }
   .project-layer { right: 12px; left: 68px; }
+  .project-layer.recovery { top: calc(178px + env(safe-area-inset-top)); }
   .project-window { width: 100%; }
   .inspector-layer { right: 10px; left: 68px; }
   .inspector-window { width: 100%; }

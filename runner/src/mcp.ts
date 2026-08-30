@@ -1,10 +1,14 @@
 import { URL } from "node:url";
 
+import { MAX_ACP_CONTROL_FRAME_BYTES, MAX_WORKFLOW_REQUEST_BYTES } from "@somite/workflow/limits";
+import { boundedResponseBytes } from "@somite/workflow/boundedResponse";
 import { SOMITE_VERSION } from "@somite/workflow/version";
+import { boundedNdjsonStream } from "./boundedNdjson.ts";
 import { MCP_OUTPUT_SCHEMAS } from "./mcpSchemas.ts";
 import { SOMITE_MCP_TOOL, type SomiteMcpToolName } from "./mcpTools.ts";
 
-const MAX_MESSAGE_BYTES = 16 * 1024 * 1024;
+const MAX_MCP_TEXT_MIRROR_BYTES = 64 * 1024;
+const MAX_IN_FLIGHT_REQUESTS = 8;
 const LEGACY_PROTOCOLS = new Set(["2024-10-07", "2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]);
 const LATEST_LEGACY_PROTOCOL = "2025-11-25";
 const MODERN_PROTOCOL = "2026-07-28";
@@ -30,6 +34,122 @@ const stringSchema = (description: string, extra: JsonObject = {}): JsonObject =
 const keySchema = stringSchema("Stable retry key for this identical action.", { pattern: "^[A-Za-z0-9_-]{8,128}$" });
 const stateSchema = stringSchema("Exact state_revision returned by somite.workflow.get.");
 const summarySchema = stringSchema("Short user-facing description of this canvas edit.", { minLength: 1, maxLength: 240 });
+const parameterValueSchema: JsonObject = {
+  type: ["string", "number", "boolean"],
+  description: "One browser-stable operator parameter value: string, finite number, or boolean.",
+};
+const noteSchema: JsonObject = {
+  type: ["string", "null"],
+  maxLength: 4_096,
+  pattern: "^[^\\u0000]*$",
+  description: "Node note text (at most 4,096 UTF-8 bytes), or null to remove it.",
+};
+
+function identifierSchema(description: string): JsonObject {
+  return stringSchema(description, { minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9_.-]+$" });
+}
+
+function parameterRecordSchema(description: string): JsonObject {
+  return { type: "object", description, additionalProperties: parameterValueSchema };
+}
+
+function taggedObjectSchema(
+  discriminator: "op" | "kind",
+  tag: string,
+  title: string,
+  description: string,
+  properties: JsonObject,
+  required: string[],
+): JsonObject {
+  return {
+    ...objectSchema({
+      [discriminator]: { type: "string", const: tag, description: `${discriminator} discriminator; use exactly ${JSON.stringify(tag)}.` },
+      ...properties,
+    }, [discriminator, ...required]),
+    title,
+    description,
+  };
+}
+
+const workflowBindingSchema: JsonObject = {
+  type: "object",
+  description: "Explicit source-workflow parameter binding, discriminated by kind.",
+  oneOf: [
+    taggedObjectSchema("kind", "project_file", "Project file binding", "Bind the parameter to one safe project-relative file.", {
+      path: stringSchema("Safe project-relative file path resolved from the workflow input location.", { minLength: 1 }),
+    }, ["path"]),
+    taggedObjectSchema("kind", "project_directory", "Project directory binding", "Bind the parameter to one safe project-relative directory.", {
+      path: stringSchema("Safe project-relative directory path resolved from the workflow input location.", { minLength: 1 }),
+    }, ["path"]),
+    taggedObjectSchema("kind", "literal", "Literal parameter binding", "Bind the parameter to one literal value accepted by its indexed source schema.", {
+      value: parameterValueSchema,
+    }, ["value"]),
+  ],
+};
+
+const sourceWorkflowEditSchema: JsonObject = {
+  type: "object",
+  description: "Exactly one typed source-workflow edit, discriminated by kind.",
+  oneOf: [
+    taggedObjectSchema("kind", "set_parameter", "Set source parameter", "Set one indexed source-workflow parameter with an explicit binding.", {
+      name: stringSchema("Exact parameter name returned by the indexed source workflow.", { minLength: 1 }),
+      binding: workflowBindingSchema,
+    }, ["name", "binding"]),
+    taggedObjectSchema("kind", "reset_parameter", "Reset source parameter", "Remove one explicit binding and restore the source workflow's default behavior.", {
+      name: stringSchema("Exact parameter name returned by the indexed source workflow.", { minLength: 1 }),
+    }, ["name"]),
+    taggedObjectSchema("kind", "replace_invocation", "Replace source invocation", "Select one reviewed native operator contract for an indexed source invocation.", {
+      invocation_id: stringSchema("Exact invocation id returned by the indexed source workflow.", { minLength: 1 }),
+      operator: identifierSchema("Exact reviewed native operator id returned by somite.catalog.search."),
+      operator_revision: stringSchema("Exact immutable operator revision returned with that catalog match.", { minLength: 1 }),
+      params: parameterRecordSchema("Optional declared parameters for the reviewed replacement operator."),
+    }, ["invocation_id", "operator", "operator_revision"]),
+    taggedObjectSchema("kind", "reset_invocation", "Reset source invocation", "Remove the selected native replacement from one indexed source invocation.", {
+      invocation_id: stringSchema("Exact invocation id returned by the indexed source workflow.", { minLength: 1 }),
+    }, ["invocation_id"]),
+  ],
+};
+
+const graphOperationSchema: JsonObject = {
+  type: "object",
+  description: "Exactly one atomic native graph operation, discriminated by op.",
+  oneOf: [
+    taggedObjectSchema("op", "add_operator", "Add native operator", "Add one reviewed catalog operator as a new editable node.", {
+      node_id: identifierSchema("New unique node id chosen for this graph."),
+      operator_id: identifierSchema("Exact reviewed native operator id returned by somite.catalog.search."),
+      params: parameterRecordSchema("Optional declared operator parameters; omit values that should use catalog defaults."),
+      x: { type: "number", description: "Optional finite canvas x coordinate; defaults to 0." },
+      y: { type: "number", description: "Optional finite canvas y coordinate; defaults to 0." },
+      note: noteSchema,
+    }, ["node_id", "operator_id"]),
+    taggedObjectSchema("op", "remove_node", "Remove node", "Remove one existing node and all of its incident edges.", {
+      node_id: identifierSchema("Exact id of the existing node to remove."),
+    }, ["node_id"]),
+    taggedObjectSchema("op", "set_param", "Set node parameter", "Set one declared parameter on an existing native node.", {
+      node_id: identifierSchema("Exact id of the existing native node."),
+      parameter: identifierSchema("Exact parameter name declared by that node's pinned operator contract."),
+      value: parameterValueSchema,
+    }, ["node_id", "parameter", "value"]),
+    taggedObjectSchema("op", "unset_param", "Reset node parameter", "Remove one explicit parameter value, restoring its default when the contract has one.", {
+      node_id: identifierSchema("Exact id of the existing native node."),
+      parameter: identifierSchema("Exact parameter name declared by that node's pinned operator contract."),
+    }, ["node_id", "parameter"]),
+    taggedObjectSchema("op", "connect", "Connect nodes", "Add one typed edge between exact ports on two existing nodes.", {
+      edge_id: identifierSchema("New unique edge id chosen for this graph."),
+      from_node: identifierSchema("Exact id of the source node."),
+      from_port: identifierSchema("Exact output port name from the source node contract."),
+      to_node: identifierSchema("Exact id of the destination node."),
+      to_port: identifierSchema("Exact input port name from the destination node contract."),
+    }, ["edge_id", "from_node", "from_port", "to_node", "to_port"]),
+    taggedObjectSchema("op", "disconnect", "Disconnect nodes", "Remove one existing graph edge without removing either node.", {
+      edge_id: identifierSchema("Exact id of the existing edge to remove."),
+    }, ["edge_id"]),
+    taggedObjectSchema("op", "set_note", "Set node note", "Set or remove the non-executable note on one existing node.", {
+      node_id: identifierSchema("Exact id of the existing node."),
+      note: noteSchema,
+    }, ["node_id", "note"]),
+  ],
+};
 
 function tool(
   name: SomiteMcpToolName,
@@ -79,7 +199,7 @@ const TOOLS: Tool[] = [
     workflow_revision: stringSchema("Exact current source workflow revision."),
     idempotency_key: keySchema,
     summary: summarySchema,
-    edits: { type: "array", minItems: 1, maxItems: 64, items: { type: "object" } },
+    edits: { type: "array", minItems: 1, maxItems: 64, description: "One to 64 ordered typed source-workflow edits.", items: sourceWorkflowEditSchema },
   }, ["base_state_revision", "workflow_revision", "idempotency_key", "summary", "edits"]), { readOnlyHint: false, destructiveHint: true }),
   tool(SOMITE_MCP_TOOL.sourceWorkflowPromote, "Promote source call", "Promote one selected source invocation replacement into an ordinary editable typed node.", objectSchema({
     base_state_revision: stateSchema,
@@ -100,11 +220,8 @@ const TOOLS: Tool[] = [
       type: "array",
       minItems: 1,
       maxItems: 64,
-      items: {
-        type: "object",
-        required: ["op"],
-        properties: { op: { enum: ["add_operator", "remove_node", "set_param", "unset_param", "connect", "disconnect", "set_note"] } },
-      },
+      description: "One to 64 ordered native graph operations committed atomically.",
+      items: graphOperationSchema,
     },
   }, ["base_state_revision", "idempotency_key", "summary", "operations"]), { readOnlyHint: false, destructiveHint: true }),
   tool(SOMITE_MCP_TOOL.workflowCompile, "Compile Somite workflow", "Freeze the ready graph into content-addressed Nextflow and Pixi artifacts.", objectSchema(), { readOnlyHint: false, openWorldHint: true }),
@@ -133,8 +250,14 @@ function parseOptions() {
   const index = process.argv.indexOf("--server-url");
   if (index < 0 || !process.argv[index + 1]) throw new Error("--server-url is required");
   const server = new URL(process.argv[index + 1]!);
-  if (server.protocol !== "http:" || !["127.0.0.1", "localhost", "[::1]", "::1"].includes(server.hostname)) {
-    throw new Error("Somite MCP only connects to a loopback HTTP runner");
+  if (server.protocol !== "http:"
+    || !["127.0.0.1", "localhost", "[::1]", "::1"].includes(server.hostname)
+    || server.username
+    || server.password
+    || server.pathname !== "/"
+    || server.search
+    || server.hash) {
+    throw new Error("Somite MCP requires a credential-free loopback HTTP origin");
   }
   const capability = process.env.SOMITE_MCP_RUNTIME_CAPABILITY;
   if (!capability || !/^[a-f0-9]{64}$/.test(capability)) throw new Error("Somite MCP runtime capability is missing");
@@ -145,11 +268,7 @@ const options = parseOptions();
 const active = new Map<JsonRpcId, AbortController>();
 
 async function responseBytes(response: Response) {
-  const announced = Number(response.headers.get("content-length") ?? 0);
-  if (Number.isFinite(announced) && announced > MAX_MESSAGE_BYTES) throw new Error("Somite response is too large");
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (bytes.byteLength > MAX_MESSAGE_BYTES) throw new Error("Somite response is too large");
-  return bytes;
+  return boundedResponseBytes(response, MAX_WORKFLOW_REQUEST_BYTES);
 }
 
 async function http(method: "GET" | "POST", path: string, body: unknown, signal: AbortSignal, milliseconds = 30_000) {
@@ -158,6 +277,7 @@ async function http(method: "GET" | "POST", path: string, body: unknown, signal:
   const response = await fetch(new URL(path, options.server), {
     method,
     signal: combined,
+    redirect: "error",
     headers: {
       accept: "application/json",
       "content-type": "application/json",
@@ -169,7 +289,7 @@ async function http(method: "GET" | "POST", path: string, body: unknown, signal:
   let value: unknown = {};
   if (bytes.byteLength) {
     try {
-      value = JSON.parse(new TextDecoder().decode(bytes));
+      value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
     } catch {
       throw new Error(`Somite returned invalid JSON (HTTP ${response.status})`);
     }
@@ -219,8 +339,15 @@ async function callTool(name: string, value: unknown, signal: AbortSignal) {
 }
 
 function toolResult(value: unknown) {
+  const serialized = JSON.stringify(value);
+  const serializedBytes = Buffer.byteLength(serialized);
   return {
-    content: [{ type: "text", text: JSON.stringify(value) }],
+    content: [{
+      type: "text",
+      text: serializedBytes <= MAX_MCP_TEXT_MIRROR_BYTES
+        ? serialized
+        : `Somite returned a ${serializedBytes}-byte structured result. Read structuredContent for the complete value.`,
+    }],
     structuredContent: value,
   };
 }
@@ -268,8 +395,24 @@ async function dispatch(method: string, params: unknown, signal: AbortSignal) {
   throw Object.assign(new Error(`method not found: ${method}`), { code: -32601 });
 }
 
+let outputChain = Promise.resolve();
+
 function write(value: unknown) {
-  process.stdout.write(`${JSON.stringify(value)}\n`);
+  let serialized = JSON.stringify(value);
+  if (Buffer.byteLength(serialized) > MAX_ACP_CONTROL_FRAME_BYTES) {
+    const raw = value && typeof value === "object" && !Array.isArray(value) ? value as JsonObject : {};
+    serialized = JSON.stringify({
+      jsonrpc: "2.0",
+      id: typeof raw.id === "string" || typeof raw.id === "number" ? raw.id : null,
+      error: { code: -32603, message: `MCP response exceeds ${MAX_ACP_CONTROL_FRAME_BYTES} bytes.` },
+    });
+  }
+  const frame = `${serialized}\n`;
+  const queued = outputChain.then(() => new Promise<void>((resolvePromise, rejectPromise) => {
+    process.stdout.write(frame, (error) => error ? rejectPromise(error) : resolvePromise());
+  }));
+  outputChain = queued.catch(() => undefined);
+  return queued;
 }
 
 async function handle(value: unknown) {
@@ -288,31 +431,39 @@ async function handle(value: unknown) {
   const controller = new AbortController();
   active.set(id, controller);
   try {
-    write({ jsonrpc: "2.0", id, result: await dispatch(message.method, message.params, controller.signal) });
+    await write({ jsonrpc: "2.0", id, result: await dispatch(message.method, message.params, controller.signal) });
   } catch (cause) {
     const failure = cause as Error & { code?: number };
-    write({ jsonrpc: "2.0", id, error: { code: failure.code ?? -32603, message: failure.message || String(cause) } });
+    await write({ jsonrpc: "2.0", id, error: { code: failure.code ?? -32603, message: failure.message || String(cause) } });
   } finally {
     active.delete(id);
   }
 }
 
-let buffer = "";
-for await (const chunk of process.stdin) {
-  buffer += Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
-  if (Buffer.byteLength(buffer) > MAX_MESSAGE_BYTES) throw new Error("MCP message is too large");
-  while (true) {
-    const newline = buffer.indexOf("\n");
-    if (newline < 0) break;
-    const line = buffer.slice(0, newline).trim();
-    buffer = buffer.slice(newline + 1);
+const framedInput = process.stdin.pipe(boundedNdjsonStream(MAX_ACP_CONTROL_FRAME_BYTES));
+for await (const chunk of framedInput) {
+  const decoded = new TextDecoder("utf-8", { fatal: true }).decode(chunk);
+  for (const candidate of decoded.split("\n")) {
+    const line = candidate.trim();
     if (!line) continue;
     let value: unknown;
     try {
       value = JSON.parse(line);
     } catch {
-      write({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
+      await write({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
       continue;
+    }
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const message = value as JsonObject;
+      const id = message.id;
+      if ((typeof id === "string" || typeof id === "number") && active.has(id)) {
+        await write({ jsonrpc: "2.0", id, error: { code: -32600, message: "duplicate in-flight request id" } });
+        continue;
+      }
+      if ((typeof id === "string" || typeof id === "number") && active.size >= MAX_IN_FLIGHT_REQUESTS) {
+        await write({ jsonrpc: "2.0", id, error: { code: -32000, message: `Somite MCP allows at most ${MAX_IN_FLIGHT_REQUESTS} in-flight requests.` } });
+        continue;
+      }
     }
     void handle(value);
   }

@@ -124,9 +124,10 @@ function storedAgentFrame(): AgentFrame & { collapsed: boolean } {
   }
 }
 
-export function AgentPanel({ snapshot, transportError, discovery, discoveryLoading, draft, onRefreshDiscovery, onConnect, onConfig, onPrompt, onCancel, onDisconnect, onPermission, onClose }: {
+export function AgentPanel({ snapshot, transportError, blockedReason, discovery, discoveryLoading, draft, onRefreshDiscovery, onConnect, onConfig, onPrompt, onCancel, onDisconnect, onPermission, onClose }: {
   snapshot: AgentSnapshot;
   transportError?: string | null;
+  blockedReason?: string | null;
   discovery: AgentDiscovery | null;
   discoveryLoading: boolean;
   draft?: { id: number; message: string } | null;
@@ -211,7 +212,7 @@ export function AgentPanel({ snapshot, transportError, discovery, discoveryLoadi
 
   const submitPrompt = async () => {
     const prompt = message.trim();
-    if (!prompt || snapshot.busy) return;
+    if (!prompt || snapshot.busy || blockedReason) return;
     setSubmitting(true);
     try {
       await onPrompt(prompt);
@@ -254,6 +255,7 @@ export function AgentPanel({ snapshot, transportError, discovery, discoveryLoadi
         </nav>
       </header>
       {!collapsed && <div className="agent-body">
+        {blockedReason && <div className="agent-blocked-notice" role="status"><CircleAlert size={13} aria-hidden="true" /><span><strong>Canvas actions are paused</strong><small>{blockedReason}</small></span></div>}
         {!snapshot.connected && !snapshot.connecting ? (
           <div className="agent-launcher">
             <div className="agent-launcher-intro">
@@ -305,8 +307,8 @@ export function AgentPanel({ snapshot, transportError, discovery, discoveryLoadi
             {activity.length > 0 && <details className="agent-activity"><summary><MoreHorizontal size={13} />{snapshot.busy ? `${activity.length} step${activity.length === 1 ? "" : "s"} in progress` : `Completed ${activity.length} step${activity.length === 1 ? "" : "s"}`}</summary><ol>{activity.map((event) => <li key={event.cursor}>{event.title}</li>)}</ol></details>}
           </div>
           <div className="agent-composer">
-            <textarea aria-label="Message Agent" rows={3} value={message} disabled={!snapshot.connected || Boolean(transportError)} placeholder={transportError ? "Waiting for the Agent connection…" : "Ask Agent to build, explain, or fix this workflow…"} onChange={(event) => setMessage(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submitPrompt(); } }} />
-            <div><span>{snapshot.agent_name ?? "Agent"}</span>{snapshot.busy ? <button type="button" className="agent-stop" onClick={() => void onCancel()}><CircleStop size={13} />Stop</button> : <button type="button" aria-label="Send to Agent" disabled={!message.trim() || submitting || Boolean(transportError)} onClick={() => void submitPrompt()}><Send size={13} />Send</button>}</div>
+            <textarea aria-label="Message Agent" rows={3} value={message} disabled={!snapshot.connected || Boolean(transportError) || Boolean(blockedReason)} placeholder={transportError ? "Waiting for the Agent connection…" : blockedReason ? "Confirm the workflow input location to use Agent…" : "Ask Agent to build, explain, or fix this workflow…"} onChange={(event) => setMessage(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void submitPrompt(); } }} />
+            <div><span>{snapshot.agent_name ?? "Agent"}</span>{snapshot.busy ? <button type="button" className="agent-stop" onClick={() => void onCancel()}><CircleStop size={13} />Stop</button> : <button type="button" aria-label="Send to Agent" disabled={!message.trim() || submitting || Boolean(transportError) || Boolean(blockedReason)} onClick={() => void submitPrompt()}><Send size={13} />Send</button>}</div>
           </div>
         </>}
       </div>}
@@ -734,19 +736,24 @@ export function LibraryPanel({
   );
 }
 
-export function ProjectPanel({ projectName, graphPath, onImportProject, onClose }: {
+export function ProjectPanel({ projectName, graphPath, recoveryMode = false, onImportProject, onClose }: {
   projectName: string;
   graphPath: string;
+  recoveryMode?: boolean;
   onImportProject: (path: string) => Promise<void>;
   onClose: () => void;
 }) {
   const [path, setPath] = useState("");
   const [importing, setImporting] = useState(false);
   const [error, setError] = useState("");
+  const pathInputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (recoveryMode) pathInputRef.current?.focus();
+  }, [recoveryMode]);
   return (
     <section className="floating-panel project-window" aria-label="Project">
       <header className="floating-panel-head"><div><strong>Project</strong><span>{projectName}</span></div><button type="button" aria-label="Close Project" onClick={onClose}><X size={15} /></button></header>
-      <div className="project-current"><span>Current graph</span><strong>{graphPath}</strong><small>Changes are saved into this Somite project.</small></div>
+      <div className="project-current"><span>Current graph</span><strong>{graphPath}</strong><small>{recoveryMode ? "The recovered canvas will stay open while you restore its file location." : "Changes are saved into this Somite project."}</small></div>
       <form className="project-import" onSubmit={(event) => {
         event.preventDefault();
         const projectPath = path.trim();
@@ -758,11 +765,11 @@ export function ProjectPanel({ projectName, graphPath, onImportProject, onClose 
           .catch((reason: unknown) => setError(reason instanceof Error ? reason.message : "Could not open project"))
           .finally(() => setImporting(false));
       }}>
-        <div className="project-import-title"><FolderOpen size={18} aria-hidden="true" /><span><strong>Open a local project</strong><small>Detect its workflow structure automatically</small></span></div>
-        <p>Open a Somite graph, Nextflow project, or Snakemake project. Somite freezes workflow source while leaving runtime data and sensitive files in place.</p>
-        <label><span>Project folder or workflow file</span><input aria-label="Local project folder or workflow file" autoComplete="off" spellCheck={false} placeholder="/path/to/project" value={path} onChange={(event) => setPath(event.target.value)} /></label>
+        <div className="project-import-title"><FolderOpen size={18} aria-hidden="true" /><span><strong>{recoveryMode ? "Choose the original workflow" : "Open a local project"}</strong><small>{recoveryMode ? "Restore relative-file resolution" : "Detect its workflow structure automatically"}</small></span></div>
+        <p>{recoveryMode ? "Choose the original .somite.json file. Somite keeps the recovered canvas and restores only the folder used for relative inputs." : "Open a Somite graph, Nextflow project, or Snakemake project. Somite freezes workflow source while leaving runtime data and sensitive files in place."}</p>
+        <label><span>{recoveryMode ? "Original Somite workflow file" : "Project folder or workflow file"}</span><input ref={pathInputRef} aria-label={recoveryMode ? "Original Somite workflow file" : "Local project folder or workflow file"} autoComplete="off" spellCheck={false} placeholder={recoveryMode ? "/path/to/original.somite.json" : "/path/to/project"} value={path} onChange={(event) => setPath(event.target.value)} /></label>
         {error && <p className="project-import-error" role="alert">{error}</p>}
-        <button type="submit" disabled={!path.trim() || importing}>{importing ? <><LoaderCircle className="spin" size={13} />Opening project…</> : <><FolderOpen size={13} />Open project</>}</button>
+        <button type="submit" disabled={!path.trim() || importing}>{importing ? <><LoaderCircle className="spin" size={13} />{recoveryMode ? "Confirming location…" : "Opening project…"}</> : <><FolderOpen size={13} />{recoveryMode ? "Use workflow location" : "Open project"}</>}</button>
       </form>
     </section>
   );
@@ -845,14 +852,14 @@ export function MachinePanel({
           </div>
         </details>}
       </section>
-      <section className="machine-storage" aria-label="Local storage">
+      <section className="machine-storage" aria-label="Project and shared storage">
         <header className="machine-storage-head">
-          <span><strong>Local storage</strong><small>Measured on this project</small></span>
+          <span><strong>Storage</strong><small>This project + shared Somite cache</small></span>
           {storageLoading ? <LoaderCircle className="spin" size={13} aria-label="Measuring storage" /> : <button type="button" onClick={() => { setCleanupArmed(false); void onRefreshStorage(); }} aria-label="Refresh storage profile">Refresh</button>}
         </header>
         {storage && <div className="machine-storage-grid">
           <div><span>Finished run work</span><strong>{formatResourceBytes(reclaimable)}</strong><small>{storage.runs.reclaimable_run_ids.length} run{storage.runs.reclaimable_run_ids.length === 1 ? "" : "s"} reclaimable</small></div>
-          <div><span>Shared tool environments</span><strong>{formatResourceBytes(storage.shared_environments.bytes)}</strong><small>Reused across exact locks</small></div>
+          <div><span>Shared tool environments</span><strong>{formatResourceBytes(storage.shared_environments.bytes)}</strong><small>Machine-wide · reused across exact locks</small></div>
           <div><span>Paper extraction cache</span><strong>{formatResourceBytes(storage.paper_cache.bytes)}</strong><small>Recreatable</small></div>
           <div><span>Retained records</span><strong>{formatResourceBytes(storage.retained_scientific_state.bytes)}</strong><small>Results, logs, inputs, evidence</small></div>
         </div>}

@@ -1,5 +1,6 @@
 import { join } from "node:path";
 
+import { boundedResponseBytes } from "@somite/workflow/boundedResponse";
 import { atomicWrite, ensurePrivateDirectory, pathExists, regularFile } from "./files.ts";
 
 const EUROPE_PMC = "https://www.ebi.ac.uk/europepmc/webservices/rest";
@@ -48,10 +49,7 @@ async function bounded(fetcher: typeof fetch, url: URL | string, maximumBytes: n
   try {
     const response = await fetcher(url, { signal: controller.signal, headers: { accept: "application/json, application/xml;q=0.9, text/xml;q=0.8", "user-agent": "Somite/0.1 paper reconstruction" } });
     if (!response.ok) throw new Error(`literature service returned ${response.status} ${response.statusText}`);
-    const announced = Number(response.headers.get("content-length") ?? 0);
-    if (Number.isFinite(announced) && announced > maximumBytes) throw new Error(`literature response exceeds ${maximumBytes} bytes`);
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.byteLength > maximumBytes) throw new Error(`literature response exceeds ${maximumBytes} bytes`);
+    const bytes = await boundedResponseBytes(response, maximumBytes, "Literature response");
     return decoder.decode(bytes);
   } finally {
     clearTimeout(timeout);

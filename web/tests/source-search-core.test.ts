@@ -124,6 +124,20 @@ test("Ensembl search propagates provider and transport failures", async (context
   }
 });
 
+test("public-data search cancels a remotely advertised oversized response", async () => {
+  let cancelled = false;
+  const fetcher: typeof fetch = async () => new Response(new ReadableStream({
+    cancel() { cancelled = true; },
+  }), {
+    headers: {
+      "content-type": "application/json",
+      "content-length": String(8 * 1024 * 1024 + 1),
+    },
+  });
+  await assert.rejects(searchEnsembl("human BRCA1", fetcher), /exceeds 8388608 bytes/);
+  assert.equal(cancelled, true);
+});
+
 test("Ensembl search rejects successful responses with malformed schemas", async (context) => {
   await context.test("gene lookup", async () => {
     await assert.rejects(

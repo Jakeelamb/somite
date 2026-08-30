@@ -11,10 +11,82 @@ import { fileURLToPath } from "node:url";
 import { byteDigest } from "@somite/workflow/contentIdentity";
 import { operatorPorts, type Operator } from "@somite/workflow/catalog";
 import { InputOrigins } from "../src/inputOrigins.ts";
-import { startServer } from "../src/server.ts";
-import { MAX_WORKFLOW_REQUEST_BYTES } from "../src/workflowLimits.ts";
+import { requestBytes, send, startServer } from "../src/server.ts";
+import { MAX_WORKFLOW_REQUEST_BYTES } from "@somite/workflow/limits";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
+
+test("request byte limits cancel an unadvertised oversized stream", async () => {
+  let cancelled = false;
+  let pulls = 0;
+  const request = new Request("http://localhost/test", {
+    method: "POST",
+    body: new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        controller.enqueue(new Uint8Array(4));
+      },
+      cancel() { cancelled = true; },
+    }),
+    duplex: "half",
+  } as RequestInit & { duplex: "half" });
+  await assert.rejects(requestBytes(request, 8), /request is too large/);
+  assert.equal(cancelled, true);
+  assert.ok(pulls <= 4, `oversized request pulled ${pulls} chunks`);
+});
+
+test("response streaming cancels its source and settles when the client disconnects", { timeout: 2_000 }, async (context) => {
+  let markCancelled!: () => void;
+  let markSettled!: () => void;
+  const sourceCancelled = new Promise<void>((resolvePromise) => { markCancelled = resolvePromise; });
+  const sendSettled = new Promise<void>((resolvePromise) => { markSettled = resolvePromise; });
+  const server = createServer((_request, response) => {
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new Uint8Array(64 * 1024));
+      },
+      cancel() {
+        markCancelled();
+      },
+    });
+    void send(new Response(body), response).then(markSettled, markSettled);
+  });
+  context.after(async () => {
+    server.closeAllConnections();
+    if (server.listening) {
+      await new Promise<void>((resolvePromise, rejectPromise) => {
+        server.close((error) => error ? rejectPromise(error) : resolvePromise());
+      });
+    }
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("test server did not bind a TCP port");
+
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    const client = httpRequest({ hostname: "127.0.0.1", port: address.port }, (response) => {
+      response.once("data", () => {
+        client.destroy();
+        resolvePromise();
+      });
+    });
+    client.once("error", rejectPromise);
+    client.end();
+  });
+
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      Promise.all([sourceCancelled, sendSettled]),
+      new Promise<never>((_resolvePromise, rejectPromise) => {
+        timeout = setTimeout(() => rejectPromise(new Error("response streaming did not settle after client disconnect")), 500);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+});
 
 async function unusedPort() {
   const reservation = createServer();

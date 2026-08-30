@@ -4,7 +4,8 @@ import { rm } from "node:fs/promises";
 
 import type { OperatorCatalog } from "@somite/workflow/catalog";
 import { byteDigest, canonicalJsonDigest } from "@somite/workflow/contentIdentity";
-import { reconstructPaper, type PaperReview } from "@somite/workflow/paper";
+import { MAX_PAPER_REVIEW_BYTES } from "@somite/workflow/limits";
+import { PaperReviewLimitError, reconstructPaper, type PaperReview } from "@somite/workflow/paper";
 import { atomicWrite, ensurePrivateDirectory, pathExists, regularFile } from "./files.ts";
 import {
   extractPaper,
@@ -74,7 +75,7 @@ const RECONSTRUCTOR_REVISION = "typed-paper-v1";
 const DEFAULT_MAX_RETAINED_JOBS = 8;
 const MAX_EXTRACTION_CACHE_BYTES = 72 * 1024 * 1024;
 const MAX_RECONSTRUCTION_CACHE_ENTRIES = 16;
-const MAX_RECONSTRUCTION_CACHE_BYTES = 16 * 1024 * 1024;
+const MAX_RECONSTRUCTION_CACHE_BYTES = MAX_PAPER_REVIEW_BYTES;
 const terminal = new Set<PaperIntakePhase>(["completed", "failed", "cancelled"]);
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -414,6 +415,8 @@ export class PaperManager {
       }
       const failure: PaperIntakeFailure = error instanceof PaperExtractionError
         ? { code: error.code, message: error.message, retryable: error.retryable }
+        : error instanceof PaperReviewLimitError
+          ? { code: error.code, message: error.message, retryable: error.retryable }
         : { code: "paper_reconstruction_failed", message: error instanceof Error ? error.message : String(error), retryable: true };
       job.status.failure = failure;
       job.status.durations_ms.total = elapsed(job.createdAt);

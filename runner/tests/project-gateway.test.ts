@@ -14,7 +14,7 @@ import { validateSourceWorkflow } from "@somite/workflow/workflow";
 import { ProjectGateway, ProjectGatewayError } from "../src/projectGateway.ts";
 import { readSourceObject } from "../src/sourceWorkflowStore.ts";
 import { verifyGraphSourceWorkflowTrust } from "../src/sourceWorkflowTrust.ts";
-import { MAX_WORKFLOW_DOCUMENT_BYTES } from "../src/workflowLimits.ts";
+import { MAX_WORKFLOW_DOCUMENT_BYTES } from "@somite/workflow/limits";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 const execFile = promisify(execFileCallback);

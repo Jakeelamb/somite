@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { lstat, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -33,11 +33,18 @@ async function terminalStatus(manager: RunManager, id: string) {
 test("RunManager completes representative validation through real Pixi and Nextflow", { timeout: 20 * 60_000 }, async (context) => {
   assert.notEqual(process.platform, "win32", "the real execution smoke requires a supported POSIX host");
   const projectRoot = await mkdtemp(join(tmpdir(), "somite-pixi-nextflow-smoke-"));
+  const cacheParent = await mkdtemp(join(tmpdir(), "somite-pixi-nextflow-cache-"));
+  const cacheRoot = join(cacheParent, "pixi");
+  const previousCacheRoot = process.env.SOMITE_PIXI_CACHE_DIR;
+  process.env.SOMITE_PIXI_CACHE_DIR = cacheRoot;
   const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
   const manager = new RunManager(projectRoot, repositoryRoot, catalog);
   context.after(async () => {
     await manager.shutdown();
+    if (previousCacheRoot === undefined) delete process.env.SOMITE_PIXI_CACHE_DIR;
+    else process.env.SOMITE_PIXI_CACHE_DIR = previousCacheRoot;
     await rm(projectRoot, { recursive: true, force: true });
+    await rm(cacheParent, { recursive: true, force: true });
   });
 
   const started = await manager.start(await representativeGraph(), "validation", "release-smoke-validation");
@@ -59,7 +66,11 @@ test("RunManager completes representative validation through real Pixi and Nextf
   assert.match(lock, /openjdk/);
   const lockDigest = byteDigest(lockBytes).slice("blake3:".length);
   const manifestDigest = byteDigest(await readFile(join(packageRoot, "pixi.toml"))).slice("blake3:".length);
-  const environmentRoot = join(projectRoot, ".somite", "pixi", "environments", pixiPlatform(), `${lockDigest}-${manifestDigest}`);
+  await assert.rejects(lstat(join(projectRoot, ".somite", "pixi", "environments")), { code: "ENOENT" });
+  const platformRoot = join(cacheRoot, "v1", pixiPlatform());
+  const entries = await readdir(platformRoot);
+  assert.equal(entries.length, 1, "one frozen lock should install one shared environment");
+  const environmentRoot = join(platformRoot, entries[0]!);
   assert.ok((await stat(join(environmentRoot, ".pixi", "envs", "default"))).isDirectory());
   const environment = JSON.parse(await readFile(join(environmentRoot, "environment.json"), "utf8")) as Record<string, unknown>;
   assert.equal(environment.lock_digest, `blake3:${lockDigest}`);

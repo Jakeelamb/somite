@@ -1,5 +1,6 @@
 import { assessWorkflow, type WorkflowAssessment } from "./assessment.ts";
 import { OperatorCatalog, operatorPorts, type PinnedOperator } from "./catalog.ts";
+import { MAX_PAPER_RESOURCE_CITATIONS, MAX_PAPER_REVIEW_BYTES } from "./limits.ts";
 import type { ParamValue, PortType, SomiteGraph, SomiteGraphNode, SomitePort } from "./model.ts";
 import { compatiblePortTypes, validateGraph } from "./workflow.ts";
 
@@ -54,6 +55,20 @@ export type PaperReview = {
   resources: PaperResourceCitation[];
   candidates: PaperCandidate[];
 };
+
+export class PaperReviewLimitError extends Error {
+  readonly code = "paper_reconstruction_limit";
+  readonly retryable = false;
+  readonly sizeBytes: number;
+  readonly maximumBytes: number;
+
+  constructor(sizeBytes: number, maximumBytes: number) {
+    super(`Paper reconstruction is ${sizeBytes} bytes; the limit is ${maximumBytes} bytes.`);
+    this.name = "PaperReviewLimitError";
+    this.sizeBytes = sizeBytes;
+    this.maximumBytes = maximumBytes;
+  }
+}
 
 type Assay = "assembly" | "rna_seq" | "variants" | "metagenome" | "single_cell" | "qc" | "unknown";
 
@@ -123,12 +138,15 @@ function normalizedName(value: string) {
 
 function headingOffset(text: string, headings: readonly string[], from = 0) {
   let offset = from;
-  for (const line of text.slice(from).split(/(?<=\n)/)) {
+  while (offset < text.length) {
+    const newline = text.indexOf("\n", offset);
+    const nextOffset = newline < 0 ? text.length : newline + 1;
+    const line = text.slice(offset, nextOffset);
     const content = line.replace(/[\s\f]+$/g, "").toLocaleLowerCase("en-US");
     const first = content.search(/[^\s\f]/);
     if (first >= 0) {
+      const rest = content.slice(first);
       for (const heading of headings) {
-        const rest = content.slice(first);
         if (rest.startsWith(heading)) {
           const suffix = rest.slice(heading.length);
           if (!suffix || /^[.:\f]/.test(suffix) || /^\s{4,}\S/.test(suffix)) return offset + first;
@@ -139,7 +157,7 @@ function headingOffset(text: string, headings: readonly string[], from = 0) {
         }
       }
     }
-    offset += line.length;
+    offset = nextOffset;
   }
   return undefined;
 }
@@ -168,40 +186,119 @@ function escapedAlias(alias: string) {
   return alias.trim().split(/\s+/).map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\\s+");
 }
 
-function aliasMatches(text: string, alias: string) {
-  const exactCase = alias.length <= 4 && /^[A-Z]+$/.test(alias);
-  const expression = new RegExp(`(^|[^A-Za-z0-9])(${escapedAlias(alias)})(?=$|[^A-Za-z0-9])`, exactCase ? "g" : "gi");
-  const matches: Array<{ start: number; end: number }> = [];
-  for (const match of text.matchAll(expression)) {
-    const prefix = match[1] ?? "";
-    const surface = match[2] ?? "";
-    const start = (match.index ?? 0) + prefix.length;
-    matches.push({ start, end: start + surface.length });
+function aliasMatchSummary(text: string, aliases: readonly string[]) {
+  let first: { start: number; end: number } | undefined;
+  let executable = false;
+  for (const alias of aliases) {
+    const exactCase = alias.length <= 4 && /^[A-Z]+$/.test(alias);
+    const expression = new RegExp(`(^|[^A-Za-z0-9])(${escapedAlias(alias)})(?=$|[^A-Za-z0-9])`, exactCase ? "g" : "gi");
+    const classifyExecutable = executable ? undefined : executableMatchClassifier(text);
+    for (const match of text.matchAll(expression)) {
+      const prefix = match[1] ?? "";
+      const surface = match[2] ?? "";
+      const start = (match.index ?? 0) + prefix.length;
+      const end = start + surface.length;
+      if (!first || start < first.start) first = { start, end };
+      if (!executable && classifyExecutable!(start, end)) executable = true;
+      if (executable) break;
+    }
   }
-  return matches;
+  return first ? { first, executable } : undefined;
 }
 
-function clause(text: string, start: number, end: number) {
-  const left = Math.max(text.lastIndexOf(".", start - 1), text.lastIndexOf(";", start - 1), text.lastIndexOf("\n", start - 1)) + 1;
-  const candidates = [text.indexOf(".", end), text.indexOf(";", end), text.indexOf("\n", end)].filter((value) => value >= 0);
-  const right = candidates.length ? Math.min(...candidates) : text.length;
-  return { before: text.slice(left, start).trim().toLocaleLowerCase("en-US"), after: text.slice(end, right).trim().toLocaleLowerCase("en-US") };
+const NON_EXECUTABLE_BEFORE = [
+  "without",
+  "did not use",
+  "not using",
+  "rather than",
+  "instead of",
+  "compared",
+  "comparing",
+  "benchmarked",
+  "evaluated",
+] as const;
+const NON_EXECUTABLE_AFTER = ["not used", "not selected", "not retained"] as const;
+
+function asciiLower(code: number) {
+  return code >= 0x41 && code <= 0x5a ? code + 0x20 : code;
+}
+
+function asciiEqualAt(text: string, offset: number, expected: string, end: number) {
+  if (offset < 0 || offset + expected.length > end) return false;
+  for (let index = 0; index < expected.length; index += 1) {
+    if (asciiLower(text.charCodeAt(offset + index)) !== expected.charCodeAt(index)) return false;
+  }
+  return true;
+}
+
+function trimWhitespace(code: number) {
+  return (code >= 0x09 && code <= 0x0d)
+    || code === 0x20
+    || code === 0xa0
+    || code === 0x1680
+    || (code >= 0x2000 && code <= 0x200a)
+    || code === 0x2028
+    || code === 0x2029
+    || code === 0x202f
+    || code === 0x205f
+    || code === 0x3000
+    || code === 0xfeff;
+}
+
+function trimmedEnd(text: string, left: number, end: number) {
+  let trimmedEnd = end;
+  while (trimmedEnd > left && trimWhitespace(text.charCodeAt(trimmedEnd - 1))) trimmedEnd -= 1;
+  return trimmedEnd;
+}
+
+function endsWithAsciiMarker(text: string, left: number, end: number, marker: string) {
+  const markerStart = end - marker.length;
+  return markerStart >= left && asciiEqualAt(text, markerStart, marker, end);
+}
+
+function executableMatchClassifier(text: string) {
+  let left = 0;
+  let scannedTo = 0;
+  let right = -1;
+  let lastAfter = -1;
+  return (start: number, end: number) => {
+    for (let offset = scannedTo; offset < start; offset += 1) {
+      const code = text.charCodeAt(offset);
+      if (code === 0x2e || code === 0x3b || code === 0x0a) left = offset + 1;
+    }
+    scannedTo = start;
+    if (end > right) {
+      right = text.length;
+      lastAfter = -1;
+      for (let offset = end; offset < text.length; offset += 1) {
+        const code = text.charCodeAt(offset);
+        if (code === 0x2e || code === 0x3b || code === 0x0a) {
+          right = offset;
+          break;
+        }
+        if (asciiLower(code) !== 0x6e) continue;
+        for (const marker of NON_EXECUTABLE_AFTER) {
+          if (asciiEqualAt(text, offset, marker, text.length)) {
+            lastAfter = offset;
+            break;
+          }
+        }
+      }
+    }
+    const beforeEnd = trimmedEnd(text, left, start);
+    for (const marker of NON_EXECUTABLE_BEFORE) {
+      if (endsWithAsciiMarker(text, left, beforeEnd, marker)) return false;
+    }
+    return lastAfter < end;
+  };
 }
 
 function executableMatch(text: string, start: number, end: number) {
-  const current = clause(text, start, end);
-  if (["without", "did not use", "not using", "rather than", "instead of"].some((value) => current.before.endsWith(value))) return false;
-  if (["not used", "not selected", "not retained"].some((value) => current.after.includes(value))) return false;
-  if (["compared", "comparing", "benchmarked", "evaluated"].some((value) => current.before.endsWith(value))) return false;
-  return true;
+  return executableMatchClassifier(text)(start, end);
 }
 
 function evidenceSnippet(text: string, start: number, end: number) {
   return text.slice(Math.max(0, start - 72), Math.min(text.length, end + 96)).replace(/\s+/g, " ").trim();
-}
-
-function pageAt(text: string, offset: number) {
-  return text.slice(0, offset).split("\f").length;
 }
 
 function location(extractedVia: PaperExtractVia, page: number) {
@@ -213,43 +310,37 @@ function recognizedMethods(catalog: OperatorCatalog, fullText: string, extracted
   const found: LocatedMention[] = [];
   for (const operator of catalog.values()) {
     if (!operator.paper) continue;
-    const matches = operator.paper.aliases.flatMap((alias) => aliasMatches(window.text, alias).map((match) => ({ alias, ...match })));
-    const first = matches.sort((left, right) => left.start - right.start)[0];
-    if (!first) continue;
-    const offset = window.offset + first.start;
-    const end = window.offset + first.end;
-    const page = pageAt(fullText, offset);
+    const matched = aliasMatchSummary(window.text, operator.paper.aliases);
+    if (!matched) continue;
+    const offset = window.offset + matched.first.start;
+    const end = window.offset + matched.first.end;
     found.push({
-      display_name: window.text.slice(first.start, first.end).replace(/\s+/g, " ").trim(),
+      display_name: window.text.slice(matched.first.start, matched.first.end).replace(/\s+/g, " ").trim(),
       normalized_name: normalizedName(operator.title),
       ...(operator.paper.operation_class ? { operation_class: operator.paper.operation_class } : {}),
       evidence: evidenceSnippet(fullText, offset, end),
       support: "operator",
       operator_id: operator.id,
-      ...(location(extractedVia, page) ? { source_location: location(extractedVia, page) } : {}),
       offset,
       end,
-      executable: matches.some((match) => executableMatch(window.text, match.start, match.end)),
+      executable: matched.executable,
       aliases: operator.paper.aliases,
     });
   }
   for (const spec of unsupportedMethods) {
-    const matches = spec.aliases.flatMap((alias) => aliasMatches(window.text, alias).map((match) => ({ alias, ...match })));
-    const first = matches.sort((left, right) => left.start - right.start)[0];
-    if (!first) continue;
-    const offset = window.offset + first.start;
-    const end = window.offset + first.end;
-    const page = pageAt(fullText, offset);
+    const matched = aliasMatchSummary(window.text, spec.aliases);
+    if (!matched) continue;
+    const offset = window.offset + matched.first.start;
+    const end = window.offset + matched.first.end;
     found.push({
-      display_name: window.text.slice(first.start, first.end).replace(/\s+/g, " ").trim() || spec.displayName,
+      display_name: window.text.slice(matched.first.start, matched.first.end).replace(/\s+/g, " ").trim() || spec.displayName,
       normalized_name: spec.normalizedName,
       operation_class: spec.operationClass,
       evidence: evidenceSnippet(fullText, offset, end),
       support: "unsupported",
-      ...(location(extractedVia, page) ? { source_location: location(extractedVia, page) } : {}),
       offset,
       end,
-      executable: matches.some((match) => executableMatch(window.text, match.start, match.end)),
+      executable: matched.executable,
       aliases: spec.aliases,
       ...(spec.ports ? { ports: spec.ports } : {}),
     });
@@ -258,18 +349,28 @@ function recognizedMethods(catalog: OperatorCatalog, fullText: string, extracted
   for (const mention of found.sort((left, right) => left.offset - right.offset || left.normalized_name.localeCompare(right.normalized_name))) {
     if (!unique.has(mention.normalized_name)) unique.set(mention.normalized_name, mention);
   }
-  return [...unique.values()];
+  const mentions = [...unique.values()];
+  if (extractedVia !== "pdfjs" && extractedVia !== "ocr") return mentions;
+  let page = 1;
+  let nextPageBreak = fullText.indexOf("\f");
+  return mentions.map((mention) => {
+    while (nextPageBreak >= 0 && nextPageBreak < mention.offset) {
+      page += 1;
+      nextPageBreak = fullText.indexOf("\f", nextPageBreak + 1);
+    }
+    return { ...mention, source_location: `PDF page ${page}` };
+  });
 }
 
 export function paperAccessionKind(accession: string): PaperResourceCitation["kind"] | undefined {
-  if (/^(?:SRR|ERR|DRR)\d{6,}$/.test(accession)) return "sra_run";
-  if (/^(?:SRP|ERP|DRP)\d{6,}$/.test(accession)) return "sra_study";
-  if (/^(?:SRX|ERX|DRX)\d{6,}$/.test(accession)) return "sra_experiment";
-  if (/^(?:SRS|ERS|DRS)\d{6,}$/.test(accession)) return "sra_sample";
-  if (/^(?:PRJNA|PRJEB|PRJDB)\d{6,}$/.test(accession)) return "bioproject";
-  if (/^(?:SAMN|SAMEA|SAMD)\d{6,}$/.test(accession)) return "biosample";
-  if (/^(?:GCA_|GCF_)\d+(?:\.\d+)?$/.test(accession)) return "assembly";
-  if (/^ENS[A-Z]*[GTP]\d{6,}(?:\.\d+)?$/.test(accession)) return "ensembl";
+  if (/^(?:SRR|ERR|DRR)\d{6,18}$/.test(accession)) return "sra_run";
+  if (/^(?:SRP|ERP|DRP)\d{6,18}$/.test(accession)) return "sra_study";
+  if (/^(?:SRX|ERX|DRX)\d{6,18}$/.test(accession)) return "sra_experiment";
+  if (/^(?:SRS|ERS|DRS)\d{6,18}$/.test(accession)) return "sra_sample";
+  if (/^(?:PRJNA|PRJEB|PRJDB)\d{6,18}$/.test(accession)) return "bioproject";
+  if (/^(?:SAMN|SAMEA|SAMD)\d{6,18}$/.test(accession)) return "biosample";
+  if (/^(?:GCA_|GCF_)\d{1,18}(?:\.\d{1,6})?$/.test(accession)) return "assembly";
+  if (/^ENS[A-Z]{0,16}[GTP]\d{6,18}(?:\.\d{1,6})?$/.test(accession)) return "ensembl";
   return undefined;
 }
 
@@ -282,32 +383,53 @@ function resourceRole(kind: PaperResourceCitation["kind"], context: string): Pap
   return "unknown";
 }
 
-export function paperResourceCitations(text: string, extractedVia: PaperExtractVia): PaperResourceCitation[] {
-  const pattern = /\b(?:SR[RPXS]|ER[RPXS]|DR[RPXS])\d{6,}\b|\b(?:PRJNA|PRJEB|PRJDB)\d{6,}\b|\b(?:SAMN|SAMEA|SAMD)\d{6,}\b|\b(?:GCA_|GCF_)\d+(?:\.\d+)?\b|\bENS[A-Z]*[GTP]\d{6,}(?:\.\d+)?\b/gi;
+function scanPaperResourceCitations(text: string, extractedVia: PaperExtractVia) {
+  const pattern = /\b(?:SR[RPXS]|ER[RPXS]|DR[RPXS])\d{6,18}\b|\b(?:PRJNA|PRJEB|PRJDB)\d{6,18}\b|\b(?:SAMN|SAMEA|SAMD)\d{6,18}\b|\b(?:GCA_|GCF_)\d{1,18}(?:\.\d{1,6})?\b|\bENS[A-Z]{0,16}[GTP]\d{6,18}(?:\.\d{1,6})?\b/gi;
   const citations = new Map<string, PaperResourceCitation>();
+  let truncated = false;
+  let page = 1;
+  let nextPageBreak = extractedVia === "pdfjs" || extractedVia === "ocr" ? text.indexOf("\f") : -1;
   for (const match of text.matchAll(pattern)) {
     const accession = match[0]!.toUpperCase();
     const kind = paperAccessionKind(accession);
     if (!kind) continue;
+    if (!citations.has(accession) && citations.size >= MAX_PAPER_RESOURCE_CITATIONS) {
+      truncated = true;
+      break;
+    }
     const offset = match.index ?? 0;
+    while (nextPageBreak >= 0 && nextPageBreak < offset) {
+      page += 1;
+      nextPageBreak = text.indexOf("\f", nextPageBreak + 1);
+    }
     const context = evidenceSnippet(text, offset, offset + accession.length);
+    const sourceLocation = location(extractedVia, page);
     const citation: PaperResourceCitation = {
       accession,
       kind,
       role: resourceRole(kind, context),
       context,
-      ...(location(extractedVia, pageAt(text, offset)) ? { source_location: location(extractedVia, pageAt(text, offset)) } : {}),
+      ...(sourceLocation ? { source_location: sourceLocation } : {}),
     };
     const existing = citations.get(accession);
     const priority = { unknown: 0, sample_metadata: 1, annotation: 2, reads: 3, reference: 4 } as const;
     if (!existing || priority[citation.role] > priority[existing.role]) citations.set(accession, citation);
   }
-  return [...citations.values()];
+  return { resources: [...citations.values()], truncated };
 }
 
-function assayScores(text: string) {
-  const lower = text.toLocaleLowerCase("en-US");
-  const score = (cues: readonly [string, number][]) => cues.reduce((total, [cue, weight]) => total + (lower.includes(cue) ? weight : 0), 0);
+export function paperResourceCitations(text: string, extractedVia: PaperExtractVia): PaperResourceCitation[] {
+  return scanPaperResourceCitations(text, extractedVia).resources;
+}
+
+export function enforcePaperReviewSize(review: PaperReview, maximumBytes = MAX_PAPER_REVIEW_BYTES): PaperReview {
+  const sizeBytes = new TextEncoder().encode(JSON.stringify(review)).byteLength;
+  if (sizeBytes > maximumBytes) throw new PaperReviewLimitError(sizeBytes, maximumBytes);
+  return review;
+}
+
+function assayScores(lowerText: string) {
+  const score = (cues: readonly [string, number][]) => cues.reduce((total, [cue, weight]) => total + (lowerText.includes(cue) ? weight : 0), 0);
   return new Map<Assay, number>([
     ["assembly", score([["hifiasm", 5], ["yahs", 4], ["genomescope", 3], ["chromosome-scale assembl", 4], ["haplotype assembl", 4], ["pacbio hifi", 2], ["falcon", 4], ["purge_dups", 4], ["purge haplotigs", 4], ["vertebrate genome project", 5]])],
     ["rna_seq", score([["nf-core/rnaseq", 6], ["hisat2", 4], ["stringtie", 4], ["rna-seq", 6], ["rna seq", 6], ["rnaseq", 6], ["differential expression", 3]])],
@@ -317,12 +439,11 @@ function assayScores(text: string) {
   ]);
 }
 
-function relevantAssays(text: string): Assay[] {
-  const lower = text.toLocaleLowerCase("en-US");
-  if (lower.includes("allmaps") && (lower.includes("linkage map") || lower.includes("ordering and orientation"))) return ["assembly"];
-  const scores = [...assayScores(text)].filter(([, value]) => value >= 6).sort((left, right) => right[1] - left[1]);
+function relevantAssays(lowerText: string): Assay[] {
+  if (lowerText.includes("allmaps") && (lowerText.includes("linkage map") || lowerText.includes("ordering and orientation"))) return ["assembly"];
+  const scores = [...assayScores(lowerText)].filter(([, value]) => value >= 6).sort((left, right) => right[1] - left[1]);
   if (scores.length) return scores.map(([assay]) => assay);
-  return lower.includes("fastqc") ? ["qc"] : ["unknown"];
+  return lowerText.includes("fastqc") ? ["qc"] : ["unknown"];
 }
 
 function operatorAssay(operator: PinnedOperator, assay: Assay) {
@@ -496,10 +617,9 @@ function layoutGraph(graph: SomiteGraph) {
   }
 }
 
-function knownGenome(text: string) {
-  const lower = text.toLocaleLowerCase("en-US");
+function knownGenome(lowerText: string) {
   for (const [needle, name] of [["grch38", "GRCh38"], ["hg38", "GRCh38"], ["grch37", "GRCh37"], ["hg19", "GRCh37"], ["grcm39", "GRCm39"], ["mm39", "GRCm39"], ["mm10", "GRCm38"], ["t2t", "T2T-CHM13"]] as const) {
-    if (lower.includes(needle)) return name;
+    if (lowerText.includes(needle)) return name;
   }
   return undefined;
 }
@@ -548,7 +668,7 @@ function isAssemblyMethod(mention: LocatedMention) {
     || (mention.operation_class === "assemble" && mention.ports?.output === "Fasta");
 }
 
-function syntheticAssemblySteps(text: string): LocatedMention[] {
+function syntheticAssemblySteps(text: string, lowerText: string): LocatedMention[] {
   const steps: Array<Readonly<{ needles: readonly string[]; displayName: string; input: PortType; inputUnion?: readonly PortType[]; output: PortType }>> = [
     { needles: ["genomescope"], displayName: "Genomescope", input: "Fastq", inputUnion: ["FastqGz"], output: "Directory" },
     { needles: ["blobtools", "blobtoolkit"], displayName: "Blobtools", input: "Fasta", inputUnion: ["FastaGz", "Directory"], output: "Directory" },
@@ -557,10 +677,9 @@ function syntheticAssemblySteps(text: string): LocatedMention[] {
     { needles: ["mitohifi"], displayName: "MitoHiFi", input: "Fastq", inputUnion: ["FastqGz"], output: "Directory" },
     { needles: ["bakta"], displayName: "Bakta", input: "Fasta", inputUnion: ["FastaGz", "Directory"], output: "Directory" },
   ];
-  const lower = text.toLocaleLowerCase("en-US");
   return steps.flatMap((step): LocatedMention[] => {
     const located = step.needles
-      .map((needle) => ({ needle, offset: lower.indexOf(needle) }))
+      .map((needle) => ({ needle, offset: lowerText.indexOf(needle) }))
       .filter((candidate) => candidate.offset >= 0)
       .sort((left, right) => left.offset - right.offset)[0];
     if (!located) return [];
@@ -621,6 +740,7 @@ function methodRank(mention: LocatedMention) {
 function buildCandidate(
   catalog: OperatorCatalog,
   text: string,
+  lowerText: string,
   resources: readonly PaperResourceCitation[],
   mentions: readonly LocatedMention[],
   assay: Assay,
@@ -629,7 +749,9 @@ function buildCandidate(
   assemblyChoice?: LocatedMention,
 ) {
   const graph: SomiteGraph = { schema_version: 3, name: candidateName(assay), nodes: [], edges: [] };
-  const linkageWorkflow = assay === "assembly" && /allmaps/i.test(text) && /linkage map|ordering and orientation/i.test(text);
+  const linkageWorkflow = assay === "assembly"
+    && lowerText.includes("allmaps")
+    && (lowerText.includes("linkage map") || lowerText.includes("ordering and orientation"));
   const selected = mentions.filter((mention) => {
     if (!mention.executable) return false;
     if (assemblyChoice && isAssemblyMethod(mention) && mention.normalized_name !== assemblyChoice.normalized_name) return false;
@@ -646,7 +768,7 @@ function buildCandidate(
     if (mention.operator_id === "diff.deseq2" && !selected.some((other) => ["quant.featurecounts", "quant.salmon"].includes(other.operator_id ?? ""))) return false;
     return true;
   });
-  if (assay === "assembly") filtered.push(...syntheticAssemblySteps(text));
+  if (assay === "assembly") filtered.push(...syntheticAssemblySteps(text, lowerText));
   const needsReads = filtered.some((mention) => {
     if (mention.support === "unsupported") return mention.ports?.input === "Fastq";
     return catalog.get(mention.operator_id!)?.ports.in.some((port) => port.type === "Fastq" || port.union?.includes("Fastq") || port.type === "FastqGz") ?? false;
@@ -665,10 +787,10 @@ function buildCandidate(
     reads = addOperatorNode(graph, catalog, "sra.fasterq_dump", "Convert the cited SRA run into FASTQ streams.");
     connectSpecific(graph, prefetch, reads);
   } else if (needsReads) {
-    const paired = /paired[- ]end|paired reads/i.test(text);
+    const paired = lowerText.includes("paired-end") || lowerText.includes("paired end") || lowerText.includes("paired reads");
     reads = addOperatorNode(graph, catalog, paired ? "files.import_paired" : "files.import", unresolvedReadNote(runs, independentReadSlots));
   }
-  const genome = knownGenome(text);
+  const genome = knownGenome(lowerText);
   const needsReference = filtered.some((mention) => mention.support === "operator" && catalog.get(mention.operator_id!)?.ports.in.some((port) => port.type === "Fasta" || port.type === "FastaGz"));
   const needsAnnotation = filtered.some((mention) => mention.support === "operator" && catalog.get(mention.operator_id!)?.ports.in.some((port) => port.type === "Gtf" || port.type === "GtfGz"));
   if (needsReference && linkageWorkflow) addOperatorNode(graph, catalog, "files.import_fasta", "The paper scaffolds a named starting assembly; attach that exact FASTA or replace this with its cited online assembly.");
@@ -726,9 +848,13 @@ function buildCandidate(
 export function reconstructPaper(catalog: OperatorCatalog, text: string, extractedVia: PaperExtractVia): PaperReview {
   const normalized = text.replace(/\r\n?/g, "\n");
   const mentions = recognizedMethods(catalog, normalized, extractedVia);
-  const resources = paperResourceCitations(normalized, extractedVia);
+  const resourceScan = scanPaperResourceCitations(normalized, extractedVia);
+  const resources = resourceScan.resources;
   const focus = paperMethodsWindow(normalized).text;
-  const assays = relevantAssays(focus.length >= 200 ? focus : normalized);
+  const assayText = focus.length >= 200 ? focus : normalized;
+  const assayLower = assayText.toLocaleLowerCase("en-US");
+  const normalizedLower = assayText === normalized ? assayLower : normalized.toLocaleLowerCase("en-US");
+  const assays = relevantAssays(assayLower);
   const candidates: PaperCandidate[] = [];
   for (const assay of assays) {
     const assemblers = assay === "assembly"
@@ -736,11 +862,11 @@ export function reconstructPaper(catalog: OperatorCatalog, text: string, extract
       : [];
     if (assemblers.length > 1) {
       for (const assembler of assemblers) {
-        const candidate = buildCandidate(catalog, normalized, resources, mentions, assay, extractedVia, "alternative", assembler);
+        const candidate = buildCandidate(catalog, normalized, normalizedLower, resources, mentions, assay, extractedVia, "alternative", assembler);
         if (candidate) candidates.push(candidate);
       }
     } else {
-      const candidate = buildCandidate(catalog, normalized, resources, mentions, assay, extractedVia, assays.length > 1 ? "parallel" : "primary");
+      const candidate = buildCandidate(catalog, normalized, normalizedLower, resources, mentions, assay, extractedVia, assays.length > 1 ? "parallel" : "primary");
       if (candidate) candidates.push(candidate);
     }
   }
@@ -749,12 +875,18 @@ export function reconstructPaper(catalog: OperatorCatalog, text: string, extract
     : mentions.length
       ? "recognized_unsupported"
       : "no_reconstructable_methods";
-  const warnings = outcome === "drafts_ready"
+  const outcomeWarnings = outcome === "drafts_ready"
     ? [...new Set(candidates.flatMap((candidate) => candidate.warnings))]
     : outcome === "recognized_unsupported"
       ? ["Somite found computational methods and retained their evidence, but no reviewed executable workflow could be assembled without guessing."]
       : ["Somite read the document but did not find enough computational-method evidence to propose a workflow."];
-  return {
+  const warnings = [
+    ...outcomeWarnings,
+    ...(resourceScan.truncated
+      ? [`This paper cites more than ${MAX_PAPER_RESOURCE_CITATIONS.toLocaleString("en-US")} unique public-data accessions. Somite retained the first ${MAX_PAPER_RESOURCE_CITATIONS.toLocaleString("en-US")} and reported the omission explicitly.`]
+      : []),
+  ];
+  return enforcePaperReviewSize({
     extracted_via: extractedVia,
     outcome,
     warnings,
@@ -769,5 +901,5 @@ export function reconstructPaper(catalog: OperatorCatalog, text: string, extract
     })),
     resources,
     candidates,
-  };
+  });
 }

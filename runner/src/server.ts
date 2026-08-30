@@ -2,6 +2,7 @@ import { lstat, realpath } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { randomBytes, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
@@ -14,7 +15,7 @@ import { canonicalJsonDigest } from "@somite/workflow/contentIdentity";
 import { parseGraph, parseParameterRecord, parseWorkflowBinding } from "@somite/workflow/graphCodec";
 import { RepresentativeValidationError } from "@somite/workflow/fixtures";
 import type { SomiteGraph } from "@somite/workflow/model";
-import { paperAccessionKind, reconstructPaper, type PaperResourceCitation } from "@somite/workflow/paper";
+import { PaperReviewLimitError, paperAccessionKind, reconstructPaper, type PaperResourceCitation } from "@somite/workflow/paper";
 import {
   applySourceWorkflowEdits,
   promoteSourceInvocation,
@@ -28,7 +29,7 @@ import { atomicWrite, containedPath, ensurePrivateDirectory, pathExists, regular
 import { discoverAgents } from "./agentDiscovery.ts";
 import { AgentManager, AgentManagerError } from "./agentManager.ts";
 import { InputOriginError, InputOrigins } from "./inputOrigins.ts";
-import { RunManager } from "./jobs.ts";
+import { FrozenPackageSizeError, RunManager } from "./jobs.ts";
 import { LiteratureGateway } from "./literatureGateway.ts";
 import { NfcoreGateway } from "./nfcoreGateway.ts";
 import { PaperExtractionError } from "./paperExtractor.ts";
@@ -45,7 +46,7 @@ import { UploadError, UploadStore } from "./uploadStore.ts";
 import { detectHardwareProfile } from "./hardwareProfile.ts";
 import { ProductionInputError } from "./productionGraph.ts";
 import { WorkflowAdmissionError } from "./workflowAdmission.ts";
-import { MAX_WORKFLOW_DOCUMENT_BYTES, MAX_WORKFLOW_REQUEST_BYTES } from "./workflowLimits.ts";
+import { MAX_WORKFLOW_DOCUMENT_BYTES, MAX_WORKFLOW_REQUEST_BYTES } from "@somite/workflow/limits";
 
 const MAX_GENERIC_REQUEST_BYTES = 16 * 1024 * 1024;
 const DEFAULT_PORT = 7310;
@@ -136,34 +137,53 @@ function requestIsMutation(request: Request) {
   return request.method !== "GET" && request.method !== "HEAD" && request.method !== "OPTIONS";
 }
 
-async function requestBytes(request: Request, maximumBytes = MAX_GENERIC_REQUEST_BYTES) {
-  const announced = Number(request.headers.get("content-length") ?? 0);
-  if (Number.isFinite(announced) && announced > maximumBytes) throw new HttpError(413, "request is too large");
+export async function requestBytes(request: Request, maximumBytes = MAX_GENERIC_REQUEST_BYTES) {
+  const contentLength = request.headers.get("content-length");
+  if (contentLength !== null) {
+    const announced = Number(contentLength);
+    if (!/^\d+$/.test(contentLength) || !Number.isSafeInteger(announced)) {
+      await request.body?.cancel().catch(() => undefined);
+      throw new HttpError(400, "request has an invalid Content-Length header");
+    }
+    if (announced > maximumBytes) {
+      await request.body?.cancel().catch(() => undefined);
+      throw new HttpError(413, "request is too large");
+    }
+  }
   if (!request.body) return new Uint8Array();
   const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
+  let bytes = new Uint8Array(Math.min(maximumBytes, 64 * 1024));
   let total = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > maximumBytes) throw new HttpError(413, "request is too large");
-    chunks.push(value);
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return bytes.subarray(0, total);
+      const required = total + value.byteLength;
+      if (required > maximumBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new HttpError(413, "request is too large");
+      }
+      if (required > bytes.byteLength) {
+        const expanded = new Uint8Array(Math.min(maximumBytes, Math.max(required, bytes.byteLength * 2)));
+        expanded.set(bytes.subarray(0, total));
+        bytes = expanded;
+      }
+      bytes.set(value, total);
+      total = required;
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
   }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes;
 }
 
 async function requestJson(request: Request, maximumBytes = MAX_GENERIC_REQUEST_BYTES) {
   const bytes = await requestBytes(request, maximumBytes);
   if (!bytes.byteLength) throw new HttpError(400, "JSON body is required");
   try {
-    return JSON.parse(new TextDecoder().decode(bytes)) as unknown;
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
   } catch {
     throw new HttpError(400, "request body is not valid JSON");
   }
@@ -1121,6 +1141,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
       return json(reconstructPaper(state.catalog, extracted.text, extracted.extractedVia));
     } catch (error) {
       if (error instanceof PaperExtractionError) throw new HttpError(422, error.message, { code: error.code, retryable: error.retryable });
+      if (error instanceof PaperReviewLimitError) throw new HttpError(422, error.message, { code: error.code, retryable: error.retryable });
       throw error;
     }
   }
@@ -1131,6 +1152,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
       const text = await state.literature.fullText(requiredString(body.id, "id"));
       return json(reconstructPaper(state.catalog, text, "jats"));
     } catch (error) {
+      if (error instanceof PaperReviewLimitError) throw new HttpError(422, error.message, { code: error.code, retryable: error.retryable });
       throw new HttpError(422, error instanceof Error ? error.message : String(error));
     }
   }
@@ -1311,20 +1333,17 @@ function authorizeRequest(request: Request, state: ProjectState) {
   }
 }
 
-async function send(response: Response, destination: ServerResponse) {
+export async function send(response: Response, destination: ServerResponse) {
   destination.statusCode = response.status;
   response.headers.forEach((value, key) => destination.setHeader(key, value));
   if (!response.body) {
     destination.end();
     return;
   }
-  await new Promise<void>((resolvePromise, rejectPromise) => {
-    const source = Readable.fromWeb(response.body as import("node:stream/web").ReadableStream);
-    source.on("error", rejectPromise);
-    destination.on("error", rejectPromise);
-    destination.on("finish", resolvePromise);
-    source.pipe(destination);
-  });
+  await pipeline(
+    Readable.fromWeb(response.body as import("node:stream/web").ReadableStream),
+    destination,
+  );
 }
 
 export async function startServer(options: ServerOptions = {}) {
@@ -1358,6 +1377,13 @@ export async function startServer(options: ServerOptions = {}) {
           ? errorResponse(422, error.message, { code: error.code })
         : error instanceof RepresentativeValidationError
           ? errorResponse(422, error.message, { code: error.code, capability: error.capability })
+        : error instanceof FrozenPackageSizeError
+          ? errorResponse(413, error.message, {
+            code: error.code,
+            component: error.component,
+            actual_bytes: error.actual_bytes,
+            maximum_bytes: error.maximum_bytes,
+          })
         : error instanceof ProjectGatewayError
           ? errorResponse(
             error.code === "project_ambiguous" ? 409

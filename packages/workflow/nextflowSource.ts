@@ -26,9 +26,9 @@ export type SourceManifest = Readonly<{
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
-const MAX_FILES = 20_000;
-const MAX_FILE_BYTES = 64 * 1024 * 1024;
-const MAX_SOURCE_BYTES = 512 * 1024 * 1024;
+export const MAX_SOURCE_FILES = 20_000;
+export const MAX_SOURCE_FILE_BYTES = 64 * 1024 * 1024;
+export const MAX_SOURCE_BYTES = 512 * 1024 * 1024;
 export const MAX_DERIVED_PROJECTION_BYTES = 32 * 1024 * 1024;
 const SOURCE_INDEX_LIMITS = {
   tokens: 1_000_000,
@@ -159,7 +159,7 @@ function portablePathKey(path: string) {
 }
 
 export function buildSourceManifest(files: readonly FrozenSourceFile[]): SourceManifest {
-  if (!files.length || files.length > MAX_FILES) throw new Error(`source must contain between 1 and ${MAX_FILES} files`);
+  if (!files.length || files.length > MAX_SOURCE_FILES) throw new Error(`source must contain between 1 and ${MAX_SOURCE_FILES} files`);
   const sorted = [...files].sort((left, right) => less(left.path, right.path));
   const portable = new Map<string, string>();
   const hasher = blake3.create();
@@ -172,7 +172,7 @@ export function buildSourceManifest(files: readonly FrozenSourceFile[]): SourceM
       throw new Error(`source contains invalid or duplicate path ${file.path}`);
     }
     if (file.mode !== 0o100644 && file.mode !== 0o100755) throw new Error(`source file ${file.path} has an unsupported mode`);
-    if (file.bytes.byteLength > MAX_FILE_BYTES) throw new Error(`source file ${file.path} exceeds ${MAX_FILE_BYTES} bytes`);
+    if (file.bytes.byteLength > MAX_SOURCE_FILE_BYTES) throw new Error(`source file ${file.path} exceeds ${MAX_SOURCE_FILE_BYTES} bytes`);
     total += file.bytes.byteLength;
     if (total > MAX_SOURCE_BYTES) throw new Error(`source exceeds ${MAX_SOURCE_BYTES} bytes`);
     const portableKey = portablePathKey(file.path);

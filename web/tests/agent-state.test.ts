@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { agentBatchMatchesAuthoritativeState, agentPollCursorAfterSnapshot, agentPollFailureState, mergeAgentSnapshots, planAgentTransactions, unseenAgentTransactions } from "../app/agentState.ts";
+import { AGENT_EVENT_RETENTION, agentBatchMatchesAuthoritativeState, agentPollCursorAfterSnapshot, agentPollFailureState, compactConsumedAgentEvents, mergeAgentSnapshots, planAgentTransactions, retainAppliedAgentTransactionIds, unseenAgentTransactions } from "../app/agentState.ts";
 import type { AgentEvent, AgentSnapshot, AgentTransaction, SomiteGraph } from "../app/types.ts";
 
 const empty: SomiteGraph = { schema_version: 3, nodes: [], edges: [] };
@@ -67,6 +67,33 @@ test("each atomic graph transaction is offered to the canvas only once", () => {
   assert.deepEqual(unseenAgentTransactions([transactionEvent], new Set(["transaction-1"])), []);
   assert.deepEqual(empty.nodes, []);
   assert.equal(transaction.graph.nodes[0].id, "reads");
+});
+
+test("applied Agent transaction deduplication retains only the visible event window", () => {
+  const ids = Array.from({ length: AGENT_EVENT_RETENTION + 1 }, (_, index) => `transaction-${index}`);
+  const retained = retainAppliedAgentTransactionIds(new Set(), ids);
+  assert.equal(retained.size, AGENT_EVENT_RETENTION);
+  assert.equal(retained.has(ids[0]!), false);
+  assert.equal(retained.has(ids.at(-1)!), true);
+
+  const refreshed = retainAppliedAgentTransactionIds(retained, [ids[1]!]);
+  assert.equal([...refreshed].at(-1), ids[1]);
+});
+
+test("consumed Agent transactions release graph bodies without erasing event metadata", () => {
+  const unconsumed = { ...transactionEvent, cursor: 3, transaction: { ...transaction, transaction_id: "transaction-2" } };
+  const compacted = compactConsumedAgentEvents(
+    [transactionEvent, unconsumed],
+    new Set(["transaction-1"]),
+  );
+
+  assert.equal(compacted[0]?.transaction, undefined);
+  assert.equal(compacted[0]?.cursor, transactionEvent.cursor);
+  assert.equal(compacted[0]?.kind, transactionEvent.kind);
+  assert.equal(compacted[0]?.title, transactionEvent.title);
+  assert.equal(compacted[0]?.detail, transactionEvent.detail);
+  assert.equal(compacted[1]?.transaction?.transaction_id, "transaction-2");
+  assert.equal(transactionEvent.transaction, transaction);
 });
 
 test("agent transactions apply only across an exact state-revision chain", () => {

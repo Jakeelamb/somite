@@ -1,0 +1,42 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import {
+  MAX_ACP_CONTROL_FRAME_BYTES,
+  MAX_AGENT_CONFIG_BYTES,
+  MAX_AGENT_EVENT_DETAIL_BYTES,
+  MAX_AGENT_EVENT_LOG_BYTES,
+  MAX_AGENT_SNAPSHOT_BYTES,
+  MAX_AGENT_SNAPSHOT_OVERHEAD_BYTES,
+  MAX_FROZEN_PACKAGE_BYTES,
+  MAX_GENERATED_PACKAGE_BYTES,
+  MAX_PIXI_LOCK_BYTES,
+  MAX_PAPER_REVIEW_BYTES,
+  MAX_PAPER_STATUS_BYTES,
+  MAX_WORKFLOW_DOCUMENT_BYTES,
+  MAX_WORKFLOW_REQUEST_BYTES,
+} from "../limits.ts";
+
+test("transport and package ceilings remain derived from their component envelopes", () => {
+  assert.equal(MAX_WORKFLOW_REQUEST_BYTES, MAX_WORKFLOW_DOCUMENT_BYTES + 64 * 1024);
+  assert.equal(
+    MAX_FROZEN_PACKAGE_BYTES,
+    MAX_WORKFLOW_DOCUMENT_BYTES + MAX_PIXI_LOCK_BYTES + MAX_GENERATED_PACKAGE_BYTES,
+  );
+  assert.equal(
+    MAX_AGENT_SNAPSHOT_BYTES,
+    MAX_AGENT_EVENT_LOG_BYTES + MAX_AGENT_CONFIG_BYTES + MAX_AGENT_SNAPSHOT_OVERHEAD_BYTES,
+  );
+  assert.ok(MAX_ACP_CONTROL_FRAME_BYTES > MAX_WORKFLOW_REQUEST_BYTES);
+  assert.ok(MAX_ACP_CONTROL_FRAME_BYTES < MAX_AGENT_SNAPSHOT_BYTES);
+  assert.ok(MAX_AGENT_EVENT_DETAIL_BYTES < MAX_AGENT_EVENT_LOG_BYTES);
+  assert.ok(MAX_PAPER_STATUS_BYTES > MAX_PAPER_REVIEW_BYTES);
+  assert.ok(MAX_PAPER_STATUS_BYTES < MAX_WORKFLOW_DOCUMENT_BYTES);
+});
+
+test("every response envelope stays well below the historical two-gibibyte allocation risk", () => {
+  const twoGibibytes = 2 * 1024 * 1024 * 1024;
+  assert.ok(MAX_ACP_CONTROL_FRAME_BYTES < twoGibibytes);
+  assert.ok(MAX_FROZEN_PACKAGE_BYTES < twoGibibytes);
+  assert.ok(MAX_AGENT_SNAPSHOT_BYTES < twoGibibytes);
+});

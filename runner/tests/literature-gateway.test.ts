@@ -61,3 +61,12 @@ test("JATS validation rejects non-bioRxiv and tiny payloads", () => {
   assert.throws(() => jatsText(jats("short", "Other Journal")), /not a bioRxiv paper/);
   assert.throws(() => jatsText(jats("short")), /full text is not available/);
 });
+
+test("literature search cancels a remotely advertised oversized response", async () => {
+  let cancelled = false;
+  const gateway = new LiteratureGateway("/tmp", async () => new Response(new ReadableStream({
+    cancel() { cancelled = true; },
+  }), { headers: { "content-length": String(2 * 1024 * 1024 + 1) } }));
+  await assert.rejects(gateway.search("genome assembly"), /exceeds 2097152 bytes/);
+  assert.equal(cancelled, true);
+});

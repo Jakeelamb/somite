@@ -8,7 +8,8 @@ port=${3:-7391}
 scenario=${4:-baseline}
 run_name=$(date -u +%Y%m%dT%H%M%SZ)-${model//[^a-zA-Z0-9._-]/-}-$effort-$scenario
 output_dir="$project_root/.somite/mcp-agent-evals/$run_name"
-graph_path="$output_dir/graph.somite.json"
+eval_project_root="$output_dir/project"
+graph_path="$eval_project_root/graph.somite.json"
 server_url="http://127.0.0.1:$port"
 capability=$(openssl rand -hex 32)
 server_pid=
@@ -45,7 +46,7 @@ if [[ "$scenario" != baseline && "$scenario" != natural && "$scenario" != source
   exit 1
 fi
 
-mkdir -p "$output_dir"
+mkdir -p "$eval_project_root"
 graph_fixture="$project_root/testdata/mcp_agent_empty.somite.json"
 if [[ "$scenario" == metagenomics ]]; then
   graph_fixture="$project_root/testdata/fastq_to_fastqc.somite.json"
@@ -53,7 +54,7 @@ fi
 install -m 0644 "$graph_fixture" "$graph_path"
 
 SOMITE_AGENT_CAPABILITY="$capability" \
-SOMITE_PROJECT_ROOT="$project_root" \
+SOMITE_PROJECT_ROOT="$eval_project_root" \
 SOMITE_GRAPH="$graph_path" \
 SOMITE_HOST="127.0.0.1" \
 SOMITE_PORT="$port" \
@@ -70,6 +71,7 @@ curl --fail --silent "$server_url/api/health" >/dev/null
 
 curl --fail --silent --request POST "$server_url/api/agent/connect" \
   --header 'content-type: application/json' \
+  --header 'x-somite-request: local' \
   --data '{"command":"npx -y @agentclientprotocol/codex-acp@1.6.2"}' \
   >"$output_dir/connect.json"
 
@@ -89,6 +91,7 @@ configure() {
     '{config_id: $config_id, value: $value}' >"$output_dir/config-request.json"
   curl --fail --silent --request POST "$server_url/api/agent/config" \
     --header 'content-type: application/json' \
+    --header 'x-somite-request: local' \
     --data-binary @"$output_dir/config-request.json" \
     >"$output_dir/config-$config_id.json"
 }
@@ -113,6 +116,7 @@ jq -n --rawfile message "$output_dir/prompt.txt" \
   '{message: $message, base_state_revision: $workflow[0].state_revision, graph: $workflow[0].graph}' >"$output_dir/prompt-request.json"
 curl --fail --silent --request POST "$server_url/api/agent/prompt" \
   --header 'content-type: application/json' \
+  --header 'x-somite-request: local' \
   --data-binary @"$output_dir/prompt-request.json" >/dev/null
 
 if [[ "$scenario" == stale ]]; then
@@ -187,7 +191,8 @@ fi
 curl --fail --silent "$server_url/api/agent/transcript" >"$output_dir/transcript.json"
 curl --fail --silent "$server_url/api/agent/graph" \
   --header "x-somite-mcp-capability: $capability" >"$output_dir/final-workflow.json"
-curl --fail --silent --request POST "$server_url/api/agent/disconnect" >/dev/null
+curl --fail --silent --request POST "$server_url/api/agent/disconnect" \
+  --header 'x-somite-request: local' >/dev/null
 
 jq -n \
   --arg model "$model" \
@@ -245,7 +250,8 @@ jq -n \
         (.output.result.structuredContent.phase // "") == "completed" and
         (.output.result.structuredContent.evidence_receipt.result // "") == "passed"),
       mcp_only: all($transcript[0].tool_calls[]?;
-        (.title // "") | startswith("somite."))
+        ((.title // "") | startswith("somite.")) or
+        ((.title // "") | test("^Read file '.*/AGENTS\\.MD'$")))
     },
     metrics: {
       first_tool: ($transcript[0].tool_calls[0].title // null),
@@ -286,7 +292,8 @@ jq -n \
         catalog_search_attempted: any($transcript[0].tool_calls[]?;
           (.title // "") == "somite.catalog.search"),
         mcp_only: all($transcript[0].tool_calls[]?;
-          (.title // "") | startswith("somite.")),
+          ((.title // "") | startswith("somite.")) or
+          ((.title // "") | test("^Read file '.*/AGENTS\\.MD'$"))),
         answer_returned: any($transcript[0].messages[]?;
           .role == "assistant" and ((.text // "") | length) > 0)
       }
@@ -316,7 +323,7 @@ jq -n \
            ((.text // "") | ascii_downcase | contains("directory")))),
         somite_native_after_mandatory_instructions: all($transcript[0].tool_calls[]?;
           ((.title // "") | startswith("somite.")) or
-          ((.title // "") == "Read file '/home/jake/Projects/agent-scripts/AGENTS.MD'"))
+          ((.title // "") | test("^Read file '.*/AGENTS\\.MD'$")))
       }
     else . end
   | .checks.exact_automatic_permission_identity = all($transcript[0].tool_calls[]?;

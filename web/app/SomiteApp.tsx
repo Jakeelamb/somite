@@ -125,7 +125,7 @@ import { portColor } from "./visual";
 import { edgeLifecycleState, evidenceNodeState } from "./validationState";
 import { GraphProjectionClock, type GraphProjectionInput } from "./graphProjection";
 import { JsonRequestError, createSomiteClient, type SomiteClient } from "./api";
-import { AGENT_POLL_DEGRADED_AFTER, AGENT_POLL_INTERVAL_MS, agentBatchMatchesAuthoritativeState, agentPollCursorAfterSnapshot, agentPollFailureState, mergeAgentSnapshots, planAgentTransactions } from "./agentState";
+import { AGENT_POLL_DEGRADED_AFTER, AGENT_POLL_INTERVAL_MS, agentBatchMatchesAuthoritativeState, agentPollCursorAfterSnapshot, agentPollFailureState, compactConsumedAgentEvents, mergeAgentSnapshots, planAgentTransactions, retainAppliedAgentTransactionIds } from "./agentState";
 import { readinessAgentPrompt, readinessSummary } from "./readinessState";
 import { appendStrokePoint, canvasColor as getCanvasColor, canvasPalette, createCanvasAnnotation, nextAnnotationId } from "./canvasPresentation";
 import type { CatalogExpansionActivity } from "./catalogExpansion";
@@ -611,6 +611,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
   const [dirty, setDirty] = useState(false);
   const [status, setStatus] = useState("Connecting to the local Somite engine…");
   const [saving, setSaving] = useState(false);
+  const [inputOriginRecovering, setInputOriginRecovering] = useState(false);
   const [activeIntent, setActiveIntent] = useState<"run" | "validation" | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [zoom, setZoom] = useState(1);
@@ -651,6 +652,10 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
   const initialViewportFitRef = useRef(false);
   const workflowCatalogLoadInFlightRef = useRef(false);
   const running = activeIntent !== null;
+  const inputOriginRecoveryRequired = Boolean(session?.input_origin_warning);
+  const inputOriginBlockedReason = inputOriginRecoveryRequired
+    ? "Confirm the original workflow location or choose this project folder first. Relative files must never resolve from an uncertain folder."
+    : null;
 
   const availableOperators = useMemo(() => {
     const operators = new Map<string, Operator>();
@@ -884,6 +889,36 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     return true;
   }, [refreshCanonicalSession]);
 
+  const recoverInputOrigin = useCallback(async (inputOriginId: string, label: string) => {
+    setInputOriginRecovering(true);
+    setStatus(`Confirming workflow input location from ${label}…`);
+    const operation = browserWriteChainRef.current.then(() => client.recoverInputOrigin(
+      stateRevisionRef.current,
+      inputOriginId,
+    ));
+    browserWriteChainRef.current = operation.then(() => undefined, () => undefined);
+    try {
+      const recovered = await operation;
+      stateRevisionRef.current = recovered.state_revision;
+      inputOriginIdRef.current = recovered.input_origin_id;
+      acknowledgedInputOriginIdRef.current = recovered.input_origin_id;
+      setSession((current) => current ? {
+        ...current,
+        state_revision: recovered.state_revision,
+        input_origin_id: recovered.input_origin_id,
+        input_origin_warning: null,
+      } : current);
+      setStatus(`Workflow input location confirmed · ${label} · save, Agent, export, validation, and run are available`);
+      return recovered;
+    } catch (error) {
+      await reconcileGraphConflict(error);
+      setStatus(`Could not confirm workflow input location — ${errorMessage(error)}`);
+      throw error;
+    } finally {
+      setInputOriginRecovering(false);
+    }
+  }, [client, reconcileGraphConflict]);
+
   const startTitleEdit = useCallback((event: React.FocusEvent<HTMLInputElement>) => {
     titleEditStartRef.current = { graph: snapshot(), dirty, title: workflowTitle };
     titleEditCancelledRef.current = false;
@@ -928,7 +963,12 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       incoming.cursor,
       eventsWereCanonicallyConsumed,
     );
-    setAgentSnapshot((current) => mergeAgentSnapshots(current, incoming));
+    setAgentSnapshot((current) => {
+      const merged = mergeAgentSnapshots(current, incoming);
+      return eventsWereCanonicallyConsumed
+        ? { ...merged, events: compactConsumedAgentEvents(merged.events, appliedAgentTransactionsRef.current) }
+        : merged;
+    });
   }, []);
 
   const refreshAgentDiscovery = useCallback(async () => {
@@ -1028,9 +1068,10 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
               : `Agent applied ${transactions.length} transactions · Undo each from the history`);
           }
         }
-        for (const transaction of [...plan.represented, ...plan.apply]) {
-          appliedAgentTransactionsRef.current.add(transaction.transaction_id);
-        }
+        appliedAgentTransactionsRef.current = retainAppliedAgentTransactionIds(
+          appliedAgentTransactionsRef.current,
+          [...plan.represented, ...plan.apply].map((transaction) => transaction.transaction_id),
+        );
         mergeAgentSnapshot(incoming, true);
         if (supersededByRefresh) {
           setStatus("Agent activity was already superseded by the current server canvas · no older graph was replayed");
@@ -1158,6 +1199,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
         setEdges((loaded.graph.edges ?? []).map((edge) => flowEdge(edge, loaded.graph.nodes)));
         setAnnotations(loaded.graph.annotations ?? []);
         setVariantOrigin(loaded.graph.variant_origin);
+        setDirty(loaded.recovered_autosave);
         setStatus(recoveryWarning ?? (loaded.recovered_autosave ? "Recovered the last autosave" : "Tab add · drag ports to wire · space-drag pan · F fit"));
       })
       .catch((error) => setStatus(`Project engine is not running — ${errorMessage(error)}`));
@@ -1260,6 +1302,11 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
   }, [client, mergeAgentSnapshot]);
 
   const promptAgent = useCallback(async (message: string) => {
+    if (session?.input_origin_warning) {
+      setProjectVisible(true);
+      setStatus("Confirm the workflow input location before Agent can change this canvas");
+      throw new Error("workflow input location needs confirmation");
+    }
     const operation = browserWriteChainRef.current.then(async () => {
       const graph = graphSnapshotRef.current;
       const requestEpoch = graphEpochRef.current;
@@ -1285,7 +1332,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       setStatus(`Agent prompt failed — ${errorMessage(error)}`);
       throw error;
     }
-  }, [client, reconcileGraphConflict]);
+  }, [client, reconcileGraphConflict, session?.input_origin_warning]);
 
   const configureAgent = useCallback(async (configId: string, value: string | boolean) => {
     try {
@@ -1370,7 +1417,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
   }, [query]);
 
   useEffect(() => {
-    if (!dirty || !session || titleEditing) return;
+    if (!dirty || !session || session.input_origin_warning || titleEditing) return;
     const graphWrite = captureGraphWrite(snapshot(), graphEpochRef.current, inputOriginIdRef.current);
     const timeout = window.setTimeout(() => {
       void writeBrowserGraph("/api/graph/autosave", graphWrite)
@@ -1590,6 +1637,15 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       const exclusions = imported.exclusions?.count
         ? ` · ${countFormatter.format(imported.exclusions.count)} runtime, sensitive, or unrelated item${imported.exclusions.count === 1 ? "" : "s"} left out`
         : "";
+      if (session?.input_origin_warning) {
+        if (imported.kind !== "somite") {
+          throw new Error("Choose the original .somite.json file, or explicitly use this project folder");
+        }
+        await recoverInputOrigin(imported.input_origin_id, label);
+        setProjectVisible(false);
+        setStatus(`Workflow input location restored from ${label} · recovered canvas kept`);
+        return;
+      }
       if (imported.kind === "somite") {
         await browserWriteChainRef.current;
         const currentDocument = snapshotDocument();
@@ -1624,7 +1680,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       setStatus(`Could not open local project — ${errorMessage(error)}`);
       throw error;
     }
-  }, [canvasCenter, client, insertImportedGraph, markCanonicalGraph, pendingAddPosition, restoreGraph, session?.project_name, snapshotDocument]);
+  }, [canvasCenter, client, insertImportedGraph, markCanonicalGraph, pendingAddPosition, recoverInputOrigin, restoreGraph, session?.input_origin_warning, session?.project_name, snapshotDocument]);
 
   const addOperator = useCallback((operator: Operator, position?: { x: number; y: number }, params?: Record<string, ParamValue>) => {
     const liveGraph = graphSnapshotRef.current;
@@ -1756,6 +1812,11 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
   }, [client]);
 
   const synchronizeBrowserGraph = useCallback(async () => {
+    if (session?.input_origin_warning) {
+      setProjectVisible(true);
+      setStatus("Confirm the workflow input location before changing a pinned source workflow");
+      throw new Error("workflow input location needs confirmation");
+    }
     if (acknowledgedGraphRef.current === JSON.stringify(graphSnapshotRef.current)
       && acknowledgedInputOriginIdRef.current === inputOriginIdRef.current) return;
     try {
@@ -1767,7 +1828,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       await reconcileGraphConflict(error);
       throw error;
     }
-  }, [reconcileGraphConflict, writeBrowserGraph]);
+  }, [reconcileGraphConflict, session?.input_origin_warning, writeBrowserGraph]);
 
   const persistSourceWorkflowEdit = useCallback(async (nodeId: string, edit: SourceWorkflowSemanticEdit) => {
     await synchronizeBrowserGraph();
@@ -2332,6 +2393,11 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
   }, [edges, flow, nodes, setEdges, setNodes]);
 
   const save = useCallback(async () => {
+    if (session?.input_origin_warning) {
+      setProjectVisible(true);
+      setStatus("Confirm the workflow input location before saving");
+      return;
+    }
     setSaving(true);
     setStatus("Validating and saving…");
     try {
@@ -2346,9 +2412,14 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     } finally {
       setSaving(false);
     }
-  }, [reconcileGraphConflict, snapshot, writeBrowserGraph]);
+  }, [reconcileGraphConflict, session?.input_origin_warning, snapshot, writeBrowserGraph]);
 
   const toggleToolchain = useCallback(async () => {
+    if (session?.input_origin_warning) {
+      setProjectVisible(true);
+      setStatus("Confirm the workflow input location before exporting");
+      return;
+    }
     if (toolchainVisible) {
       setToolchainVisible(false);
       return;
@@ -2372,9 +2443,14 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     } finally {
       setExportLoading(false);
     }
-  }, [client, graphRequest, toolchainVisible]);
+  }, [client, graphRequest, session?.input_origin_warning, toolchainVisible]);
 
   const downloadBundle = useCallback(async () => {
+    if (session?.input_origin_warning) {
+      setProjectVisible(true);
+      setStatus("Confirm the workflow input location before exporting");
+      return;
+    }
     setExportDownloading(true);
     setStatus("Freezing the Pixi/Nextflow run project…");
     try {
@@ -2393,10 +2469,15 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     } finally {
       setExportDownloading(false);
     }
-  }, [client, exportPlan, graphRequest, workflowTitle]);
+  }, [client, exportPlan, graphRequest, session?.input_origin_warning, workflowTitle]);
 
   const executeGraph = useCallback(async (intent: "run" | "validation") => {
     if (running) return;
+    if (session?.input_origin_warning) {
+      setProjectVisible(true);
+      setStatus(`Confirm the workflow input location before ${intent === "validation" ? "validating" : "running"}`);
+      return;
+    }
     const requestedKey = semanticKey;
     const graph = snapshot();
     if (intent === "validation") {
@@ -2467,7 +2548,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       setActiveRunId(null);
       setActiveIntent(null);
     }
-  }, [client, focusRequirement, graphRequest, readiness, running, semanticKey, setEdges, setNodes, snapshot, workflowCatalog]);
+  }, [client, focusRequirement, graphRequest, readiness, running, semanticKey, session?.input_origin_warning, setEdges, setNodes, snapshot, workflowCatalog]);
 
   const runGraph = useCallback(() => executeGraph("run"), [executeGraph]);
   const validateGraphWithFixtures = useCallback(() => executeGraph("validation"), [executeGraph]);
@@ -2848,12 +2929,21 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
             <button type="button" className="studio-button" onClick={undo} disabled={!history.past.length} title="Undo (Ctrl/Cmd Z)"><Undo2 size={14} aria-hidden="true" /><span>Undo</span></button>
             <button type="button" className="studio-button" onClick={redo} disabled={!history.future.length} title="Redo (Shift Ctrl/Cmd Z)"><Redo2 size={14} aria-hidden="true" /><span>Redo</span></button>
             <button type="button" className="studio-button theme-toggle" aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`} title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`} onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun size={14} aria-hidden="true" /> : <Moon size={14} aria-hidden="true" />}</button>
-            <button type="button" className="studio-button" onClick={() => void save()} disabled={saving || !dirty}>{saving ? <span className="spin"><LoaderCircle size={14} /></span> : dirty ? <Save size={14} /> : <Check size={14} />}<span>{saving ? "Saving…" : dirty ? "Save" : "Saved"}</span></button>
-            <button type="button" className={`studio-button ${toolchainVisible ? "active" : ""}`} onClick={() => void toggleToolchain()} title="Environment and Export"><PackageOpen size={14} aria-hidden="true" /><span>Export</span></button>
-            <button type="button" className="studio-button validation-button" disabled={running || !validationCapability.supported} onClick={() => void validateGraphWithFixtures()} title={validationCapability.supported ? "Validate with small representative FASTQ fixtures" : validationCapability.reason}>{activeIntent === "validation" ? <span className="spin"><LoaderCircle size={14} /></span> : <ShieldCheck size={14} />}<span>{activeIntent === "validation" ? "Validating…" : "Validate"}</span></button>
-            <button type="button" className={`run-button ${running ? "is-running" : ""}`} disabled={running && !activeRunId} onClick={() => void (running ? cancelRun() : runGraph())} title={running ? "Cancel active Nextflow run" : "Run workflow (F5 or Ctrl/Cmd Enter)"}>{running ? activeRunId ? <><Square size={12} fill="currentColor" />Cancel</> : <><span className="spin"><LoaderCircle size={14} /></span>Preparing…</> : <><Play size={14} />Run</>}</button>
+            <button type="button" className="studio-button" onClick={() => void save()} disabled={saving || !dirty || inputOriginRecoveryRequired} title={inputOriginBlockedReason ?? "Save workflow"}>{saving ? <span className="spin"><LoaderCircle size={14} /></span> : inputOriginRecoveryRequired ? <CircleAlert size={14} /> : dirty ? <Save size={14} /> : <Check size={14} />}<span>{saving ? "Saving…" : inputOriginRecoveryRequired ? "Paused" : dirty ? "Save" : "Saved"}</span></button>
+            <button type="button" className={`studio-button ${toolchainVisible ? "active" : ""}`} onClick={() => void toggleToolchain()} disabled={inputOriginRecoveryRequired} title={inputOriginBlockedReason ?? "Environment and Export"}><PackageOpen size={14} aria-hidden="true" /><span>Export</span></button>
+            <button type="button" className="studio-button validation-button" disabled={inputOriginRecoveryRequired || running || !validationCapability.supported} onClick={() => void validateGraphWithFixtures()} title={inputOriginBlockedReason ?? (validationCapability.supported ? "Validate with small representative FASTQ fixtures" : validationCapability.reason)}>{activeIntent === "validation" ? <span className="spin"><LoaderCircle size={14} /></span> : <ShieldCheck size={14} />}<span>{activeIntent === "validation" ? "Validating…" : "Validate"}</span></button>
+            <button type="button" className={`run-button ${running ? "is-running" : ""}`} disabled={(!running && inputOriginRecoveryRequired) || (running && !activeRunId)} onClick={() => void (running ? cancelRun() : runGraph())} title={inputOriginBlockedReason ?? (running ? "Cancel active Nextflow run" : "Run workflow (F5 or Ctrl/Cmd Enter)")}>{running ? activeRunId ? <><Square size={12} fill="currentColor" />Cancel</> : <><span className="spin"><LoaderCircle size={14} /></span>Preparing…</> : <><Play size={14} />Run</>}</button>
           </div>
         </header>
+
+        {inputOriginRecoveryRequired && <section className="input-origin-recovery" role="alert" aria-busy={inputOriginRecovering}>
+          <CircleAlert size={18} aria-hidden="true" />
+          <span><strong>Confirm where this workflow&apos;s files live</strong><small>Somite recovered the canvas, but its saved input location no longer matches. Save, Agent edits, Export, Validate, and Run are paused so relative files cannot come from the wrong folder.</small></span>
+          <div>
+            <button type="button" className="primary" disabled={inputOriginRecovering} onClick={() => { setLibraryVisible(false); setPaperVisible(false); setToolchainVisible(false); setProjectVisible(true); }}>Choose original workflow</button>
+            <button type="button" disabled={inputOriginRecovering} onClick={() => void recoverInputOrigin(inputOriginIdRef.current, "this project folder").catch(() => undefined)}>{inputOriginRecovering ? <><LoaderCircle className="spin" size={12} />Confirming…</> : "Use this project folder"}</button>
+          </div>
+        </section>}
 
         <section id="workflow-canvas" aria-label="Workflow Canvas" className={`canvas-wrap studio-canvas tool-${canvasTool}`} onDrop={onDrop} onDragOver={(event) => event.preventDefault()} onPointerDownCapture={beginStroke} onPointerMove={continueStroke} onPointerUp={finishStroke} onPointerCancel={finishStroke} onDoubleClick={(event) => {
           if (canvasTool !== "select" || !flow || !(event.target instanceof Element) || !event.target.closest(".react-flow__pane")) return;
@@ -2992,7 +3082,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
 
         {libraryVisible && <div className="panel-layer" onPointerDown={(event) => event.stopPropagation()}><LibraryPanel client={client} operators={availableOperators} query={query} filterQuery={deferredQuery} favorites={favorites} recent={recent} categoryOpen={categoryOpen} searchInputRef={searchInputRef} continuation={pendingConnection} catalogExpansion={catalogExpansion} workflowCatalogState={workflowCatalogState} onQuery={setQuery} onClose={() => { setLibraryVisible(false); setPendingConnection(null); setCatalogExpansion(null); }} onAddOperator={addOperator} onAddSource={addSource} onImportFiles={(files) => addDroppedFiles(files, canvasCenter())} onToggleFavorite={(id) => setFavorites((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; })} onToggleCategory={(title, open) => setCategoryOpen((current) => ({ ...current, [title]: open }))} onRetryWorkflowCatalogs={retryWorkflowCatalogs} onDismissCatalogExpansion={() => { setStatus(`${catalogExpansion?.title ?? "Workflow"} was not added · canvas unchanged`); setCatalogExpansion(null); }} /></div>}
 
-        {projectVisible && <div className="project-layer" onPointerDown={(event) => event.stopPropagation()}><ProjectPanel projectName={session.project_name} graphPath={session.graph_path} onImportProject={importLocalProject} onClose={() => setProjectVisible(false)} /></div>}
+        {projectVisible && <div className={`project-layer ${inputOriginRecoveryRequired ? "recovery" : ""}`} onPointerDown={(event) => event.stopPropagation()}><ProjectPanel projectName={session.project_name} graphPath={session.graph_path} recoveryMode={inputOriginRecoveryRequired} onImportProject={importLocalProject} onClose={() => setProjectVisible(false)} /></div>}
 
         {selectedNode && selectedOperator && <div className="inspector-layer" onPointerDown={(event) => event.stopPropagation()}><InspectorPanel key={selectedNode.id} node={selectedNode.data.graphNode} selectedCount={selectedIds.length} operator={selectedOperator} hiddenViewerCount={selectedHiddenCount} setupCount={selectedNode.data.readinessItems.length} updateParam={updateParam} updateSourceBinding={updateSourceWorkflowBinding} browseSourceBinding={browseSourceWorkflowBinding} pendingSourceFile={pendingSourceFile?.nodeId === selectedNode.id ? pendingSourceFile : undefined} bindPendingSourceFile={bindPendingSourceFile} dismissPendingSourceFile={() => setPendingSourceFile(null)} beginParamEdit={beginParamEdit} browseParam={browseParam} rename={renameSelected} toggleViewers={toggleSelectedViewers} exploreSource={() => exploreSourceWorkflow(selectedNode.id)} close={() => { setSelectedIds([]); flow?.setNodes((current) => current.map((node) => ({ ...node, selected: false }))); }} /></div>}
 
@@ -3004,7 +3094,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
 
         {readinessVisible && readiness && <div className={`readiness-layer ${agentVisible ? "with-agent" : ""}`} onPointerDown={(event) => event.stopPropagation()}><ReadinessPanel snapshot={readiness} evidence={validationEvidence} validationCapability={validationCapability} onResolve={resolveRequirement} onFocus={focusRequirement} onAttachFile={attachRequirementFile} onAskAssistant={askAssistantAboutRequirement} onClose={() => setReadinessVisible(false)} /></div>}
 
-        {agentVisible && <div className="agent-layer" onPointerDown={(event) => event.stopPropagation()}><AgentPanel key={agentDraft?.id ?? "agent"} snapshot={agentSnapshot} transportError={agentTransportError} discovery={agentDiscovery} discoveryLoading={agentDiscoveryLoading} draft={agentDraft} onRefreshDiscovery={refreshAgentDiscovery} onConnect={connectAgent} onConfig={configureAgent} onPrompt={promptAgent} onCancel={cancelAgent} onDisconnect={disconnectAgent} onPermission={answerAgentPermission} onClose={() => { setAgentVisible(false); setAgentDraft(null); }} /></div>}
+        {agentVisible && <div className="agent-layer" onPointerDown={(event) => event.stopPropagation()}><AgentPanel key={agentDraft?.id ?? "agent"} snapshot={agentSnapshot} transportError={agentTransportError} blockedReason={inputOriginBlockedReason} discovery={agentDiscovery} discoveryLoading={agentDiscoveryLoading} draft={agentDraft} onRefreshDiscovery={refreshAgentDiscovery} onConnect={connectAgent} onConfig={configureAgent} onPrompt={promptAgent} onCancel={cancelAgent} onDisconnect={disconnectAgent} onPermission={answerAgentPermission} onClose={() => { setAgentVisible(false); setAgentDraft(null); }} /></div>}
 
         <footer className="statusbar studio-statusbar" aria-live="polite">
           <span className={`engine-light ${statusError ? "error" : ""}`} />

@@ -2,16 +2,30 @@ import assert from "node:assert/strict";
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
 import type { SomiteGraph } from "@somite/workflow/model";
 import { SOMITE_TYPESCRIPT_RUNNER_IDENTITY } from "@somite/workflow/version";
-import { RunManager } from "../src/jobs.ts";
+import {
+  FrozenPackageSizeError,
+  RunManager,
+  enforceFrozenArchiveSize,
+  enforceFrozenPackageFiles,
+} from "../src/jobs.ts";
 import { PixiCache } from "../src/pixiCache.ts";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
+const testCacheParent = await mkdtemp(join(tmpdir(), "somite-ts-jobs-cache-"));
+const testCacheRoot = join(testCacheParent, "pixi");
+const previousPixiCacheRoot = process.env.SOMITE_PIXI_CACHE_DIR;
+process.env.SOMITE_PIXI_CACHE_DIR = testCacheRoot;
+after(async () => {
+  if (previousPixiCacheRoot === undefined) delete process.env.SOMITE_PIXI_CACHE_DIR;
+  else process.env.SOMITE_PIXI_CACHE_DIR = previousPixiCacheRoot;
+  await rm(testCacheParent, { recursive: true, force: true });
+});
 
 async function graphFixture() {
   const cases = JSON.parse(await readFile(join(repositoryRoot, "testdata", "assessment-parity-graphs.json"), "utf8")) as Array<{ name: string; graph: SomiteGraph }>;
@@ -66,6 +80,34 @@ async function terminalStatus(manager: RunManager, id: string) {
   throw new Error("run did not become terminal");
 }
 
+test("frozen package limits reject one complete component or archive beyond its envelope", () => {
+  const limits = { workflowDocumentBytes: 4, pixiLockBytes: 4, generatedBytes: 4, archiveBytes: 12 };
+  assert.equal(enforceFrozenPackageFiles(new Map([
+    ["workflow.somite.json", new Uint8Array(4)],
+    ["pixi.lock", new Uint8Array(4)],
+    ["main.nf", new Uint8Array(4)],
+  ]), limits), 12);
+
+  assert.throws(
+    () => enforceFrozenPackageFiles(new Map([
+      ["workflow.somite.json", new Uint8Array(5)],
+      ["pixi.lock", new Uint8Array(1)],
+    ]), limits),
+    (error: unknown) => error instanceof FrozenPackageSizeError
+      && error.code === "workflow_document_too_large"
+      && error.actual_bytes === 5
+      && error.maximum_bytes === 4,
+  );
+  assert.doesNotThrow(() => enforceFrozenArchiveSize(8, 8));
+  assert.throws(
+    () => enforceFrozenArchiveSize(9, 8),
+    (error: unknown) => error instanceof FrozenPackageSizeError
+      && error.code === "frozen_package_too_large"
+      && error.actual_bytes === 9
+      && error.maximum_bytes === 8,
+  );
+});
+
 test("TypeScript runner freezes, executes, traces, validates, and exports one path", async () => {
   const project = await mockProject();
   const previousPath = process.env.PATH;
@@ -103,7 +145,7 @@ test("TypeScript runner freezes, executes, traces, validates, and exports one pa
       `${validation.evidence_receipt!.receipt_digest.slice("blake3:".length)}.json`,
     );
     assert.equal(JSON.parse(await readFile(receiptPath, "utf8")).receipt_digest, validation.evidence_receipt?.receipt_digest);
-    const environmentRoot = join(project.root, ".somite", "pixi", "environments");
+    const environmentRoot = join(testCacheRoot, "v1");
     const platforms = await readdir(environmentRoot);
     assert.equal(platforms.length, 1);
     assert.equal((await readdir(join(environmentRoot, platforms[0]!))).length, 1, "one exact lock must reuse one Pixi environment");
