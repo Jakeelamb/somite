@@ -30,7 +30,7 @@ import {
 } from "lucide-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent as ReactDragEvent, type PointerEvent as ReactPointerEvent, type RefObject } from "react";
 import { clampAgentFrame, type AgentFrame } from "./agentFrame";
-import { classifySource, type SourceRequest, type SourceSearchResponse, type SourceSearchResult } from "./sourceBuilder";
+import { classifySource, type SourceRequest, type SourceSearchResult } from "./sourceBuilder";
 import { operatorContinues, type PendingConnection } from "./graphInteractions";
 import type {
   AgentConfigOption,
@@ -47,7 +47,6 @@ import type {
   ParamValue,
   PaperReview,
   PaperResourceResolution,
-  PaperSearchResponse,
   PaperSearchResult,
   ExportPlan,
   SystemProfile,
@@ -56,7 +55,7 @@ import type {
   WorkflowParameterField,
 } from "./types";
 import { OperatorGlyph, portColor } from "./visual";
-import { jsonRequest } from "./api";
+import type { SomiteClient } from "./api";
 import { formatResourceBytes } from "./readinessState";
 import { nextPaperReadSlot, paperAttentionItems, paperParameterValue, paperResourceApplied, paperSupportedCount } from "./paperResolution";
 import { formatPaperElapsed, paperCandidateCanApply, paperIntakeIsBusy, paperIntakePresentation, paperUnsupportedMentions, type PaperIntakeState } from "./paperIntake";
@@ -489,6 +488,7 @@ function buildSections(
 }
 
 export function LibraryPanel({
+  client,
   operators,
   query,
   filterQuery,
@@ -509,6 +509,7 @@ export function LibraryPanel({
   onRetryWorkflowCatalogs,
   onDismissCatalogExpansion,
 }: {
+  client: SomiteClient;
   operators: Operator[];
   query: string;
   filterQuery: string;
@@ -563,9 +564,7 @@ export function LibraryPanel({
       setActiveSourceResult(0);
       let pending = 2;
       for (const provider of ["ncbi", "ensembl"] as const) {
-        jsonRequest<SourceSearchResponse>(`/api/sources/search?q=${encodeURIComponent(sourceQuery)}&provider=${provider}`, {
-          signal: controller.signal,
-        })
+        client.searchSources(sourceQuery, provider, controller.signal)
           .then((response) => {
             if (controller.signal.aborted) return;
             setSourceResults((current) => [
@@ -594,7 +593,7 @@ export function LibraryPanel({
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [continuation, filterQuery, sourceRetry]);
+  }, [client, continuation, filterQuery, sourceRetry]);
 
   const chooseSource = (source: SourceRequest) => {
     onAddSource(source);
@@ -932,7 +931,8 @@ function PaperElapsed({ startedAtMs }: { startedAtMs: number }) {
   return <small className="paper-job-elapsed">Elapsed {formatPaperElapsed(startedAtMs, nowMs)}</small>;
 }
 
-export function PaperPanel({ intake, active, applied, preparingField, onFile, onRetry, onCancel, onExample, onReconstruct, onSelect, onApply, onUseResource, onAttachInput, onSetInput, onEscalate, onEvidence, onClose }: {
+export function PaperPanel({ client, intake, active, applied, preparingField, onFile, onRetry, onCancel, onExample, onReconstruct, onSelect, onApply, onUseResource, onAttachInput, onSetInput, onEscalate, onEvidence, onClose }: {
+  client: SomiteClient;
   intake: PaperIntakeState;
   active: number;
   applied: number | null;
@@ -1000,18 +1000,13 @@ export function PaperPanel({ intake, active, applied, preparingField, onFile, on
     if (!resources.length) {
       return () => controller.abort();
     }
-    jsonRequest<PaperResourceResolution>("/api/paper/resources/resolve", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ resources }),
-      signal: controller.signal,
-    }).then((response) => {
+    client.resolvePaperResources(resources, controller.signal).then((response) => {
       if (!controller.signal.aborted) setResourceLookup({ key: resourceKey, resolution: response, error: "" });
     }).catch((error: unknown) => {
       if (!controller.signal.aborted) setResourceLookup({ key: resourceKey, resolution: null, error: error instanceof Error ? error.message : "Could not check cited data" });
     });
     return () => controller.abort();
-  }, [resourceKey, review?.resources]);
+  }, [client, resourceKey, review?.resources]);
 
   useEffect(() => {
     const query = paperQuery.trim();
@@ -1020,7 +1015,7 @@ export function PaperPanel({ intake, active, applied, preparingField, onFile, on
       return () => controller.abort();
     }
     const timer = window.setTimeout(() => {
-      jsonRequest<PaperSearchResponse>(`/api/papers/search?q=${encodeURIComponent(query)}`, { signal: controller.signal })
+      client.searchPapers(query, controller.signal)
         .then((response) => {
           if (!controller.signal.aborted) setResults(response.results);
         })
@@ -1041,7 +1036,7 @@ export function PaperPanel({ intake, active, applied, preparingField, onFile, on
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [paperQuery]);
+  }, [client, paperQuery]);
 
   const updatePaperQuery = (value: string) => {
     setPaperQuery(value);

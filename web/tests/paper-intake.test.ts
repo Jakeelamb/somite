@@ -12,7 +12,7 @@ import {
   type PaperIntakeTransport,
   type PaperReconstructionSource,
 } from "../app/paperIntake.ts";
-import { createPaperIntakeHttpTransport } from "../app/paperIntakeApi.ts";
+import { createPaperIntakeHttpTransport, type PaperIntakeClient } from "../app/paperIntakeApi.ts";
 import type { PaperReview } from "../app/types.ts";
 
 function deferred<T>() {
@@ -23,6 +23,38 @@ function deferred<T>() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+type TestPaperRequest = <T>(path: string, init?: RequestInit) => Promise<T>;
+
+function paperClient(request: TestPaperRequest): PaperIntakeClient {
+  return {
+    uploadPaper(file, signal) {
+      const body = new FormData();
+      body.append("file", file);
+      return request("/api/papers/uploads", { method: "POST", body, signal });
+    },
+    startPaperIntake(digest, attemptKey, signal) {
+      return request(`/api/papers/intakes?idempotency_key=${encodeURIComponent(attemptKey)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ digest }),
+        ...(signal ? { signal } : {}),
+      });
+    },
+    paperIntakeStatus(jobId, signal) {
+      return request(`/api/papers/intakes/${encodeURIComponent(jobId)}?wait_ms=15000`, signal ? { signal } : undefined);
+    },
+    cancelPaperIntake(jobId) {
+      return request(`/api/papers/intakes/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
+    },
+    reconstructBiorxiv(id, signal) {
+      return request("/api/papers/biorxiv/reconstruct", { method: "POST", body: JSON.stringify({ id }), signal });
+    },
+    reconstructPaperPath(path, signal) {
+      return request("/api/paper", { method: "POST", body: JSON.stringify({ path }), signal });
+    },
+  };
 }
 
 function readyReview(name: string): PaperReview {
@@ -236,7 +268,7 @@ test("the HTTP adapter follows the digest job through measured phases", async ()
     if (path.startsWith("/api/papers/intakes?")) return { job_id: "paper-7", source_digest: "blake3:abc", phase: "queued", replayed: false } as T;
     return statuses.shift() as T;
   };
-  const transport = createPaperIntakeHttpTransport(request);
+  const transport = createPaperIntakeHttpTransport(paperClient(request));
   const progress: string[] = [];
 
   const receipt = await transport.reconstruct({ kind: "artifact", artifact: { digest: "blake3:abc", path: ".somite/papers/abc/payload.pdf", filename: "paper.pdf", size_bytes: 42, media_kind: "pdf", reused: false } }, {
@@ -265,7 +297,7 @@ test("an abort that lands with the start response still cancels the created serv
     }
     throw new Error(`unexpected request: ${path}`);
   };
-  const transport = createPaperIntakeHttpTransport(request);
+  const transport = createPaperIntakeHttpTransport(paperClient(request));
 
   await assert.rejects(transport.reconstruct({ kind: "artifact", artifact: { digest: "blake3:abc", path: "payload.pdf", filename: "paper.pdf", size_bytes: 42, media_kind: "pdf", reused: false } }, {
     signal: controller.signal,
@@ -298,7 +330,7 @@ test("an ambiguous aborted start replays the same attempt key to recover and can
     }
     throw new Error(`unexpected request: ${path}`);
   };
-  const transport = createPaperIntakeHttpTransport(request);
+  const transport = createPaperIntakeHttpTransport(paperClient(request));
 
   await assert.rejects(transport.reconstruct({ kind: "artifact", artifact: { digest: "blake3:abc", path: "payload.pdf", filename: "paper.pdf", size_bytes: 42, media_kind: "pdf", reused: false } }, {
     signal: controller.signal,
@@ -328,7 +360,7 @@ test("a failed cancellation acknowledgement is not reported as cancelled", async
       init?.signal?.addEventListener("abort", () => reject(new DOMException("poll aborted", "AbortError")), { once: true });
     });
   };
-  const transport = createPaperIntakeHttpTransport(request);
+  const transport = createPaperIntakeHttpTransport(paperClient(request));
   const reconstruction = transport.reconstruct({ kind: "artifact", artifact: { digest: "blake3:abc", path: "payload.pdf", filename: "paper.pdf", size_bytes: 42, media_kind: "pdf", reused: false } }, {
     signal: controller.signal,
     attemptKey: "paper-cancel-failure",
@@ -359,7 +391,7 @@ test("a transient poll resumes the same job without creating another intake", as
     if (polls === 1) throw new Error("temporary gateway failure");
     return { job_id: "paper-resume", source_digest: "blake3:abc", phase: "completed", durations_ms: {}, cache: { extraction: true, reconstruction: false }, result: readyReview("Resumed workflow") } as T;
   };
-  const transport = createPaperIntakeHttpTransport(request, {
+  const transport = createPaperIntakeHttpTransport(paperClient(request), {
     pollRetryDelaysMs: [25],
     sleep: async (delayMs) => { delays.push(delayMs); },
   });
@@ -384,7 +416,7 @@ test("server failure code and retryability survive transport and coordinator", a
     }
     return { job_id: "paper-limit", source_digest: "blake3:abc", phase: "failed", failure, durations_ms: {}, cache: { extraction: false, reconstruction: false } } as T;
   };
-  const transport = createPaperIntakeHttpTransport(request);
+  const transport = createPaperIntakeHttpTransport(paperClient(request));
   const intake = createPaperIntakeCoordinator(transport, { createAttemptKey: () => "paper-limit-attempt" });
   const source = { kind: "local" as const, label: "large.pdf", file: { name: "large.pdf" } as File };
   const artifact = { digest: "blake3:abc", path: "payload.pdf", filename: "large.pdf", size_bytes: 42, media_kind: "pdf", reused: false };

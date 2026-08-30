@@ -1,7 +1,5 @@
-import { jsonRequest } from "./api.ts";
+import type { PaperIntakeStartResponse, PaperIntakeStatusResponse, SomiteClient } from "./api.ts";
 import type {
-  PaperArtifact,
-  PaperIntakeFailure,
   PaperIntakeProgress,
   PaperIntakeStage,
   PaperIntakeTransport,
@@ -9,27 +7,15 @@ import type {
   PaperReconstructionSource,
 } from "./paperIntake";
 import { PaperIntakeFailureError } from "./paperIntake.ts";
-import type { PaperReview } from "./types";
 
-type PaperHttpRequest = <T>(path: string, init?: RequestInit) => Promise<T>;
-
-type PaperIntakeStartResponse = {
-  job_id: string;
-  source_digest: string;
-  phase: string;
-  replayed: boolean;
-};
-
-type PaperIntakeStatusResponse = {
-  job_id: string;
-  source_digest: string;
-  phase: "queued" | "extracting" | "locating_methods" | "recognizing_methods" | "assessing_drafts" | "completed" | "failed" | "cancelling" | "cancelled";
-  progress?: { completed: number; total?: number | null; unit?: string | null; message: string };
-  durations_ms?: Record<string, number>;
-  cache?: { extraction?: boolean; reconstruction?: boolean };
-  result?: PaperReview;
-  failure?: PaperIntakeFailure;
-};
+export type PaperIntakeClient = Pick<SomiteClient,
+  | "uploadPaper"
+  | "startPaperIntake"
+  | "paperIntakeStatus"
+  | "cancelPaperIntake"
+  | "reconstructBiorxiv"
+  | "reconstructPaperPath"
+>;
 
 type PaperIntakeHttpTransportOptions = {
   pollRetryDelaysMs?: readonly number[];
@@ -101,26 +87,18 @@ function delayWithSignal(delayMs: number, signal: AbortSignal) {
 }
 
 async function reconstructArtifact(
-  request: PaperHttpRequest,
+  client: PaperIntakeClient,
   source: Extract<PaperReconstructionSource, { kind: "artifact" }>,
   options: Parameters<PaperIntakeTransport["reconstruct"]>[1],
   transportOptions: Required<PaperIntakeHttpTransportOptions>,
 ): Promise<PaperReconstructionReceipt> {
   if (options.signal.aborted) throw abortError();
-  const startPath = `/api/papers/intakes?idempotency_key=${encodeURIComponent(options.attemptKey)}`;
-  const startInit = {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ digest: source.artifact.digest }),
-    signal: options.signal,
-  } satisfies RequestInit;
   let started: PaperIntakeStartResponse;
   try {
-    started = await request<PaperIntakeStartResponse>(startPath, startInit);
+    started = await client.startPaperIntake(source.artifact.digest, options.attemptKey, options.signal);
   } catch (firstError) {
     try {
-      const replayInit = { ...startInit, signal: undefined };
-      started = await request<PaperIntakeStartResponse>(startPath, replayInit);
+      started = await client.startPaperIntake(source.artifact.digest, options.attemptKey);
     } catch (replayError) {
       if (options.signal.aborted) throw cancellationUnconfirmed(replayError);
       throw new PaperIntakeFailureError({
@@ -130,10 +108,9 @@ async function reconstructArtifact(
       });
     }
   }
-  const jobPath = `/api/papers/intakes/${encodeURIComponent(started.job_id)}`;
   let cancellation: Promise<CancellationOutcome> | null = null;
   const cancel = () => {
-    cancellation ??= request<PaperIntakeStatusResponse>(`${jobPath}/cancel`, { method: "POST" })
+    cancellation ??= client.cancelPaperIntake(started.job_id)
       .then((status): CancellationOutcome => ({ acknowledged: true, status }))
       .catch((error): CancellationOutcome => ({ acknowledged: false, error }));
     return cancellation;
@@ -159,7 +136,7 @@ async function reconstructArtifact(
     while (true) {
       let status: PaperIntakeStatusResponse;
       try {
-        status = await request<PaperIntakeStatusResponse>(`${jobPath}?wait_ms=15000`, { signal: options.signal });
+        status = await client.paperIntakeStatus(started.job_id, options.signal);
         pollFailureCount = 0;
       } catch (error) {
         if (options.signal.aborted) await abortAfterAcknowledgement();
@@ -212,33 +189,19 @@ async function reconstructArtifact(
   }
 }
 
-export function createPaperIntakeHttpTransport(request: PaperHttpRequest = jsonRequest, options: PaperIntakeHttpTransportOptions = {}): PaperIntakeTransport {
+export function createPaperIntakeHttpTransport(client: PaperIntakeClient, options: PaperIntakeHttpTransportOptions = {}): PaperIntakeTransport {
   const transportOptions: Required<PaperIntakeHttpTransportOptions> = {
     pollRetryDelaysMs: options.pollRetryDelaysMs ?? [250, 750, 1_500],
     sleep: options.sleep ?? delayWithSignal,
   };
   return {
-    async upload(file, signal) {
-      const body = new FormData();
-      body.append("file", file);
-      return request<PaperArtifact>("/api/papers/uploads", { method: "POST", body, signal });
-    },
+    upload: (file, signal) => client.uploadPaper(file, signal),
     async reconstruct(source, options) {
-      if (source.kind === "artifact") return reconstructArtifact(request, source, options, transportOptions);
+      if (source.kind === "artifact") return reconstructArtifact(client, source, options, transportOptions);
       options.onProgress("recognizing_methods", { completed: 0, message: source.kind === "biorxiv" ? "Fetching full text and recognizing methods" : "Recognizing methods" });
       const review = source.kind === "biorxiv"
-        ? await request<PaperReview>("/api/papers/biorxiv/reconstruct", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id: source.id }),
-          signal: options.signal,
-        })
-        : await request<PaperReview>("/api/paper", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ path: source.path }),
-          signal: options.signal,
-        });
+        ? await client.reconstructBiorxiv(source.id, options.signal)
+        : await client.reconstructPaperPath(source.path, options.signal);
       return { review };
     },
   };

@@ -84,7 +84,6 @@ import {
   paperCandidateCanApply,
   paperIntakeIsBusy,
   paperIntakePresentation,
-  type PaperIntakeCoordinator,
 } from "./paperIntake";
 import { createPaperIntakeHttpTransport } from "./paperIntakeApi";
 import {
@@ -110,27 +109,21 @@ import type {
   PaperEvidence,
   PaperSearchResult,
   ExportPlan,
-  ProjectOpenResponse,
   ProjectSession,
   ReadinessItem,
   ReadinessSnapshot,
   RunNodeState,
-  RunStartResponse,
-  RunStorageCleanup,
   RunStorageProfile,
   RunStatusResponse,
   SystemProfile,
   UploadResult,
   ValidationEvidenceResponse,
-  GraphWriteResponse,
-  SourceWorkflowEditResponse,
   SourceWorkflowVariantOrigin,
   WorkflowBinding,
-  WorkflowGraphResponse,
 } from "./types";
 import { portColor } from "./visual";
 import { edgeLifecycleState, evidenceNodeState, semanticGraphKey } from "./validationState";
-import { JsonRequestError, configureSomiteServer, jsonRequest, somiteServerUrl } from "./api";
+import { JsonRequestError, createSomiteClient, type SomiteClient } from "./api";
 import { AGENT_POLL_DEGRADED_AFTER, AGENT_POLL_INTERVAL_MS, agentBatchMatchesAuthoritativeState, agentPollCursorAfterSnapshot, agentPollFailureState, mergeAgentSnapshots, planAgentTransactions } from "./agentState";
 import { readinessAgentPrompt, readinessSummary } from "./readinessState";
 import { appendStrokePoint, canvasColor as getCanvasColor, canvasPalette, createCanvasAnnotation, nextAnnotationId } from "./canvasPresentation";
@@ -156,7 +149,6 @@ import { representativeValidationCapability } from "@somite/workflow/fixtures";
 const SNAP: [number, number] = [20, 20];
 const HISTORY_LIMIT = 80;
 const countFormatter = new Intl.NumberFormat();
-const paperIntakeTransport = createPaperIntakeHttpTransport();
 
 type SomiteNodeData = Record<string, unknown> & {
   graphNode: SomiteGraphNode;
@@ -558,7 +550,7 @@ function neighborAlignment(node: SomiteFlowNode, nodes: SomiteFlowNode[]) {
   return { x, y };
 }
 
-function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
+function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; client: SomiteClient }) {
   const [session, setSession] = useState<ProjectSession | null>(null);
   const [system, setSystem] = useState<SystemProfile | null>(null);
   const [storage, setStorage] = useState<RunStorageProfile | null>(null);
@@ -596,9 +588,10 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const [agentTransportError, setAgentTransportError] = useState<string | null>(null);
   const [agentDiscovery, setAgentDiscovery] = useState<AgentDiscovery | null>(null);
   const [agentDiscoveryLoading, setAgentDiscoveryLoading] = useState(false);
-  const paperIntakeCoordinatorRef = useRef<PaperIntakeCoordinator | null>(null);
-  if (!paperIntakeCoordinatorRef.current) paperIntakeCoordinatorRef.current = createPaperIntakeCoordinator(paperIntakeTransport);
-  const paperIntakeCoordinator = paperIntakeCoordinatorRef.current;
+  const paperIntakeCoordinator = useMemo(
+    () => createPaperIntakeCoordinator(createPaperIntakeHttpTransport(client)),
+    [client],
+  );
   const [paperIntake, setPaperIntake] = useState(() => paperIntakeCoordinator.getState());
   const paperReview = paperIntake.current?.review ?? null;
   const [activePaperCandidate, setActivePaperCandidate] = useState(0);
@@ -717,7 +710,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     if (!requestPath) return;
     const requestedKey = semanticKey;
     const timeout = window.setTimeout(() => {
-      void jsonRequest<ValidationEvidenceResponse>(requestPath, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(graphRequest(graph)) })
+      void client.validationEvidence(graphRequest(graph))
         .then((evidence) => {
           if (semanticKeyRef.current !== requestedKey) return;
           setValidationEvidence(evidence);
@@ -733,7 +726,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
         .catch(() => undefined);
     }, 240);
     return () => window.clearTimeout(timeout);
-  }, [activeIntent, graphRequest, readiness?.state, semanticKey, session, setEdges, setNodes]);
+  }, [activeIntent, client, graphRequest, readiness?.state, semanticKey, session, setEdges, setNodes]);
 
   useEffect(() => {
     if (!workflowCatalog || activeIntent) return;
@@ -798,16 +791,12 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
         acknowledgedGraphRef.current = JSON.stringify(snapshot.graph);
         acknowledgedInputOriginIdRef.current = snapshot.input_origin_id ?? acknowledgedInputOriginIdRef.current;
       },
-      (requestPath, request) => jsonRequest<GraphWriteResponse>(requestPath, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(request),
-      }),
+      (requestPath, request) => client.writeGraph(requestPath, request),
       path,
       snapshot,
       () => canonicalEpochRef.current,
     );
-  }, []);
+  }, [client]);
 
   const markCanonicalGraph = useCallback((graph: SomiteGraph) => {
     graphEpochRef.current += 1;
@@ -825,7 +814,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       stateRevision: stateRevisionRef.current,
     };
     try {
-      const loaded = await jsonRequest<ProjectSession>("/api/session");
+      const loaded = await client.session();
       const disposition = canonicalRefreshDisposition(
         requested,
         {
@@ -869,7 +858,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     } finally {
       reconcilingGraphRef.current = false;
     }
-  }, [markCanonicalGraph, restoreGraph, snapshotDocument]);
+  }, [client, markCanonicalGraph, restoreGraph, snapshotDocument]);
 
   const reconcileGraphConflict = useCallback(async (error: unknown) => {
     if (!(error instanceof JsonRequestError) || error.status !== 409) return false;
@@ -939,13 +928,13 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const refreshAgentDiscovery = useCallback(async () => {
     setAgentDiscoveryLoading(true);
     try {
-      setAgentDiscovery(await jsonRequest<AgentDiscovery>("/api/agent/discover"));
+      setAgentDiscovery(await client.discoverAgents());
     } catch (error) {
       setStatus(`Agent scan failed — ${errorMessage(error)}`);
     } finally {
       setAgentDiscoveryLoading(false);
     }
-  }, []);
+  }, [client]);
 
   useEffect(() => {
     if (!session || (!agentVisible && !agentSnapshot.connected && !agentSnapshot.connecting)) return;
@@ -963,7 +952,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       agentPollInFlightRef.current = true;
       let nextDelayMs = AGENT_POLL_INTERVAL_MS;
       try {
-        const incoming = await jsonRequest<AgentSnapshot>(`/api/agent/events?after=${agentCursorRef.current}`);
+        const incoming = await client.agentEvents(agentCursorRef.current);
         if (stopped) return;
         const recovered = consecutiveFailures >= AGENT_POLL_DEGRADED_AFTER;
         consecutiveFailures = 0;
@@ -1064,7 +1053,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       stopped = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [agentSnapshot.connected, agentSnapshot.connecting, agentVisible, markCanonicalGraph, mergeAgentSnapshot, refreshCanonicalSession, restoreGraph, session, snapshotDocument]);
+  }, [agentSnapshot.connected, agentSnapshot.connecting, agentVisible, client, markCanonicalGraph, mergeAgentSnapshot, refreshCanonicalSession, restoreGraph, session, snapshotDocument]);
 
   const undo = useCallback(() => {
     const current = snapshotDocument();
@@ -1124,7 +1113,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       graphEpoch: graphEpochRef.current,
       stateRevision: stateRevisionRef.current,
     };
-    jsonRequest<ProjectSession>("/api/session")
+    client.session()
       .then((loaded) => {
         const operators = new Map(loaded.operators.map((operator) => [operator.id, operator]));
         const localDraft = graphSnapshotRef.current;
@@ -1166,12 +1155,12 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
         setStatus(recoveryWarning ?? (loaded.recovered_autosave ? "Recovered the last autosave" : "Tab add · drag ports to wire · space-drag pan · F fit"));
       })
       .catch((error) => setStatus(`Project engine is not running — ${errorMessage(error)}`));
-    jsonRequest<SystemProfile>("/api/system").then(setSystem).catch(() => undefined);
+    client.system().then(setSystem).catch(() => undefined);
   // The React Flow state helpers are not part of this effect's lifecycle.
   // Loading must happen exactly once or a setter identity change can turn the
   // project bootstrap into a fetch -> set state -> fetch render loop.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [client]);
 
   useEffect(() => {
     const requestPaths = workflowCatalogRequestPaths({
@@ -1183,13 +1172,13 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     workflowCatalogLoadInFlightRef.current = true;
     setWorkflowCatalogState("loading");
     const requests = requestPaths.map((requestPath) => requestPath === "/api/catalog/nfcore"
-      ? jsonRequest<NfcoreCatalog>(requestPath).then(setNfcoreCatalog)
-      : jsonRequest<SnakemakeCatalog>(requestPath).then(setSnakemakeCatalog));
+      ? client.workflowCatalog("nfcore").then(setNfcoreCatalog)
+      : client.workflowCatalog("snakemake").then(setSnakemakeCatalog));
     void Promise.allSettled(requests).then((results) => {
       workflowCatalogLoadInFlightRef.current = false;
       setWorkflowCatalogState(results.every((result) => result.status === "fulfilled") ? "loaded" : "failed");
     });
-  }, [libraryVisible, session, workflowCatalogState]);
+  }, [client, libraryVisible, session, workflowCatalogState]);
 
   const retryWorkflowCatalogs = useCallback(() => {
     if (!workflowCatalogLoadInFlightRef.current) setWorkflowCatalogState("idle");
@@ -1199,13 +1188,13 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     setStorageLoading(true);
     setStorageError(null);
     try {
-      setStorage(await jsonRequest<RunStorageProfile>("/api/storage"));
+      setStorage(await client.storage());
     } catch (error) {
       setStorageError(errorMessage(error));
     } finally {
       setStorageLoading(false);
     }
-  }, []);
+  }, [client]);
 
   const reclaimFinishedRunWork = useCallback(async () => {
     const runIds = storage?.runs.reclaimable_run_ids ?? [];
@@ -1213,11 +1202,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     setStorageReclaiming(true);
     setStorageError(null);
     try {
-      const result = await jsonRequest<RunStorageCleanup>("/api/storage/dehydrate-runs", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ run_ids: runIds }),
-      });
+      const result = await client.dehydrateRuns(runIds);
       setStatus(`Reclaimed ${result.reclaimed_bytes.toLocaleString()} bytes of finished-run work · results and evidence retained`);
       await refreshStorage();
     } catch (error) {
@@ -1227,7 +1212,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     } finally {
       setStorageReclaiming(false);
     }
-  }, [refreshStorage, storage?.runs.reclaimable_run_ids, storageReclaiming]);
+  }, [client, refreshStorage, storage?.runs.reclaimable_run_ids, storageReclaiming]);
 
   const installPaperTools = useCallback(async () => {
     if (paperToolsInstalling) return;
@@ -1235,11 +1220,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     setPaperToolsError(null);
     setStatus("Installing and verifying scanned-PDF OCR tools with Pixi…");
     try {
-      const installed = await jsonRequest<{ preflight: SystemProfile["paper_extraction"] }>("/api/paper-tools/ocr/install", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: "{}",
-      });
+      const installed = await client.installPaperOcr();
       setSystem((current) => current ? { ...current, paper_extraction: installed.preflight } : current);
       setStatus("Scanned PDF OCR is ready · Poppler and Tesseract were verified and pinned locally");
       await refreshStorage();
@@ -1250,7 +1231,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     } finally {
       setPaperToolsInstalling(false);
     }
-  }, [paperToolsInstalling, refreshStorage]);
+  }, [client, paperToolsInstalling, refreshStorage]);
 
   useEffect(() => {
     if (!flow || !session || nodes.length === 0 || initialViewportFitRef.current) return;
@@ -1264,31 +1245,23 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const connectAgent = useCallback(async (command: string) => {
     try {
       setAgentTransportError(null);
-      const connected = await jsonRequest<AgentSnapshot>("/api/agent/connect", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ command }),
-      });
+      const connected = await client.connectAgent(command);
       mergeAgentSnapshot(connected);
       setStatus("Agent is connecting…");
     } catch (error) {
       setStatus(`Agent connection failed — ${errorMessage(error)}`);
     }
-  }, [mergeAgentSnapshot]);
+  }, [client, mergeAgentSnapshot]);
 
   const promptAgent = useCallback(async (message: string) => {
     const operation = browserWriteChainRef.current.then(async () => {
       const graph = graphSnapshotRef.current;
       const requestEpoch = graphEpochRef.current;
-      const response = await jsonRequest<GraphWriteResponse>("/api/agent/prompt", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          message,
-          base_state_revision: stateRevisionRef.current,
-          graph,
-          input_origin_id: inputOriginIdRef.current,
-        }),
+      const response = await client.promptAgent({
+        message,
+        base_state_revision: stateRevisionRef.current,
+        graph,
+        input_origin_id: inputOriginIdRef.current,
       });
       commitIfCanonicalEpochCurrent(requestEpoch, () => canonicalEpochRef.current, () => {
         stateRevisionRef.current = response.state_revision;
@@ -1306,48 +1279,40 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       setStatus(`Agent prompt failed — ${errorMessage(error)}`);
       throw error;
     }
-  }, [reconcileGraphConflict]);
+  }, [client, reconcileGraphConflict]);
 
   const configureAgent = useCallback(async (configId: string, value: string | boolean) => {
     try {
-      const configured = await jsonRequest<AgentSnapshot>("/api/agent/config", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ config_id: configId, value }),
-      });
+      const configured = await client.configureAgent(configId, value);
       mergeAgentSnapshot(configured);
       setStatus("Agent configuration updated");
     } catch (error) {
       setStatus(`Agent configuration failed — ${errorMessage(error)}`);
     }
-  }, [mergeAgentSnapshot]);
+  }, [client, mergeAgentSnapshot]);
 
   const cancelAgent = useCallback(async () => {
     try {
-      await jsonRequest<void>("/api/agent/cancel", { method: "POST" });
+      await client.cancelAgent();
       setStatus("Cancelling the agent turn…");
     } catch (error) {
       setStatus(`Could not cancel agent — ${errorMessage(error)}`);
     }
-  }, []);
+  }, [client]);
 
   const disconnectAgent = useCallback(async () => {
     try {
-      await jsonRequest<void>("/api/agent/disconnect", { method: "POST" });
+      await client.disconnectAgent();
       setAgentTransportError(null);
       setStatus("Disconnecting Agent…");
     } catch (error) {
       setStatus(`Could not disconnect agent — ${errorMessage(error)}`);
     }
-  }, []);
+  }, [client]);
 
   const answerAgentPermission = useCallback(async (permissionId: string, optionId?: string) => {
     try {
-      await jsonRequest<void>(`/api/agent/permissions/${encodeURIComponent(permissionId)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ option_id: optionId }),
-      });
+      await client.answerAgentPermission(permissionId, optionId);
       setAgentSnapshot((current) => ({
         ...current,
         events: current.events.map((event) => event.permission_id === permissionId
@@ -1358,7 +1323,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     } catch (error) {
       setStatus(`Permission response failed — ${errorMessage(error)}`);
     }
-  }, []);
+  }, [client]);
 
   useEffect(() => {
     const timeout = window.setTimeout(() => {
@@ -1613,11 +1578,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     const target = pendingAddPosition ?? canvasCenter();
     setStatus(`Opening local project ${path}…`);
     try {
-      const imported = await jsonRequest<ProjectOpenResponse>("/api/projects/open", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path, snakemake_targets: [] }),
-      });
+      const imported = await client.openProject(path);
       const label = path.split("/").filter(Boolean).at(-1) ?? "Local project";
       const kind = imported.kind === "somite" ? "Somite graph" : imported.kind === "nextflow" ? "frozen Nextflow source" : "Snakemake rules";
       const exclusions = imported.exclusions?.count
@@ -1657,7 +1618,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       setStatus(`Could not open local project — ${errorMessage(error)}`);
       throw error;
     }
-  }, [canvasCenter, insertImportedGraph, markCanonicalGraph, pendingAddPosition, restoreGraph, session?.project_name, snapshotDocument]);
+  }, [canvasCenter, client, insertImportedGraph, markCanonicalGraph, pendingAddPosition, restoreGraph, session?.project_name, snapshotDocument]);
 
   const addOperator = useCallback((operator: Operator, position?: { x: number; y: number }, params?: Record<string, ParamValue>) => {
     const liveGraph = graphSnapshotRef.current;
@@ -1702,11 +1663,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
         setStatus(detail);
         return;
       }
-      void jsonRequest<WorkflowGraphResponse>(isNfcore ? "/api/catalog/nfcore/expand" : "/api/catalog/snakemake/expand", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ workflow, revision }),
-      }).then((imported) => {
+      void client.expandWorkflow(isNfcore ? "nfcore" : "snakemake", workflow, revision).then((imported) => {
         setCatalogExpansion((current) => current?.operatorId === operator.id ? null : current);
         insertImportedGraph(imported, target, isNfcore ? `Added ${operator.title} ${revision}` : `Expanded ${operator.title} ${revision}${imported.cached ? " · cached" : ""}`, operator.id);
       }).catch((error) => {
@@ -1739,7 +1696,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     if (connected) setLibraryVisible(false);
     setDirty(true);
     setStatus(connected ? `${id} connected${companion ? " · paired R1 + R2" : ""}` : `Dropped ${id}`);
-  }, [canvasCenter, edges, insertImportedGraph, nodes, operatorMap, pendingAddPosition, pendingConnection, remember, setEdges, setNodes]);
+  }, [canvasCenter, client, edges, insertImportedGraph, nodes, operatorMap, pendingAddPosition, pendingConnection, remember, setEdges, setNodes]);
 
   const addSource = useCallback((request: SourceRequest) => {
     if (graphSnapshotRef.current.nodes.some((node) => Boolean(node.source_workflow))) {
@@ -1789,10 +1746,8 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   }, [canvasCenter, nodes, operatorMap, remember, setEdges, setNodes]);
 
   const upload = useCallback(async (file: File) => {
-    const body = new FormData();
-    body.append("file", file);
-    return jsonRequest<UploadResult>("/api/files", { method: "POST", body });
-  }, []);
+    return client.uploadFile(file);
+  }, [client]);
 
   const synchronizeBrowserGraph = useCallback(async () => {
     if (acknowledgedGraphRef.current === JSON.stringify(graphSnapshotRef.current)
@@ -1815,14 +1770,10 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       if (!workflow) throw new Error("Selected node is not a source-backed workflow");
       const baseWorkflowRevision = workflow.workflow_revision;
       const requestEpoch = graphEpochRef.current;
-      const response = await jsonRequest<SourceWorkflowEditResponse>("/api/source-workflows/edit", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          base_state_revision: stateRevisionRef.current,
-          workflow_revision: baseWorkflowRevision,
-          edits: [edit],
-        }),
+      const response = await client.editSourceWorkflow({
+        base_state_revision: stateRevisionRef.current,
+        workflow_revision: baseWorkflowRevision,
+        edits: [edit],
       });
       if (!commitIfCanonicalEpochCurrent(
         requestEpoch,
@@ -1871,7 +1822,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       await reconcileGraphConflict(error);
       throw error;
     }
-  }, [markCanonicalGraph, operatorMap, reconcileGraphConflict, setEdges, setNodes, synchronizeBrowserGraph]);
+  }, [client, markCanonicalGraph, operatorMap, reconcileGraphConflict, setEdges, setNodes, synchronizeBrowserGraph]);
 
   const editSourceWorkflowBinding = useCallback(async (nodeId: string, key: string, binding: WorkflowBinding | undefined) => {
     await persistSourceWorkflowEdit(nodeId, binding
@@ -1913,14 +1864,10 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     setStatus(`Creating an editable ${title} node…`);
 
     const operation = browserWriteChainRef.current.then(async () => {
-      const response = await jsonRequest<SourceWorkflowEditResponse>("/api/source-workflows/promote", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          base_state_revision: stateRevisionRef.current,
-          workflow_revision: workflow.workflow_revision,
-          invocation_id: invocationId,
-        }),
+      const response = await client.promoteSourceWorkflow({
+        base_state_revision: stateRevisionRef.current,
+        workflow_revision: workflow.workflow_revision,
+        invocation_id: invocationId,
       });
       if (!commitIfCanonicalEpochCurrent(
         requestEpoch,
@@ -1947,7 +1894,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       setStatus(`Could not create the editable node — ${errorMessage(error)}`);
       throw error;
     }
-  }, [markCanonicalGraph, operatorMap, reconcileGraphConflict, restoreGraph, snapshotDocument, synchronizeBrowserGraph]);
+  }, [client, markCanonicalGraph, operatorMap, reconcileGraphConflict, restoreGraph, snapshotDocument, synchronizeBrowserGraph]);
 
   const restorePinnedSourceWorkflow = useCallback(async () => {
     const origin = graphSnapshotRef.current.variant_origin;
@@ -1960,11 +1907,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     setStatus("Returning to the pinned source workflow…");
 
     const operation = browserWriteChainRef.current.then(async () => {
-      const response = await jsonRequest<SourceWorkflowEditResponse>("/api/source-workflows/restore", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ base_state_revision: stateRevisionRef.current }),
-      });
+      const response = await client.restoreSourceWorkflow(stateRevisionRef.current);
       if (!commitIfCanonicalEpochCurrent(
         requestEpoch,
         () => canonicalEpochRef.current,
@@ -1989,7 +1932,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       await reconcileGraphConflict(error);
       setStatus(`Could not restore the pinned source — ${errorMessage(error)}`);
     }
-  }, [markCanonicalGraph, reconcileGraphConflict, restoreGraph, snapshotDocument, synchronizeBrowserGraph]);
+  }, [client, markCanonicalGraph, reconcileGraphConflict, restoreGraph, snapshotDocument, synchronizeBrowserGraph]);
 
   const attachRequirementFile = useCallback(async (item: ReadinessItem, field: string, file: File) => {
     const sourceNode = graphSnapshotRef.current.nodes.find((node) => node.id === item.node_id && node.source_workflow);
@@ -2327,7 +2270,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     const additions = [somite, ...(companion ? [companion] : [])].filter((edge) => !edges.some((current) => current.id === edge.id)).map((edge) => flowEdge(edge, graphNodes));
     const connected = additions.reduce((current, edge) => addEdge(edge, current), edges);
     try {
-      await jsonRequest<{ valid: boolean }>("/api/graph/validate", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(graphRequest(somiteGraph(workflowTitle, nodes, connected, annotations, variantOrigin))) });
+      await client.validateGraph(graphRequest(somiteGraph(workflowTitle, nodes, connected, annotations, variantOrigin)));
       remember();
       setEdges(connected);
       setDirty(true);
@@ -2335,7 +2278,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     } catch (error) {
       setStatus(`These ports cannot connect — ${errorMessage(error)}`);
     }
-  }, [annotations, edges, graphRequest, nodes, remember, setEdges, variantOrigin, workflowTitle]);
+  }, [annotations, client, edges, graphRequest, nodes, remember, setEdges, variantOrigin, workflowTitle]);
 
   const onConnectStart = useCallback((_: MouseEvent | TouchEvent, params: OnConnectStartParams) => {
     const node = nodes.find((candidate) => candidate.id === params.nodeId);
@@ -2414,7 +2357,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     setExportLoading(true);
     setStatus("Resolving workflow tools…");
     try {
-      const plan = await jsonRequest<ExportPlan>("/api/export/plan", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(graphRequest()) });
+      const plan = await client.exportPlan(graphRequest());
       setExportPlan(plan);
       const attention = plan.source_setup_count + plan.manual_count + plan.details_count + plan.legacy_count + plan.adapter_count;
       setStatus(`${plan.ready_count} ready · ${plan.installable_count} managed${attention ? ` · ${attention} need your attention` : ""}`);
@@ -2423,18 +2366,13 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     } finally {
       setExportLoading(false);
     }
-  }, [graphRequest, toolchainVisible]);
+  }, [client, graphRequest, toolchainVisible]);
 
   const downloadBundle = useCallback(async () => {
     setExportDownloading(true);
     setStatus("Freezing the Pixi/Nextflow run project…");
     try {
-      const response = await fetch(`${somiteServerUrl()}/api/export`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(graphRequest()) });
-      if (!response.ok) {
-        const detail = (await response.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(detail?.error ?? `${response.status} ${response.statusText}`);
-      }
-      const blob = await response.blob();
+      const blob = await client.downloadExport(graphRequest());
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url;
@@ -2449,7 +2387,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     } finally {
       setExportDownloading(false);
     }
-  }, [exportPlan, graphRequest, workflowTitle]);
+  }, [client, exportPlan, graphRequest, workflowTitle]);
 
   const executeGraph = useCallback(async (intent: "run" | "validation") => {
     if (running) return;
@@ -2487,15 +2425,14 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, runState: "queued" } })));
     setEdges((current) => current.map((edge) => ({ ...edge, animated: true, data: intent === "validation" && edge.data ? { ...edge.data, validationState: "queued" } : edge.data })));
     try {
-      const endpoint = intent === "validation" ? "/api/validations" : "/api/runs";
-      const started = await jsonRequest<RunStartResponse>(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(graphRequest(graph)) });
+      const started = await client.startRun(intent, graphRequest(graph));
       setActiveRunId(started.run_id);
       let report: RunStatusResponse;
       do {
         await new Promise((resolve) => window.setTimeout(resolve, 350));
-        report = await jsonRequest<RunStatusResponse>(`/api/runs/${encodeURIComponent(started.run_id)}`);
+        report = await client.runStatus(started.run_id);
         if (semanticKeyRef.current !== requestedKey) {
-          await jsonRequest<RunStatusResponse>(`/api/runs/${encodeURIComponent(started.run_id)}/cancel`, { method: "POST" }).catch(() => undefined);
+          await client.cancelRun(started.run_id).catch(() => undefined);
           setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, runState: "idle" } })));
           setEdges((current) => current.map((edge) => ({ ...edge, animated: false, data: edge.data ? { ...edge.data, validationState: "idle" } : edge.data })));
           setStatus("Graph changed · stale execution stopped and evidence invalidated");
@@ -2524,7 +2461,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       setActiveRunId(null);
       setActiveIntent(null);
     }
-  }, [focusRequirement, graphRequest, readiness, running, semanticKey, setEdges, setNodes, snapshot, workflowCatalog]);
+  }, [client, focusRequirement, graphRequest, readiness, running, semanticKey, setEdges, setNodes, snapshot, workflowCatalog]);
 
   const runGraph = useCallback(() => executeGraph("run"), [executeGraph]);
   const validateGraphWithFixtures = useCallback(() => executeGraph("validation"), [executeGraph]);
@@ -2533,11 +2470,11 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     if (!activeRunId) return;
     setStatus("Stopping Nextflow…");
     try {
-      await jsonRequest<RunStatusResponse>(`/api/runs/${encodeURIComponent(activeRunId)}/cancel`, { method: "POST" });
+      await client.cancelRun(activeRunId);
     } catch (error) {
       setStatus(`Could not cancel run — ${errorMessage(error)}`);
     }
-  }, [activeRunId]);
+  }, [activeRunId, client]);
 
   const beginParamEdit = useCallback((key: string) => {
     const historyKey = `${selectedIds.at(-1) ?? ""}.${key}`;
@@ -3047,7 +2984,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
           <button type="button" aria-label={allViewersHidden ? "Show All Viewers" : "Hide All Viewers"} title={allViewersHidden ? "Show all viewers" : "Hide all viewers"} disabled={!nodes.length} onClick={toggleAllViewers}>{allViewersHidden ? <Eye size={16} aria-hidden="true" /> : <EyeOff size={16} aria-hidden="true" />}</button>
         </div>}
 
-        {libraryVisible && <div className="panel-layer" onPointerDown={(event) => event.stopPropagation()}><LibraryPanel operators={availableOperators} query={query} filterQuery={deferredQuery} favorites={favorites} recent={recent} categoryOpen={categoryOpen} searchInputRef={searchInputRef} continuation={pendingConnection} catalogExpansion={catalogExpansion} workflowCatalogState={workflowCatalogState} onQuery={setQuery} onClose={() => { setLibraryVisible(false); setPendingConnection(null); setCatalogExpansion(null); }} onAddOperator={addOperator} onAddSource={addSource} onImportFiles={(files) => addDroppedFiles(files, canvasCenter())} onToggleFavorite={(id) => setFavorites((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; })} onToggleCategory={(title, open) => setCategoryOpen((current) => ({ ...current, [title]: open }))} onRetryWorkflowCatalogs={retryWorkflowCatalogs} onDismissCatalogExpansion={() => { setStatus(`${catalogExpansion?.title ?? "Workflow"} was not added · canvas unchanged`); setCatalogExpansion(null); }} /></div>}
+        {libraryVisible && <div className="panel-layer" onPointerDown={(event) => event.stopPropagation()}><LibraryPanel client={client} operators={availableOperators} query={query} filterQuery={deferredQuery} favorites={favorites} recent={recent} categoryOpen={categoryOpen} searchInputRef={searchInputRef} continuation={pendingConnection} catalogExpansion={catalogExpansion} workflowCatalogState={workflowCatalogState} onQuery={setQuery} onClose={() => { setLibraryVisible(false); setPendingConnection(null); setCatalogExpansion(null); }} onAddOperator={addOperator} onAddSource={addSource} onImportFiles={(files) => addDroppedFiles(files, canvasCenter())} onToggleFavorite={(id) => setFavorites((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; })} onToggleCategory={(title, open) => setCategoryOpen((current) => ({ ...current, [title]: open }))} onRetryWorkflowCatalogs={retryWorkflowCatalogs} onDismissCatalogExpansion={() => { setStatus(`${catalogExpansion?.title ?? "Workflow"} was not added · canvas unchanged`); setCatalogExpansion(null); }} /></div>}
 
         {projectVisible && <div className="project-layer" onPointerDown={(event) => event.stopPropagation()}><ProjectPanel projectName={session.project_name} graphPath={session.graph_path} onImportProject={importLocalProject} onClose={() => setProjectVisible(false)} /></div>}
 
@@ -3057,7 +2994,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
 
         {toolchainVisible && <div className="toolchain-layer" onPointerDown={(event) => event.stopPropagation()}><ToolchainPanel plan={exportPlan} pixiReady={system?.tools.pixi} loading={exportLoading} downloading={exportDownloading} onDownload={downloadBundle} onClose={() => setToolchainVisible(false)} /></div>}
 
-        {paperVisible && <div className="paper-layer" onPointerDown={(event) => event.stopPropagation()}><PaperPanel intake={paperIntake} active={activePaperCandidate} applied={appliedPaperCandidate} preparingField={paperPreparingField} onFile={rebuildPaper} onRetry={retryPaper} onCancel={cancelPaper} onExample={openExamplePaper} onReconstruct={rebuildBiorxivPaper} onSelect={setActivePaperCandidate} onApply={(index) => { const candidate = paperReview?.candidates[index]; if (candidate) installPaperCandidate(candidate, index); }} onUseResource={usePaperResource} onAttachInput={attachPaperInput} onSetInput={setPaperInput} onEscalate={askAgentAboutPaperItem} onEvidence={focusPaperEvidence} onClose={() => setPaperVisible(false)} /></div>}
+        {paperVisible && <div className="paper-layer" onPointerDown={(event) => event.stopPropagation()}><PaperPanel client={client} intake={paperIntake} active={activePaperCandidate} applied={appliedPaperCandidate} preparingField={paperPreparingField} onFile={rebuildPaper} onRetry={retryPaper} onCancel={cancelPaper} onExample={openExamplePaper} onReconstruct={rebuildBiorxivPaper} onSelect={setActivePaperCandidate} onApply={(index) => { const candidate = paperReview?.candidates[index]; if (candidate) installPaperCandidate(candidate, index); }} onUseResource={usePaperResource} onAttachInput={attachPaperInput} onSetInput={setPaperInput} onEscalate={askAgentAboutPaperItem} onEvidence={focusPaperEvidence} onClose={() => setPaperVisible(false)} /></div>}
 
         {readinessVisible && readiness && <div className={`readiness-layer ${agentVisible ? "with-agent" : ""}`} onPointerDown={(event) => event.stopPropagation()}><ReadinessPanel snapshot={readiness} evidence={validationEvidence} validationCapability={validationCapability} onResolve={resolveRequirement} onFocus={focusRequirement} onAttachFile={attachRequirementFile} onAskAssistant={askAssistantAboutRequirement} onClose={() => setReadinessVisible(false)} /></div>}
 
@@ -3086,6 +3023,6 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
 }
 
 export function SomiteApp({ initialQuery = "", serverUrl = "http://localhost:7310" }: { initialQuery?: string; serverUrl?: string }) {
-  configureSomiteServer(serverUrl);
-  return <ReactFlowProvider><SomiteWorkspace initialQuery={initialQuery} /></ReactFlowProvider>;
+  const client = useMemo(() => createSomiteClient(serverUrl), [serverUrl]);
+  return <ReactFlowProvider><SomiteWorkspace key={client.origin} initialQuery={initialQuery} client={client} /></ReactFlowProvider>;
 }

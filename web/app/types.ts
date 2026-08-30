@@ -54,9 +54,30 @@ export type {
   WorkflowAssessment,
 } from "@somite/workflow/assessment";
 
+export type {
+  EvidenceReceipt,
+  EvidenceResult,
+} from "@somite/workflow/linker";
+
+export type {
+  BundlePlan as ExportPlan,
+  ToolRequirement as ExportTool,
+} from "@somite/workflow/bundle";
+
+export type {
+  PaperCandidate,
+  PaperEvidence,
+  PaperExtractVia,
+  PaperMethodMention,
+  PaperReconstructionOutcome,
+  PaperResourceCitation,
+  PaperReview,
+} from "@somite/workflow/paper";
+
 import type { SomiteGraph } from "@somite/workflow/model";
 import type { Operator } from "@somite/workflow/catalog";
-import type { WorkflowAssessment } from "@somite/workflow/assessment";
+import type { EvidenceReceipt } from "@somite/workflow/linker";
+import type { PaperResourceCitation } from "@somite/workflow/paper";
 
 export type NfcoreCatalog = {
   entries: Array<{ operator: Operator; description: string; topics: string[]; revision: string }>;
@@ -217,7 +238,9 @@ export type RunStartResponse = {
   replayed: boolean;
 };
 
-export type RunStatusResponse = RunStartResponse & {
+export type RunStatusResponse = {
+  run_id: string;
+  phase: RunPhase;
   states: Record<string, RunNodeState>;
   closure_digest?: string;
   exit_code?: number;
@@ -226,85 +249,11 @@ export type RunStatusResponse = RunStartResponse & {
   progress: { completed: number; total: number; unit: string; message: string };
 };
 
-export type EvidenceResult = "passed" | "failed" | "inconclusive";
-
-export type EvidenceReceipt = {
-  receipt_digest: string;
-  recorded_at_unix_ms: number;
-  subject_digest: string;
-  observed_closure_digest?: string;
-  kind: string;
-  scope: string;
-  configuration_digest: string;
-  fixture_digests: string[];
-  verifier: string;
-  result: EvidenceResult;
-  node_results: Record<string, EvidenceResult>;
-  edge_results: Record<string, EvidenceResult>;
-  artifact_digests: string[];
-  log_digests: string[];
-};
-
 export type ValidationEvidenceResponse = {
   subject_digest: string;
   configuration_digest: string;
   fixture_pack: string;
   receipt?: EvidenceReceipt;
-};
-
-export type PaperEvidence = {
-  target_kind: "node" | "edge";
-  target_id: string;
-  status: "explicit" | "inferred" | "needs_adapter";
-  detail: string;
-  resolution_kind?: "input_required" | "managed_tool" | "source_workflow" | "built_in" | "system_tool" | "manual_checkpoint" | "method_details" | "legacy_source" | "adapter";
-  resolution_label?: string;
-  resolution_detail?: string;
-  resolution_required?: boolean;
-  source_location?: string;
-};
-
-export type ExportTool = {
-  operator_id: string;
-  title: string;
-  binary?: string;
-  packages: string[];
-  state: "built_in" | "ready" | "installable" | "system_required" | "source_setup" | "manual_checkpoint" | "method_details" | "legacy_source" | "adapter_needed";
-  detail: string;
-};
-
-export type ExportPlan = {
-  filename: string;
-  platform: string;
-  channels: string[];
-  packages: string[];
-  tools: ExportTool[];
-  ready_count: number;
-  installable_count: number;
-  source_setup_count: number;
-  manual_count: number;
-  details_count: number;
-  legacy_count: number;
-  adapter_count: number;
-  assessment: WorkflowAssessment;
-};
-
-export type PaperCandidate = {
-  name: string;
-  role: "primary" | "parallel" | "alternative";
-  assay: string;
-  graph: SomiteGraph;
-  warnings: string[];
-  evidence: PaperEvidence[];
-  assessment: WorkflowAssessment;
-};
-
-export type PaperResourceCitation = {
-  accession: string;
-  kind: "sra_study" | "sra_sample" | "sra_experiment" | "sra_run" | "bioproject" | "biosample" | "assembly" | "ensembl";
-  role: "reads" | "reference" | "annotation" | "sample_metadata" | "unknown";
-  context: string;
-  source_location?: string;
 };
 
 export type PaperResourceGroup = {
@@ -316,27 +265,6 @@ export type PaperResourceGroup = {
 
 export type PaperResourceResolution = {
   groups: PaperResourceGroup[];
-};
-
-export type PaperReconstructionOutcome = "drafts_ready" | "recognized_unsupported" | "no_reconstructable_methods";
-
-export type PaperMethodMention = {
-  display_name: string;
-  normalized_name: string;
-  operation_class?: string;
-  evidence: string;
-  support: "operator" | "unsupported";
-  operator_id?: string;
-  source_location?: string;
-};
-
-export type PaperReview = {
-  extracted_via: "text" | "pdfjs" | "poppler" | "ocr" | "jats";
-  outcome: PaperReconstructionOutcome;
-  warnings: string[];
-  mentions: PaperMethodMention[];
-  resources: PaperResourceCitation[];
-  candidates: PaperCandidate[];
 };
 
 export type PaperSearchResult = {

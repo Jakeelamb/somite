@@ -23,10 +23,11 @@ test("server-renders the Somite web shell", async () => {
 });
 
 test("starter preview is removed and the real canvas is wired", async () => {
-  const [page, app, panels, paperIntake, paperIntakeApi, paperReading, catalogExpansion, css, packageJson] = await Promise.all([
+  const [page, app, panels, api, paperIntake, paperIntakeApi, paperReading, catalogExpansion, css, packageJson] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/SomiteApp.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/WorkspacePanels.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/api.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/paperIntake.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/paperIntakeApi.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/paperReading.ts", import.meta.url), "utf8"),
@@ -36,23 +37,24 @@ test("starter preview is removed and the real canvas is wired", async () => {
   ]);
   assert.match(page, /<SomiteApp initialQuery=/);
   assert.match(app, /ReactFlowProvider/);
-  assert.match(app, /api\/graph\/validate/);
-  assert.match(app, /api\/run/);
+  assert.match(app, /client\.validateGraph/);
+  assert.match(app, /client\.startRun/);
   assert.match(app, /createPaperIntakeCoordinator/);
-  assert.match(paperIntakeApi, /api\/papers\/uploads/);
-  assert.match(paperIntakeApi, /api\/papers\/intakes/);
-  assert.match(paperIntakeApi, /api\/papers\/biorxiv\/reconstruct/);
+  assert.match(paperIntakeApi, /client\.uploadPaper/);
+  assert.match(paperIntakeApi, /client\.startPaperIntake/);
+  assert.match(paperIntakeApi, /client\.reconstructBiorxiv/);
+  assert.match(api, /api\/papers\/uploads/);
   assert.match(app, /panActivationKeyCode="Space"/);
   assert.match(app, /pairedCompanion/);
   assert.match(app, /onConnectEnd=/);
   assert.match(app, /ContinuationContext/);
   assert.match(app, /focusPaperEvidence/);
-  assert.match(app, /api\/agent\/events/);
+  assert.match(app, /client\.agentEvents/);
   assert.match(app, /assessWorkflow/);
   assert.doesNotMatch(app, /api\/readiness/);
-  assert.match(app, /api\/agent\/discover/);
-  assert.match(app, /api\/agent\/config/);
-  assert.match(app, /api\/projects\/open/);
+  assert.match(app, /client\.discoverAgents/);
+  assert.match(app, /client\.configureAgent/);
+  assert.match(app, /client\.openProject/);
   assert.match(app, /planAgentTransactions/);
   assert.match(panels, /Compatible Tools/);
   assert.match(panels, /Choose your Agent/);
@@ -90,7 +92,8 @@ test("starter preview is removed and the real canvas is wired", async () => {
   assert.match(paperReading, /Somite managed Pixi/);
   assert.doesNotMatch(paperReading, /Restart Somite to recheck/);
   assert.match(panels, /Enable scanned PDF OCR/);
-  assert.match(app, /\/api\/paper-tools\/ocr\/install/);
+  assert.match(app, /client\.installPaperOcr/);
+  assert.match(api, /\/api\/paper-tools\/ocr\/install/);
   assert.match(css, /\.paper-reading-guidance \{[^}]*font-size: 10px/);
   assert.match(css, /\.paper-reading-tools article p \{[^}]*font-size: 10px/);
   assert.match(css, /\.paper-job > p \{[^}]*font-size: 10px/);
@@ -129,8 +132,8 @@ test("starter preview is removed and the real canvas is wired", async () => {
   assert.match(app, /Replace source invocation/);
   assert.match(app, /Connections need checking/);
   assert.match(app, /Edit on canvas/);
-  assert.match(app, /api\/source-workflows\/promote/);
-  assert.match(app, /api\/source-workflows\/restore/);
+  assert.match(app, /client\.promoteSourceWorkflow/);
+  assert.match(app, /client\.restoreSourceWorkflow/);
   assert.match(app, /Native variant/);
   assert.match(app, /Return to pinned source/);
   assert.match(app, /setVariantOrigin\(loaded\.graph\.variant_origin\)/);
