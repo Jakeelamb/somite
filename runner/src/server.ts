@@ -1,6 +1,5 @@
 import { lstat, realpath } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { availableParallelism, cpus, hostname, platform, totalmem } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Readable } from "node:stream";
 import { randomBytes, randomUUID } from "node:crypto";
@@ -37,6 +36,7 @@ import { SourceSearchGateway } from "./sourceSearchGateway.ts";
 import { SourceWorkflowTrustError, verifyGraphSourceWorkflowTrust } from "./sourceWorkflowTrust.ts";
 import { executablePath, pixiPlatform } from "./system.ts";
 import { UploadError, UploadStore } from "./uploadStore.ts";
+import { detectHardwareProfile } from "./hardwareProfile.ts";
 
 const MAX_REQUEST_BYTES = 16 * 1024 * 1024;
 const DEFAULT_PORT = 7310;
@@ -688,21 +688,16 @@ async function resolvePaperResources(state: ProjectState, value: unknown) {
 }
 
 async function systemProfile(state: ProjectState) {
-  const [pixi, prefetch, datasets, nextflow, snakemake] = await Promise.all([
+  const [hardware, pixi, prefetch, datasets, nextflow, snakemake] = await Promise.all([
+    detectHardwareProfile(),
     executablePath(state.root, "pixi"),
     executablePath(state.root, "prefetch"),
     executablePath(state.root, "datasets"),
     executablePath(state.root, "nextflow"),
     executablePath(state.root, "snakemake"),
   ]);
-  const cpuList = cpus();
   return {
-    cpu: cpuList[0]?.model.trim() || hostname(),
-    physical_cores: availableParallelism(),
-    logical_threads: cpuList.length || availableParallelism(),
-    memory_bytes: totalmem(),
-    gpus: [],
-    os: `${platform()} ${process.arch}`,
+    ...hardware,
     tools: {
       pixi: Boolean(pixi),
       sra: Boolean(prefetch),

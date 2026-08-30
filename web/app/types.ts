@@ -352,8 +352,9 @@ export type PaperExtractionPreflight = {
 
 export type SystemProfile = {
   cpu: string;
-  physical_cores: number;
+  physical_cores: number | null;
   logical_threads: number;
+  available_parallelism: number;
   memory_bytes: number;
   gpus: string[];
   os: string;

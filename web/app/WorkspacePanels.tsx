@@ -750,9 +750,10 @@ export function MachinePanel({ profile, onClose }: { profile: SystemProfile | nu
       <div className="machine-hero"><Cpu size={20} aria-hidden="true" /><span><strong>{profile?.cpu ?? "Detecting hardware…"}</strong><small>{profile?.os ?? "Reading system profile"}</small></span></div>
       <dl className="machine-grid">
         <div><dt>Physical Cores</dt><dd>{profile?.physical_cores ?? "—"}</dd></div>
+        <div><dt>Available Workers</dt><dd>{profile?.available_parallelism ?? "—"}</dd></div>
         <div><dt>Logical Threads</dt><dd>{profile?.logical_threads ?? "—"}</dd></div>
         <div><dt>Memory</dt><dd>{memory}</dd></div>
-        <div><dt>GPU</dt><dd>{profile?.gpus.join(", ") || "None detected"}</dd></div>
+        <div className="machine-gpu"><dt>GPU</dt><dd>{profile?.gpus.join(", ") || "None detected"}</dd></div>
       </dl>
       <section className="paper-reading" aria-label="Paper reading readiness">
         <header className="paper-reading-head">
