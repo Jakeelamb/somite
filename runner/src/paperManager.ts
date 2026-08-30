@@ -6,7 +6,7 @@ import type { OperatorCatalog } from "@somite/workflow/catalog";
 import { byteDigest, canonicalJsonDigest } from "@somite/workflow/contentIdentity";
 import { reconstructPaper, type PaperReview } from "@somite/workflow/paper";
 import { atomicWrite, ensurePrivateDirectory, pathExists, regularFile } from "./files.ts";
-import { extractPaper, PaperExtractionError, type PaperExtraction, type PaperExtractionProgress } from "./paperExtractor.ts";
+import { extractPaperPath, PaperExtractionError, type PaperExtraction, type PaperExtractionProgress } from "./paperExtractor.ts";
 import { PaperStore } from "./paperStore.ts";
 
 export type PaperIntakePhase = "queued" | "extracting" | "locating_methods" | "recognizing_methods" | "assessing_drafts" | "completed" | "failed" | "cancelling" | "cancelled";
@@ -36,7 +36,7 @@ type MutableStatus = {
 
 type PaperJob = {
   status: MutableStatus;
-  artifact: Awaited<ReturnType<PaperStore["resolveDigest"]>>;
+  artifact: Awaited<ReturnType<PaperStore["resolveDigestPath"]>>;
   controller: AbortController;
   createdAt: number;
   revision: number;
@@ -123,7 +123,7 @@ export class PaperManager {
         this.#replays.delete(idempotencyKey);
       }
     }
-    const artifact = await this.store.resolveDigest(digest);
+    const artifact = await this.store.resolveDigestPath(digest);
     this.#prune();
     if (this.#jobs.size >= MAX_JOBS && ![...this.#jobs.values()].some((job) => terminal.has(job.status.phase))) throw new Error("paper intake capacity is busy");
     const jobId = `paper-${randomUUID()}`;
@@ -241,7 +241,11 @@ export class PaperManager {
         // Generated cache corruption is recoverable; recompute from the verified source object.
       }
     }
-    const extracted = await extractPaper(job.artifact.bytes, job.artifact.metadata.media_kind, {
+    const extracted = await extractPaperPath({
+      path: job.artifact.path,
+      digest: job.status.source_digest,
+      sizeBytes: job.artifact.metadata.size_bytes,
+    }, job.artifact.metadata.media_kind, {
       signal: job.controller.signal,
       onProgress: (progress) => {
         if (job.status.phase === "extracting") {

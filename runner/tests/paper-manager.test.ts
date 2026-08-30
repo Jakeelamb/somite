@@ -7,11 +7,12 @@ import test from "node:test";
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
 import { PaperManager } from "../src/paperManager.ts";
 import { PaperStoreError } from "../src/paperStore.ts";
+import { pdfWithText } from "./pdfFixture.ts";
 
 const repository = path.resolve(import.meta.dirname, "../..");
 const loaded = await loadOperatorCatalog(path.join(repository, "operators"));
 
-function uploadRequest(filename: string, contents: string, type = "text/plain") {
+function uploadRequest(filename: string, contents: BlobPart, type = "text/plain") {
   const form = new FormData();
   form.set("file", new File([contents], filename, { type }));
   return new Request("http://localhost/api/papers/uploads", { method: "POST", body: form });
@@ -52,6 +53,23 @@ test("content-addressed paper intake is replayable, cached, and reconstructs typ
     const secondStatus = await completed(manager, second.job_id);
     assert.equal(secondStatus.phase, "completed");
     assert.deepEqual(secondStatus.cache, { extraction: true, reconstruction: true });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("content-addressed PDF intake extracts through the isolated worker", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "somite-paper-pdf-manager-"));
+  try {
+    const manager = new PaperManager(root, loaded.catalog, loaded.revision);
+    const methods = "Methods RNA-seq reads were quality checked with FastQC and aligned with STAR. ".repeat(20);
+    const artifact = await manager.store.upload(uploadRequest("methods.pdf", pdfWithText(methods), "application/pdf"));
+    const started = await manager.start(artifact.digest);
+    const status = await completed(manager, started.job_id);
+    assert.equal(status.phase, "completed");
+    assert.equal(status.cache.extraction, false);
+    assert.equal(status.result?.outcome, "drafts_ready");
+    await manager.shutdown();
   } finally {
     await rm(root, { recursive: true, force: true });
   }

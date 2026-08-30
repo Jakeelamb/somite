@@ -142,15 +142,22 @@ export class PaperStore {
   }
 
   async resolveDigest(digest: string) {
+    const resolved = await this.resolveDigestPath(digest);
+    const bytes = await readFile(resolved.path);
+    if (bytes.byteLength !== resolved.metadata.size_bytes || byteDigest(bytes) !== digest) throw new PaperStoreError(409, "paper_object_invalid", "Stored paper bytes do not match their content address.");
+    return { ...resolved, bytes };
+  }
+
+  async resolveDigestPath(digest: string) {
     if (!/^blake3:[0-9a-f]{64}$/.test(digest)) throw new PaperStoreError(400, "paper_digest_invalid", "Paper digest is malformed.");
     const identity = digest.slice("blake3:".length);
     const directory = containedPath(this.#root, `.somite/papers/objects/${identity}`);
     const metadata = storedArtifact(JSON.parse(await readFile(join(directory, "artifact.json"), "utf8")));
     if (metadata.digest !== digest || metadata.size_bytes > MAX_PAPER_BYTES) throw new PaperStoreError(409, "paper_object_invalid", "Stored paper metadata does not match the requested digest.");
     const path = join(directory, metadata.media_kind === "pdf" ? "payload.pdf" : "payload.txt");
-    const bytes = await regularFile(path, MAX_PAPER_BYTES, "stored paper");
-    if (bytes.byteLength !== metadata.size_bytes || byteDigest(bytes) !== digest) throw new PaperStoreError(409, "paper_object_invalid", "Stored paper bytes do not match their content address.");
-    return { metadata, path, bytes };
+    const file = await lstat(path);
+    if (file.isSymbolicLink() || !file.isFile() || file.size !== metadata.size_bytes) throw new PaperStoreError(409, "paper_object_invalid", "Stored paper is not the expected regular file.");
+    return { metadata, path };
   }
 
   async resolveProjectPath(path: string) {
