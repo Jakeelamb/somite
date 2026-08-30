@@ -151,6 +151,7 @@ import { validationEvidenceRequestPath, workflowCatalogRequestPaths, type Workfl
 import { planLocalInputs } from "./localInputPlanning";
 import { assessWorkflow } from "@somite/workflow/assessment";
 import { OperatorCatalog } from "@somite/workflow/catalog";
+import { representativeValidationCapability } from "@somite/workflow/fixtures";
 
 const SNAP: [number, number] = [20, 20];
 const HISTORY_LIMIT = 80;
@@ -667,6 +668,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   const snapshotDocument = useCallback((graph = snapshot()) => workflowDocument(graph, inputOriginIdRef.current), [snapshot]);
   const graphRequest = useCallback((graph = snapshot()) => scopedGraphRequest(snapshotDocument(graph)), [snapshot, snapshotDocument]);
   const renderedGraph = useMemo(() => somiteGraph(workflowTitle, nodes, edges, annotations, variantOrigin), [annotations, edges, nodes, variantOrigin, workflowTitle]);
+  const validationCapability = useMemo(() => representativeValidationCapability(renderedGraph), [renderedGraph]);
   const semanticKey = useMemo(() => semanticGraphKey(renderedGraph), [renderedGraph]);
   semanticKeyRef.current = semanticKey;
   const renderedGraphKey = useMemo(() => JSON.stringify(renderedGraph), [renderedGraph]);
@@ -2383,6 +2385,14 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     if (running) return;
     const requestedKey = semanticKey;
     const graph = snapshot();
+    if (intent === "validation") {
+      const capability = representativeValidationCapability(graph);
+      if (!capability.supported) {
+        setStatus(capability.reason);
+        if (readiness) setReadinessVisible(true);
+        return;
+      }
+    }
     try {
       if (!workflowCatalog) throw new Error("operator catalog is not ready");
       const latest = assessWorkflow(graph, workflowCatalog);
@@ -2444,7 +2454,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       setActiveRunId(null);
       setActiveIntent(null);
     }
-  }, [focusRequirement, graphRequest, running, semanticKey, setEdges, setNodes, snapshot, workflowCatalog]);
+  }, [focusRequirement, graphRequest, readiness, running, semanticKey, setEdges, setNodes, snapshot, workflowCatalog]);
 
   const runGraph = useCallback(() => executeGraph("run"), [executeGraph]);
   const validateGraphWithFixtures = useCallback(() => executeGraph("validation"), [executeGraph]);
@@ -2827,7 +2837,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
             <button type="button" className="studio-button theme-toggle" aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`} title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`} onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun size={14} aria-hidden="true" /> : <Moon size={14} aria-hidden="true" />}</button>
             <button type="button" className="studio-button" onClick={() => void save()} disabled={saving || !dirty}>{saving ? <span className="spin"><LoaderCircle size={14} /></span> : dirty ? <Save size={14} /> : <Check size={14} />}<span>{saving ? "Saving…" : dirty ? "Save" : "Saved"}</span></button>
             <button type="button" className={`studio-button ${toolchainVisible ? "active" : ""}`} onClick={() => void toggleToolchain()} title="Environment and Export"><PackageOpen size={14} aria-hidden="true" /><span>Export</span></button>
-            <button type="button" className="studio-button validation-button" disabled={running} onClick={() => void validateGraphWithFixtures()} title="Validate with small representative fixtures">{activeIntent === "validation" ? <span className="spin"><LoaderCircle size={14} /></span> : <ShieldCheck size={14} />}<span>{activeIntent === "validation" ? "Validating…" : "Validate"}</span></button>
+            <button type="button" className="studio-button validation-button" disabled={running || !validationCapability.supported} onClick={() => void validateGraphWithFixtures()} title={validationCapability.supported ? "Validate with small representative FASTQ fixtures" : validationCapability.reason}>{activeIntent === "validation" ? <span className="spin"><LoaderCircle size={14} /></span> : <ShieldCheck size={14} />}<span>{activeIntent === "validation" ? "Validating…" : "Validate"}</span></button>
             <button type="button" className={`run-button ${running ? "is-running" : ""}`} disabled={running && !activeRunId} onClick={() => void (running ? cancelRun() : runGraph())} title={running ? "Cancel active Nextflow run" : "Run workflow (F5 or Ctrl/Cmd Enter)"}>{running ? activeRunId ? <><Square size={12} fill="currentColor" />Cancel</> : <><span className="spin"><LoaderCircle size={14} /></span>Preparing…</> : <><Play size={14} />Run</>}</button>
           </div>
         </header>
@@ -2979,7 +2989,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
 
         {paperVisible && <div className="paper-layer" onPointerDown={(event) => event.stopPropagation()}><PaperPanel intake={paperIntake} active={activePaperCandidate} applied={appliedPaperCandidate} preparingField={paperPreparingField} onFile={rebuildPaper} onRetry={retryPaper} onCancel={cancelPaper} onExample={openExamplePaper} onReconstruct={rebuildBiorxivPaper} onSelect={setActivePaperCandidate} onApply={(index) => { const candidate = paperReview?.candidates[index]; if (candidate) installPaperCandidate(candidate, index); }} onUseResource={usePaperResource} onAttachInput={attachPaperInput} onSetInput={setPaperInput} onEscalate={askAgentAboutPaperItem} onEvidence={focusPaperEvidence} onClose={() => setPaperVisible(false)} /></div>}
 
-        {readinessVisible && readiness && <div className={`readiness-layer ${agentVisible ? "with-agent" : ""}`} onPointerDown={(event) => event.stopPropagation()}><ReadinessPanel snapshot={readiness} evidence={validationEvidence} onResolve={resolveRequirement} onFocus={focusRequirement} onAttachFile={attachRequirementFile} onAskAssistant={askAssistantAboutRequirement} onClose={() => setReadinessVisible(false)} /></div>}
+        {readinessVisible && readiness && <div className={`readiness-layer ${agentVisible ? "with-agent" : ""}`} onPointerDown={(event) => event.stopPropagation()}><ReadinessPanel snapshot={readiness} evidence={validationEvidence} validationCapability={validationCapability} onResolve={resolveRequirement} onFocus={focusRequirement} onAttachFile={attachRequirementFile} onAskAssistant={askAssistantAboutRequirement} onClose={() => setReadinessVisible(false)} /></div>}
 
         {agentVisible && <div className="agent-layer" onPointerDown={(event) => event.stopPropagation()}><AgentPanel key={agentDraft?.id ?? "agent"} snapshot={agentSnapshot} discovery={agentDiscovery} discoveryLoading={agentDiscoveryLoading} draft={agentDraft} onRefreshDiscovery={refreshAgentDiscovery} onConnect={connectAgent} onConfig={configureAgent} onPrompt={promptAgent} onCancel={cancelAgent} onDisconnect={disconnectAgent} onPermission={answerAgentPermission} onClose={() => { setAgentVisible(false); setAgentDraft(null); }} /></div>}
 

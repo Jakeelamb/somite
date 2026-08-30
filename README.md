@@ -92,10 +92,13 @@ show missing inputs, parameters, managed resources, manual checkpoints, and
 unsupported contracts. Run, Validate, and Agent compilation stop before doing
 work when readiness is blocked.
 
-Validation substitutes small content-addressed FASTQ fixtures, runs the same
-frozen Nextflow path as production, and records an append-only evidence receipt
-for the exact semantic graph revision. A compiled graph is not described as
-validated until that run succeeds.
+For workflows rooted in local single or paired FASTQ inputs, Validation
+substitutes small content-addressed fixtures, runs the same frozen Nextflow path
+as production, and records an append-only evidence receipt for the exact
+semantic graph revision. Other input roots remain runnable with real data, but
+the Validate control stays unavailable until Somite has a reviewed fixture
+adapter for that root. A compiled graph is never described as validated until
+its representative run succeeds.
 
 ### Rebuild from a paper
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer, request as httpRequest } from "node:http";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { byteDigest } from "@somite/workflow/contentIdentity";
+import { operatorPorts, type Operator } from "@somite/workflow/catalog";
 import { startServer } from "../src/server.ts";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
@@ -230,6 +231,54 @@ test("opening an external Somite document preserves it exactly and carries its r
     await running.close().catch(() => undefined);
     await rm(root, { recursive: true, force: true });
     await rm(external, { recursive: true, force: true });
+  }
+});
+
+test("unsupported representative validation returns a typed capability before writing fixture state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "somite-runner-validation-capability-"));
+  const running = await startServer({ projectRoot: root, port: await unusedPort() });
+  const mutationHeaders = { "content-type": "application/json", origin: "http://localhost:3000" };
+  try {
+    const session = await fetch(`${running.url}/api/session`).then((response) => response.json()) as {
+      operators: Operator[];
+    };
+    const input = session.operators.find((operator) => operator.id === "files.import_fasta");
+    assert.ok(input?.revision);
+    await writeFile(join(root, "reference.fasta"), ">reference\nACGT\n");
+    const graph = {
+      schema_version: 3,
+      name: "FASTA-rooted workflow",
+      nodes: [{
+        id: "reference",
+        operator: input.id,
+        operator_revision: input.revision,
+        ports: operatorPorts(input),
+        params: { path: "reference.fasta" },
+        layout: { x: 0, y: 0 },
+      }],
+      edges: [],
+    };
+    for (const path of ["/api/validations", "/api/validations/status"]) {
+      const response = await fetch(`${running.url}${path}`, {
+        method: "POST",
+        headers: mutationHeaders,
+        body: JSON.stringify(graph),
+      });
+      assert.equal(response.status, 422, `${path}: ${await response.clone().text()}`);
+      const body = await response.json() as { code: string; capability: { supported: boolean; unsupported_roots: string[] }; error: string };
+      assert.equal(body.code, "representative_fixture_unsupported");
+      assert.deepEqual(body.capability, {
+        supported: false,
+        code: "representative_fixture_unsupported",
+        reason: body.error,
+        unsupported_roots: ["files.import_fasta"],
+      });
+    }
+    await assert.rejects(access(join(root, ".somite", "fixtures")), { code: "ENOENT" });
+    await assert.rejects(access(join(root, ".somite", "runs")), { code: "ENOENT" });
+  } finally {
+    await running.close();
+    await rm(root, { recursive: true, force: true });
   }
 });
 

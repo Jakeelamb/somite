@@ -13,6 +13,50 @@ export type FixtureBinding = Readonly<{
   graph: SomiteGraph;
 }>;
 
+export type RepresentativeValidationCapability =
+  | Readonly<{ supported: true; fixture_pack: typeof REPRESENTATIVE_FASTQ_PACK }>
+  | Readonly<{ supported: false; code: "representative_fixture_unsupported"; reason: string; unsupported_roots: string[] }>;
+
+export class RepresentativeValidationError extends Error {
+  readonly code = "representative_fixture_unsupported" as const;
+  readonly capability: Extract<RepresentativeValidationCapability, { supported: false }>;
+
+  constructor(capability: Extract<RepresentativeValidationCapability, { supported: false }>) {
+    super(capability.reason);
+    this.name = "RepresentativeValidationError";
+    this.capability = capability;
+  }
+}
+
+function representativeSourceParametersAreBindable(node: SomiteGraph["nodes"][number]) {
+  if (node.operator === "files.import") return typeof node.params?.path === "string";
+  if (node.operator === "files.import_paired") {
+    return typeof node.params?.r1 === "string" && typeof node.params?.r2 === "string";
+  }
+  return false;
+}
+
+/** The exact fixture capability shared by browser affordances and the runner. */
+export function representativeValidationCapability(graph: SomiteGraph): RepresentativeValidationCapability {
+  const roots = graph.nodes.filter((node) => {
+    const hasInbound = graph.edges.some((edge) => edge.to_node === node.id);
+    const hasInputPort = node.ports.some((port) => port.dir === "in");
+    return !hasInbound && !hasInputPort;
+  });
+  const unsupportedRoots = roots.filter((node) => !representativeSourceParametersAreBindable(node)).map((node) => node.operator);
+  if (graph.nodes.length > 0 && roots.length > 0 && unsupportedRoots.length === 0) {
+    return { supported: true, fixture_pack: REPRESENTATIVE_FASTQ_PACK };
+  }
+  const shown = [...new Set(unsupportedRoots)].sort();
+  const starts = shown.length ? shown.join(", ") : graph.nodes.length ? "no bindable root input" : "an empty canvas";
+  return {
+    supported: false,
+    code: "representative_fixture_unsupported",
+    reason: `Representative validation currently supports workflows rooted in local single or paired FASTQ inputs. This workflow starts with ${starts}; Run can still use its real inputs, but Validate is unavailable until a reviewed fixture adapter exists.`,
+    unsupported_roots: shown,
+  };
+}
+
 function cloneGraph(graph: SomiteGraph) {
   return structuredClone(graph);
 }
@@ -32,6 +76,8 @@ export function bindRepresentativeFastq(
 ): FixtureBinding {
   const validation = validateGraph(graph);
   if (!validation.ok) throw new Error(`invalid graph: ${validation.issue.message}`);
+  const capability = representativeValidationCapability(graph);
+  if (!capability.supported) throw new RepresentativeValidationError(capability);
   const runnable = cloneGraph(graph);
   const normalized = cloneGraph(graph);
   const digests = new Set<string>();

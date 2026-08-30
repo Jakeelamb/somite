@@ -64,6 +64,7 @@ import { paperReadingPresentation } from "./paperReading";
 import { publicSourceOutcome, type PublicSourceFailures } from "./publicSourceSearch";
 import { catalogExpansionPresentation, type CatalogExpansionActivity } from "./catalogExpansion";
 import type { WorkflowCatalogLoadState } from "./backgroundRequests";
+import type { RepresentativeValidationCapability } from "@somite/workflow/fixtures";
 import {
   groupedWorkflowParameters,
   hiddenRequiredWorkflowParameters,
@@ -312,9 +313,10 @@ export function AgentPanel({ snapshot, discovery, discoveryLoading, draft, onRef
   );
 }
 
-export function ReadinessPanel({ snapshot, evidence, onResolve, onFocus, onAttachFile, onAskAssistant, onClose }: {
+export function ReadinessPanel({ snapshot, evidence, validationCapability, onResolve, onFocus, onAttachFile, onAskAssistant, onClose }: {
   snapshot: ReadinessSnapshot;
   evidence: ValidationEvidenceResponse | null;
+  validationCapability: RepresentativeValidationCapability;
   onResolve: (item: ReadinessItem) => void;
   onFocus: (item: ReadinessItem) => void;
   onAttachFile: (item: ReadinessItem, field: string, file: File) => Promise<void>;
@@ -328,7 +330,9 @@ export function ReadinessPanel({ snapshot, evidence, onResolve, onFocus, onAttac
     .filter((resolution) => resolution.recommended && resolution.kind !== "connect" && resolution.kind !== "configure")
     .map((resolution) => ({ item, resolution })));
   const receipt = evidence?.receipt;
-  const evidenceLabel = receipt?.result === "passed" ? "Validated" : receipt?.result === "failed" ? "Failed" : receipt ? "Inconclusive" : "Not validated";
+  const evidenceLabel = !validationCapability.supported
+    ? "Unavailable"
+    : receipt?.result === "passed" ? "Validated" : receipt?.result === "failed" ? "Failed" : receipt ? "Inconclusive" : "Not validated";
   const sourceBlocker = current?.operator_id === "workflow.source" && current.fields.length === 0;
   return (
     <section className="floating-panel readiness-window" aria-label="Workflow Readiness">
@@ -393,7 +397,9 @@ export function ReadinessPanel({ snapshot, evidence, onResolve, onFocus, onAttac
           <header><strong>Evidence</strong><span>{evidenceLabel}</span></header>
           <div className={receipt?.result === "passed" ? "passed" : receipt?.result === "failed" ? "failed" : "pending"}>
             {receipt?.result === "passed" ? <CheckCircle2 size={14} /> : <CircleAlert size={14} />}
-            <span><strong>{evidenceLabel}</strong><small>{receipt ? `${receipt.scope} · ${receipt.fixture_digests.length} fixture${receipt.fixture_digests.length === 1 ? "" : "s"}` : "Validate with representative fixtures when readiness is clear."}</small></span>
+            <span><strong>{evidenceLabel}</strong><small>{!validationCapability.supported
+              ? validationCapability.reason
+              : receipt ? `${receipt.scope} · ${receipt.fixture_digests.length} fixture${receipt.fixture_digests.length === 1 ? "" : "s"}` : "Validate with representative fixtures when readiness is clear."}</small></span>
           </div>
         </section>
       </div>

@@ -101,6 +101,9 @@ network, or AI work.
 
 Readiness and evidence remain different claims. A structurally complete graph
 may be ready to run without having a passing validation receipt.
+Representative validation is capability-gated separately: the current fixture
+adapter supports local single and paired FASTQ roots. Other roots use their real
+inputs for Run and never enter a synthetic validation attempt.
 
 ### Compilation and freezing
 

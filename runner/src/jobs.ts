@@ -21,8 +21,10 @@ import { OperatorCatalog } from "@somite/workflow/catalog";
 import { byteDigest } from "@somite/workflow/contentIdentity";
 import {
   bindRepresentativeFastq,
+  representativeValidationCapability,
   type FixtureBinding,
   type MaterializedFastqFixture,
+  RepresentativeValidationError,
 } from "@somite/workflow/fixtures";
 import {
   createEvidenceReceipt,
@@ -411,6 +413,8 @@ export class RunManager {
   }
 
   async #validationContext(graph: SomiteGraph): Promise<ValidationContext> {
+    const capability = representativeValidationCapability(graph);
+    if (!capability.supported) throw new RepresentativeValidationError(capability);
     const [readOne, readTwo] = await Promise.all([
       materializeFixtureObject(this.#projectRoot, join(this.#repositoryRoot, "fixtures", "fastq", "v1", "reads_R1.fastq")),
       materializeFixtureObject(this.#projectRoot, join(this.#repositoryRoot, "fixtures", "fastq", "v1", "reads_R2.fastq")),

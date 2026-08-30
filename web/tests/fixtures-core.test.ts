@@ -5,7 +5,11 @@ import { fileURLToPath } from "node:url";
 
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
 import { byteDigest } from "@somite/workflow/contentIdentity";
-import { bindRepresentativeFastq } from "@somite/workflow/fixtures";
+import {
+  bindRepresentativeFastq,
+  representativeValidationCapability,
+  RepresentativeValidationError,
+} from "@somite/workflow/fixtures";
 import type { SomiteGraph, SomiteGraphNode } from "@somite/workflow/model";
 
 async function fixtureGraph() {
@@ -56,8 +60,18 @@ test("representative FASTQ identity is path-independent", async () => {
 test("representative validation rejects unsupported root sources", async () => {
   const { graph, fixtures } = await fixtureGraph();
   const unsupported: SomiteGraphNode = { ...graph.nodes[0], operator: "sra.prefetch" };
+  const capability = representativeValidationCapability({ ...graph, nodes: [unsupported] });
+  assert.deepEqual(capability, {
+    supported: false,
+    code: "representative_fixture_unsupported",
+    reason: "Representative validation currently supports workflows rooted in local single or paired FASTQ inputs. This workflow starts with sra.prefetch; Run can still use its real inputs, but Validate is unavailable until a reviewed fixture adapter exists.",
+    unsupported_roots: ["sra.prefetch"],
+  });
   assert.throws(
     () => bindRepresentativeFastq({ ...graph, nodes: [unsupported] }, fixtures),
-    /unsupported validation source sra\.prefetch/,
+    (error) => error instanceof RepresentativeValidationError
+      && error.code === "representative_fixture_unsupported"
+      && error.capability.reason === capability.reason
+      && error.capability.unsupported_roots.join(",") === "sra.prefetch",
   );
 });

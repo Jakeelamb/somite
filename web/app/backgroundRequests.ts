@@ -1,4 +1,5 @@
-import type { SomiteGraph, SomiteGraphNode } from "./types";
+import type { SomiteGraph } from "./types";
+import { representativeValidationCapability } from "@somite/workflow/fixtures";
 
 export type WorkflowCatalogLoadState = "idle" | "loading" | "loaded" | "failed";
 
@@ -16,24 +17,8 @@ export function workflowCatalogRequestPaths({
   return sessionReady && libraryVisible && loadState === "idle" ? WORKFLOW_CATALOG_PATHS : [];
 }
 
-function representativeSourceParametersAreBindable(node: SomiteGraphNode) {
-  if (node.operator === "files.import") return typeof node.params?.path === "string";
-  if (node.operator === "files.import_paired") {
-    return typeof node.params?.r1 === "string" && typeof node.params?.r2 === "string";
-  }
-  return false;
-}
-
 export function graphSupportsRepresentativeValidation(graph: SomiteGraph) {
-  if (graph.nodes.length === 0) return false;
-  if (graph.nodes.some((node) => node.operator === "workflow.source" || node.source_workflow)) return false;
-
-  const roots = graph.nodes.filter((node) => {
-    const hasInbound = graph.edges.some((edge) => edge.to_node === node.id);
-    const hasInputPort = node.ports.some((port) => port.dir === "in");
-    return !hasInbound && !hasInputPort;
-  });
-  return roots.length > 0 && roots.every(representativeSourceParametersAreBindable);
+  return representativeValidationCapability(graph).supported;
 }
 
 export function validationEvidenceRequestPath({

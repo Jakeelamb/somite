@@ -12,6 +12,7 @@ import { OperatorCatalog, operatorPorts, type PinnedOperator } from "@somite/wor
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
 import { canonicalJsonDigest } from "@somite/workflow/contentIdentity";
 import { parseGraph, parseParameterRecord, parseWorkflowBinding } from "@somite/workflow/graphCodec";
+import { RepresentativeValidationError } from "@somite/workflow/fixtures";
 import type { SomiteGraph } from "@somite/workflow/model";
 import { paperAccessionKind, reconstructPaper, type PaperResourceCitation } from "@somite/workflow/paper";
 import {
@@ -1183,7 +1184,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
       );
       return json(started, { status: 202 });
     } catch (error) {
-      if (error instanceof WorkflowAdmissionError || error instanceof ProductionInputError) throw error;
+      if (error instanceof WorkflowAdmissionError || error instanceof ProductionInputError || error instanceof RepresentativeValidationError) throw error;
       throw new HttpError(409, error instanceof Error ? error.message : String(error));
     }
   }
@@ -1193,6 +1194,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     try {
       return json(await state.runs.validationStatus(graph));
     } catch (error) {
+      if (error instanceof RepresentativeValidationError) throw error;
       throw new HttpError(422, error instanceof Error ? error.message : String(error));
     }
   }
@@ -1306,6 +1308,8 @@ export async function startServer(options: ServerOptions = {}) {
           ? errorResponse(422, error.message, { code: "workflow_not_ready", assessment: error.assessment })
         : error instanceof ProductionInputError
           ? errorResponse(422, error.message, { code: error.code })
+        : error instanceof RepresentativeValidationError
+          ? errorResponse(422, error.message, { code: error.code, capability: error.capability })
         : error instanceof ProjectGatewayError
           ? errorResponse(
             error.code === "project_ambiguous" ? 409
