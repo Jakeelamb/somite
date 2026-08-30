@@ -409,6 +409,7 @@ async function commitAutosavedGraph(
   inputOriginId = state.inputOrigins.currentId,
   canonical = false,
 ) {
+  state.inputOrigins.requireRecovered();
   const encoded = encodeGraph(graph);
   if (canonical) await atomicWrite(state.graphPath, encoded);
   await atomicWrite(state.autosavePath, encoded);
@@ -671,6 +672,7 @@ async function resolveAgentNfcore(state: ProjectState, value: unknown) {
   }
   const currentRevision = projectStateRevision(state);
   if (fields.baseStateRevision !== currentRevision) throw new HttpError(409, "canvas changed since this import started", { state_revision: currentRevision });
+  state.inputOrigins.requireRecovered();
   if (state.graph.nodes.length || state.graph.edges.length) throw new HttpError(422, "source workflow import requires an empty canvas");
   const imported = await state.nfcore.import(workflow, revision);
   return commitAgentMutation(state, { ...fields, requestDigest }, (current) => ({
@@ -759,6 +761,29 @@ async function saveGraph(state: ProjectState, request: Request, canonical: boole
   state.writeChain = operation.catch(() => undefined);
   await operation;
   return json({ valid: true, state_revision: responseRevision });
+}
+
+async function recoverInputOrigin(state: ProjectState, request: Request) {
+  const body = object(await requestJson(request), "input location recovery");
+  knownFields(body, "input location recovery", ["base_state_revision", "input_origin_id"]);
+  const baseStateRevision = requiredString(body.base_state_revision, "base_state_revision");
+  const inputOriginId = requiredString(body.input_origin_id, "input_origin_id");
+  let response: { state_revision: string; input_origin_id: string; input_origin_warning: null } | undefined;
+  const operation = state.writeChain.then(async () => {
+    const currentRevision = projectStateRevision(state);
+    if (baseStateRevision !== currentRevision) {
+      throw new HttpError(409, "canvas changed since input recovery started", { state_revision: currentRevision });
+    }
+    await state.inputOrigins.recover(inputOriginId, state.graph);
+    response = {
+      state_revision: projectStateRevision(state),
+      input_origin_id: state.inputOrigins.currentId,
+      input_origin_warning: null,
+    };
+  });
+  state.writeChain = operation.catch(() => undefined);
+  await operation;
+  return json(response!);
 }
 
 function paperResource(value: unknown, index: number): PaperResourceCitation {
@@ -941,7 +966,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     return json(await state.runs.compile(
       state.graph,
       { archiveName: state.graph.name ?? basename(state.root), platform: pixiPlatform() },
-      state.inputOrigins.location(),
+      state.inputOrigins.executionLocation(),
     ));
   }
   if (request.method === "GET" && url.pathname === "/api/agent/evidence") {
@@ -1161,6 +1186,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
       throw new HttpError(422, error instanceof Error ? error.message : String(error));
     }
   }
+  if (request.method === "POST" && url.pathname === "/api/input-origin/recover") return recoverInputOrigin(state, request);
   if (request.method === "PUT" && url.pathname === "/api/graph") return saveGraph(state, request, true);
   if (request.method === "PUT" && url.pathname === "/api/graph/autosave") return saveGraph(state, request, false);
   if (request.method === "POST" && url.pathname === "/api/graph/validate") {
@@ -1179,7 +1205,8 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     }, (binary) => state.availableBinaries.has(binary)));
   }
   if (request.method === "POST" && url.pathname === "/api/export") {
-    const { graph, inputLocation } = scopedGraph(state, await requestWorkflowJson(request), "export request");
+    const { graph, inputOriginId } = scopedGraph(state, await requestWorkflowJson(request), "export request");
+    const inputLocation = state.inputOrigins.executionLocation(inputOriginId);
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     const exported = await state.runs.export(graph, {
       archiveName: graph.name ?? basename(state.root),
@@ -1193,7 +1220,8 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     });
   }
   if (request.method === "POST" && (url.pathname === "/api/runs" || url.pathname === "/api/validations")) {
-    const { graph, inputLocation } = scopedGraph(state, await requestWorkflowJson(request), "run request");
+    const { graph, inputOriginId } = scopedGraph(state, await requestWorkflowJson(request), "run request");
+    const inputLocation = state.inputOrigins.executionLocation(inputOriginId);
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, graph);
     try {
       const started = await state.runs.start(
@@ -1338,7 +1366,7 @@ export async function startServer(options: ServerOptions = {}) {
             { code: error.code },
           )
         : error instanceof InputOriginError
-          ? errorResponse(400, error.message, { code: error.code })
+          ? errorResponse(error.code === "input_origin_recovery_required" ? 409 : 400, error.message, { code: error.code })
         : error instanceof AgentManagerError
           ? errorResponse(error.code === "already_connected" || error.code === "busy" ? 409 : error.code === "not_connected" ? 404 : 400, error.message, { code: error.code })
         : error instanceof PaperStoreError

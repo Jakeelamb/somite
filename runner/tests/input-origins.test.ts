@@ -43,6 +43,18 @@ test("InputOrigins keeps external directories opaque and restores the exact auto
     assert.match(stale.warning ?? "", /does not match the recovered canvas/);
     assert.deepEqual(stale.location(), { graphBase: root, relativeInputOrder: "project_first" });
     assert.throws(
+      () => stale.executionLocation(),
+      (error: unknown) => error instanceof InputOriginError && error.code === "input_origin_recovery_required",
+    );
+    await assert.rejects(
+      stale.record(stale.currentId, graph("Different graph")),
+      (error: unknown) => error instanceof InputOriginError && error.code === "input_origin_recovery_required",
+    );
+    const recoveredId = await stale.registerOpenedGraph(external);
+    await stale.recover(recoveredId, graph("Different graph"));
+    assert.equal(stale.warning, null);
+    assert.deepEqual(stale.executionLocation(), { graphBase: external, relativeInputOrder: "graph_first" });
+    assert.throws(
       () => origins.location("AAAAAAAAAAAAAAAAAAAAAAAA"),
       (error: unknown) => error instanceof InputOriginError && error.code === "input_origin_unknown",
     );

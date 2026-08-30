@@ -20,7 +20,7 @@ type PersistedInputOrigin = Readonly<{
 }>;
 
 export class InputOriginError extends Error {
-  readonly code: "input_origin_invalid" | "input_origin_unknown" | "input_origin_limit";
+  readonly code: "input_origin_invalid" | "input_origin_unknown" | "input_origin_limit" | "input_origin_recovery_required";
 
   constructor(code: InputOriginError["code"], message: string, cause?: unknown) {
     super(message, cause === undefined ? undefined : { cause });
@@ -117,11 +117,37 @@ export class InputOrigins {
     return location;
   }
 
+  requireRecovered() {
+    if (!this.warning) return;
+    throw new InputOriginError(
+      "input_origin_recovery_required",
+      "Workflow input location needs confirmation before Somite can save or materialize files. Reopen the original .somite.json file, or explicitly use this project folder.",
+    );
+  }
+
+  executionLocation(originId = this.#currentId) {
+    this.requireRecovered();
+    return this.location(originId);
+  }
+
   async registerOpenedGraph(graphBase: string) {
     return this.#register(graphBase, "graph_first");
   }
 
   async record(originId: string, graph: SomiteGraph) {
+    this.requireRecovered();
+    await this.#persist(originId, graph);
+  }
+
+  async recover(originId: string, graph: SomiteGraph) {
+    const location = this.location(originId);
+    const available = await canonicalDirectory(location.graphBase, "workflow input location", true);
+    if (available !== location.graphBase) throw new InputOriginError("input_origin_invalid", "workflow input location changed before recovery");
+    await this.#persist(originId, graph);
+    this.warning = null;
+  }
+
+  async #persist(originId: string, graph: SomiteGraph) {
     const location = this.location(originId);
     const persisted: PersistedInputOrigin = {
       schema_version: 1,

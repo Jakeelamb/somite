@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 
 import { byteDigest } from "@somite/workflow/contentIdentity";
 import { operatorPorts, type Operator } from "@somite/workflow/catalog";
+import { InputOrigins } from "../src/inputOrigins.ts";
 import { startServer } from "../src/server.ts";
 import { MAX_WORKFLOW_REQUEST_BYTES } from "../src/workflowLimits.ts";
 
@@ -555,6 +556,81 @@ test("project startup still recovers a valid autosave without a warning", async 
   } finally {
     await running.close();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("recovered graphs fail closed until their local input location is explicitly rebound", async () => {
+  const root = await mkdtemp(join(tmpdir(), "somite-runner-origin-recovery-"));
+  const external = await mkdtemp(join(tmpdir(), "somite-runner-origin-recovery-external-"));
+  const graphPath = join(root, "saved.somite.json");
+  const autosavePath = join(root, "saved.somite.autosave.somite.json");
+  const saved = { schema_version: 3 as const, name: "Saved workflow", nodes: [], edges: [] };
+  const recovered = { schema_version: 3 as const, name: "Recovered workflow", nodes: [], edges: [] };
+  const mutationHeaders = { "content-type": "application/json", origin: "http://localhost:3000" };
+  const agentCapability = "a".repeat(64);
+  let running: Awaited<ReturnType<typeof startServer>> | undefined;
+  try {
+    await mkdir(join(root, ".somite"));
+    await writeFile(graphPath, `${JSON.stringify(saved, null, 2)}\n`);
+    await writeFile(autosavePath, `${JSON.stringify(recovered, null, 2)}\n`);
+    const origins = await InputOrigins.open(root, graphPath, root, saved);
+    const externalId = await origins.registerOpenedGraph(external);
+    await origins.record(externalId, saved);
+    const externalGraphPath = join(external, "original.somite.json");
+    await writeFile(externalGraphPath, `${JSON.stringify(recovered, null, 2)}\n`);
+
+    running = await startServer({ projectRoot: root, graph: "saved.somite.json", port: await unusedPort(), agentCapability });
+    const session = await fetch(`${running.url}/api/session`).then((response) => response.json()) as {
+      graph: unknown;
+      state_revision: string;
+      input_origin_id: string;
+      input_origin_warning: string | null;
+    };
+    assert.match(session.input_origin_warning ?? "", /does not match the recovered canvas/);
+
+    const graphRequest = { graph: session.graph, input_origin_id: session.input_origin_id };
+    const blocked = [
+      fetch(`${running.url}/api/graph/autosave`, { method: "PUT", headers: mutationHeaders, body: JSON.stringify({ ...graphRequest, base_state_revision: session.state_revision }) }),
+      fetch(`${running.url}/api/export`, { method: "POST", headers: mutationHeaders, body: JSON.stringify(graphRequest) }),
+      fetch(`${running.url}/api/runs`, { method: "POST", headers: mutationHeaders, body: JSON.stringify(graphRequest) }),
+      fetch(`${running.url}/api/validations`, { method: "POST", headers: mutationHeaders, body: JSON.stringify(graphRequest) }),
+      fetch(`${running.url}/api/agent/compile`, { method: "POST", headers: { ...mutationHeaders, "x-somite-mcp-capability": agentCapability }, body: "{}" }),
+    ];
+    for (const response of await Promise.all(blocked)) {
+      assert.equal(response.status, 409, await response.clone().text());
+      assert.equal((await response.json() as { code?: string }).code, "input_origin_recovery_required");
+    }
+
+    const openedResponse = await fetch(`${running.url}/api/projects/open`, {
+      method: "POST",
+      headers: mutationHeaders,
+      body: JSON.stringify({ path: externalGraphPath, snakemake_targets: [] }),
+    });
+    assert.equal(openedResponse.status, 200, await openedResponse.clone().text());
+    const opened = await openedResponse.json() as { input_origin_id: string };
+    const reboundResponse = await fetch(`${running.url}/api/input-origin/recover`, {
+      method: "POST",
+      headers: mutationHeaders,
+      body: JSON.stringify({ base_state_revision: session.state_revision, input_origin_id: opened.input_origin_id }),
+    });
+    assert.equal(reboundResponse.status, 200, await reboundResponse.clone().text());
+    const rebound = await reboundResponse.json() as { state_revision: string; input_origin_id: string; input_origin_warning: null };
+    assert.equal(rebound.input_origin_id, opened.input_origin_id);
+    assert.equal(rebound.input_origin_warning, null);
+    assert.notEqual(rebound.state_revision, session.state_revision);
+
+    const savedAfterRecovery = await fetch(`${running.url}/api/graph/autosave`, {
+      method: "PUT",
+      headers: mutationHeaders,
+      body: JSON.stringify({ graph: session.graph, base_state_revision: rebound.state_revision, input_origin_id: rebound.input_origin_id }),
+    });
+    assert.equal(savedAfterRecovery.status, 200, await savedAfterRecovery.clone().text());
+    const recoveredSession = await fetch(`${running.url}/api/session`).then((response) => response.json()) as { input_origin_warning: string | null };
+    assert.equal(recoveredSession.input_origin_warning, null);
+  } finally {
+    await running?.close().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+    await rm(external, { recursive: true, force: true });
   }
 });
 
