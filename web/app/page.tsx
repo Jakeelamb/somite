@@ -12,5 +12,8 @@ export default async function Home({
   searchParams: Promise<{ q?: string | string[] }>;
 }) {
   const { q } = await searchParams;
-  return <SomiteApp initialQuery={typeof q === "string" ? q : ""} />;
+  const serverUrl = process.env.SOMITE_SERVER_URL
+    ?? process.env.NEXT_PUBLIC_SOMITE_SERVER
+    ?? "http://localhost:7310";
+  return <SomiteApp initialQuery={typeof q === "string" ? q : ""} serverUrl={serverUrl} />;
 }

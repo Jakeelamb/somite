@@ -103,6 +103,7 @@ try {
     ? ["start", "--hostname", "127.0.0.1"]
     : ["dev"], {
     ...process.env,
+    SOMITE_SERVER_URL: process.env.SOMITE_SERVER_URL ?? runnerUrl,
     NEXT_PUBLIC_SOMITE_SERVER: process.env.NEXT_PUBLIC_SOMITE_SERVER ?? runnerUrl,
   });
   const result = await new Promise<number | null>((resolvePromise) => web.once("close", resolvePromise));

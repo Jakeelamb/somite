@@ -130,7 +130,7 @@ import type {
 } from "./types";
 import { portColor } from "./visual";
 import { edgeLifecycleState, evidenceNodeState, semanticGraphKey } from "./validationState";
-import { JsonRequestError, SOMITE_SERVER, jsonRequest } from "./api";
+import { JsonRequestError, configureSomiteServer, jsonRequest, somiteServerUrl } from "./api";
 import { AGENT_POLL_DEGRADED_AFTER, AGENT_POLL_INTERVAL_MS, agentBatchMatchesAuthoritativeState, agentPollCursorAfterSnapshot, agentPollFailureState, mergeAgentSnapshots, planAgentTransactions } from "./agentState";
 import { readinessAgentPrompt, readinessSummary } from "./readinessState";
 import { appendStrokePoint, canvasColor as getCanvasColor, canvasPalette, createCanvasAnnotation, nextAnnotationId } from "./canvasPresentation";
@@ -2429,7 +2429,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
     setExportDownloading(true);
     setStatus("Freezing the Pixi/Nextflow run project…");
     try {
-      const response = await fetch(`${SOMITE_SERVER}/api/export`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(graphRequest()) });
+      const response = await fetch(`${somiteServerUrl()}/api/export`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(graphRequest()) });
       if (!response.ok) {
         const detail = (await response.json().catch(() => null)) as { error?: string } | null;
         throw new Error(detail?.error ?? `${response.status} ${response.statusText}`);
@@ -3083,6 +3083,7 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
   );
 }
 
-export function SomiteApp({ initialQuery = "" }: { initialQuery?: string }) {
+export function SomiteApp({ initialQuery = "", serverUrl = "http://localhost:7310" }: { initialQuery?: string; serverUrl?: string }) {
+  configureSomiteServer(serverUrl);
   return <ReactFlowProvider><SomiteWorkspace initialQuery={initialQuery} /></ReactFlowProvider>;
 }
