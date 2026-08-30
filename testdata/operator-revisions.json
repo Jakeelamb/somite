@@ -1,5 +1,5 @@
 {
-  "catalog_revision": "blake3:8fd858222d64023fd043f3cd26437b85ceac8e2e363f8545edda79773522d008",
+  "catalog_revision": "blake3:f6a6a2d52360dbc7f71bd690507aeb2c78a2d2580ddac2e93a74e93ccebeaed9",
   "operator_revisions": {
     "align.bowtie2": "blake3:f168b92d9daec4eef0b339520f74b8b220721012a01cf6b3d545951250b65022",
     "align.bowtie2_build": "blake3:8544639508e6ee61a02c675f1bce827c450d7357dc2b58d784e6b27093fe9f35",
@@ -23,6 +23,7 @@
     "files.import": "blake3:4919927a3059aa4543d45380fd700993964e3e239ceb9e3fda73b5956b89bc4a",
     "files.import_directory": "blake3:a4e7b5f483849df76af5efa1be6d125b377eb0853018727725cf16ec958efa62",
     "files.import_fasta": "blake3:930a33853b72fb4d3e04f62bbd3a3c0af48a00029113c9a3afe71c04468bc2e3",
+    "files.import_kraken2_database": "blake3:e3dc0224d30ddd91d9f89080a3f9d238e55f79fe2fd200f9caaed0d9b1603418",
     "files.import_paired": "blake3:149bec674c767c1f10479bba53836d2e5245202088e7d1e175822411bb997ec3",
     "gap.missing": "blake3:b52aa44cf71ad53b70e59b27f940f0c3c39f62e86d4dd00b5c627f222f23f4c1",
     "legacy.agouti": "blake3:f2286d63f3bc98195d03c9b8c3e1e60e9e947b6239ff5194418c76ed0a9936b1",

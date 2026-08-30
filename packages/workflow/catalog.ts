@@ -36,6 +36,8 @@ export type PortSpec = {
   type: PortType;
   union?: PortType[];
   optional?: boolean;
+  /** Scientific resource format provided by this output, beyond its physical artifact type. */
+  resource_profile?: string;
   resource?: ResourceSpec;
   stage_as?: string;
   import_param?: string;
@@ -111,6 +113,7 @@ export type CatalogIssueCode =
   | "unknown_operator"
   | "revision_mismatch"
   | "port_contract_mismatch"
+  | "resource_profile_mismatch"
   | "source_workflow_contract_mismatch";
 
 export type CatalogIssue = Readonly<{ code: CatalogIssueCode; message: string }>;
@@ -262,6 +265,28 @@ export class OperatorCatalog {
     if (graph.variant_origin) {
       const issue = this.#verifyNode(graph.variant_origin.source_node);
       if (issue) return issue;
+    }
+    const nodes = new Map(graph.nodes.map((node) => [node.id, node]));
+    for (const edge of graph.edges) {
+      const sourceNode = nodes.get(edge.from_node);
+      const targetNode = nodes.get(edge.to_node);
+      if (!sourceNode || !targetNode) continue;
+      const sourceOperator = this.#operators.get(sourceNode.operator);
+      const targetOperator = this.#operators.get(targetNode.operator);
+      if (!sourceOperator || !targetOperator) continue;
+      const requiredProfile = targetOperator.ports.in
+        .find((port) => port.name === edge.to_port)
+        ?.resource?.profile;
+      if (!requiredProfile) continue;
+      const providedProfile = sourceOperator.ports.out
+        .find((port) => port.name === edge.from_port)
+        ?.resource_profile;
+      if (providedProfile !== requiredProfile) {
+        return failure(
+          "resource_profile_mismatch",
+          `edge ${edge.id} requires resource profile ${requiredProfile} at ${edge.to_node}.${edge.to_port}, but ${edge.from_node}.${edge.from_port} provides ${providedProfile ? `resource profile ${providedProfile}` : "no resource profile"}`,
+        );
+      }
     }
     return { ok: true };
   }

@@ -86,6 +86,8 @@ it is not an anonymous path or part of a Pixi environment.
 **Resource profile** — the machine-checkable scientific format of a Managed
 resource, such as `kraken2-database`. It refines the physical artifact kind so
 an arbitrary Directory cannot satisfy a specialized database or index input.
+A reviewed existing-resource import provides this profile on its output; the
+catalog verifies it against the consuming input before accepting the Edge.
 
 **Resource materialization** — importing, downloading, or building a Managed
 resource into a user-owned persistent store and recording its identity. It is

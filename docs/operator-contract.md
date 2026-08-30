@@ -24,6 +24,13 @@ accepts at most one edge. Paired reads remain separate `r1` and `r2` ports.
 `Directory` is not a wildcard. Use it only when the directory itself is the
 tool's real artifact contract. Do not use it to avoid defining files.
 
+A managed-resource input refines that physical type with `resource.profile`.
+An output may provide the matching provenance with `resource_profile`. Catalog
+verification requires an exact profile match before it accepts the edge, so an
+ordinary `Directory` cannot satisfy a Kraken2 database input. A profiled output
+remains usable by a generic `Directory` input because it still has that physical
+artifact type.
+
 Collections, scatter/gather, tuple metadata, and streaming channels are not in
 Graph schema v1. An Operator that requires them is an adapter gap, not a reason
 to hide semantics in a shell command.
@@ -86,6 +93,9 @@ checkpoints lower to input channels. An output port may declare
 `import_param` to name the parameter containing the local file it represents;
 this supports multi-file checkpoints without adding paper-specific compiler
 branches. Other in-process operators fail compilation until explicitly lowered.
+An existing managed-resource directory uses this same local-path contract and a
+reviewed output `resource_profile`; this records compatibility but neither
+downloads the resource nor claims its biological contents were validated.
 
 ### `reference`
 

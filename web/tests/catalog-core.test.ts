@@ -37,7 +37,7 @@ function graph(nodes: SomiteGraphNode[], edges: SomiteGraph["edges"] = []): Somi
 test("catalog loading reproduces every reviewed operator and revision", async () => {
   const loaded = await reviewedCatalog();
   const oracle = JSON.parse(await readFile(oraclePath, "utf8")) as RevisionOracle;
-  assert.equal(loaded.operators.length, 48);
+  assert.equal(loaded.operators.length, 49);
   assert.deepEqual(
     Object.fromEntries(loaded.operators.map((operator) => [operator.id, operator.revision])),
     oracle.operator_revisions,

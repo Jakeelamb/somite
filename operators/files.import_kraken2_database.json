@@ -1,0 +1,23 @@
+{
+  "id": "files.import_kraken2_database",
+  "title": "Existing Kraken2 database",
+  "palette": ["Files", "Metagenomics"],
+  "kind": "inprocess",
+  "cost": "low",
+  "params": {
+    "path": { "type": "string", "label": "Kraken2 database directory", "page": "Database", "required": true }
+  },
+  "ports": {
+    "in": [],
+    "out": [
+      {
+        "name": "database",
+        "type": "Directory",
+        "import_param": "path",
+        "resource_profile": "kraken2-database"
+      }
+    ]
+  },
+  "argv": [],
+  "outputs": {}
+}

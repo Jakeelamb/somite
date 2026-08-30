@@ -106,6 +106,18 @@ function portTypes(value: unknown, path: string) {
   return value.map((item, index) => portType(item, `${path}[${index}]`));
 }
 
+function resourceProfile(value: unknown, path: string) {
+  const profile = string(value, path);
+  if (profile.length > 128 || !/^[a-z0-9]+(?:[._-][a-z0-9]+)*$/.test(profile)) {
+    throw new Error(`${path} must be a lowercase resource profile identifier`);
+  }
+  return profile;
+}
+
+function optionalResourceProfile(value: unknown, path: string) {
+  return value === undefined || value === null ? undefined : resourceProfile(value, path);
+}
+
 function parseParamSpec(value: unknown, path: string): ParamSpec {
   const raw = object(value, path);
   knownFields(raw, path, ["type", "label", "page", "default", "required", "min", "max"]);
@@ -144,7 +156,7 @@ function parseResource(value: unknown, path: string): ResourceSpec {
   const resolutions = raw.resolutions === undefined ? [] : raw.resolutions;
   if (!Array.isArray(resolutions)) throw new Error(`${path}.resolutions must be an array`);
   return {
-    profile: string(raw.profile, `${path}.profile`),
+    profile: resourceProfile(raw.profile, `${path}.profile`),
     title: string(raw.title, `${path}.title`),
     detail: string(raw.detail, `${path}.detail`),
     resolutions: resolutions.map((item, index) => parseResolution(item, `${path}.resolutions[${index}]`)),
@@ -153,8 +165,9 @@ function parseResource(value: unknown, path: string): ResourceSpec {
 
 function parsePort(value: unknown, path: string): PortSpec {
   const raw = object(value, path);
-  knownFields(raw, path, ["name", "type", "union", "optional", "resource", "stage_as", "import_param"]);
+  knownFields(raw, path, ["name", "type", "union", "optional", "resource", "resource_profile", "stage_as", "import_param"]);
   const resource = raw.resource === undefined || raw.resource === null ? undefined : parseResource(raw.resource, `${path}.resource`);
+  const providedResourceProfile = optionalResourceProfile(raw.resource_profile, `${path}.resource_profile`);
   const stageAs = optionalString(raw.stage_as, `${path}.stage_as`);
   const importParam = optionalString(raw.import_param, `${path}.import_param`);
   return {
@@ -163,6 +176,7 @@ function parsePort(value: unknown, path: string): PortSpec {
     union: portTypes(raw.union, `${path}.union`),
     optional: boolean(raw.optional, `${path}.optional`),
     ...(resource ? { resource } : {}),
+    ...(providedResourceProfile !== undefined ? { resource_profile: providedResourceProfile } : {}),
     ...(stageAs !== undefined ? { stage_as: stageAs } : {}),
     ...(importParam !== undefined ? { import_param: importParam } : {}),
   };
@@ -288,6 +302,7 @@ function canonicalPort(spec: PortSpec) {
     union: spec.union ?? [],
     optional: spec.optional ?? false,
     ...(spec.resource ? { resource: canonicalResource(spec.resource) } : {}),
+    ...(spec.resource_profile !== undefined ? { resource_profile: spec.resource_profile } : {}),
     ...(spec.stage_as !== undefined ? { stage_as: spec.stage_as } : {}),
     ...(spec.import_param !== undefined ? { import_param: spec.import_param } : {}),
   };
