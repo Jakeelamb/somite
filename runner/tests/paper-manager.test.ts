@@ -6,6 +6,7 @@ import { Readable } from "node:stream";
 import test from "node:test";
 
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
+import { paperIntakeConfigFromEnvironment } from "../src/paperConfig.ts";
 import { PaperManager } from "../src/paperManager.ts";
 import { PaperStoreError } from "../src/paperStore.ts";
 import { pdfWithText } from "./pdfFixture.ts";
@@ -76,14 +77,15 @@ test("content-addressed PDF intake extracts through the isolated worker", async 
     assert.equal(status.phase, "completed");
     assert.equal(status.cache.extraction, false);
     assert.equal(status.result?.outcome, "drafts_ready");
-    const cachePath = path.join(root, ".somite", "papers", "cache", "extracted", `${artifact.digest.slice("blake3:".length)}-pdfjs-ocr-v3.json`);
-    const cache = JSON.parse(await readFile(cachePath, "utf8")) as { schema_version: number; extractor_identity: string };
-    assert.equal(cache.schema_version, 2);
+    const cachePath = path.join(root, ".somite", "papers", "cache", "extracted", `${artifact.digest.slice("blake3:".length)}-pdfjs-ocr-v4.json`);
+    const cache = JSON.parse(await readFile(cachePath, "utf8")) as { schema_version: number; configuration_digest: string; extractor_identity: string };
+    assert.equal(cache.schema_version, 3);
+    assert.match(cache.configuration_digest, /^blake3:[0-9a-f]{64}$/);
     assert.match(cache.extractor_identity, /^blake3:[0-9a-f]{64}$/);
-    await writeFile(cachePath, `${JSON.stringify({ ...cache, extractor_identity: `blake3:${"0".repeat(64)}` })}\n`);
+    await writeFile(cachePath, `${JSON.stringify({ ...cache, configuration_digest: `blake3:${"0".repeat(64)}` })}\n`);
     const rerun = await completed(manager, (await manager.start(artifact.digest)).job_id);
     assert.equal(rerun.phase, "completed");
-    assert.equal(rerun.cache.extraction, false, "a cache from another PDF.js identity must be recomputed");
+    assert.equal(rerun.cache.extraction, false, "a cache from another intake policy must be recomputed");
     await manager.shutdown();
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -122,6 +124,35 @@ test("paper intake automatically uses an available project-local OCR toolchain",
   }
 });
 
+test("paper intake verifies and invokes the configured OCR languages", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "somite-paper-manager-languages-"));
+  const argumentsPath = path.join(root, "tesseract-arguments.json");
+  try {
+    const bin = path.join(root, ".somite", "tools", "paper", ".pixi", "envs", "default", "bin");
+    await fakeExecutable(path.join(bin, "pdfinfo"), `if (process.argv.includes("-v")) process.stderr.write("pdfinfo version 25.01.0\\n"); else process.stdout.write("Pages: 1\\n");`);
+    await fakeExecutable(path.join(bin, "pdftoppm"), `if (process.argv.includes("-v")) process.stderr.write("pdftoppm version 25.01.0\\n"); else require("node:fs").writeFileSync(process.argv.at(-1) + ".png", "fake raster");`);
+    await fakeExecutable(path.join(bin, "tesseract"), `
+      if (process.argv.includes("--version")) process.stdout.write("tesseract 5.5.0\\n");
+      else if (process.argv.includes("--list-langs")) process.stdout.write("List of available languages (2):\\ndeu\\neng\\n");
+      else {
+        require("node:fs").writeFileSync(${JSON.stringify(argumentsPath)}, JSON.stringify(process.argv.slice(2)));
+        process.stdout.write("Methods RNA sequencing reads were checked with FastQC and aligned with STAR for expression analysis.\\n");
+      }
+    `);
+    const configuration = paperIntakeConfigFromEnvironment({ SOMITE_OCR_LANGS: "deu+eng" });
+    const manager = new PaperManager(root, loaded.catalog, loaded.revision, configuration);
+    const artifact = await manager.store.upload(uploadRequest("scan.pdf", pdfWithText(""), "application/pdf"));
+    const status = await completed(manager, (await manager.start(artifact.digest)).job_id);
+    assert.equal(status.phase, "completed");
+    const args = JSON.parse(await readFile(argumentsPath, "utf8")) as string[];
+    assert.equal(args[args.indexOf("-l") + 1], "deu+eng");
+    assert.equal((await manager.paperTools.preflight()).tools.find((tool) => tool.name === "tesseract")?.identity, "tesseract@5.5.0+deu+eng");
+    await manager.shutdown();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("oversized extraction caches are ignored and replaced within the byte bound", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "somite-paper-cache-bound-"));
   try {
@@ -130,7 +161,7 @@ test("oversized extraction caches are ignored and replaced within the byte bound
     const artifact = await manager.store.upload(uploadRequest("methods.txt", methods));
     const cacheDirectory = path.join(root, ".somite", "papers", "cache", "extracted");
     await mkdir(cacheDirectory, { recursive: true });
-    const cachePath = path.join(cacheDirectory, `${artifact.digest.slice("blake3:".length)}-pdfjs-ocr-v3.json`);
+    const cachePath = path.join(cacheDirectory, `${artifact.digest.slice("blake3:".length)}-pdfjs-ocr-v4.json`);
     await writeFile(cachePath, "");
     await truncate(cachePath, 72 * 1024 * 1024 + 1);
 
@@ -187,7 +218,9 @@ test("paper cancellation reaches a terminal observable state", async () => {
 test("paper upload rejects disguised and unsupported files before storage", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "somite-paper-upload-"));
   try {
-    const manager = new PaperManager(root, loaded.catalog, loaded.revision);
+    const manager = new PaperManager(root, loaded.catalog, loaded.revision, paperIntakeConfigFromEnvironment({
+      SOMITE_PAPER_MAX_UPLOAD_BYTES: String(64 * 1024 * 1024),
+    }));
     await assert.rejects(
       () => manager.store.upload(uploadRequest("fake.pdf", "not a PDF", "application/pdf")),
       (error: unknown) => error instanceof PaperStoreError && error.code === "paper_pdf_invalid",
@@ -210,7 +243,8 @@ test("paper upload rejects disguised and unsupported files before storage", asyn
     });
     await assert.rejects(
       () => manager.store.upload(oversized),
-      (error: unknown) => error instanceof PaperStoreError && error.status === 413 && error.code === "paper_upload_too_large",
+      (error: unknown) => error instanceof PaperStoreError && error.status === 413 && error.code === "paper_upload_too_large"
+        && /SOMITE_PAPER_MAX_UPLOAD_BYTES/.test(error.message),
     );
 
     const boundary = "somite-unbounded-field";

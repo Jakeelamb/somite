@@ -6,6 +6,7 @@ import { createRequire } from "node:module";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { atomicWrite, ensurePrivateDirectory, pathExists, regularFile } from "./files.ts";
+import { DEFAULT_PAPER_INTAKE_CONFIG, ocrLanguageCodes } from "./paperConfig.ts";
 import { terminateProcessTree } from "./process.ts";
 import { pixiPlatform } from "./system.ts";
 
@@ -51,6 +52,7 @@ export type PaperToolchainOptions = Readonly<{
   operatingSystem?: NodeJS.Platform;
   architecture?: string;
   pixiPath?: string;
+  ocrLanguages?: string;
 }>;
 
 export type PaperCommandOptions = Readonly<{
@@ -392,6 +394,7 @@ async function probeTool(
   path: string,
   cwd: string,
   environment: NodeJS.ProcessEnv,
+  requiredOcrLanguages: readonly string[],
 ): Promise<{ probe?: ToolProbe; failure?: string }> {
   const invoke = async (args: readonly string[]) => runPaperCommand(path, args, cwd, {
     timeoutMs: PROBE_TIMEOUT_MS,
@@ -411,8 +414,12 @@ async function probeTool(
     if (name === "tesseract") {
       const languages = await invoke(["--list-langs"]);
       if (languages.code !== 0) return { failure: "Tesseract could not inspect its trained data." };
-      if (!/^eng\s*$/m.test(decoded(languages))) return { failure: "Tesseract has no usable English (eng) trained data." };
-      return { probe: { version, identity: `tesseract@${version}+eng` } };
+      const installed = new Set(decoded(languages).split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
+      const missing = requiredOcrLanguages.filter((language) => !installed.has(language));
+      if (missing.length) return { failure: missing.length === 1 && missing[0] === "eng"
+        ? "Tesseract has no usable English (eng) trained data. Install eng or set SOMITE_OCR_LANGS to available trained data."
+        : `Tesseract is missing configured OCR trained data: ${missing.join(", ")}. Install those languages or set SOMITE_OCR_LANGS to available trained data.` };
+      return { probe: { version, identity: `tesseract@${version}+${requiredOcrLanguages.join("+")}` } };
     }
     return { probe: { version, identity: `${name}@${version}` } };
   } catch (error) {
@@ -431,6 +438,7 @@ async function resolveUsableTool(
   suffixes: readonly string[],
   cwd: string,
   environment: NodeJS.ProcessEnv,
+  requiredOcrLanguages: readonly string[],
 ): Promise<ToolResolution> {
   const failures: string[] = [];
   for (const directory of directories.slice(0, 128)) {
@@ -438,7 +446,7 @@ async function resolveUsableTool(
     for (const suffix of suffixes) {
       const path = await canonicalExecutable(join(directory, `${name}${suffix}`));
       if (!path) continue;
-      const result = await probeTool(name, path, cwd, environment);
+      const result = await probeTool(name, path, cwd, environment, requiredOcrLanguages);
       if (result.probe) return { resolved: { path, source, ...result.probe }, failures };
       if (result.failure) failures.push(result.failure);
     }
@@ -541,6 +549,7 @@ export class PaperToolchain {
   readonly #operatingSystem: NodeJS.Platform;
   readonly #architecture: string;
   readonly #pixiPath?: string;
+  readonly #ocrLanguages: readonly string[];
   #installation?: Promise<ManagedPaperToolchainInstall>;
 
   constructor(root: string, options: PaperToolchainOptions = {}) {
@@ -549,6 +558,7 @@ export class PaperToolchain {
     this.#operatingSystem = options.operatingSystem ?? process.platform;
     this.#architecture = options.architecture ?? process.arch;
     this.#pixiPath = options.pixiPath;
+    this.#ocrLanguages = ocrLanguageCodes(options.ocrLanguages ?? DEFAULT_PAPER_INTAKE_CONFIG.ocrLanguages);
   }
 
   async preflight(): Promise<PaperToolchainPreflight> {
@@ -573,17 +583,17 @@ export class PaperToolchain {
       const failures: string[] = [];
       let resolved = published?.tools[name];
       if (!resolved) {
-        const legacy = await resolveUsableTool(name, "managed_pixi", legacyManaged, suffixes, root, managedEnvironment);
+        const legacy = await resolveUsableTool(name, "managed_pixi", legacyManaged, suffixes, root, managedEnvironment, this.#ocrLanguages);
         resolved = legacy.resolved;
         failures.push(...legacy.failures);
       }
       if (!resolved) {
-        const local = await resolveUsableTool(name, "project_pixi", project, suffixes, root, probeEnvironment);
+        const local = await resolveUsableTool(name, "project_pixi", project, suffixes, root, probeEnvironment, this.#ocrLanguages);
         resolved = local.resolved;
         failures.push(...local.failures);
       }
       if (!resolved) {
-        const path = await resolveUsableTool(name, "system_path", system, suffixes, root, probeEnvironment);
+        const path = await resolveUsableTool(name, "system_path", system, suffixes, root, probeEnvironment, this.#ocrLanguages);
         resolved = path.resolved;
         failures.push(...path.failures);
       }
@@ -734,7 +744,7 @@ export class PaperToolchain {
     const suffixes = executableSuffixes(this.#operatingSystem, this.#environment);
     const bins = environmentBins(join(directory, ".pixi", "envs", "default"), this.#operatingSystem);
     const environment = minimalEnvironment(this.#environment, false);
-    const results = await Promise.all(toolNames.map((name) => resolveUsableTool(name, "managed_pixi", bins, suffixes, directory, environment)));
+    const results = await Promise.all(toolNames.map((name) => resolveUsableTool(name, "managed_pixi", bins, suffixes, directory, environment, this.#ocrLanguages)));
     if (results.some((result) => !result.resolved)) return undefined;
     return Object.fromEntries(toolNames.map((name, index) => [name, results[index]!.resolved!])) as Record<PaperToolName, ResolvedTool>;
   }

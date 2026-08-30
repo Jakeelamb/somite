@@ -41,6 +41,21 @@ test("mixed PDFs identify unreadable pages instead of silently accepting partial
   );
 });
 
+test("configured extraction limits fail with the exact deployment setting", async () => {
+  await assert.rejects(
+    () => extractPaper(pdfWithPages(["Methods FastQC", "Methods STAR"]), "pdf", { maxPdfPages: 1 }),
+    (error: unknown) => error instanceof PaperExtractionError
+      && error.code === "paper_extraction_limit"
+      && /SOMITE_PAPER_MAX_PAGES/.test(error.message),
+  );
+  await assert.rejects(
+    () => extractPaper(new TextEncoder().encode("12345678"), "text", { maxTextBytes: 7 }),
+    (error: unknown) => error instanceof PaperExtractionError
+      && error.code === "paper_extraction_limit"
+      && /SOMITE_PAPER_MAX_TEXT_BYTES/.test(error.message),
+  );
+});
+
 test("text extraction validates UTF-8 and observes cancellation", async () => {
   await assert.rejects(() => extractPaper(Uint8Array.of(0xff), "text"), (error: unknown) => error instanceof PaperExtractionError && error.code === "paper_text_invalid");
   const controller = new AbortController();

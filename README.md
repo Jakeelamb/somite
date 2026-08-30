@@ -116,9 +116,27 @@ missing inputs, and extraction failures remain distinct outcomes.
 
 For scanned or mixed PDFs, Somite identifies the exact pages that need OCR. The
 Machine panel can install a project-local, Pixi-locked Poppler and Tesseract
-toolchain in one click, verifies executable identities and English trained data,
-and refreshes readiness immediately. Missing OCR capability remains an explicit
-actionable result; Somite never silently treats scanned pages as empty.
+toolchain in one click, verifies executable identities and every configured OCR
+language, and refreshes readiness immediately. Missing OCR capability remains
+an explicit actionable result; Somite never silently treats scanned pages as
+empty.
+
+Paper limits are parsed once when the runner starts. Invalid values stop startup
+with the exact variable and accepted range; upload and extraction failures name
+the setting to change:
+
+| Variable | Default | Accepted value |
+| --- | ---: | --- |
+| `SOMITE_PAPER_MAX_UPLOAD_BYTES` | 100 MiB | 1 byte–1 GiB |
+| `SOMITE_PAPER_MAX_TEXT_BYTES` | 64 MiB | 1 byte–1 GiB |
+| `SOMITE_PAPER_MAX_PAGES` | 200 | 1–10,000 PDF pages |
+| `SOMITE_PAPER_MAX_OCR_PAGES` | 200 | 1–10,000 and no greater than the PDF-page limit |
+| `SOMITE_OCR_LANGS` | `eng` | Tesseract list such as `eng` or `eng+deu` |
+
+`OMARCHY_OCR_LANGS` remains a compatibility fallback when
+`SOMITE_OCR_LANGS` is unset. Somite verifies the requested trained-data codes
+with `tesseract --list-langs` before OCR and includes the language list in its
+cache and tool identities.
 
 ### Work with an Agent
 

@@ -9,10 +9,10 @@ import { pipeline } from "node:stream/promises";
 
 import { byteDigest, createByteDigester } from "@somite/workflow/contentIdentity";
 import { atomicWrite, containedPath, ensurePrivateDirectory, pathExists, regularFile } from "./files.ts";
+import { DEFAULT_PAPER_INTAKE_CONFIG, MAX_CONFIGURED_PAPER_UPLOAD_BYTES, PaperConfigurationError } from "./paperConfig.ts";
 import type { PaperMediaKind } from "./paperExtractor.ts";
 
-const MAX_PAPER_BYTES = 64 * 1024 * 1024;
-const MAX_MULTIPART_BYTES = MAX_PAPER_BYTES + 1024 * 1024;
+const MULTIPART_OVERHEAD_BYTES = 1024 * 1024;
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
 export type PaperArtifact = Readonly<{
@@ -81,7 +81,11 @@ function validatedMediaKind(filename: string, contentType: string, bytes: Uint8A
   return kind;
 }
 
-function validatingStream(kind: PaperMediaKind) {
+function uploadLimitMessage(maximumBytes: number) {
+  return `Paper upload exceeds the configured ${maximumBytes}-byte limit. Choose a smaller file or raise SOMITE_PAPER_MAX_UPLOAD_BYTES (maximum ${MAX_CONFIGURED_PAPER_UPLOAD_BYTES}) and restart Somite.`;
+}
+
+function validatingStream(kind: PaperMediaKind, maximumBytes: number) {
   const digester = createByteDigester();
   const header = Buffer.alloc(5);
   const textDecoder = kind === "text" ? new TextDecoder("utf-8", { fatal: true }) : undefined;
@@ -91,8 +95,8 @@ function validatingStream(kind: PaperMediaKind) {
     transform(chunk: Buffer, _encoding, callback) {
       const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       total += bytes.byteLength;
-      if (total > MAX_PAPER_BYTES) {
-        callback(new PaperStoreError(413, "paper_upload_too_large", `Paper upload exceeds ${MAX_PAPER_BYTES} bytes.`));
+      if (total > maximumBytes) {
+        callback(new PaperStoreError(413, "paper_upload_too_large", uploadLimitMessage(maximumBytes)));
         return;
       }
       digester.update(bytes);
@@ -177,9 +181,16 @@ function storedArtifact(value: unknown): StoredArtifact {
 
 export class PaperStore {
   readonly #root: string;
+  readonly #maxPaperBytes: number;
+  readonly #maxMultipartBytes: number;
 
-  constructor(root: string) {
+  constructor(root: string, maxPaperBytes = DEFAULT_PAPER_INTAKE_CONFIG.maxUploadBytes) {
+    if (!Number.isSafeInteger(maxPaperBytes) || maxPaperBytes < 1 || maxPaperBytes > MAX_CONFIGURED_PAPER_UPLOAD_BYTES) {
+      throw new PaperConfigurationError(`Paper upload limit must be an integer from 1 to ${MAX_CONFIGURED_PAPER_UPLOAD_BYTES} bytes.`);
+    }
     this.#root = resolve(root);
+    this.#maxPaperBytes = maxPaperBytes;
+    this.#maxMultipartBytes = maxPaperBytes + MULTIPART_OVERHEAD_BYTES;
   }
 
   receive(request: IncomingMessage) {
@@ -197,7 +208,7 @@ export class PaperStore {
 
   async #receiveMultipart(source: Readable, headers: IncomingHttpHeaders): Promise<PaperArtifact> {
     const announced = Number(headers["content-length"] ?? 0);
-    if (Number.isFinite(announced) && announced > MAX_MULTIPART_BYTES) throw new PaperStoreError(413, "paper_upload_too_large", `Paper upload exceeds ${MAX_PAPER_BYTES} bytes.`);
+    if (Number.isFinite(announced) && announced > this.#maxMultipartBytes) throw new PaperStoreError(413, "paper_upload_too_large", uploadLimitMessage(this.#maxPaperBytes));
     const objects = await ensurePrivateDirectory(this.#root, ".somite/papers/objects");
     let temporary: string | undefined;
     let uploaded: { filename: string; kind: PaperMediaKind; digest: string; size: number } | undefined;
@@ -209,7 +220,7 @@ export class PaperStore {
       try {
         return Busboy({
           headers,
-          limits: { fileSize: MAX_PAPER_BYTES + 1, files: 2, fields: 1, parts: 3, headerPairs: 100 },
+          limits: { fileSize: this.#maxPaperBytes + 1, files: 2, fields: 1, parts: 3, headerPairs: 100 },
         });
       } catch (error) {
         throw new PaperStoreError(400, "paper_multipart_invalid", `Paper upload is not valid multipart data: ${error instanceof Error ? error.message : String(error)}`);
@@ -218,8 +229,8 @@ export class PaperStore {
     const parsed = new Promise<void>((resolvePromise, rejectPromise) => {
       source.on("data", (chunk: Buffer) => {
         received += chunk.byteLength;
-        if (received > MAX_MULTIPART_BYTES) {
-          source.destroy(new PaperStoreError(413, "paper_upload_too_large", `Paper upload exceeds ${MAX_PAPER_BYTES} bytes.`));
+        if (received > this.#maxMultipartBytes) {
+          source.destroy(new PaperStoreError(413, "paper_upload_too_large", uploadLimitMessage(this.#maxPaperBytes)));
         }
       });
       source.once("error", (error) => rejectPromise(error instanceof PaperStoreError
@@ -249,13 +260,13 @@ export class PaperStore {
         }
         temporary = join(objects, `.paper-upload-${process.pid}-${randomUUID()}`);
         const destination = createWriteStream(temporary, { flags: "wx", mode: 0o600 });
-        const validator = validatingStream(kind);
+        const validator = validatingStream(kind, this.#maxPaperBytes);
         let limited = false;
         stream.once("limit", () => { limited = true; });
         fileWrite = pipeline(stream, validator.stream, destination).then(async () => {
           const metadata = await lstat(temporary!);
-          if (limited || stream.truncated || metadata.size > MAX_PAPER_BYTES) {
-            throw new PaperStoreError(413, "paper_upload_too_large", `Paper upload exceeds ${MAX_PAPER_BYTES} bytes.`);
+          if (limited || stream.truncated || metadata.size > this.#maxPaperBytes) {
+            throw new PaperStoreError(413, "paper_upload_too_large", uploadLimitMessage(this.#maxPaperBytes));
           }
           const result = validator.result();
           if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.size !== result.size) {
@@ -323,7 +334,7 @@ export class PaperStore {
     const identity = digest.slice("blake3:".length);
     const directory = containedPath(this.#root, `.somite/papers/objects/${identity}`);
     const metadata = storedArtifact(JSON.parse(await readFile(join(directory, "artifact.json"), "utf8")));
-    if (metadata.digest !== digest || metadata.size_bytes > MAX_PAPER_BYTES) throw new PaperStoreError(409, "paper_object_invalid", "Stored paper metadata does not match the requested digest.");
+    if (metadata.digest !== digest || metadata.size_bytes > this.#maxPaperBytes) throw new PaperStoreError(409, "paper_object_invalid", "Stored paper metadata does not match the requested digest or configured upload limit.");
     const path = join(directory, metadata.media_kind === "pdf" ? "payload.pdf" : "payload.txt");
     const file = await lstat(path);
     if (file.isSymbolicLink() || !file.isFile() || file.size !== metadata.size_bytes) throw new PaperStoreError(409, "paper_object_invalid", "Stored paper is not the expected regular file.");
@@ -334,7 +345,7 @@ export class PaperStore {
     const destination = isAbsolute(path) ? resolve(path) : resolve(this.#root, path);
     const shown = relative(this.#root, destination);
     if (!shown || shown.startsWith("..") || isAbsolute(shown)) throw new PaperStoreError(403, "paper_path_outside_project", "Paper path must stay inside this project.");
-    const bytes = await regularFile(destination, MAX_PAPER_BYTES, "paper");
+    const bytes = await regularFile(destination, this.#maxPaperBytes, "paper");
     const filename = safeFilename(destination);
     const kind = validatedMediaKind(filename, "", bytes);
     return { bytes, mediaKind: kind, filename, path: destination };

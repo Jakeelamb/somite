@@ -175,10 +175,21 @@ Paper intake stores bounded content-addressed PDF/text objects. An isolated
 PDF.js worker extracts native text page by page with cancellation and progress.
 Only unreadable pages in scanned or mixed PDFs enter bounded OCR. Somite can
 install Poppler and Tesseract into a project-local, Pixi-locked environment,
-then verifies versions and English trained data before publishing an atomic
-receipt. Missing capability returns `paper_ocr_unavailable`; it never produces
-a partial-paper reconstruction. Extraction caches retain the exact PDF.js/OCR
-tool identity and options separately from deterministic reconstruction caches.
+then verifies versions and the configured trained data before publishing an
+atomic receipt. Missing capability returns `paper_ocr_unavailable`; it never
+produces a partial-paper reconstruction. Extraction caches retain the exact
+PDF.js/OCR tool identity and options separately from deterministic
+reconstruction caches.
+
+One server-owned Paper configuration is parsed before the project opens and is
+passed unchanged to upload storage, the isolated PDF worker, OCR, toolchain
+preflight, and extraction-cache policy. `SOMITE_PAPER_MAX_UPLOAD_BYTES`,
+`SOMITE_PAPER_MAX_TEXT_BYTES`, `SOMITE_PAPER_MAX_PAGES`, and
+`SOMITE_PAPER_MAX_OCR_PAGES` are bounded numeric overrides. `SOMITE_OCR_LANGS`
+selects a validated Tesseract language list; `OMARCHY_OCR_LANGS` is consulted
+only as a compatibility fallback. Invalid settings fail startup with recovery
+guidance, and a policy or language change cannot reuse an extraction cache from
+the previous configuration.
 
 Reconstruction retains exact method surfaces, nearby evidence, PDF pages,
 unsupported identities, and cited resources. Parallel analyses and alternative

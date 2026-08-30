@@ -1,10 +1,20 @@
 import { spawn } from "node:child_process";
+import { createReadStream, createWriteStream } from "node:fs";
 import { lstat, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
 
-import { byteDigest, canonicalJsonDigest } from "@somite/workflow/contentIdentity";
+import { byteDigest, canonicalJsonDigest, createByteDigester } from "@somite/workflow/contentIdentity";
+import {
+  DEFAULT_PAPER_INTAKE_CONFIG,
+  MAX_CONFIGURED_PAPER_PAGES,
+  MAX_CONFIGURED_PAPER_TEXT_BYTES,
+  MAX_CONFIGURED_PAPER_UPLOAD_BYTES,
+  ocrLanguageCodes,
+} from "./paperConfig.ts";
 import { terminateProcessTree } from "./process.ts";
 import {
   PaperToolchain,
@@ -31,20 +41,22 @@ export type PaperExtractionOptions = Readonly<{
   signal?: AbortSignal;
   onProgress?: (progress: PaperExtractionProgress) => void;
   pdfTimeoutMs?: number;
+  maxSourceBytes?: number;
+  maxTextBytes?: number;
+  maxPdfPages?: number;
   ocr?: PaperOcrOptions;
 }>;
 
-export const MAX_PDF_BYTES = 64 * 1024 * 1024;
-export const MAX_TEXT_BYTES = 64 * 1024 * 1024;
-export const MAX_PAGES = 200;
-export const MAX_OCR_PAGES = 200;
-export const DEFAULT_OCR_PAGES = 50;
+export const MAX_PDF_BYTES = MAX_CONFIGURED_PAPER_UPLOAD_BYTES;
+export const MAX_TEXT_BYTES = MAX_CONFIGURED_PAPER_TEXT_BYTES;
+export const MAX_PAGES = MAX_CONFIGURED_PAPER_PAGES;
+export const MAX_OCR_PAGES = MAX_CONFIGURED_PAPER_PAGES;
+export const DEFAULT_OCR_PAGES = DEFAULT_PAPER_INTAKE_CONFIG.maxOcrPages;
 export const DEFAULT_PAPER_COMMAND_TIMEOUT_MS = 120_000;
 export const DEFAULT_PDF_TIMEOUT_MS = 120_000;
 export const DEFAULT_OCR_TOTAL_TIMEOUT_MS = 15 * 60 * 1_000;
 export const PDF_EXTRACTION_CONCURRENCY = 1;
 
-const MAX_PDF_RESULT_BYTES = MAX_TEXT_BYTES;
 const MAX_COMMAND_DIAGNOSTIC_BYTES = 1024 * 1024;
 const MAX_PAGE_IMAGE_BYTES = 128 * 1024 * 1024;
 const MAX_PROTOCOL_BYTES = 256 * 1024;
@@ -81,7 +93,7 @@ function ocrExtractorIdentity(
 }
 
 /** Current deterministic identity used to validate persistent extraction caches. */
-export function paperExtractorIdentity(preflight: PaperToolchainPreflight | undefined, via: PaperExtractionVia) {
+export function paperExtractorIdentity(preflight: PaperToolchainPreflight | undefined, via: PaperExtractionVia, languages = DEFAULT_PAPER_INTAKE_CONFIG.ocrLanguages) {
   if (via === "text") return TEXT_EXTRACTOR_IDENTITY;
   const nativeIdentity = preflight?.tools.find((tool) => tool.name === "PDF.js")?.identity;
   if (!nativeIdentity) return undefined;
@@ -97,7 +109,7 @@ export function paperExtractorIdentity(preflight: PaperToolchainPreflight | unde
     pdfinfo: tools.pdfinfo,
     pdftoppm: tools.pdftoppm,
     tesseract: tools.tesseract,
-  }, "eng");
+  }, ocrLanguageCodes(languages).join("+"));
 }
 
 export class PaperExtractionError extends Error {
@@ -169,6 +181,22 @@ function validateSource(source: PaperPathSource, maximumBytes: number) {
   }
 }
 
+function boundedInteger(value: number | undefined, fallback: number, maximum: number, label: string) {
+  const configured = value ?? fallback;
+  if (!Number.isSafeInteger(configured) || configured < 1 || configured > maximum) {
+    throw new PaperExtractionError("paper_extraction_limit", `${label} must be between 1 and ${maximum}.`);
+  }
+  return configured;
+}
+
+function boundedExtractionOptions(options: PaperExtractionOptions) {
+  return {
+    maxSourceBytes: boundedInteger(options.maxSourceBytes, DEFAULT_PAPER_INTAKE_CONFIG.maxUploadBytes, MAX_PDF_BYTES, "Paper source byte limit"),
+    maxTextBytes: boundedInteger(options.maxTextBytes, DEFAULT_PAPER_INTAKE_CONFIG.maxTextBytes, MAX_TEXT_BYTES, "Paper text byte limit"),
+    maxPdfPages: boundedInteger(options.maxPdfPages, DEFAULT_PAPER_INTAKE_CONFIG.maxPdfPages, MAX_PAGES, "PDF page limit"),
+  };
+}
+
 async function sourceMetadata(source: PaperPathSource, maximumBytes: number) {
   validateSource(source, maximumBytes);
   let metadata;
@@ -197,10 +225,44 @@ async function verifiedBytes(source: PaperPathSource, maximumBytes: number) {
   return bytes;
 }
 
-function textExtraction(bytes: Uint8Array, signal?: AbortSignal): PaperExtraction {
+async function copyVerifiedSource(source: PaperPathSource, maximumBytes: number, destination: string, signal?: AbortSignal) {
+  await sourceMetadata(source, maximumBytes);
+  const digester = createByteDigester();
+  let size = 0;
+  const verifier = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      size += chunk.byteLength;
+      if (size > maximumBytes) {
+        callback(new PaperExtractionError("paper_extraction_limit", `Paper source exceeds the ${maximumBytes} byte limit.`));
+        return;
+      }
+      digester.update(chunk);
+      callback(null, chunk);
+    },
+  });
+  try {
+    await pipeline(
+      createReadStream(source.path),
+      verifier,
+      createWriteStream(destination, { flags: "wx", mode: 0o600 }),
+      { signal },
+    );
+  } catch (error) {
+    await rm(destination, { force: true }).catch(() => undefined);
+    if (signal?.aborted) cancelled(signal);
+    if (error instanceof PaperExtractionError) throw error;
+    throw new PaperExtractionError("paper_source_invalid", "The stored paper source could not be copied for OCR.", true);
+  }
+  if (size !== source.sizeBytes || digester.digest() !== source.digest) {
+    await rm(destination, { force: true }).catch(() => undefined);
+    throw new PaperExtractionError("paper_source_invalid", "The stored paper source does not match its content address.");
+  }
+}
+
+function textExtraction(bytes: Uint8Array, maximumBytes: number, signal?: AbortSignal): PaperExtraction {
   cancelled(signal);
   if (!bytes.byteLength) throw new PaperExtractionError("paper_empty", "The paper file is empty.");
-  if (bytes.byteLength > MAX_TEXT_BYTES) throw new PaperExtractionError("paper_extraction_limit", `Text paper exceeds the ${MAX_TEXT_BYTES} byte limit.`);
+  if (bytes.byteLength > maximumBytes) throw new PaperExtractionError("paper_extraction_limit", `Text paper exceeds the configured ${maximumBytes}-byte limit. Raise SOMITE_PAPER_MAX_TEXT_BYTES and restart Somite, or use a smaller text source.`);
   try {
     return { text: decoder.decode(bytes), extractedVia: "text", extractorIdentity: TEXT_EXTRACTOR_IDENTITY };
   } catch {
@@ -242,11 +304,11 @@ function progressMessage(value: unknown): PaperExtractionProgress | undefined {
   };
 }
 
-function resultMessage(value: unknown): PdfResultMessage | undefined {
+function resultMessage(value: unknown, maxPages: number, maxTextBytes: number): PdfResultMessage | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
-  if (raw.type !== "result" || !Number.isSafeInteger(raw.pages) || (raw.pages as number) < 1 || (raw.pages as number) > MAX_PAGES
-    || !Number.isSafeInteger(raw.text_bytes) || (raw.text_bytes as number) < 0 || (raw.text_bytes as number) > MAX_PDF_RESULT_BYTES
+  if (raw.type !== "result" || !Number.isSafeInteger(raw.pages) || (raw.pages as number) < 1 || (raw.pages as number) > maxPages
+    || !Number.isSafeInteger(raw.text_bytes) || (raw.text_bytes as number) < 0 || (raw.text_bytes as number) > maxTextBytes
     || typeof raw.text_digest !== "string" || !/^blake3:[0-9a-f]{64}$/.test(raw.text_digest)
     || typeof raw.extractor_identity !== "string" || !/^[\x20-\x7e]{1,200}$/.test(raw.extractor_identity)) return undefined;
   if (!Array.isArray(raw.page_text_bytes) || raw.page_text_bytes.length !== raw.pages
@@ -298,13 +360,17 @@ function boundedPdfTimeout(value: number | undefined) {
 
 async function extractPdfChild(source: PaperPathSource, options: PaperExtractionOptions): Promise<NativePdfExtraction> {
   cancelled(options.signal);
-  await sourceMetadata(source, MAX_PDF_BYTES);
+  const limits = boundedExtractionOptions(options);
+  await sourceMetadata(source, limits.maxSourceBytes);
   const pdfTimeoutMs = boundedPdfTimeout(options.pdfTimeoutMs);
 
   const temporary = await mkdtemp(join(tmpdir(), "somite-pdf-extraction-"));
   const outputPath = join(temporary, "extracted.txt");
   try {
-    const child = spawn(process.execPath, ["--experimental-strip-types", childEntry, source.path, outputPath, source.digest, String(source.sizeBytes)], {
+    const child = spawn(process.execPath, [
+      "--experimental-strip-types", childEntry, source.path, outputPath, source.digest, String(source.sizeBytes),
+      String(limits.maxSourceBytes), String(limits.maxPdfPages), String(limits.maxTextBytes),
+    ], {
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
@@ -345,7 +411,7 @@ async function extractPdfChild(source: PaperPathSource, options: PaperExtraction
         }
         return;
       }
-      const completed = resultMessage(parsed);
+      const completed = resultMessage(parsed, limits.maxPdfPages, limits.maxTextBytes);
       if (completed && !result && !failure) {
         result = completed;
         return;
@@ -405,7 +471,7 @@ async function extractPdfChild(source: PaperPathSource, options: PaperExtraction
       throw new PaperExtractionError("paper_extraction_failed", `PDF.js could not read this paper${detail ? `: ${detail}` : "."}`, true);
     }
     const output = await lstat(outputPath);
-    if (output.isSymbolicLink() || !output.isFile() || output.size !== result.text_bytes || output.size > MAX_PDF_RESULT_BYTES) {
+    if (output.isSymbolicLink() || !output.isFile() || output.size !== result.text_bytes || output.size > limits.maxTextBytes) {
       throw new PaperExtractionError("paper_extraction_failed", "The PDF extractor result exceeded its declared bounds.", true);
     }
     const textBytes = await readFile(outputPath);
@@ -432,12 +498,17 @@ async function extractPdfChild(source: PaperPathSource, options: PaperExtraction
 
 function boundedOcrOptions(options: PaperOcrOptions) {
   const maxPages = options.maxPages ?? DEFAULT_OCR_PAGES;
-  const maxTextBytes = options.maxTextBytes ?? MAX_TEXT_BYTES;
+  const maxTextBytes = options.maxTextBytes ?? DEFAULT_PAPER_INTAKE_CONFIG.maxTextBytes;
   const commandTimeoutMs = options.commandTimeoutMs ?? DEFAULT_PAPER_COMMAND_TIMEOUT_MS;
   const totalTimeoutMs = options.totalTimeoutMs ?? DEFAULT_OCR_TOTAL_TIMEOUT_MS;
-  const languages = options.languages ?? "eng";
+  let languages: string;
+  try {
+    languages = ocrLanguageCodes(options.languages ?? DEFAULT_PAPER_INTAKE_CONFIG.ocrLanguages).join("+");
+  } catch {
+    throw new PaperExtractionError("paper_ocr_configuration_invalid", "OCR languages must be a unique Tesseract language list such as eng or eng+deu; configure SOMITE_OCR_LANGS and restart Somite.");
+  }
   if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > MAX_OCR_PAGES) {
-    throw new PaperExtractionError("paper_extraction_limit", `OCR page limit must be between 1 and ${MAX_OCR_PAGES}.`);
+    throw new PaperExtractionError("paper_extraction_limit", `OCR page limit must be between 1 and ${MAX_OCR_PAGES}; configure SOMITE_PAPER_MAX_OCR_PAGES within that range.`);
   }
   if (!Number.isSafeInteger(maxTextBytes) || maxTextBytes < 1 || maxTextBytes > MAX_TEXT_BYTES) {
     throw new PaperExtractionError("paper_extraction_limit", `OCR text limit must be between 1 and ${MAX_TEXT_BYTES} bytes.`);
@@ -447,9 +518,6 @@ function boundedOcrOptions(options: PaperOcrOptions) {
   }
   if (!Number.isSafeInteger(totalTimeoutMs) || totalTimeoutMs < 1 || totalTimeoutMs > 60 * 60 * 1_000) {
     throw new PaperExtractionError("paper_extraction_limit", "OCR total timeout must be between 1 ms and 60 minutes.");
-  }
-  if (!/^[A-Za-z0-9_+.-]{1,80}$/.test(languages)) {
-    throw new PaperExtractionError("paper_ocr_configuration_invalid", "OCR languages must be a Tesseract language list such as eng or eng+deu.");
   }
   return { maxPages, maxTextBytes, commandTimeoutMs, totalTimeoutMs, languages };
 }
@@ -545,9 +613,9 @@ async function extractPdfOcr(
   cancelled(options.signal);
   const temporary = await mkdtemp(join(tmpdir(), "somite-paper-ocr-"));
   try {
-    const verified = await verifiedBytes(source, MAX_PDF_BYTES);
     const ocrSource = join(temporary, "source.pdf");
-    await writeFile(ocrSource, verified, { flag: "wx", mode: 0o600 });
+    const extractionLimits = boundedExtractionOptions(options);
+    await copyVerifiedSource(source, extractionLimits.maxSourceBytes, ocrSource, options.signal);
     reportProgress(options, { completed: 0, unit: "pages", message: "Counting pages for bounded OCR" });
     const info = await paperCommand("pdfinfo", tools.pdfinfo, [ocrSource], temporary, options.signal, nextTimeout(), MAX_COMMAND_DIAGNOSTIC_BYTES);
     if (info.code !== 0) {
@@ -555,12 +623,12 @@ async function extractPdfOcr(
       throw new PaperExtractionError("paper_ocr_failed", `pdfinfo could not inspect this PDF${detail ? `: ${detail}` : "."}`, true);
     }
     const pages = pdfPageCount(info.stdout);
-    if (pages > MAX_OCR_PAGES || (native?.pages !== undefined && native.pages !== pages)) {
-      throw new PaperExtractionError("paper_extraction_limit", `PDF has ${pages} pages; the hard maximum is ${MAX_OCR_PAGES}.`);
+    if (pages > extractionLimits.maxPdfPages || (native?.pages !== undefined && native.pages !== pages)) {
+      throw new PaperExtractionError("paper_extraction_limit", `PDF has ${pages} pages; the configured extraction limit is ${extractionLimits.maxPdfPages} (SOMITE_PAPER_MAX_PAGES).`);
     }
     const ocrPages = native?.ocrPages ?? Array.from({ length: pages }, (_, index) => index + 1);
     if (ocrPages.length > configured.maxPages) {
-      throw new PaperExtractionError("paper_extraction_limit", `PDF requires OCR on ${ocrPages.length} pages; the configured OCR limit is ${configured.maxPages} pages (hard maximum ${MAX_OCR_PAGES}).`);
+      throw new PaperExtractionError("paper_extraction_limit", `PDF requires OCR on ${ocrPages.length} pages; the configured OCR limit is ${configured.maxPages} pages (SOMITE_PAPER_MAX_OCR_PAGES, maximum ${MAX_OCR_PAGES}).`);
     }
     const chunks = native ? [...native.pageTexts] : Array.from({ length: pages }, () => "");
     let textBytes = chunks.reduce((total, value) => total + Buffer.byteLength(value), Math.max(0, pages - 1) * 3);
@@ -645,15 +713,17 @@ async function extractPdf(source: PaperPathSource, options: PaperExtractionOptio
 
 export async function extractPaperPath(source: PaperPathSource, mediaKind: PaperMediaKind, options: PaperExtractionOptions = {}): Promise<PaperExtraction> {
   cancelled(options.signal);
-  if (mediaKind === "text") return textExtraction(await verifiedBytes(source, MAX_TEXT_BYTES), options.signal);
+  const limits = boundedExtractionOptions(options);
+  if (mediaKind === "text") return textExtraction(await verifiedBytes(source, limits.maxTextBytes), limits.maxTextBytes, options.signal);
   return queuedPdfExtraction(() => extractPdf(source, options), options.signal);
 }
 
 export async function extractPaper(bytes: Uint8Array, mediaKind: PaperMediaKind, options: PaperExtractionOptions = {}): Promise<PaperExtraction> {
   cancelled(options.signal);
-  if (mediaKind === "text") return textExtraction(bytes, options.signal);
+  const limits = boundedExtractionOptions(options);
+  if (mediaKind === "text") return textExtraction(bytes, limits.maxTextBytes, options.signal);
   if (!bytes.byteLength) throw new PaperExtractionError("paper_empty", "The paper file is empty.");
-  if (bytes.byteLength > MAX_PDF_BYTES) throw new PaperExtractionError("paper_extraction_limit", `PDF exceeds the ${MAX_PDF_BYTES} byte limit.`);
+  if (bytes.byteLength > limits.maxSourceBytes) throw new PaperExtractionError("paper_extraction_limit", `PDF exceeds the configured ${limits.maxSourceBytes}-byte limit. Raise SOMITE_PAPER_MAX_UPLOAD_BYTES and restart Somite, or use a smaller PDF.`);
   if (bytes.byteLength < 5 || decoder.decode(bytes.subarray(0, 5)) !== "%PDF-") throw new PaperExtractionError("paper_pdf_invalid", "The uploaded file does not contain a PDF header.");
 
   const temporary = await mkdtemp(join(tmpdir(), "somite-pdf-source-"));

@@ -31,7 +31,8 @@ import { InputOriginError, InputOrigins } from "./inputOrigins.ts";
 import { RunManager } from "./jobs.ts";
 import { LiteratureGateway } from "./literatureGateway.ts";
 import { NfcoreGateway } from "./nfcoreGateway.ts";
-import { extractPaper, PaperExtractionError } from "./paperExtractor.ts";
+import { PaperExtractionError } from "./paperExtractor.ts";
+import { paperIntakeConfigFromEnvironment } from "./paperConfig.ts";
 import { PaperManager } from "./paperManager.ts";
 import { PaperStoreError } from "./paperStore.ts";
 import { PaperToolchainError } from "./paperToolchain.ts";
@@ -265,6 +266,7 @@ async function projectGraphPath(root: string, path: string, label: string) {
 }
 
 async function initializeProject(serverUrl: string, options: ServerOptions): Promise<ProjectState> {
+  const paperConfiguration = paperIntakeConfigFromEnvironment();
   const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
   const requestedRoot = resolve(options.projectRoot ?? process.env.SOMITE_PROJECT_ROOT ?? repositoryRoot);
   const root = await realpath(requestedRoot);
@@ -324,7 +326,7 @@ async function initializeProject(serverUrl: string, options: ServerOptions): Pro
     inputOrigins,
     sourceSearch: new SourceSearchGateway(),
     uploads: new UploadStore(root),
-    papers: new PaperManager(root, catalogLoaded.catalog, catalogLoaded.revision),
+    papers: new PaperManager(root, catalogLoaded.catalog, catalogLoaded.revision, paperConfiguration),
     literature: new LiteratureGateway(root),
     graph,
     recoveredAutosave,
@@ -1073,7 +1075,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     knownFields(body, "paper request", ["path"]);
     const source = await state.papers.store.resolveProjectPath(requiredString(body.path, "path"));
     try {
-      const extracted = await extractPaper(source.bytes, source.mediaKind, { ocr: { toolchain: state.papers.paperTools } });
+      const extracted = await state.papers.extract(source.bytes, source.mediaKind);
       return json(reconstructPaper(state.catalog, extracted.text, extracted.extractedVia));
     } catch (error) {
       if (error instanceof PaperExtractionError) throw new HttpError(422, error.message, { code: error.code, retryable: error.retryable });

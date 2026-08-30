@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 
-import { extractPaper, PaperExtractionError } from "../src/paperExtractor.ts";
+import { DEFAULT_OCR_PAGES, extractPaper, MAX_OCR_PAGES, PaperExtractionError } from "../src/paperExtractor.ts";
 import { PaperToolchain } from "../src/paperToolchain.ts";
 import { pdfWithPages, pdfWithText } from "./pdfFixture.ts";
 
@@ -108,6 +108,11 @@ test("paper OCR preflight rejects executable-name impostors and Tesseract withou
     assert.equal(preflight.tools.find((tool) => tool.name === "pdfinfo")?.source, "project_pixi");
     assert.equal(preflight.tools.find((tool) => tool.name === "tesseract")?.source, "project_pixi");
 
+    const german = await new PaperToolchain(root, { environment: { PATH: "" }, ocrLanguages: "deu" }).preflight();
+    assert.equal(german.scanned_pdf_ocr, true);
+    assert.equal(german.tools.find((tool) => tool.name === "tesseract")?.source, "managed_pixi");
+    assert.equal(german.tools.find((tool) => tool.name === "tesseract")?.identity, "tesseract@5.5.0+deu");
+
     await rm(join(root, ".pixi"), { recursive: true });
     const unavailable = await new PaperToolchain(root, { environment: { PATH: "" } }).preflight();
     assert.equal(unavailable.scanned_pdf_ocr, false);
@@ -176,19 +181,22 @@ test("image-only PDF falls back to bounded OCR with determinate progress", async
   }
 });
 
-test("OCR defaults to 50 pages and never permits more than the 200-page hard ceiling", async () => {
+test("OCR defaults to the production page limit and rejects configured overflow", async () => {
   const root = await mkdtemp(join(tmpdir(), "somite-paper-ocr-page-bound-"));
   try {
     const bin = join(root, ".somite", "tools", "paper", ".pixi", "envs", "default", "bin");
-    await fakeOcrTools(bin, { pages: 51 });
+    await fakeOcrTools(bin, { pages: 2 });
     const toolchain = new PaperToolchain(root);
+    assert.equal(DEFAULT_OCR_PAGES, 200);
+    assert.equal(MAX_OCR_PAGES, 10_000);
     await assert.rejects(
-      () => extractPaper(pdfWithPages(Array.from({ length: 51 }, () => "")), "pdf", { ocr: { toolchain } }),
-      (error: unknown) => error instanceof PaperExtractionError && error.code === "paper_extraction_limit" && /configured OCR limit is 50/.test(error.message),
+      () => extractPaper(pdfWithPages(["", ""]), "pdf", { ocr: { toolchain, maxPages: 1 } }),
+      (error: unknown) => error instanceof PaperExtractionError && error.code === "paper_extraction_limit"
+        && /configured OCR limit is 1.*SOMITE_PAPER_MAX_OCR_PAGES/.test(error.message),
     );
     await assert.rejects(
-      () => extractPaper(pdfWithText(""), "pdf", { ocr: { toolchain, maxPages: 201 } }),
-      (error: unknown) => error instanceof PaperExtractionError && error.code === "paper_extraction_limit" && /between 1 and 200/.test(error.message),
+      () => extractPaper(pdfWithText(""), "pdf", { ocr: { toolchain, maxPages: 10_001 } }),
+      (error: unknown) => error instanceof PaperExtractionError && error.code === "paper_extraction_limit" && /between 1 and 10000/.test(error.message),
     );
   } finally {
     await rm(root, { recursive: true, force: true });

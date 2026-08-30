@@ -6,7 +6,6 @@ import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 
 import { MAX_PAGES, MAX_PDF_BYTES, MAX_TEXT_BYTES, PaperExtractionError, type PaperExtractionProgress } from "./paperExtractor.ts";
 
-const MAX_PDF_RESULT_BYTES = MAX_TEXT_BYTES;
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const encoder = new TextEncoder();
 const require = createRequire(import.meta.url);
@@ -58,8 +57,16 @@ function progress(value: PaperExtractionProgress) {
   emit({ type: "progress", ...value });
 }
 
-async function verifiedPdf(path: string, digest: string, expectedSize: number) {
-  if (!/^blake3:[0-9a-f]{64}$/.test(digest) || !Number.isSafeInteger(expectedSize) || expectedSize < 1 || expectedSize > MAX_PDF_BYTES) {
+function configuredLimit(value: string, maximum: number) {
+  const parsed = Number(value);
+  if (!/^[0-9]+$/.test(value) || !Number.isSafeInteger(parsed) || parsed < 1 || parsed > maximum) {
+    throw new PaperExtractionError("paper_extraction_failed", "The PDF extractor limits are invalid.");
+  }
+  return parsed;
+}
+
+async function verifiedPdf(path: string, digest: string, expectedSize: number, maxSourceBytes: number) {
+  if (!/^blake3:[0-9a-f]{64}$/.test(digest) || !Number.isSafeInteger(expectedSize) || expectedSize < 1 || expectedSize > maxSourceBytes) {
     throw new PaperExtractionError("paper_source_invalid", "The stored paper source identity is invalid.");
   }
   const metadata = await lstat(path);
@@ -76,15 +83,15 @@ async function verifiedPdf(path: string, digest: string, expectedSize: number) {
   return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 }
 
-async function extract(path: string, outputPath: string, digest: string, expectedSize: number) {
-  const bytes = await verifiedPdf(path, digest, expectedSize);
+async function extract(path: string, outputPath: string, digest: string, expectedSize: number, maxSourceBytes: number, maxPages: number, maxTextBytes: number) {
+  const bytes = await verifiedPdf(path, digest, expectedSize, maxSourceBytes);
   progress({ completed: 0, unit: "pages", message: "Opening the PDF text layer" });
   let loading: ReturnType<typeof getDocument> | undefined;
   let document: Awaited<ReturnType<typeof getDocument>["promise"]> | undefined;
   try {
     loading = getDocument({ data: bytes, useSystemFonts: true, verbosity: 0 });
     document = await loading.promise;
-    if (document.numPages > MAX_PAGES) throw new PaperExtractionError("paper_extraction_limit", `PDF has ${document.numPages} pages; the limit is ${MAX_PAGES}.`);
+    if (document.numPages > maxPages) throw new PaperExtractionError("paper_extraction_limit", `PDF has ${document.numPages} pages; the configured extraction limit is ${maxPages} (SOMITE_PAPER_MAX_PAGES).`);
     const pages: string[] = [];
     const pageTextBytes: number[] = [];
     const ocrPages: number[] = [];
@@ -98,7 +105,7 @@ async function extract(path: string, outputPath: string, digest: string, expecte
       const pageBytes = encoder.encode(pageText).byteLength;
       const separatorBytes = pageNumber === 1 ? 0 : 3;
       accumulatedTextBytes += separatorBytes + pageBytes;
-      if (accumulatedTextBytes > MAX_TEXT_BYTES) throw new PaperExtractionError("paper_extraction_limit", `Extracted PDF text exceeds the ${MAX_TEXT_BYTES} byte limit.`);
+      if (accumulatedTextBytes > maxTextBytes) throw new PaperExtractionError("paper_extraction_limit", `Extracted PDF text exceeds the configured ${maxTextBytes}-byte limit (SOMITE_PAPER_MAX_TEXT_BYTES).`);
       pages.push(pageText);
       pageTextBytes.push(pageBytes);
       if (pageNeedsOcr(pageText)) ocrPages.push(pageNumber);
@@ -106,7 +113,7 @@ async function extract(path: string, outputPath: string, digest: string, expecte
     }
     const text = pages.join("\n\f\n");
     const textBytes = encoder.encode(text);
-    if (textBytes.byteLength > MAX_PDF_RESULT_BYTES) throw new PaperExtractionError("paper_extraction_limit", "Extracted PDF text exceeds the bounded worker-output limit.");
+    if (textBytes.byteLength > maxTextBytes) throw new PaperExtractionError("paper_extraction_limit", "Extracted PDF text exceeds the configured worker-output limit.");
     await writeFile(outputPath, textBytes, { flag: "wx", mode: 0o600 });
     emit({
       type: "result",
@@ -126,13 +133,21 @@ async function extract(path: string, outputPath: string, digest: string, expecte
   }
 }
 
-const [sourcePath, outputPath, digest, rawSize, extra] = process.argv.slice(2);
-if (!sourcePath || !outputPath || !digest || !rawSize || extra !== undefined) {
+const [sourcePath, outputPath, digest, rawSize, rawMaxSourceBytes, rawMaxPages, rawMaxTextBytes, extra] = process.argv.slice(2);
+if (!sourcePath || !outputPath || !digest || !rawSize || !rawMaxSourceBytes || !rawMaxPages || !rawMaxTextBytes || extra !== undefined) {
   emit({ type: "error", code: "paper_extraction_failed", message: "The PDF extractor invocation is invalid.", retryable: false });
   process.exitCode = 1;
 } else {
   try {
-    await extract(sourcePath, outputPath, digest, Number(rawSize));
+    await extract(
+      sourcePath,
+      outputPath,
+      digest,
+      Number(rawSize),
+      configuredLimit(rawMaxSourceBytes, MAX_PDF_BYTES),
+      configuredLimit(rawMaxPages, MAX_PAGES),
+      configuredLimit(rawMaxTextBytes, MAX_TEXT_BYTES),
+    );
   } catch (error) {
     const failure = error instanceof PaperExtractionError
       ? error

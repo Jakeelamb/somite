@@ -7,12 +7,15 @@ import { byteDigest, canonicalJsonDigest } from "@somite/workflow/contentIdentit
 import { reconstructPaper, type PaperReview } from "@somite/workflow/paper";
 import { atomicWrite, ensurePrivateDirectory, pathExists, regularFile } from "./files.ts";
 import {
+  extractPaper,
   extractPaperPath,
   paperExtractorIdentity,
   PaperExtractionError,
   type PaperExtraction,
   type PaperExtractionProgress,
+  type PaperMediaKind,
 } from "./paperExtractor.ts";
+import { DEFAULT_PAPER_INTAKE_CONFIG, type PaperIntakeConfig } from "./paperConfig.ts";
 import { PaperStore } from "./paperStore.ts";
 import { PaperToolchain } from "./paperToolchain.ts";
 
@@ -51,9 +54,10 @@ type PaperJob = {
 };
 
 type ExtractionCache = Readonly<{
-  schema_version: 2;
+  schema_version: 3;
   source_digest: string;
   extractor_revision: string;
+  configuration_digest: string;
   extracted_via: "text" | "pdfjs" | "ocr";
   extractor_identity: string;
   text_digest: string;
@@ -61,8 +65,8 @@ type ExtractionCache = Readonly<{
   pages?: number;
 }>;
 
-const EXTRACTOR_REVISION = "pdfjs-ocr-v3";
-const LEGACY_EXTRACTOR_REVISIONS = ["pdfjs-ocr-v2"] as const;
+const EXTRACTOR_REVISION = "pdfjs-ocr-v4";
+const LEGACY_EXTRACTOR_REVISIONS = ["pdfjs-ocr-v2", "pdfjs-ocr-v3"] as const;
 const RECONSTRUCTOR_REVISION = "typed-paper-v1";
 const MAX_JOBS = 8;
 const MAX_EXTRACTION_CACHE_BYTES = 72 * 1024 * 1024;
@@ -84,10 +88,10 @@ function validIdempotencyKey(value: string) {
   return value.length >= 1 && value.length <= 160 && /^[A-Za-z0-9._:-]+$/.test(value);
 }
 
-function extractionCache(value: unknown, digest: string): ExtractionCache | undefined {
+function extractionCache(value: unknown, digest: string, configurationDigest: string): ExtractionCache | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
-  if (raw.schema_version !== 2 || raw.source_digest !== digest || raw.extractor_revision !== EXTRACTOR_REVISION
+  if (raw.schema_version !== 3 || raw.source_digest !== digest || raw.extractor_revision !== EXTRACTOR_REVISION || raw.configuration_digest !== configurationDigest
     || (raw.extracted_via !== "text" && raw.extracted_via !== "pdfjs" && raw.extracted_via !== "ocr")
     || typeof raw.extractor_identity !== "string" || !/^blake3:[0-9a-f]{64}$/.test(raw.extractor_identity)
     || typeof raw.text_digest !== "string" || typeof raw.text !== "string") return undefined;
@@ -110,6 +114,7 @@ function phaseProgress(phase: PaperIntakePhase): PaperExtractionProgress | undef
 export class PaperManager {
   readonly store: PaperStore;
   readonly paperTools: PaperToolchain;
+  readonly configuration: PaperIntakeConfig;
   readonly #root: string;
   readonly #catalog: OperatorCatalog;
   readonly #catalogRevision: string;
@@ -118,15 +123,41 @@ export class PaperManager {
   readonly #reconstructionCache = new Map<string, { review: PaperReview; bytes: number }>();
   readonly #pending: PaperJob[] = [];
   readonly #executions = new Set<Promise<void>>();
+  readonly #extractionConfigurationDigest: string;
   #active = 0;
   #reconstructionCacheBytes = 0;
 
-  constructor(root: string, catalog: OperatorCatalog, catalogRevision: string) {
+  constructor(root: string, catalog: OperatorCatalog, catalogRevision: string, configuration: PaperIntakeConfig = DEFAULT_PAPER_INTAKE_CONFIG) {
     this.#root = root;
     this.#catalog = catalog;
     this.#catalogRevision = catalogRevision;
-    this.store = new PaperStore(root);
-    this.paperTools = new PaperToolchain(root);
+    this.configuration = configuration;
+    this.#extractionConfigurationDigest = canonicalJsonDigest({
+      max_text_bytes: configuration.maxTextBytes,
+      max_pdf_pages: configuration.maxPdfPages,
+      max_ocr_pages: configuration.maxOcrPages,
+      ocr_languages: configuration.ocrLanguages,
+    });
+    this.store = new PaperStore(root, configuration.maxUploadBytes);
+    this.paperTools = new PaperToolchain(root, { ocrLanguages: configuration.ocrLanguages });
+  }
+
+  extract(bytes: Uint8Array, mediaKind: PaperMediaKind) {
+    return extractPaper(bytes, mediaKind, this.#extractionOptions());
+  }
+
+  #extractionOptions() {
+    return {
+      maxSourceBytes: this.configuration.maxUploadBytes,
+      maxTextBytes: this.configuration.maxTextBytes,
+      maxPdfPages: this.configuration.maxPdfPages,
+      ocr: {
+        toolchain: this.paperTools,
+        maxPages: this.configuration.maxOcrPages,
+        maxTextBytes: this.configuration.maxTextBytes,
+        languages: this.configuration.ocrLanguages,
+      },
+    } as const;
   }
 
   async start(digest: string, idempotencyKey?: string) {
@@ -278,10 +309,10 @@ export class PaperManager {
     if (await pathExists(cachePath)) {
       try {
         const bytes = await regularFile(cachePath, MAX_EXTRACTION_CACHE_BYTES, "paper extraction cache");
-        const cached = extractionCache(JSON.parse(decoder.decode(bytes)), job.status.source_digest);
+        const cached = extractionCache(JSON.parse(decoder.decode(bytes)), job.status.source_digest, this.#extractionConfigurationDigest);
         if (cached) {
           const preflight = cached.extracted_via === "text" ? undefined : await this.paperTools.preflight();
-          const currentIdentity = paperExtractorIdentity(preflight, cached.extracted_via);
+          const currentIdentity = paperExtractorIdentity(preflight, cached.extracted_via, this.configuration.ocrLanguages);
           if (!currentIdentity || currentIdentity === cached.extractor_identity) {
             job.status.cache.extraction = true;
             return {
@@ -301,8 +332,8 @@ export class PaperManager {
       digest: job.status.source_digest,
       sizeBytes: job.artifact.metadata.size_bytes,
     }, job.artifact.metadata.media_kind, {
+      ...this.#extractionOptions(),
       signal: job.controller.signal,
-      ocr: { toolchain: this.paperTools },
       onProgress: (progress) => {
         if (job.status.phase === "extracting") {
           job.status.progress = progress;
@@ -311,9 +342,10 @@ export class PaperManager {
       },
     });
     const cached: ExtractionCache = {
-      schema_version: 2,
+      schema_version: 3,
       source_digest: job.status.source_digest,
       extractor_revision: EXTRACTOR_REVISION,
+      configuration_digest: this.#extractionConfigurationDigest,
       extracted_via: extracted.extractedVia,
       extractor_identity: extracted.extractorIdentity,
       text_digest: byteDigest(encoder.encode(extracted.text)),
