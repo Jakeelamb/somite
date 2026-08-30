@@ -13,7 +13,7 @@ import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
 import { canonicalJsonDigest } from "@somite/workflow/contentIdentity";
 import { parseGraph, parseParameterRecord, parseWorkflowBinding } from "@somite/workflow/graphCodec";
 import type { SomiteGraph } from "@somite/workflow/model";
-import { reconstructPaper, type PaperResourceCitation } from "@somite/workflow/paper";
+import { paperAccessionKind, reconstructPaper, type PaperResourceCitation } from "@somite/workflow/paper";
 import {
   applySourceWorkflowEdits,
   promoteSourceInvocation,
@@ -38,6 +38,8 @@ import { SourceWorkflowTrustError, verifyGraphSourceWorkflowTrust } from "./sour
 import { executablePath, pixiPlatform } from "./system.ts";
 import { UploadError, UploadStore } from "./uploadStore.ts";
 import { detectHardwareProfile } from "./hardwareProfile.ts";
+import { ProductionInputError } from "./productionGraph.ts";
+import { WorkflowAdmissionError } from "./workflowAdmission.ts";
 
 const MAX_REQUEST_BYTES = 16 * 1024 * 1024;
 const DEFAULT_PORT = 7310;
@@ -309,7 +311,7 @@ async function initializeProject(serverUrl: string, options: ServerOptions): Pro
     catalogRevision: catalogLoaded.revision,
     operators: [...catalogLoaded.catalog.values()].filter((operator) => !operator.id.startsWith("nf.") && !operator.id.startsWith("smk.")),
     availableBinaries,
-    runs: new RunManager(root, repositoryRoot, catalogLoaded.catalog),
+    runs: new RunManager(root, repositoryRoot, catalogLoaded.catalog, dirname(graphPath)),
     nfcore: new NfcoreGateway(root, catalogLoaded.catalog),
     snakemake,
     projects: new ProjectGateway(root, catalogLoaded.catalog, snakemake),
@@ -684,6 +686,11 @@ function paperResource(value: unknown, index: number): PaperResourceCitation {
   const kinds = new Set(["sra_study", "sra_sample", "sra_experiment", "sra_run", "bioproject", "biosample", "assembly", "ensembl"]);
   const roles = new Set(["reads", "reference", "annotation", "sample_metadata", "unknown"]);
   if (typeof resource.kind !== "string" || !kinds.has(resource.kind)) throw new HttpError(400, `resources[${index}].kind is invalid`);
+  const detectedKind = paperAccessionKind(accession);
+  if (!detectedKind) throw new HttpError(400, `resources[${index}].accession is not a supported biological accession`);
+  if (detectedKind !== resource.kind) {
+    throw new HttpError(400, `resources[${index}].kind must be ${detectedKind} for ${accession}`);
+  }
   if (typeof resource.role !== "string" || !roles.has(resource.role)) throw new HttpError(400, `resources[${index}].role is invalid`);
   if (typeof resource.context !== "string" || resource.context.length > 1_000) throw new HttpError(400, `resources[${index}].context is invalid`);
   if (resource.source_location !== undefined && (typeof resource.source_location !== "string" || resource.source_location.length > 100)) throw new HttpError(400, `resources[${index}].source_location is invalid`);
@@ -1106,6 +1113,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
       );
       return json(started, { status: 202 });
     } catch (error) {
+      if (error instanceof WorkflowAdmissionError || error instanceof ProductionInputError) throw error;
       throw new HttpError(409, error instanceof Error ? error.message : String(error));
     }
   }
@@ -1223,6 +1231,10 @@ export async function startServer(options: ServerOptions = {}) {
       response = error instanceof HttpError
         ? errorResponse(error.status, error.message, error.extra)
         : error instanceof SourceWorkflowTrustError
+          ? errorResponse(422, error.message, { code: error.code })
+        : error instanceof WorkflowAdmissionError
+          ? errorResponse(422, error.message, { code: "workflow_not_ready", assessment: error.assessment })
+        : error instanceof ProductionInputError
           ? errorResponse(422, error.message, { code: error.code })
         : error instanceof ProjectGatewayError
           ? errorResponse(

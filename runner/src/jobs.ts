@@ -11,7 +11,6 @@ import { dirname, join, relative } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 
-import { assessWorkflow } from "@somite/workflow/assessment";
 import {
   archiveFrozenPackage,
   createFrozenPackageFiles,
@@ -37,7 +36,9 @@ import { EvidenceStore } from "./evidenceStore.ts";
 import { atomicWrite } from "./files.ts";
 import { PixiCache } from "./pixiCache.ts";
 import { terminateProcessTree } from "./process.ts";
+import { materializeProductionGraph } from "./productionGraph.ts";
 import { RunStorage } from "./runStorage.ts";
+import { requireReadyWorkflow } from "./workflowAdmission.ts";
 import { executablePath, pixiPlatform } from "./system.ts";
 
 export type RunPhase = "preparing" | "running" | "finalizing" | "completed" | "failed" | "cancelling" | "cancelled";
@@ -218,6 +219,7 @@ async function materializeFixtureObject(projectRoot: string, sourcePath: string)
 export class RunManager {
   readonly #projectRoot: string;
   readonly #repositoryRoot: string;
+  readonly #graphBase: string;
   readonly #catalog: OperatorCatalog;
   readonly #evidence: EvidenceStore;
   readonly #pixi: PixiCache;
@@ -226,9 +228,10 @@ export class RunManager {
   readonly #startReplays = new Map<string, { request: string; result: RunStart }>();
   readonly #executions = new Set<Promise<void>>();
 
-  constructor(projectRoot: string, repositoryRoot: string, catalog: OperatorCatalog) {
+  constructor(projectRoot: string, repositoryRoot: string, catalog: OperatorCatalog, graphBase = projectRoot) {
     this.#projectRoot = projectRoot;
     this.#repositoryRoot = repositoryRoot;
+    this.#graphBase = graphBase;
     this.#catalog = catalog;
     this.#evidence = new EvidenceStore(projectRoot);
     this.#pixi = new PixiCache(projectRoot);
@@ -245,15 +248,14 @@ export class RunManager {
         return { ...replay.result, replayed: true };
       }
     }
-    const assessment = assessWorkflow(graph, this.#catalog);
-    if (assessment.state !== "ready") {
-      const detail = assessment.state === "empty"
-        ? "add at least one operator"
-        : `resolve ${assessment.required_count} required item${assessment.required_count === 1 ? "" : "s"}: ${assessment.items.map((item) => `${item.title}: ${item.detail}`).join("; ")}`;
-      throw new Error(detail);
-    }
+    requireReadyWorkflow(graph, this.#catalog, intent === "validation" ? "validate" : "run");
     const validation = intent === "validation" ? await this.#validationContext(graph) : undefined;
-    const runnable = validation?.binding.graph ?? graph;
+    const runnable = await materializeProductionGraph(
+      validation?.binding.graph ?? graph,
+      this.#catalog,
+      this.#projectRoot,
+      this.#graphBase,
+    );
     const id = `${intent}-${Date.now().toString(16)}-${randomUUID().slice(0, 8)}`;
     const job: RunJob = {
       id,
@@ -339,13 +341,13 @@ export class RunManager {
   }
 
   async compile(graph: SomiteGraph, target: ExportTarget) {
-    const assessment = assessWorkflow(graph, this.#catalog);
-    if (assessment.state !== "ready") throw new Error(`workflow is not ready: ${assessment.required_count} required items remain`);
+    requireReadyWorkflow(graph, this.#catalog, "compile");
     const parent = join(this.#projectRoot, ".somite", "compiled");
     const temporary = join(parent, `.compile-${randomUUID()}.partial`);
     await mkdir(parent, { recursive: true });
     try {
-      const { frozen } = await prepareFrozenPackage(graph, this.#catalog, target, temporary, this.#projectRoot, this.#pixi);
+      const runnable = await materializeProductionGraph(graph, this.#catalog, this.#projectRoot, this.#graphBase);
+      const { frozen } = await prepareFrozenPackage(runnable, this.#catalog, target, temporary, this.#projectRoot, this.#pixi);
       const destination = join(parent, frozen.closure.closure_digest.replace(/^blake3:/, ""));
       let reused = false;
       try {
@@ -391,12 +393,12 @@ export class RunManager {
   }
 
   async export(graph: SomiteGraph, target: ExportTarget) {
-    const assessment = assessWorkflow(graph, this.#catalog);
-    if (assessment.state !== "ready") throw new Error("workflow is not ready to export");
+    requireReadyWorkflow(graph, this.#catalog, "export");
     const directory = join(this.#projectRoot, ".somite", "exports", `export-${randomUUID()}`);
     await mkdir(join(directory, ".."), { recursive: true });
     try {
-      const { frozen } = await prepareFrozenPackage(graph, this.#catalog, target, directory, this.#projectRoot, this.#pixi);
+      const runnable = await materializeProductionGraph(graph, this.#catalog, this.#projectRoot, this.#graphBase);
+      const { frozen } = await prepareFrozenPackage(runnable, this.#catalog, target, directory, this.#projectRoot, this.#pixi);
       return { filename: frozen.plan.filename, bytes: archiveFrozenPackage(frozen.files) };
     } finally {
       await rm(directory, { recursive: true, force: true });

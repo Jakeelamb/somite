@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, lstat, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import test from "node:test";
@@ -20,10 +20,12 @@ async function graphFixture() {
 async function mockProject() {
   const root = await mkdtemp(join(tmpdir(), "somite-ts-jobs-"));
   const bin = join(root, "bin");
-  await import("node:fs/promises").then(({ mkdir }) => mkdir(bin));
+  await mkdir(bin);
+  await mkdir(join(root, "data"));
+  await writeFile(join(root, "data", "reads.fastq"), "@read\nACGT\n+\n!!!!\n");
   const pixi = join(bin, "pixi");
   await writeFile(pixi, `#!/usr/bin/env node
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 const args = process.argv.slice(2);
 await appendFile(join(dirname(process.argv[1]), "invocations.log"), args[0] + "\\n");
@@ -41,6 +43,8 @@ if (args[0] === "install") {
 }
 const delay = Number(process.env.SOMITE_MOCK_RUN_DELAY_MS ?? 0);
 if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+const params = JSON.parse(await readFile(join(process.cwd(), "params.json"), "utf8"));
+for (const input of Object.values(params.inputs ?? {})) await lstat(input);
 const nodeMap = JSON.parse(await readFile(join(process.cwd(), "node-map.json"), "utf8"));
 await mkdir(join(process.cwd(), ".somite"), { recursive: true });
 const processes = Object.values(nodeMap.nodes).map((entry) => entry.process).filter(Boolean);
@@ -131,6 +135,32 @@ test("cancellation terminates the active process tree and settles honestly", asy
     assert.ok(Object.values(cancelled.states).every((state) => ["done", "cached", "cancelled", "skipped"].includes(state)));
   } finally {
     delete process.env.SOMITE_MOCK_RUN_DELAY_MS;
+    process.env.PATH = previousPath;
+    await rm(project.root, { recursive: true, force: true });
+  }
+});
+
+test("production runs resolve graph-relative inputs before entering the run directory", async () => {
+  const project = await mockProject();
+  const previousPath = process.env.PATH;
+  process.env.PATH = project.path;
+  try {
+    const graphBase = join(project.root, "graphs");
+    await rm(join(project.root, "data"), { recursive: true });
+    await mkdir(join(graphBase, "data"), { recursive: true });
+    await writeFile(join(graphBase, "data", "reads.fastq"), "@graph\nTGCA\n+\n!!!!\n");
+    const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+    const graph = await graphFixture();
+    const manager = new RunManager(project.root, repositoryRoot, catalog, graphBase);
+
+    const started = await manager.start(graph, "run");
+    const run = await terminalStatus(manager, started.run_id);
+    assert.equal(run.phase, "completed", run.error);
+    const params = JSON.parse(await readFile(join(project.root, ".somite", "runs", started.run_id, "params.json"), "utf8"));
+    assert.deepEqual(Object.values(params.inputs), [join(graphBase, "data", "reads.fastq")]);
+    assert.equal(graph.nodes[0]?.params?.path, "data/reads.fastq");
+    await manager.shutdown();
+  } finally {
     process.env.PATH = previousPath;
     await rm(project.root, { recursive: true, force: true });
   }

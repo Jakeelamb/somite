@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -370,6 +370,61 @@ test("project startup refuses a persisted source graph with forged capabilities"
       (error: unknown) => error instanceof SourceWorkflowTrustError && error.code === "source_derivation_mismatch",
     );
   } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("source workflows remain inspectable but every production boundary reports the frozen-environment blocker", async () => {
+  const fixture = await sourceFixture();
+  const graphPath = join(fixture.root, "workflow.somite.json");
+  await writeFile(graphPath, `${JSON.stringify(fixture.graph, null, 2)}\n`);
+  const capability = "d".repeat(64);
+  const running = await startServer({
+    projectRoot: fixture.root,
+    graph: "workflow.somite.json",
+    port: await unusedPort(),
+    agentCapability: capability,
+  });
+  const mutationHeaders = { "content-type": "application/json", "x-somite-request": "local" };
+  try {
+    for (const path of ["/api/graph/validate", "/api/export/plan"]) {
+      const response = await fetch(`${running.url}${path}`, {
+        method: "POST",
+        headers: mutationHeaders,
+        body: JSON.stringify(fixture.graph),
+      });
+      assert.equal(response.status, 200, `${path}: ${await response.clone().text()}`);
+    }
+
+    const blocked = [
+      { path: "/api/export", headers: mutationHeaders, body: fixture.graph },
+      { path: "/api/runs", headers: mutationHeaders, body: fixture.graph },
+      { path: "/api/validations", headers: mutationHeaders, body: fixture.graph },
+      {
+        path: "/api/agent/compile",
+        headers: { "content-type": "application/json", "x-somite-mcp-capability": capability },
+        body: {},
+      },
+    ];
+    for (const request of blocked) {
+      const response = await fetch(`${running.url}${request.path}`, {
+        method: "POST",
+        headers: request.headers,
+        body: JSON.stringify(request.body),
+      });
+      const text = await response.text();
+      assert.equal(response.status, 422, `${request.path}: ${text}`);
+      const body = JSON.parse(text) as { code: string; error: string };
+      assert.equal(body.code, "workflow_not_ready", request.path);
+      assert.match(body.error, /Finish the execution environment/, request.path);
+      assert.match(body.error, /task containers or Conda environments are not frozen/, request.path);
+    }
+
+    for (const directory of ["exports", "runs", "compiled"]) {
+      await assert.rejects(access(join(fixture.root, ".somite", directory)), { code: "ENOENT" }, directory);
+    }
+  } finally {
+    await running.close();
     await rm(fixture.root, { recursive: true, force: true });
   }
 });

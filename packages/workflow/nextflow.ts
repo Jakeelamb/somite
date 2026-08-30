@@ -235,20 +235,13 @@ function compileImport(
     fail("port_contract_mismatch", `node ${node.id} ports do not match operator ${operator.id}`);
   }
   const values = resolvedParams(node, operator);
-  const declaredImports = operator.ports.out
-    .filter((port) => port.import_param !== undefined)
-    .map((port) => [port.name, port.import_param!] as const);
-  let paths: readonly (readonly [string, string])[];
-  if (declaredImports.length > 0) paths = declaredImports;
-  else if (operator.id === "files.import_paired") paths = [["r1", "r1"], ["r2", "r2"]];
-  else if (Object.hasOwn(operator.params, "path") && operator.ports.out.length === 1) {
-    paths = [[operator.ports.out[0].name, "path"]];
-  } else {
+  const paths = operatorImportPaths(operator);
+  if (!paths.length) {
     fail("unsupported_inprocess", `node ${node.id} uses unsupported in-process operator ${operator.id}`);
   }
 
   const hash = shortHash(node.id);
-  for (const [port, parameter] of paths) {
+  for (const { port, parameter } of paths) {
     const path = values.get(parameter);
     if (typeof path !== "string") {
       fail("missing_import_path", `import node ${node.id} is missing string path parameter ${parameter}`);
@@ -267,6 +260,35 @@ function compileImport(
     kind: "input",
     ...(source ? { source } : {}),
   });
+}
+
+export type OperatorImportPath = Readonly<{
+  port: string;
+  parameter: string;
+  kind: "file" | "directory";
+}>;
+
+/** The exact local path parameters consumed directly by one in-process import operator. */
+export function operatorImportPaths(operator: PinnedOperator): readonly OperatorImportPath[] {
+  const declared = operator.ports.out
+    .filter((port) => port.import_param !== undefined)
+    .map((port) => ({
+      port: port.name,
+      parameter: port.import_param!,
+      kind: port.type === "Directory" ? "directory" as const : "file" as const,
+    }));
+  if (declared.length) return declared;
+  if (operator.id === "files.import_paired") {
+    return [
+      { port: "r1", parameter: "r1", kind: "file" },
+      { port: "r2", parameter: "r2", kind: "file" },
+    ];
+  }
+  if (Object.hasOwn(operator.params, "path") && operator.ports.out.length === 1) {
+    const port = operator.ports.out[0]!;
+    return [{ port: port.name, parameter: "path", kind: port.type === "Directory" ? "directory" : "file" }];
+  }
+  return [];
 }
 
 function promotedSourceEntry(graph: SomiteGraph, node: SomiteGraphNode): PromotedSourceMapEntry | undefined {

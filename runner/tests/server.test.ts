@@ -288,3 +288,25 @@ test("project startup still recovers a valid autosave without a warning", async 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("paper resource resolution rejects accession-kind mismatches before network lookup", async () => {
+  const root = await mkdtemp(join(tmpdir(), "somite-runner-paper-resource-"));
+  const running = await startServer({ projectRoot: root, port: await unusedPort() });
+  try {
+    const response = await fetch(`${running.url}/api/paper/resources/resolve`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "http://localhost:3000" },
+      body: JSON.stringify({ resources: [{
+        accession: "SRR123456",
+        kind: "assembly",
+        role: "reads",
+        context: "cited sequencing reads",
+      }] }),
+    });
+    assert.equal(response.status, 400);
+    assert.match(await response.text(), /kind must be sra_run for SRR123456/);
+  } finally {
+    await running.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

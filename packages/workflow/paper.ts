@@ -261,7 +261,7 @@ function recognizedMethods(catalog: OperatorCatalog, fullText: string, extracted
   return [...unique.values()];
 }
 
-function accessionKind(accession: string): PaperResourceCitation["kind"] | undefined {
+export function paperAccessionKind(accession: string): PaperResourceCitation["kind"] | undefined {
   if (/^(?:SRR|ERR|DRR)\d{6,}$/.test(accession)) return "sra_run";
   if (/^(?:SRP|ERP|DRP)\d{6,}$/.test(accession)) return "sra_study";
   if (/^(?:SRX|ERX|DRX)\d{6,}$/.test(accession)) return "sra_experiment";
@@ -287,7 +287,7 @@ export function paperResourceCitations(text: string, extractedVia: PaperExtractV
   const citations = new Map<string, PaperResourceCitation>();
   for (const match of text.matchAll(pattern)) {
     const accession = match[0]!.toUpperCase();
-    const kind = accessionKind(accession);
+    const kind = paperAccessionKind(accession);
     if (!kind) continue;
     const offset = match.index ?? 0;
     const context = evidenceSnippet(text, offset, offset + accession.length);
