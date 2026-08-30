@@ -55,6 +55,11 @@ test("production workbench persists its name, restores Agent controls, and adds 
   context.after(() => page.close());
   const assertNoPageErrors = watchPage(page);
   await emptyCatalogs(page, app);
+  await page.route(`${app.runnerUrl}/api/agent/discover`, (route) => fulfillJson(route, app, {
+    registry_url: "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json",
+    registry_status: "unavailable",
+    agents: [],
+  }));
   await page.route(`${app.runnerUrl}/api/sources/search?*`, async (route) => {
     const provider = new URL(route.request().url()).searchParams.get("provider");
     await fulfillJson(route, app, provider === "ncbi" ? {
@@ -99,6 +104,23 @@ test("production workbench persists its name, restores Agent controls, and adds 
   await page.getByRole("button", { name: "Open Agent" }).waitFor();
   await page.getByRole("button", { name: "Open Agent" }).click();
   await agent.waitFor();
+  await agent.getByRole("button", { name: /More agents/ }).click();
+  await agent.getByText("Connection details", { exact: true }).click();
+  const fakeAgent = join(repositoryRoot, "runner", "tests", "fixtures", "fake-acp-agent.ts");
+  await agent.getByLabel("Custom command").fill(`${JSON.stringify(process.execPath)} --experimental-strip-types ${JSON.stringify(fakeAgent)}`);
+  await agent.getByRole("button", { name: "Connect", exact: true }).click();
+  const message = agent.getByRole("textbox", { name: "Message Agent" });
+  await message.click({ trial: true, timeout: 30_000 });
+  assert.equal(await message.isEnabled(), true);
+  await page.getByRole("button", { name: "Agent settings" }).click();
+  await agent.getByLabel("Model").selectOption("deep");
+  await message.fill("Explain this workflow");
+  await agent.getByRole("button", { name: "Send to Agent" }).click();
+  const feed = agent.getByRole("log");
+  await feed.getByText(/client-version:0\.1\.0/).waitFor({ timeout: 30_000 });
+  await feed.getByText(/approved:allow-session/).waitFor({ timeout: 30_000 });
+  await agent.getByRole("button", { name: "Disconnect Somite Test Agent" }).click();
+  await agent.getByText("Choose an assistant", { exact: true }).waitFor();
   await page.getByRole("button", { name: "Close Agent" }).click();
 
   const library = page.locator("section[aria-label='Operator Library']");
@@ -109,6 +131,10 @@ test("production workbench persists its name, restores Agent controls, and adds 
   assert.equal(await page.locator(".react-flow__node").count(), 2);
   await page.locator(".node-operator", { hasText: "sra.prefetch" }).waitFor();
   await page.locator(".node-operator", { hasText: "sra.fasterq_dump" }).waitFor();
+  await page.getByLabel("Import local files").setInputFiles(join(repositoryRoot, "testdata", "tiny_R1.fastq"));
+  await page.locator(".react-flow__node").nth(2).waitFor();
+  assert.equal(await page.locator(".react-flow__node").count(), 3);
+  await page.locator(".node-operator", { hasText: "files.import" }).waitFor();
   assertNoPageErrors();
 });
 
