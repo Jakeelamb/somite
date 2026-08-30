@@ -30,12 +30,16 @@ jobs:
         run: npm run check:version -- "$GITHUB_REF_NAME"
       - name: Install locked TypeScript dependencies
         run: npm ci
+      - name: Audit locked dependencies
+        run: npm audit --audit-level=moderate
       - name: Typecheck product
         run: npm run typecheck
       - name: Lint product
         run: npm run lint
       - name: Build and test product
         run: npm test
+      - name: Exercise production browser journeys
+        run: npm run smoke:browser
       - name: Exercise production startup and real workflow execution
         run: pixi run smoke
       # GitHub's generated source archives are the only release artifacts.

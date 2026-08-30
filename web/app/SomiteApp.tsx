@@ -2439,8 +2439,10 @@ function SomiteWorkspace({ initialQuery }: { initialQuery: string }) {
       const anchor = document.createElement("a");
       anchor.href = url;
       anchor.download = exportPlan?.filename ?? `${safeWorkflowFilename(workflowTitle)}.somite-run.zip`;
+      document.body.append(anchor);
       anchor.click();
-      URL.revokeObjectURL(url);
+      anchor.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 0);
       setStatus(`Exported ${anchor.download} · ${exportPlan?.tools.length ?? 0} tool contracts`);
     } catch (error) {
       setStatus(`Could not export workflow — ${errorMessage(error)}`);

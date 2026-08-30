@@ -19,6 +19,7 @@
     "dev": "node --experimental-strip-types scripts/somite-web.ts",
     "dev:web": "npm run dev --workspace=somite-web",
     "lint": "npm run lint --workspace=somite-web",
+    "smoke:browser": "node --experimental-strip-types --test --test-concurrency=1 runner/tests/production-browser.acceptance.ts",
     "smoke:release": "node --experimental-strip-types --test --test-concurrency=1 runner/tests/production-launcher.smoke.ts runner/tests/pixi-nextflow.smoke.ts",
     "start": "node --experimental-strip-types scripts/somite-web.ts --production",
     "start:runner": "npm run start --workspace=somite-runner",
@@ -27,6 +28,7 @@
   },
   "devDependencies": {
     "@types/node": "22.19.19",
+    "playwright-core": "1.62.1",
     "typescript": "5.9.3"
   },
   "allowScripts": {

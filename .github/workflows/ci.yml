@@ -36,6 +36,8 @@ jobs:
         run: npm run lint
       - name: Build and test
         run: npm test
+      - name: Exercise production browser journeys
+        run: npm run smoke:browser
 
   execution-smoke:
     name: Release smoke (${{ matrix.name }})
