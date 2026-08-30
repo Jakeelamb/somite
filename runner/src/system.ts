@@ -37,6 +37,9 @@ export function pixiPlatform(
   if (operatingSystem === "win32") {
     throw new Error("Native Windows workflow execution is unsupported; run Somite inside WSL2.");
   }
-  if (operatingSystem === "darwin") return machine === "arm64" ? "osx-arm64" : "osx-64";
-  return machine === "arm64" ? "linux-aarch64" : "linux-64";
+  if (operatingSystem === "darwin" && machine === "arm64") return "osx-arm64";
+  if (operatingSystem === "darwin" && machine === "x64") return "osx-64";
+  if (operatingSystem === "linux" && machine === "arm64") return "linux-aarch64";
+  if (operatingSystem === "linux" && machine === "x64") return "linux-64";
+  throw new Error(`Workflow execution is unsupported on ${operatingSystem}/${machine}; Somite supports Linux and macOS on x64 or arm64.`);
 }

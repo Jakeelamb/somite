@@ -34,4 +34,7 @@ test("workflow execution supports Unix Pixi targets and directs Windows users to
   assert.equal(pixiPlatform("darwin", "x64"), "osx-64");
   assert.equal(pixiPlatform("darwin", "arm64"), "osx-arm64");
   assert.throws(() => pixiPlatform("win32", "x64"), /WSL2/);
+  assert.throws(() => pixiPlatform("freebsd", "x64"), /unsupported on freebsd\/x64/);
+  assert.throws(() => pixiPlatform("linux", "riscv64"), /unsupported on linux\/riscv64/);
+  assert.throws(() => pixiPlatform("darwin", "ppc64"), /unsupported on darwin\/ppc64/);
 });
