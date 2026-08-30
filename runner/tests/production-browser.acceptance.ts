@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, copyFile, mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,21 +9,7 @@ import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
 import { NfcoreGateway } from "../src/nfcoreGateway.ts";
 import { nfcoreCatalogFixture, nfcoreSourceArchive } from "./helpers/nfcoreFixture.ts";
 import { repositoryRoot, startProductionApp, type ProductionApp } from "./helpers/productionApp.ts";
-
-const browserCandidates = process.platform === "darwin"
-  ? [
-      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-      "/Applications/Chromium.app/Contents/MacOS/Chromium",
-    ]
-  : ["/usr/bin/google-chrome-stable", "/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser"];
-
-async function browserExecutable() {
-  const candidates = [process.env.SOMITE_BROWSER_PATH, ...browserCandidates].filter((value): value is string => Boolean(value));
-  for (const candidate of candidates) {
-    if (await access(candidate).then(() => true).catch(() => false)) return candidate;
-  }
-  throw new Error(`No supported system Chrome/Chromium was found. Set SOMITE_BROWSER_PATH to one of: ${browserCandidates.join(", ")}`);
-}
+import { systemBrowserExecutable } from "./helpers/systemBrowser.ts";
 
 function cors(app: ProductionApp) {
   return {
@@ -55,7 +41,7 @@ async function emptyCatalogs(page: Page, app: ProductionApp) {
 let browser: Browser;
 
 test.before(async () => {
-  browser = await chromium.launch({ executablePath: await browserExecutable(), headless: true });
+  browser = await chromium.launch({ executablePath: await systemBrowserExecutable(), headless: true });
 });
 
 test.after(async () => {
