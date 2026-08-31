@@ -9,7 +9,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 
 async function call(client: Client, name: string, args: Record<string, unknown>) {
   const result = await client.callTool({ name, arguments: args });
-  assert.notEqual(result.isError, true, `${name} failed: ${JSON.stringify(result.structuredContent)}`);
+  assert.notEqual(result.isError, true, `${name} failed: ${JSON.stringify(result.structuredContent ?? result.content)}`);
   return result;
 }
 

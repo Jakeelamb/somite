@@ -2,11 +2,13 @@
 name = "somite"
 version = "0.1.0"
 description = "Visual, reproducible bioinformatics workflow builder"
-channels = ["conda-forge"]
+channels = ["conda-forge", "bioconda"]
 platforms = ["linux-64", "linux-aarch64", "osx-64", "osx-arm64"]
 
 [dependencies]
 nodejs = ">=22.13,<23"
+nextflow = "==26.04.6"
+openjdk = "==25.0.2"
 
 [tasks]
 install = "npm ci"

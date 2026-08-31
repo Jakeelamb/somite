@@ -42,6 +42,20 @@ test("commands use argument arrays and return bounded evidence", async () => {
   assert.equal(result.command[0], "node");
 });
 
+test("missing executables return structured command evidence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "somite-missing-command-"));
+  try {
+    const result = await runCommand(join(root, "not-installed"), [], root);
+    assert.equal(result.ok, false);
+    assert.equal(result.exit_code, null);
+    assert.equal(result.signal, null);
+    assert.match(result.stderr, /ENOENT|not found/i);
+    assert.equal(toolResult(result).structuredContent.ok, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("command cancellation kills an owned process tree after its leader exits and settles", { skip: process.platform === "win32", timeout: 8_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "somite-command-tree-"));
   const pidFile = join(root, "descendant.pid");

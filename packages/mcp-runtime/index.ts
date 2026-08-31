@@ -139,8 +139,14 @@ export async function runCommand(binary: string, args: readonly string[], cwd: s
     stderrTruncated ||= next.truncated;
   });
 
-  const completion = new Promise<{ exitCode: number | null; exitSignal: NodeJS.Signals | null }>((resolvePromise, rejectPromise) => {
-    child.once("error", rejectPromise);
+  const completion = new Promise<{ exitCode: number | null; exitSignal: NodeJS.Signals | null }>((resolvePromise) => {
+    child.once("error", (cause: Error) => {
+      const message = Buffer.from(`${stderr.byteLength ? "\n" : ""}${cause.message}`, "utf8");
+      const next = boundedAppend(stderr, message, maximum);
+      stderr = next.bytes;
+      stderrTruncated ||= next.truncated;
+      resolvePromise({ exitCode: null, exitSignal: null });
+    });
     child.once("close", (exitCode, exitSignal) => resolvePromise({ exitCode, exitSignal }));
   });
   let rejectCleanup: (cause: unknown) => void = () => undefined;

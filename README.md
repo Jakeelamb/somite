@@ -34,6 +34,9 @@ pixi run start
 
 Later launches use the existing production bundle, so `pixi run start` does not
 rebuild it. After pulling application changes, run `pixi run setup` again.
+When Somite is started through Pixi, the locked application environment includes
+the exact Nextflow and OpenJDK versions used by the Agent and release smoke, so
+execution never falls back to an unrelated host installation.
 
 Or use Node.js 22.13.x directly and keep the same build-once flow. Somite pins
 the Node 22 runtime line so local and hosted builds use the same tested runtime:
@@ -331,7 +334,8 @@ npm audit --audit-level=moderate
 
 `npm run check` typechecks every workspace and the launcher, lints the browser,
 builds the production web bundle, enforces tracked-source and client-bundle
-size budgets, and runs the runner, shared-workflow, and UI tests.
+size budgets, verifies native package locks for every supported CPU/OS target,
+and runs the runner, shared-workflow, and UI tests.
 `npm run smoke:browser` then launches that built bundle in a system Chrome or
 Chromium and checks document persistence, Agent controls, local and public data,
 local Snakemake and pinned Nextflow workflows, paper reconstruction, readiness,

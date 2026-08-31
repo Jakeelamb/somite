@@ -18,6 +18,7 @@
     "benchmark:quick": "node --experimental-strip-types scripts/benchmark.ts quick",
     "benchmark:release": "node --experimental-strip-types scripts/benchmark.ts release",
     "build": "npm run build --workspace=@somite/pixi-mcp-server && npm run build --workspace=@somite/nextflow-mcp-server && npm run build --workspace=somite-web && npm run check:size",
+    "check:platform-lock": "node --experimental-strip-types scripts/check-platform-lock.ts",
     "check:size": "node --experimental-strip-types scripts/check-release-size.ts",
     "check:version": "node --experimental-strip-types scripts/check-version-contract.ts",
     "check": "npm run typecheck && npm run lint && npm test",
@@ -37,7 +38,7 @@
     "smoke:release": "npm run smoke:execution && npm run smoke:browser:execution",
     "start": "node --experimental-strip-types scripts/somite-web.ts --production",
     "start:runner": "npm run start --workspace=somite-runner",
-    "test": "npm run check:version && npm run test --workspace=@somite/mcp-runtime && npm run test --workspace=@somite/pixi-mcp-server && npm run test --workspace=@somite/nextflow-mcp-server && npm run test --workspace=@somite/workflow && npm run test --workspace=somite-runner && npm run test --workspace=somite-web && npm run check:size",
+    "test": "npm run check:version && npm run check:platform-lock && npm run test --workspace=@somite/mcp-runtime && npm run test --workspace=@somite/pixi-mcp-server && npm run test --workspace=@somite/nextflow-mcp-server && npm run test --workspace=@somite/workflow && npm run test --workspace=somite-runner && npm run test --workspace=somite-web && npm run check:size",
     "typecheck": "tsc --noEmit -p tsconfig.json && npm run typecheck --workspaces --if-present"
   },
   "devDependencies": {
