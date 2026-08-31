@@ -21,7 +21,7 @@
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "^2.0.0",
-    "@types/node": "22.19.19",
-    "typescript": "5.9.3"
+    "@types/node": "26.4.0",
+    "typescript": "7.0.2"
   }
 }
