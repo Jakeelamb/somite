@@ -47,7 +47,7 @@ import {
 } from "@somite/workflow/limits";
 import { semanticGraphRevision } from "@somite/workflow/workflow";
 import { EvidenceStore } from "./evidenceStore.ts";
-import { atomicWrite, containedPath } from "./files.ts";
+import { atomicWrite, containedPath, pathExists } from "./files.ts";
 import { PixiCache, type LockedManifest } from "./pixiCache.ts";
 import { readSourceObject } from "./sourceWorkflowStore.ts";
 import { terminateProcessTree } from "./process.ts";
@@ -58,6 +58,8 @@ import { executablePath, pixiPlatform } from "./system.ts";
 
 export type RunPhase = "preparing" | "running" | "finalizing" | "completed" | "failed" | "cancelling" | "cancelled";
 export type RunNodeState = "queued" | "running" | "cached" | "done" | "failed" | "skipped" | "cancelled";
+
+const MAX_FAILURE_LOG_TAIL_BYTES = 64 * 1024;
 
 export type RunStatus = {
   run_id: string;
@@ -740,8 +742,7 @@ export class RunManager {
             await this.#terminalUpdate(job, { phase: "completed", exit_code: result.code });
           }
         } else {
-          const error = await this.#logTail(join(job.packagePath, "run.stderr.log"))
-            ?? `Nextflow exited with ${result.code ?? result.signal ?? "unknown status"}`;
+          const error = await this.#executionFailure(job, result);
           this.#markFailureStates(job);
           if (job.validation) {
             this.#update(job, { phase: "finalizing", exit_code: result.code ?? undefined, error });
@@ -810,8 +811,7 @@ export class RunManager {
         }
       } else {
         job.status.states[nodeId] = "failed";
-        const error = await this.#logTail(join(job.packagePath, "run.stderr.log"))
-          ?? `Nextflow exited with ${result.code ?? result.signal ?? "unknown status"}`;
+        const error = await this.#executionFailure(job, result);
         if (job.validation) {
           this.#update(job, { phase: "finalizing", exit_code: result.code ?? undefined, error });
           await this.#recordEvidence(job, prepared.closureDigest, "failed");
@@ -897,7 +897,14 @@ export class RunManager {
       return [edge.id, result];
     }));
     const artifactFiles = await collectFiles(join(job.packagePath, "results"));
-    const logFiles = [join(job.packagePath, "run.stdout.log"), join(job.packagePath, "run.stderr.log")];
+    const candidateLogFiles = [
+      join(job.packagePath, "run.stdout.log"),
+      join(job.packagePath, "run.stderr.log"),
+      join(job.packagePath, ".nextflow.log"),
+    ];
+    const logFiles = (await Promise.all(candidateLogFiles.map(async (path) => ({ path, exists: await pathExists(path) }))))
+      .filter((candidate) => candidate.exists)
+      .map((candidate) => candidate.path);
     const receipt = createEvidenceReceipt({
       recorded_at_unix_ms: Date.now(),
       subject_digest: validation.subjectDigest,
@@ -918,10 +925,45 @@ export class RunManager {
   }
 
   async #logTail(path: string) {
-    const raw = await readOptional(path);
-    if (!raw) return undefined;
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
+    let raw: string;
+    let truncated = false;
+    try {
+      handle = await open(path, "r");
+      const metadata = await handle.stat();
+      if (!metadata.isFile() || metadata.size === 0) return undefined;
+      const length = Math.min(metadata.size, MAX_FAILURE_LOG_TAIL_BYTES);
+      const offset = metadata.size - length;
+      const bytes = Buffer.alloc(length);
+      let total = 0;
+      while (total < length) {
+        const read = await handle.read(bytes, total, length - total, offset + total);
+        if (read.bytesRead === 0) break;
+        total += read.bytesRead;
+      }
+      raw = bytes.subarray(0, total).toString("utf8");
+      truncated = offset > 0;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    } finally {
+      await handle?.close();
+    }
     const lines = raw.split("\n").filter((line) => line.trim()).slice(-8);
-    return lines.length ? lines.join("\n") : undefined;
+    if (!lines.length) return undefined;
+    return `${truncated ? "[earlier log bytes omitted]\n" : ""}${lines.join("\n")}`;
+  }
+
+  async #executionFailure(job: RunJob, result: { code: number | null; signal: NodeJS.Signals | null }) {
+    const evidence = await Promise.all([
+      ["stderr", join(job.packagePath, "run.stderr.log")],
+      ["stdout", join(job.packagePath, "run.stdout.log")],
+      [".nextflow.log", join(job.packagePath, ".nextflow.log")],
+    ].map(async ([label, path]) => ({ label, tail: await this.#logTail(path) })));
+    const shown = evidence.filter((entry) => entry.tail).map((entry) => `${entry.label}:\n${entry.tail}`);
+    return shown.length
+      ? shown.join("\n")
+      : `Nextflow exited with ${result.code ?? result.signal ?? "unknown status"}`;
   }
 }
 

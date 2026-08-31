@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 
 import { operatorPorts } from "@somite/workflow/catalog";
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
+import { byteDigest } from "@somite/workflow/contentIdentity";
 import type { SomiteGraph } from "@somite/workflow/model";
 import type { FrozenSourceFile } from "@somite/workflow/nextflowSource";
 import { applySourceWorkflowEdits, deriveSourceWorkflow, promoteSourceInvocations } from "@somite/workflow/sourceWorkflow";
@@ -130,6 +131,12 @@ if (args[0] === "install") {
 }
 const delay = Number(process.env.SOMITE_MOCK_RUN_DELAY_MS ?? 0);
 if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+if (process.env.SOMITE_MOCK_RUN_FAILURE) {
+  process.stdout.write("Nextflow console failure detail\\n");
+  const padding = process.env.SOMITE_MOCK_RUN_LARGE_LOG ? "x".repeat(256 * 1024) + "\\n" : "";
+  await writeFile(join(process.cwd(), ".nextflow.log"), padding + "Nextflow internal failure detail\\n");
+  process.exit(31);
+}
 const params = JSON.parse(await readFile(join(process.cwd(), "params.json"), "utf8"));
 for (const input of Object.values(params.inputs ?? {})) await lstat(input);
 const nodeMap = JSON.parse(await readFile(join(process.cwd(), "node-map.json"), "utf8"));
@@ -302,6 +309,37 @@ test("cancellation terminates the active process tree and settles honestly", asy
     assert.ok(Object.values(cancelled.states).every((state) => ["done", "cached", "cancelled", "skipped"].includes(state)));
   } finally {
     delete process.env.SOMITE_MOCK_RUN_DELAY_MS;
+    process.env.PATH = previousPath;
+    await rm(project.root, { recursive: true, force: true });
+  }
+});
+
+test("failed runs surface Nextflow stdout and log evidence when stderr is empty", async () => {
+  const project = await mockProject();
+  const previousPath = process.env.PATH;
+  let manager: RunManager | undefined;
+  process.env.PATH = project.path;
+  process.env.SOMITE_MOCK_RUN_FAILURE = "1";
+  process.env.SOMITE_MOCK_RUN_LARGE_LOG = "1";
+  try {
+    const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+    manager = new RunManager(project.root, repositoryRoot, catalog);
+    const started = await manager.start(await graphFixture(), "validation");
+    const failed = await terminalStatus(manager, started.run_id);
+
+    assert.equal(failed.phase, "failed");
+    assert.equal(failed.exit_code, 31);
+    assert.match(failed.error ?? "", /stdout:\nNextflow console failure detail/);
+    assert.match(failed.error ?? "", /\.nextflow\.log:\n\[earlier log bytes omitted\]/);
+    assert.match(failed.error ?? "", /Nextflow internal failure detail/);
+    assert.ok((failed.error?.length ?? 0) <= 70 * 1024, "failure evidence must remain byte-bounded");
+    assert.equal(failed.evidence_receipt?.result, "failed");
+    const nextflowLog = Buffer.from(`${"x".repeat(256 * 1024)}\nNextflow internal failure detail\n`);
+    assert.ok(failed.evidence_receipt?.log_digests.includes(byteDigest(nextflowLog)));
+  } finally {
+    await manager?.shutdown();
+    delete process.env.SOMITE_MOCK_RUN_FAILURE;
+    delete process.env.SOMITE_MOCK_RUN_LARGE_LOG;
     process.env.PATH = previousPath;
     await rm(project.root, { recursive: true, force: true });
   }

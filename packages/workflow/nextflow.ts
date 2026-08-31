@@ -553,14 +553,12 @@ function renderOutputValidators(operator: PinnedOperator) {
     const spec = (operator.outputs ?? {})[port.name];
     if (!spec) fail("invalid_output", `operator ${operator.id} output ${port.name}: missing output collection rule`);
     const pattern = controlledOutputPattern(operator, port.name, spec);
-    const variable = `somite_output_${lowerIdent(port.name)}`;
-    validators.push(`    mapfile -t ${variable} < <(compgen -G '${bashSingle(pattern)}' || true)\n`);
-    if (!(spec.optional || port.optional)) {
-      validators.push(
-        `    if (( \${#${variable}[@]} == 0 )); then echo 'Somite: required output ${bashSingle(port.name)} was not created' >&2; exit 74; fi\n`,
-      );
-    }
-    validators.push(`    for somite_artifact in "\${${variable}[@]}"; do\n`);
+    const count = `somite_output_${lowerIdent(port.name)}_count`;
+    // macOS ships Bash 3.2, which predates mapfile/readarray. Keep output
+    // collection on the Bash-3.2-compatible surface used by the rest of the task.
+    validators.push(`    ${count}=0\n`);
+    validators.push("    while IFS= read -r somite_artifact; do\n");
+    validators.push(`      ${count}=$(( ${count} + 1 ))\n`);
     if (port.type === "Directory") {
       validators.push("      if [[ ! -d \"$somite_artifact\" ]]; then echo \"Somite: expected directory $somite_artifact\" >&2; exit 74; fi\n");
     } else {
@@ -569,7 +567,12 @@ function renderOutputValidators(operator: PinnedOperator) {
         validators.push("      gzip -t -- \"$somite_artifact\" || { echo \"Somite: corrupt gzip $somite_artifact\" >&2; exit 74; }\n");
       }
     }
-    validators.push("    done\n");
+    validators.push(`    done < <(compgen -G '${bashSingle(pattern)}' || true)\n`);
+    if (!(spec.optional || port.optional)) {
+      validators.push(
+        `    if (( ${count} == 0 )); then echo 'Somite: required output ${bashSingle(port.name)} was not created' >&2; exit 74; fi\n`,
+      );
+    }
   }
   return validators;
 }

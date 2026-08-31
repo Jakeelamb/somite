@@ -14,7 +14,7 @@ import { reconstructPaper } from "@somite/workflow/paper";
 import { projectSourceCanvas, validateSourceCanvasView } from "@somite/workflow/sourceCanvas";
 import { deriveSourceWorkflow } from "@somite/workflow/sourceWorkflow";
 import { topologicalOrder, validateGraph } from "@somite/workflow/workflow";
-import { semanticDigest, type BenchmarkQuality } from "./benchmark-core.ts";
+import { normalizeSamplingHeapProfile, semanticDigest, type BenchmarkQuality } from "./benchmark-core.ts";
 import { hasOrderedPath, hasSharedRootBranch, matchingNodes } from "./benchmark-paper-topology.ts";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -100,7 +100,7 @@ async function profileScope<T>(work: () => T): Promise<T> {
       failure = error;
     }
     const stopped = await inspectorPost(session, profileKind === "cpu" ? "Profiler.stop" : "HeapProfiler.stopSampling");
-    const profile = stopped.profile;
+    const profile = profileKind === "heap" ? normalizeSamplingHeapProfile(stopped.profile) : stopped.profile;
     if (!profile || typeof profile !== "object") throw new Error("inspector did not return a benchmark profile");
     await writeFile(profileOutput!, JSON.stringify(profile), { flag: "wx", mode: 0o600 });
     if (failure !== undefined) throw failure;

@@ -228,6 +228,34 @@ export function semanticDigest(value: unknown) {
   return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
 }
 
+/**
+ * V8 snapshots the sampling tree before its sample list. An allocation made
+ * while that snapshot is being built can therefore appear only in `samples`.
+ * Such a sample has no attributable call frame or matching `selfSize`, so keep
+ * the completed tree authoritative and omit only those dangling samples.
+ */
+export function normalizeSamplingHeapProfile(value: unknown) {
+  const profile = record(value, "sampling heap profile");
+  const head = record(profile.head, "sampling heap profile head");
+  if (!Array.isArray(profile.samples)) throw new Error("sampling heap profile samples must be an array");
+
+  const nodeIds = new Set<number>();
+  const pending: unknown[] = [head];
+  while (pending.length) {
+    const node = record(pending.pop(), "sampling heap profile node");
+    const id = integer(node.id, "sampling heap profile node id");
+    if (!Array.isArray(node.children)) throw new Error("sampling heap profile node children must be an array");
+    nodeIds.add(id);
+    pending.push(...node.children);
+  }
+
+  const samples = profile.samples.filter((value, index) => {
+    const sample = record(value, `sampling heap profile sample ${index}`);
+    return nodeIds.has(integer(sample.nodeId, `sampling heap profile sample ${index} nodeId`));
+  });
+  return samples.length === profile.samples.length ? profile : { ...profile, samples };
+}
+
 export function tapOutcomeQuality(id: string, stdout: string): BenchmarkQuality {
   const lines = stdout
     .replace(/\u001b\[[0-9;]*m/g, "")

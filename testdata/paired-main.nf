@@ -33,18 +33,20 @@ process SOMITE_FASTP_7C5EAAC1 {
       "${SOMITE_PARAM_7C5EAAC1_THREADS}"
     )
     "${argv[@]}"
-    mapfile -t somite_output_r1 < <(compgen -G 'somite_out/clean_R1.fastq.gz' || true)
-    if (( ${#somite_output_r1[@]} == 0 )); then echo 'Somite: required output r1 was not created' >&2; exit 74; fi
-    for somite_artifact in "${somite_output_r1[@]}"; do
+    somite_output_r1_count=0
+    while IFS= read -r somite_artifact; do
+      somite_output_r1_count=$(( somite_output_r1_count + 1 ))
       if [[ ! -s "$somite_artifact" ]]; then echo "Somite: empty output $somite_artifact" >&2; exit 74; fi
       gzip -t -- "$somite_artifact" || { echo "Somite: corrupt gzip $somite_artifact" >&2; exit 74; }
-    done
-    mapfile -t somite_output_r2 < <(compgen -G 'somite_out/clean_R2.fastq.gz' || true)
-    if (( ${#somite_output_r2[@]} == 0 )); then echo 'Somite: required output r2 was not created' >&2; exit 74; fi
-    for somite_artifact in "${somite_output_r2[@]}"; do
+    done < <(compgen -G 'somite_out/clean_R1.fastq.gz' || true)
+    if (( somite_output_r1_count == 0 )); then echo 'Somite: required output r1 was not created' >&2; exit 74; fi
+    somite_output_r2_count=0
+    while IFS= read -r somite_artifact; do
+      somite_output_r2_count=$(( somite_output_r2_count + 1 ))
       if [[ ! -s "$somite_artifact" ]]; then echo "Somite: empty output $somite_artifact" >&2; exit 74; fi
       gzip -t -- "$somite_artifact" || { echo "Somite: corrupt gzip $somite_artifact" >&2; exit 74; }
-    done
+    done < <(compgen -G 'somite_out/clean_R2.fastq.gz' || true)
+    if (( somite_output_r2_count == 0 )); then echo 'Somite: required output r2 was not created' >&2; exit 74; fi
     '''
 }
 
@@ -74,16 +76,18 @@ process SOMITE_FASTQC_AF430D22 {
       '--extract'
     )
     "${argv[@]}"
-    mapfile -t somite_output_report_r1 < <(compgen -G 'somite_out/clean_R1_fastqc.html' || true)
-    if (( ${#somite_output_report_r1[@]} == 0 )); then echo 'Somite: required output report_r1 was not created' >&2; exit 74; fi
-    for somite_artifact in "${somite_output_report_r1[@]}"; do
+    somite_output_report_r1_count=0
+    while IFS= read -r somite_artifact; do
+      somite_output_report_r1_count=$(( somite_output_report_r1_count + 1 ))
       if [[ ! -s "$somite_artifact" ]]; then echo "Somite: empty output $somite_artifact" >&2; exit 74; fi
-    done
-    mapfile -t somite_output_report_r2 < <(compgen -G 'somite_out/clean_R2_fastqc.html' || true)
-    if (( ${#somite_output_report_r2[@]} == 0 )); then echo 'Somite: required output report_r2 was not created' >&2; exit 74; fi
-    for somite_artifact in "${somite_output_report_r2[@]}"; do
+    done < <(compgen -G 'somite_out/clean_R1_fastqc.html' || true)
+    if (( somite_output_report_r1_count == 0 )); then echo 'Somite: required output report_r1 was not created' >&2; exit 74; fi
+    somite_output_report_r2_count=0
+    while IFS= read -r somite_artifact; do
+      somite_output_report_r2_count=$(( somite_output_report_r2_count + 1 ))
       if [[ ! -s "$somite_artifact" ]]; then echo "Somite: empty output $somite_artifact" >&2; exit 74; fi
-    done
+    done < <(compgen -G 'somite_out/clean_R2_fastqc.html' || true)
+    if (( somite_output_report_r2_count == 0 )); then echo 'Somite: required output report_r2 was not created' >&2; exit 74; fi
     '''
 }
 

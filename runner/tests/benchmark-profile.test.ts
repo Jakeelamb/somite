@@ -7,6 +7,8 @@ import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { normalizeSamplingHeapProfile } from "../../scripts/benchmark-core.ts";
+
 const benchmarkCaseCli = fileURLToPath(new URL("../../scripts/benchmark-case.ts", import.meta.url));
 const benchmarkCase = "workflow.graph_wide_10k";
 
@@ -117,6 +119,23 @@ test("scoped heap profiling emits a valid V8 sampling heap profile", { timeout: 
     assertFiniteNumber(sample.ordinal, `heap profile sample ${index}.ordinal`);
     assert.ok(nodeIds.has(sample.nodeId), `heap profile sample ${index} references an unknown node`);
   }
+});
+
+test("heap profile normalization removes only samples absent from V8's completed tree", () => {
+  const retained = { size: 35_840, nodeId: 7, ordinal: 1 };
+  const dangling = { size: 34_880, nodeId: 56, ordinal: 412 };
+  const profile = {
+    head: {
+      id: 1,
+      children: [{ id: 7, children: [] }],
+    },
+    samples: [dangling, retained],
+  };
+
+  const normalized = normalizeSamplingHeapProfile(profile);
+
+  assert.deepEqual(normalized.samples, [retained]);
+  assert.deepEqual(profile.samples, [dangling, retained], "normalization must not mutate inspector output");
 });
 
 test("profiling rejects malformed arguments before writing an artifact", async (context) => {

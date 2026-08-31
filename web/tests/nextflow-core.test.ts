@@ -106,6 +106,38 @@ test("the compiler reproduces every byte of the reviewed Nextflow artifacts", as
   assert.equal(compiled.mainNf, await readFile(goldenPath, "utf8"));
 });
 
+test("output validation stays on Bash 3.2 and preserves required and optional outputs", async () => {
+  const { graph, catalog } = await pairedFixture();
+  const fastqc = catalog.get("qc.fastqc_paired")!;
+  const optionalFastqc: PinnedOperator = {
+    ...fastqc,
+    revision: "test-optional-fastqc",
+    ports: {
+      ...fastqc.ports,
+      out: fastqc.ports.out.map((port) => port.name === "report_r2" ? { ...port, optional: true } : port),
+    },
+    outputs: {
+      ...fastqc.outputs,
+      report_r2: { ...fastqc.outputs!.report_r2!, optional: true },
+    },
+  };
+  const changedCatalog = new OperatorCatalog([...catalog.values()].map((operator) => operator.id === fastqc.id ? optionalFastqc : operator));
+  const changedGraph: SomiteGraph = {
+    ...graph,
+    nodes: graph.nodes.map((node) => node.operator === fastqc.id ? {
+      ...node,
+      operator_revision: optionalFastqc.revision,
+      ports: operatorPorts(optionalFastqc),
+    } : node),
+  };
+  const compiled = compileNextflow(changedGraph, changedCatalog, options);
+
+  assert.doesNotMatch(compiled.mainNf, /\b(?:mapfile|readarray)\b/, "generated tasks must run on macOS Bash 3.2");
+  assert.match(compiled.mainNf, /while IFS= read -r somite_artifact; do/);
+  assert.match(compiled.mainNf, /required output report_r1 was not created/);
+  assert.doesNotMatch(compiled.mainNf, /required output report_r2 was not created/);
+});
+
 test("compiler edge indexing scales linearly with repeated external processes", async () => {
   const fixture = await pairedFixture();
   const smaller = repeatedFastpGraph(fixture.graph, 12);

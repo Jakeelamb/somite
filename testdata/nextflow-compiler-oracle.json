@@ -1,8 +1,8 @@
 {
   "artifacts": {
     "main_nf": {
-      "digest": "blake3:cefecbf6641e0ffe4465bb214ec48c0f05e06e5bddff1fc1a922168625f44622",
-      "bytes": 3706
+      "digest": "blake3:93b163d8ac9490cd7f54b58ead4c589742de103ef1f8ed9076fccfeeedd16c16",
+      "bytes": 3904
     },
     "nextflow_config": {
       "digest": "blake3:3cf6605e9fecd239bc92cccf58fe6385dfdeb063c1d8efac344d90158065f433",
