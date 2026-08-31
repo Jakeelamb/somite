@@ -11,12 +11,27 @@ export type LoadedOperatorCatalog = Readonly<{
 
 /** Load, validate, pin, and identify the reviewed operator directory. */
 export async function loadOperatorCatalog(directory: string): Promise<LoadedOperatorCatalog> {
+  return loadOperatorCatalogDirectories([directory]);
+}
+
+/** Load reviewed built-in and project-local directories into one immutable catalog. */
+export async function loadOperatorCatalogDirectories(directories: readonly string[]): Promise<LoadedOperatorCatalog> {
+  const operators: PinnedOperator[] = [];
+  for (const directory of directories) operators.push(...await loadOperatorDirectory(directory));
+  return {
+    catalog: new OperatorCatalog(operators),
+    revision: catalogRevision(operators),
+    operators,
+  };
+}
+
+async function loadOperatorDirectory(directory: string): Promise<PinnedOperator[]> {
   let entries;
   try {
     entries = await readdir(directory, { withFileTypes: true });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return { catalog: new OperatorCatalog([]), revision: catalogRevision([]), operators: [] };
+      return [];
     }
     throw error;
   }
@@ -36,9 +51,5 @@ export async function loadOperatorCatalog(directory: string): Promise<LoadedOper
     const operator = parseOperator(value, path);
     operators.push({ ...operator, revision: operatorRevision(operator) });
   }
-  return {
-    catalog: new OperatorCatalog(operators),
-    revision: catalogRevision(operators),
-    operators,
-  };
+  return operators;
 }

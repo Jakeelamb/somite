@@ -42,7 +42,7 @@
       "nodes": [{
         "id": "kraken1",
         "operator": "class.kraken2",
-        "operator_revision": "blake3:a370d1ec6ecdb21cd42a98c021b849eeda1fe1e9ddea97587cf51d2104453768",
+        "operator_revision": "blake3:a41eda6b13cc31f2b5a90b36b600e5efa75c86d228eabb379efdd11507469113",
         "ports": [
           { "name": "r1", "dir": "in", "ty": "Fastq", "union": ["Fastq", "FastqGz"] },
           { "name": "r2", "dir": "in", "ty": "Fastq", "union": ["Fastq", "FastqGz"], "optional": true },

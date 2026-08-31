@@ -43,6 +43,7 @@ import type {
   RunStorageProfile,
   SomiteGraphNode,
   Operator,
+  ManagedResourceJob,
   ParamSpec,
   ParamValue,
   PaperReview,
@@ -63,7 +64,7 @@ import { paperReadingPresentation } from "./paperReading";
 import { publicSourceOutcome, type PublicSourceFailures } from "./publicSourceSearch";
 import { catalogExpansionPresentation, type CatalogExpansionActivity } from "./catalogExpansion";
 import type { WorkflowCatalogLoadState } from "./backgroundRequests";
-import type { RepresentativeValidationCapability } from "@somite/workflow/fixtures";
+import { SOURCE_PREVIEW_PACK, type RepresentativeValidationCapability } from "@somite/workflow/fixtures";
 import {
   groupedWorkflowParameters,
   hiddenRequiredWorkflowParameters,
@@ -316,11 +317,13 @@ export function AgentPanel({ snapshot, transportError, blockedReason, discovery,
   );
 }
 
-export function ReadinessPanel({ snapshot, evidence, validationCapability, onResolve, onFocus, onAttachFile, onAskAssistant, onClose }: {
+export function ReadinessPanel({ snapshot, evidence, validationCapability, managedResourceJob, onResolve, onCancelManagedResource, onFocus, onAttachFile, onAskAssistant, onClose }: {
   snapshot: ReadinessSnapshot;
   evidence: ValidationEvidenceResponse | null;
   validationCapability: RepresentativeValidationCapability;
+  managedResourceJob: ManagedResourceJob | null;
   onResolve: (item: ReadinessItem, resolution?: ReadinessItem["resolutions"][number]) => void;
+  onCancelManagedResource: (jobId: string) => Promise<void>;
   onFocus: (item: ReadinessItem) => void;
   onAttachFile: (item: ReadinessItem, field: string, file: File) => Promise<void>;
   onAskAssistant: (item: ReadinessItem) => void;
@@ -333,10 +336,14 @@ export function ReadinessPanel({ snapshot, evidence, validationCapability, onRes
     .filter((resolution) => resolution.recommended && resolution.kind !== "connect" && resolution.kind !== "configure")
     .map((resolution) => ({ item, resolution })));
   const receipt = evidence?.receipt;
+  const sourcePreview = validationCapability.supported && validationCapability.fixture_pack === SOURCE_PREVIEW_PACK;
   const evidenceLabel = !validationCapability.supported
     ? "Unavailable"
-    : receipt?.result === "passed" ? "Validated" : receipt?.result === "failed" ? "Failed" : receipt ? "Inconclusive" : "Not validated";
+    : sourcePreview
+      ? receipt?.result === "passed" ? "Source checked" : receipt?.result === "failed" ? "Source check failed" : receipt ? "Source check inconclusive" : "Not checked"
+      : receipt?.result === "passed" ? "Validated" : receipt?.result === "failed" ? "Failed" : receipt ? "Inconclusive" : "Not validated";
   const sourceBlocker = current?.operator_id === "workflow.source" && current.fields.length === 0;
+  const currentResourceJob = current?.resource_profile === managedResourceJob?.profile ? managedResourceJob : null;
   return (
     <section className="floating-panel readiness-window" aria-label="Workflow Readiness">
       <header className="floating-panel-head">
@@ -366,12 +373,14 @@ export function ReadinessPanel({ snapshot, evidence, validationCapability, onRes
               {current.resolutions.map((resolution) => {
                 const download = formatResourceBytes(resolution.download_bytes);
                 const stored = formatResourceBytes(resolution.stored_bytes);
+                const active = currentResourceJob?.resolution === resolution.id && !["completed", "failed", "cancelled"].includes(currentResourceJob.phase);
                 return <div key={resolution.id} className={resolution.recommended ? "recommended" : ""}>
                   <header><strong>{resolution.label}</strong>{resolution.recommended && <em>Recommended</em>}</header>
                   <p>{resolution.detail}</p>
                   {(download || stored) && <small>{download && `${download} download`}{download && stored && " · "}{stored && `${stored} stored`}</small>}
                   {resolution.scientific_effect && <p className="scientific-effect">{resolution.scientific_effect}</p>}
-                  <button type="button" onClick={() => onResolve(current, resolution)}>{resolution.kind === "use_existing" ? "Choose existing" : "View guidance"}</button>
+                  {active && <div className="resource-install-progress" role="status"><progress max={Math.max(1, currentResourceJob.progress.total)} value={currentResourceJob.progress.completed} /><span>{currentResourceJob.progress.message}</span></div>}
+                  <button type="button" disabled={Boolean(currentResourceJob && currentResourceJob.resolution !== resolution.id && !["completed", "failed", "cancelled"].includes(currentResourceJob.phase))} onClick={() => active ? void onCancelManagedResource(currentResourceJob.job_id) : onResolve(current, resolution)}>{active ? <><CircleStop size={11} />Cancel</> : resolution.kind === "use_existing" ? "Choose existing" : resolution.kind === "download" ? <><Download size={11} />{currentResourceJob?.resolution === resolution.id && currentResourceJob.phase === "failed" ? "Retry download" : "Download and connect"}</> : "View build guide"}</button>
                 </div>;
               })}
             </div>}
@@ -403,7 +412,9 @@ export function ReadinessPanel({ snapshot, evidence, validationCapability, onRes
             {receipt?.result === "passed" ? <CheckCircle2 size={14} /> : <CircleAlert size={14} />}
             <span><strong>{evidenceLabel}</strong><small>{!validationCapability.supported
               ? validationCapability.reason
-              : receipt ? `${receipt.scope} · ${receipt.fixture_digests.length} fixture${receipt.fixture_digests.length === 1 ? "" : "s"}` : "Validate with representative fixtures when readiness is clear."}</small></span>
+              : sourcePreview
+                ? receipt ? "Nextflow preview compiled this frozen source without running its tasks." : "Check the frozen source in Nextflow preview mode when readiness is clear."
+                : receipt ? `${receipt.scope} · ${receipt.fixture_digests.length} fixture${receipt.fixture_digests.length === 1 ? "" : "s"}` : "Validate with representative fixtures when readiness is clear."}</small></span>
           </div>
         </section>
       </div>
@@ -1314,14 +1325,14 @@ function SourceWorkflowInspector({ node, setupCount, updateSourceBinding, browse
             <code>{workflow.source.entrypoint} · {workflow.source.resolved_revision.slice(0, 12)}</code>
             <small>{workflow.source.file_count.toLocaleString()} pinned files · {(workflow.source.source_bytes / 1_000_000).toLocaleString(undefined, { maximumFractionDigits: 1 })} MB</small>
           </section>
-          <button className="source-outline-open" type="button" disabled={!root} onClick={exploreSource}><FileSearch size={15} aria-hidden="true" /><span><strong>Open editable nested canvas</strong><small>{root ? `${(workflow.scopes ?? []).length} source-anchored scopes · replace tools and explore one layer at a time` : "No source scopes available"}</small></span><ChevronRight size={14} aria-hidden="true" /></button>
+          <button className="source-outline-open" type="button" disabled={!root} onClick={exploreSource}><FileSearch size={15} aria-hidden="true" /><span><strong>Open source workflow</strong><small>{root ? `${(workflow.invocations ?? []).length} calls · arrange freely, then group what helps` : "No source calls available"}</small></span><ChevronRight size={14} aria-hidden="true" /></button>
           <section className="source-capabilities">
             <header><strong>What you can do</strong><span>Current source contract</span></header>
             <div>{sourceCapabilityRows(workflow.capabilities).map((capability) => <span className={capability.available ? "available" : "unavailable"} key={capability.key}>{capability.available ? <CheckCircle2 size={11} aria-hidden="true" /> : <CircleStop size={11} aria-hidden="true" />}{capability.label}</span>)}</div>
           </section>
           {!parameterEditingAvailable && <section className="source-structure-lock"><CircleStop size={15} aria-hidden="true" /><span><strong>Parameter editing is read-only</strong><small>This source schema contains a constraint Somite cannot evaluate safely. Review the source notes below; no parameter changes will be guessed.</small></span></section>}
           {hiddenRequired.length > 0 && <section className="source-structure-lock"><CircleStop size={15} aria-hidden="true" /><span><strong>Hidden source setup is required</strong><small>{hiddenRequired.map((parameter) => parameter.name).join(", ")} {hiddenRequired.length === 1 ? "is" : "are"} required by the pinned source but intentionally hidden by its schema. Somite keeps the requirement visible without inventing a value.</small></span></section>}
-          <section className="source-structure-lock source-variant-guidance"><CircleAlert size={15} aria-hidden="true" /><span><strong>Creative variants are available</strong><small>Replace any source invocation on the nested canvas. Somite preserves uncertain connections as Logic checks, locks chosen tools with Pixi, and uses validation—not contracts—as proof.</small></span></section>
+          <section className="source-structure-lock source-variant-guidance"><CircleAlert size={15} aria-hidden="true" /><span><strong>Creative variants are available</strong><small>Replace any source invocation on the source canvas. Somite preserves uncertain connections as Logic checks, locks chosen tools with Pixi, and uses validation—not contracts—as proof.</small></span></section>
           {pendingSourceFile && <section className="source-drop-target">
             <header><span><strong>Choose this file&apos;s input</strong><small>{pendingSourceFile.file.name}</small></span><button type="button" aria-label="Dismiss dropped file" onClick={dismissPendingSourceFile}><X size={12} /></button></header>
             <p>Somite found several required file inputs, so it will not guess the biological role.</p>

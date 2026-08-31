@@ -47,7 +47,7 @@ const graphPort = openObject({
   optional: boolean,
 }, ["name", "dir", "ty"]);
 const sourceWorkflow = openObject({
-  schema_version: integer,
+  schema_version: { const: 1 },
   workflow_revision: string,
   source: openObject({
     provider: { enum: ["nf_core", "local"] },
@@ -182,15 +182,24 @@ const runStatus = object({
   evidence_receipt: evidenceReceipt,
   progress: object({ completed: integer, total: integer, unit: { const: "nodes" }, message: string }),
 }, ["run_id", "phase", "states", "progress"]);
+const operatorCandidate = openObject({
+  schema_version: { const: 1 },
+  candidate_id: string,
+  operator: openObject({ id: string, revision: string }, ["id", "revision"]),
+  sources: array(openObject({ url: string }, ["url"])),
+  created_at: string,
+  status: string,
+}, ["schema_version", "candidate_id", "operator", "sources", "created_at", "status"]);
+const operatorProofReceipt = openObject({
+  receipt_digest: string,
+}, ["receipt_digest"]);
 
 const toolFailure = object({
-  error: object({
-    code: string,
-    message: string,
-    retryable: boolean,
-    status: integer,
-    detail: { type: "object", additionalProperties: true },
-  }, ["code", "message", "retryable"]),
+  // Error responses may carry status and tool-specific detail, but callers only
+  // need these three stable fields to decide whether and how to recover. Keeping
+  // the extension fields open avoids repeating a large generic schema for every
+  // advertised tool.
+  error: openObject({ retryable: boolean }, ["code", "message", "retryable"]),
 });
 
 function result(success: JsonSchema): JsonSchema {
@@ -241,6 +250,22 @@ export const MCP_OUTPUT_SCHEMAS = Object.freeze({
       }, ["kind", "value", "provider", "result", "action", "operator_ids"]),
     }, ["key", "title", "accession", "provider", "data_kind", "request"])),
   })),
+  "somite.operator_candidate.draft": result(operatorCandidate),
+  "somite.operator_candidate.prove": result(object({ proof_id: string, replayed: boolean })),
+  "somite.operator_proof.status": result(openObject({
+    proof_id: string,
+    candidate_id: string,
+    run: openObject({ run_id: string, phase: runPhase }, ["run_id", "phase"]),
+    receipt: operatorProofReceipt,
+  }, ["proof_id", "candidate_id", "run"])),
+  "somite.resource": result(openObject({
+    job_id: string,
+    provider_id: string,
+    profile: string,
+    resolution: string,
+    phase: string,
+    progress: openObject({ completed: integer, total: integer, unit: string, message: string }, ["completed", "total", "unit", "message"]),
+  }, ["job_id", "provider_id", "profile", "resolution", "phase", "progress"])),
   "somite.graph.apply_transaction": result(transaction),
   "somite.workflow.compile": result(object({
     source_graph_revision: string,

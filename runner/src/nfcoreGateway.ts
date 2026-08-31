@@ -132,7 +132,7 @@ function requestKey(workflow: string, revision: string) {
 
 export class NfcoreGateway {
   readonly #root: string;
-  readonly #catalog: OperatorCatalog;
+  #catalog: OperatorCatalog;
   readonly #fetcher: typeof fetch;
   #snapshot?: Promise<CatalogSnapshot>;
 
@@ -140,6 +140,11 @@ export class NfcoreGateway {
     this.#root = root;
     this.#catalog = catalog;
     this.#fetcher = fetcher;
+  }
+
+  updateCatalog(catalog: OperatorCatalog) {
+    if (!catalog.isExtensionOf(this.#catalog)) throw new Error("nf-core catalog updates must preserve every pinned operator revision");
+    this.#catalog = catalog;
   }
 
   async catalog() {
@@ -160,8 +165,13 @@ export class NfcoreGateway {
     const requests = await ensurePrivateDirectory(this.#root, ".somite/source-workflows/requests-ts");
     const requestPath = join(requests, `${requestKey(workflow, revision)}.json`);
     if (await pathExists(requestPath)) {
-      const cached = JSON.parse(decoder.decode(await regularFile(requestPath, 32 * 1024 * 1024, "nf-core source request"))) as { workflow: SourceWorkflowInstance };
-      if (sourceWorkflowRevision(cached.workflow) !== cached.workflow.workflow_revision
+      const cached = JSON.parse(decoder.decode(await regularFile(requestPath, 32 * 1024 * 1024, "nf-core source request"))) as {
+        schema_version?: unknown;
+        indexer_revision?: unknown;
+        workflow: SourceWorkflowInstance;
+      };
+      if (cached.schema_version !== 1 || cached.indexer_revision !== SOURCE_INDEXER_REVISION
+        || sourceWorkflowRevision(cached.workflow) !== cached.workflow.workflow_revision
         || cached.workflow.source.requested_revision !== revision
         || cached.workflow.source.resolved_revision !== pipeline.resolvedRevision) throw new Error("cached nf-core source request has an invalid identity");
       return this.#response(workflow, revision, cached.workflow, true);

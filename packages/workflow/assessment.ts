@@ -70,6 +70,30 @@ export type WorkflowAssessment = {
 
 export type ReadinessSnapshot = WorkflowAssessment;
 
+export type ManagedResourceAvailability = Readonly<{
+  reference: string;
+  provider_id: string;
+  profile: string;
+  resolution: string;
+  title: string;
+  available: boolean;
+  detail: string;
+  download_bytes: number;
+  stored_bytes: number;
+  scientific_effect: string;
+  source_url: string;
+  error?: string;
+}>;
+
+export type WorkflowAssessmentContext = Readonly<{
+  managed_resources?: readonly ManagedResourceAvailability[];
+}>;
+
+export function managedResourceReferenceId(value: unknown) {
+  if (typeof value !== "string") return undefined;
+  return /^somite-resource:([a-z0-9]+(?:[._-][a-z0-9]+)*)$/.exec(value)?.[1];
+}
+
 function emptyResolution(
   id: string,
   label: string,
@@ -160,7 +184,6 @@ function assessNode(node: SomiteGraphNode, operator: Operator, resolutionUnresol
     const replacements = workflow.replacements ?? [];
     const requiresAction = missingParameter
       || (workflow.unsupported_required_parameters?.length ?? 0) > 0
-      || !workflow.capabilities.parameter_edits
       || !workflow.capabilities.exact_execution
       || replacements.length > 0;
     return {
@@ -258,13 +281,14 @@ function compareText(left: string, right: string) {
 }
 
 /** One deterministic assessment consumed by canvas, export, paper, and Agent surfaces. */
-export function assessWorkflow(graph: SomiteGraph, catalog: OperatorCatalog): WorkflowAssessment {
+export function assessWorkflow(graph: SomiteGraph, catalog: OperatorCatalog, context: WorkflowAssessmentContext = {}): WorkflowAssessment {
   const graphValidation = validateGraph(graph);
   if (!graphValidation.ok) throw new Error(`invalid graph: ${graphValidation.issue.message}`);
   const catalogValidation = catalog.verifyGraph(graph);
   if (!catalogValidation.ok) throw new Error(`catalog: ${catalogValidation.issue.message}`);
 
   const boundInputs = new Set(graph.edges.map((edge) => `${edge.to_node}\0${edge.to_port}`));
+  const managedResources = new Map((context.managed_resources ?? []).map((resource) => [resource.reference, resource]));
   const items: ReadinessItem[] = [];
   const nodes: NodeAssessment[] = [];
 
@@ -275,6 +299,52 @@ export function assessWorkflow(graph: SomiteGraph, catalog: OperatorCatalog): Wo
     const resolutionUnresolved = operator.resolution !== undefined
       && (operator.resolution.parameters.length === 0 || missingResolutionParameters.length > 0);
     nodes.push(assessNode(node, operator, resolutionUnresolved));
+
+    const managedReference = typeof node.params?.path === "string" && managedResourceReferenceId(node.params.path)
+      ? node.params.path
+      : undefined;
+    if (managedReference) {
+      const availability = managedResources.get(managedReference);
+      if (!availability?.available) {
+        const outputProfile = operator.ports.out.find((port) => port.import_param === "path")?.resource_profile;
+        const detail = availability?.error
+          ? `${availability.title} is not usable on this machine: ${availability.error}`
+          : availability
+            ? `${availability.title} is configured in this workflow but has not been downloaded and verified on this machine.`
+            : "This workflow uses a managed scientific resource that is not known on this machine.";
+        items.push({
+          id: `managed-reference:${node.id}:path`,
+          node_id: node.id,
+          operator_id: node.operator,
+          field: "path",
+          fields: [],
+          title: availability?.title ?? "Managed scientific resource",
+          detail,
+          kind: "managed_resource",
+          priority: 30 + nodePriority(nodeIndex),
+          escalatable: Boolean(availability),
+          resource_profile: availability?.profile ?? outputProfile ?? null,
+          resolutions: availability ? [{
+            id: availability.resolution,
+            label: `Download and verify ${availability.title}`,
+            detail: availability.detail,
+            kind: "download",
+            recommended: true,
+            download_bytes: availability.download_bytes,
+            stored_bytes: availability.stored_bytes,
+            scientific_effect: availability.scientific_effect,
+            source_url: availability.source_url,
+          }] : [emptyResolution(
+            "use-existing",
+            "Reconnect resource",
+            "Choose a compatible managed resource on this machine.",
+            "use_existing",
+            true,
+          )],
+          recipes: [],
+        });
+      }
+    }
 
     const workflow = node.source_workflow;
     if (workflow) {
@@ -337,30 +407,6 @@ export function assessWorkflow(graph: SomiteGraph, catalog: OperatorCatalog): Wo
             "review-source-schema",
             "Source schema review required",
             "Use the exact upstream schema or a future typed adapter; this release cannot bind this required value safely.",
-            "review",
-            false,
-          )],
-          recipes: [],
-        });
-      }
-
-      if (!workflow.capabilities.parameter_edits) {
-        items.push({
-          id: `source-schema:${node.id}`,
-          node_id: node.id,
-          operator_id: node.operator,
-          field: "parameter_schema",
-          fields: [],
-          title: "Review the source parameter schema",
-          detail: "Somite cannot represent the complete pinned parameter schema with proven validation parity. The schema remains source-only and parameter editing is disabled rather than silently ignoring constraints.",
-          kind: "parameter",
-          priority: 20 + nodePriority(nodeIndex),
-          escalatable: false,
-          resource_profile: null,
-          resolutions: [emptyResolution(
-            "review-source-schema",
-            "Source schema review required",
-            "Review the exact upstream schema or use a future typed adapter that implements every retained constraint.",
             "review",
             false,
           )],
@@ -510,7 +556,7 @@ export function assessWorkflow(graph: SomiteGraph, catalog: OperatorCatalog): Wo
             download_bytes: candidate.download_bytes ?? null,
             stored_bytes: candidate.stored_bytes ?? null,
             scientific_effect: candidate.scientific_effect ?? null,
-            source_url: null,
+            source_url: candidate.source_url ?? null,
           })),
           recipes: [],
         });

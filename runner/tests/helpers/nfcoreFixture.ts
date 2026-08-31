@@ -41,6 +41,28 @@ export function nfcoreSourceArchive() {
   ]));
 }
 
+export function nfcoreGroupableSourceArchive() {
+  const main = `include { READ_QC } from './subworkflows/read_qc'\ninclude { REPORT } from './modules/report'\nworkflow {\n  READ_QC()\n  REPORT()\n}\n`;
+  const subworkflow = `include { FASTQC } from '../modules/fastqc'\ninclude { TRIM } from '../modules/trim'\nworkflow READ_QC {\n  main:\n  FASTQC()\n  TRIM()\n}\n`;
+  const fastqc = `process FASTQC {\n  script:\n  \"\"\"fastqc reads.fastq\"\"\"\n}\n`;
+  const trim = `process TRIM {\n  script:\n  \"\"\"printf 'trimmed\\n' > trimmed.fastq\"\"\"\n}\n`;
+  const report = `process REPORT {\n  script:\n  \"\"\"printf 'complete\\n' > report.txt\"\"\"\n}\n`;
+  const schema = JSON.stringify({
+    type: "object",
+    properties: { input: { type: "string", format: "file-path", description: "Reads" } },
+    required: ["input"],
+  });
+  return gzipSync(Buffer.concat([
+    tarEntry("grouping-demo/main.nf", main),
+    tarEntry("grouping-demo/subworkflows/read_qc.nf", subworkflow),
+    tarEntry("grouping-demo/modules/fastqc.nf", fastqc),
+    tarEntry("grouping-demo/modules/trim.nf", trim),
+    tarEntry("grouping-demo/modules/report.nf", report),
+    tarEntry("grouping-demo/nextflow_schema.json", schema),
+    Buffer.alloc(1024),
+  ]));
+}
+
 export const nfcoreCatalogFixture = JSON.stringify({ remote_workflows: [{
   name: "demo",
   description: "Deterministic demonstration pipeline",

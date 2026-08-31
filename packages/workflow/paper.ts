@@ -89,6 +89,8 @@ type LocatedMention = PaperMethodMention & {
 };
 
 const unsupportedMethods: readonly UnsupportedMethod[] = [
+  { displayName: "ARTIC", normalizedName: "artic", operationClass: "amplicon_sequencing", aliases: ["artic workflow", "artic pipeline", "artic"] },
+  { displayName: "Freyja", normalizedName: "freyja", operationClass: "variant_calling", aliases: ["freyja"] },
   { displayName: "Ballgown", normalizedName: "ballgown", operationClass: "differential_expression", aliases: ["ballgown"], ports: { input: "Gtf", output: "Table" } },
   { displayName: "Kallisto", normalizedName: "kallisto", operationClass: "transcript_quantification", aliases: ["kallisto"], ports: { input: "Fastq", output: "Table" } },
   { displayName: "MultiQC", normalizedName: "multiqc", operationClass: "aggregate_qc", aliases: ["multiqc"], ports: { input: "Directory", output: "Html" } },
@@ -301,6 +303,56 @@ function evidenceSnippet(text: string, start: number, end: number) {
   return text.slice(Math.max(0, start - 72), Math.min(text.length, end + 96)).replace(/\s+/g, " ").trim();
 }
 
+function inferredNovelToolContract(methods: string) {
+  const lower = methods.toLocaleLowerCase("en-US");
+  if (/\b(?:variant|snp)\s*call/i.test(methods) && /\bbam\s+files?\b/i.test(methods) && /\bvcf\s+files?\b/i.test(methods)) {
+    return { operationClass: "variant_calling", ports: { input: "Bam" as const, output: "Vcf" as const } };
+  }
+  if (/\b(?:genome|metagenome)\s+assembl/i.test(methods) && /\b(?:fastq|sequencing reads?)\b/i.test(methods) && /\b(?:fasta|assembl(?:y|ies))\b/i.test(methods)) {
+    return { operationClass: "assemble", ports: { input: "Fastq" as const, inputUnion: ["FastqGz" as const], output: "Fasta" as const } };
+  }
+  if (/\b(?:align|mapp)(?:ed|ing|ment)?\b/i.test(methods) && /\b(?:fastq|sequencing reads?)\b/i.test(methods) && /\bbam\b/i.test(methods)) {
+    return { operationClass: "align", ports: { input: "Fastq" as const, inputUnion: ["FastqGz" as const], output: "Bam" as const } };
+  }
+  if (lower.includes("count matrix") && /\b(?:fastq|bam)\b/i.test(methods)) {
+    return { operationClass: "quantification", ports: { input: lower.includes("bam") ? "Bam" as const : "Fastq" as const, output: "Table" as const } };
+  }
+  return undefined;
+}
+
+/**
+ * Discover a paper's own named software conservatively from an explicit public
+ * repository statement. This creates an evidence-backed gap, never an
+ * executable contract; command and package details still require proof.
+ */
+function discoveredNovelMethods(fullText: string, methods: ReturnType<typeof paperMethodsWindow>): LocatedMention[] {
+  const names = new Map<string, string>();
+  const availability = /\b([A-Za-z][A-Za-z0-9_.+-]{2,40})\s+is\s+(?:freely\s+)?available\s+(?:at|on)\s+(?:https?:\/\/)?github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/gi;
+  for (const match of fullText.matchAll(availability)) {
+    const displayName = match[1]!;
+    const normalized = normalizedName(displayName);
+    if (normalized.length >= 3) names.set(normalized, displayName);
+  }
+  const contract = inferredNovelToolContract(methods.text);
+  return [...names].flatMap(([normalized, displayName]): LocatedMention[] => {
+    const matched = aliasMatchSummary(methods.text, [displayName]);
+    if (!matched) return [];
+    const offset = methods.offset + matched.first.start;
+    const end = methods.offset + matched.first.end;
+    return [{
+      display_name: displayName,
+      normalized_name: normalized,
+      ...(contract ? { operation_class: contract.operationClass, ports: contract.ports } : { operation_class: "novel_software" }),
+      evidence: evidenceSnippet(fullText, offset, end),
+      support: "unsupported",
+      offset,
+      end,
+      executable: matched.executable,
+      aliases: [displayName],
+    }];
+  });
+}
+
 function location(extractedVia: PaperExtractVia, page: number) {
   return extractedVia === "pdfjs" || extractedVia === "ocr" ? `PDF page ${page}` : undefined;
 }
@@ -344,6 +396,10 @@ function recognizedMethods(catalog: OperatorCatalog, fullText: string, extracted
       aliases: spec.aliases,
       ...(spec.ports ? { ports: spec.ports } : {}),
     });
+  }
+  const alreadyNamed = new Set(found.map((mention) => mention.normalized_name));
+  for (const mention of discoveredNovelMethods(fullText, window)) {
+    if (!alreadyNamed.has(mention.normalized_name)) found.push(mention);
   }
   const unique = new Map<string, LocatedMention>();
   for (const mention of found.sort((left, right) => left.offset - right.offset || left.normalized_name.localeCompare(right.normalized_name))) {
@@ -444,6 +500,16 @@ function relevantAssays(lowerText: string): Assay[] {
   const scores = [...assayScores(lowerText)].filter(([, value]) => value >= 6).sort((left, right) => right[1] - left[1]);
   if (scores.length) return scores.map(([assay]) => assay);
   return lowerText.includes("fastqc") ? ["qc"] : ["unknown"];
+}
+
+function assayFromMethodEvidence(mentions: readonly LocatedMention[]): Assay | undefined {
+  const classes = new Set(mentions.filter((mention) => mention.executable).map((mention) => mention.operation_class));
+  if ([...classes].some((value) => value?.includes("variant"))) return "variants";
+  if ([...classes].some((value) => value?.includes("assembl"))) return "assembly";
+  if ([...classes].some((value) => value?.includes("single_cell"))) return "single_cell";
+  if ([...classes].some((value) => value?.includes("quantif") || value?.includes("differential_expression"))) return "rna_seq";
+  if ([...classes].some((value) => value?.includes("classif") || value?.includes("binning"))) return "metagenome";
+  return undefined;
 }
 
 function operatorAssay(operator: PinnedOperator, assay: Assay) {
@@ -823,14 +889,15 @@ function buildCandidate(
   if (linkageWorkflow) enforceLinkageFlow(graph, catalog);
   layoutGraph(graph);
   const reviewed = graph.nodes.some((node) => node.operator !== "gap.missing" && catalog.get(node.operator)?.paper);
-  if (!reviewed) return undefined;
+  const evidenceBackedGap = graph.nodes.some((node) => node.operator === "gap.missing" && node.note && node.ports.some((port) => port.dir === "in") && node.ports.some((port) => port.dir === "out"));
+  if (!reviewed && !evidenceBackedGap) return undefined;
   const graphValidation = validateGraph(graph);
   const catalogValidation = catalog.verifyGraph(graph);
   if (!graphValidation.ok || !catalogValidation.ok) return undefined;
   const assessment = assessWorkflow(graph, catalog);
   const warnings = [
     ...(assessment.required_count
-      ? [`Draft reconstructed from paper evidence; ${assessment.required_count} item${assessment.required_count === 1 ? "" : "s"} still need review or input before it can run.`]
+      ? [`Draft reconstructed from paper evidence; ${assessment.required_count} item${assessment.required_count === 1 ? "" : "s"} still ${assessment.required_count === 1 ? "needs" : "need"} review or input before it can run.`]
       : []),
     ...(readResolutionWarning ? [readResolutionWarning] : []),
   ];
@@ -854,7 +921,9 @@ export function reconstructPaper(catalog: OperatorCatalog, text: string, extract
   const assayText = focus.length >= 200 ? focus : normalized;
   const assayLower = assayText.toLocaleLowerCase("en-US");
   const normalizedLower = assayText === normalized ? assayLower : normalized.toLocaleLowerCase("en-US");
-  const assays = relevantAssays(assayLower);
+  const scoredAssays = relevantAssays(assayLower);
+  const evidenceAssay = scoredAssays.length === 1 && scoredAssays[0] === "unknown" ? assayFromMethodEvidence(mentions) : undefined;
+  const assays = evidenceAssay ? [evidenceAssay] : scoredAssays;
   const candidates: PaperCandidate[] = [];
   for (const assay of assays) {
     const assemblers = assay === "assembly"

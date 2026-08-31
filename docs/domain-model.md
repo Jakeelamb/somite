@@ -28,8 +28,10 @@ canvas layout.
 
 **Source-backed workflow** — one exact engine-authored workflow retained as a
 pinned commit tree and represented by one outer Node. The Node is a collapsed
-canvas view; opening it shows the source-anchored Workflow outline. Somite does
-not translate that outline into native Nodes or execute it as a nested engine.
+canvas view; opening it shows the complete source-anchored Workflow outline as
+a normal flat graph of indexed invocation calls with no automatic groups.
+Somite does not translate that outline into native Nodes or execute it as a
+nested engine.
 
 **Native workflow variant** — an ordinary executable Graph created by promoting
 Source invocations. Its typed Nodes and Edges are executable truth, while its
@@ -46,9 +48,46 @@ immutable revision, entrypoint, and complete tracked-file content digest for a
 Source-backed workflow. Bytes come from raw blobs in that exact commit, never
 from the mutable worktree, Git status, or checkout filters.
 
-**Workflow outline** — a nested, source-anchored read model of workflow,
-subworkflow, process, and invocation scopes. It supports navigation and honest
-capability reporting. It is not a fabricated Port/Edge execution graph.
+**Workflow outline** — a source-anchored read model of indexed invocation calls
+and their known relationships. Workflow, subworkflow, and process scopes remain
+provenance and grouping-suggestion metadata rather than visible entities. It is
+not a fabricated Port/Edge execution graph.
+
+**Semantic frame** — one level of detail inside the persistent canvas. The root
+Graph, a Workflow outline, and a focused Source group are different projections
+shown by the same React Flow host, controls, grid, and interaction model.
+
+**Source-structure relationship** — a dashed, nonconnectable relationship
+retained from imported Source structure. It preserves known organization but
+has no Ports and never claims typed dataflow. Each invocation appears once;
+unresolved calls remain explicit, and shared or cyclic scope metadata does not
+duplicate call entities.
+
+**Source group** — an explicitly authored presentation membership over
+Workflow-outline entities. A selected relationship contributes its exact
+canonical endpoints; displayed relationships are then derived from retained
+entity identities. Groups form a forest of arbitrary depth independent of
+Source scopes. A Source scope may suggest members, but acceptance uses the same
+grouping operation as any user selection.
+
+**Soft hull** — the expanded presentation of a Source group. It overlays the
+flat graph without resizing its member cards, changing their source identity,
+or claiming canvas-node ownership.
+
+**Macro** — the collapsed presentation of a Source group. It contains a live
+miniature of its members but is neither an executable Compound nor a connectable
+Node. Boundary relationships rendered at the Macro retain the exact underlying
+relationship and member endpoints.
+
+**Semantic portal** — a Workflow instance, soft hull, or Macro whose child
+preview becomes the active Semantic frame when cursor-centered zoom makes the
+portal fill the viewport. Entry and exit are exact inverse camera transforms;
+the portal does not open a copied Graph or a second canvas.
+
+**Source-group presentation** — persisted, undoable membership, nesting,
+collapse, and placement state for Source groups. It contributes to Graph state
+revision but not semantic Graph revision, Run closure, or Evidence receipt
+identity.
 
 **Workflow binding** — one explicit parameter value or project file/directory
 bound to a Source-backed workflow instance. Bindings and execution profiles are
@@ -94,6 +133,17 @@ resource into a user-owned persistent store and recording its identity. It is
 separate from Staging, which places an already materialized artifact into one
 isolated run.
 
+**Operator candidate** — one project-local `project.*` Operator contract plus
+authoritative evidence. It is not part of the Catalog while its status is
+`draft` or `proven`.
+
+**Operator proof** — an immutable receipt from running the exact candidate once
+inside a ready representative fixture graph through the production freezer and
+runner. Passing proves that fixture only; it does not accept the candidate.
+
+**Operator acceptance** — the human-only transition that publishes a proven
+candidate into the Project Catalog without replacing any pinned revision.
+
 **Project** — a directory containing graphs and local `.somite/` state.
 
 **Input origin** — the runner-owned canonical base and relative-path search
@@ -116,6 +166,7 @@ bindings. Layout, human notes, and Workflow-outline presentation are excluded.
 **Graph state revision** — the full editable-document digest used only for
 compare-and-swap writes. It includes the Workflow name, layout, and notes so
 concurrent document or presentation edits cannot silently overwrite one another.
+Source-group presentation is included for the same reason.
 
 **Run closure** — the target-specific identity linking one Graph revision to
 its pinned Operator revisions, exact Pixi lock, platform, compiler, Nextflow,
@@ -308,6 +359,23 @@ downloadable run or silently chooses the first member of a collection.
   channel contracts.
 - A Source-backed workflow pins exact source bytes and never runs by repository
   name or mutable release tag.
+- Zooming into a Source-backed Workflow instance reveals every indexed
+  invocation call in the same persistent canvas with no automatic Source
+  groups; Source scopes remain quiet provenance and suggestion metadata.
+- Source-structure relationships are dashed and nonconnectable and never
+  satisfy or substitute for typed Ports or Edges.
+- Source groups are explicit presentation only. Source scopes may suggest
+  membership but never create it automatically or become canvas ownership.
+- Expanded soft hulls preserve normal member dimensions. Collapsed Macros show
+  live child previews, and focused-frame boundary portals preserve every exact
+  underlying relationship and endpoint without becoming executable or
+  connectable.
+- Moving a member out or back, renesting, expanding, collapsing, and ungrouping
+  never deletes or duplicates a Workflow-outline entity, relationship, or
+  provenance anchor; no visible relationship has a dangling endpoint.
+- Each indexed invocation appears once. Unresolved calls remain explicit rather
+  than becoming guessed Nodes, and shared or cyclic Source-scope metadata never
+  duplicates call entities.
 - DOT and other engine visualizations are never execution truth.
 - Every edge passes port-type validation and the graph remains acyclic.
 - Scientific bytes live in artifacts, never inside graph JSON.
@@ -333,7 +401,8 @@ downloadable run or silently chooses the first member of a collection.
 - Generated engine syntax never introduces an unmapped executable node.
 - Workflow name, presentation-only layout, notes, Canvas annotations, and Node
   colors never alter the semantic Graph revision; all remain part of the
-  editable Graph state revision.
+  editable Graph state revision. Source-group presentation follows the same
+  identity rule.
 - Canvas annotation IDs are unique across the Graph and annotation coordinates,
   dimensions, text, and stroke size are validated before persistence.
 - Evidence refers to executable identity but is never included in that identity.

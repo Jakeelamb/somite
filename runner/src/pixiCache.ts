@@ -125,6 +125,20 @@ export class PixiCache {
     return this.#shared(this.#locks, key, (sharedSignal) => this.#lock(manifest, manifestDigest, platform, sharedSignal), signal);
   }
 
+  async adoptLock(manifest: Uint8Array, lock: Uint8Array): Promise<LockedManifest> {
+    if (!manifest.byteLength || manifest.byteLength > MAX_MANIFEST_BYTES) throw new Error("source Pixi manifest size is invalid");
+    if (!lock.byteLength || lock.byteLength > MAX_PIXI_LOCK_BYTES) throw new Error("source Pixi lock size is invalid");
+    const pixi = await executablePath(this.#projectRoot, "pixi");
+    if (!pixi) throw new Error("Pixi is required to install this source workflow's frozen environment");
+    return {
+      pixi,
+      manifest,
+      lock,
+      manifest_digest: byteDigest(manifest),
+      lock_digest: byteDigest(lock),
+    };
+  }
+
   async environment(locked: LockedManifest, platform: string, signal?: AbortSignal) {
     if (!PLATFORM.test(platform)) throw new Error(`invalid Pixi platform ${platform}`);
     const key = `${platform}:${locked.lock_digest}:${locked.manifest_digest}`;

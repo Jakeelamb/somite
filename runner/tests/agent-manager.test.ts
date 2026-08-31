@@ -13,6 +13,7 @@ import {
   boundedAgentConfigOptions,
   boundedDetail,
   parseAgentCommand,
+  trustedAutomaticMcpPermissionTool,
   trustedSomiteMcpPermissionTool,
 } from "../src/agentManager.ts";
 import { SOMITE_MCP_TOOL_NAMES } from "../src/mcpTools.ts";
@@ -106,6 +107,51 @@ test("every canonical Somite MCP tool has one exact trusted permission identity"
   }
 });
 
+test("bundled Pixi and Nextflow MCP auto-approval is exact and read-only", () => {
+  assert.equal(trustedAutomaticMcpPermissionTool({
+    toolCallId: "pixi-search",
+    title: "mcp.Pixi.pixi_package_search",
+    name: "mcp.Pixi.pixi_package_search",
+    rawInput: { server: "Pixi", tool: "pixi_package_search", arguments: { spec: "samtools" } },
+  }), "pixi_package_search");
+  assert.equal(trustedAutomaticMcpPermissionTool({
+    toolCallId: "nextflow-lint",
+    title: "mcp.Nextflow.nextflow_analyze",
+    name: "mcp.Nextflow.nextflow_analyze",
+    rawInput: { server: "Nextflow", tool: "nextflow_analyze", arguments: { action: "lint" } },
+  }), "nextflow_analyze");
+  assert.equal(trustedAutomaticMcpPermissionTool({
+    toolCallId: "nextflow-run",
+    title: "mcp.Nextflow.nextflow_run",
+    name: "mcp.Nextflow.nextflow_run",
+    rawInput: { server: "Nextflow", tool: "nextflow_run", arguments: { mode: "full" } },
+  }), undefined);
+  assert.equal(trustedAutomaticMcpPermissionTool({
+    toolCallId: "nextflow-auth-config",
+    title: "mcp.Nextflow.nextflow_platform",
+    name: "mcp.Nextflow.nextflow_platform",
+    rawInput: { server: "Nextflow", tool: "nextflow_platform", arguments: { action: "auth_config" } },
+  }), undefined);
+  assert.equal(trustedAutomaticMcpPermissionTool({
+    toolCallId: "nextflow-secret-read",
+    title: "mcp.Nextflow.nextflow_storage",
+    name: "mcp.Nextflow.nextflow_storage",
+    rawInput: { server: "Nextflow", tool: "nextflow_storage", arguments: { action: "cat", source: ".env" } },
+  }), undefined);
+  assert.equal(trustedAutomaticMcpPermissionTool({
+    toolCallId: "nextflow-source-read",
+    title: "mcp.Nextflow.nextflow_storage",
+    name: "mcp.Nextflow.nextflow_storage",
+    rawInput: { server: "Nextflow", tool: "nextflow_storage", arguments: { action: "cat", source: "main.nf" } },
+  }), "nextflow_storage");
+  assert.equal(trustedAutomaticMcpPermissionTool({
+    toolCallId: "mislabeled",
+    title: "mcp.Nextflow.nextflow_docs_read",
+    name: "shell",
+    rawInput: { server: "Nextflow", tool: "nextflow_docs_read", arguments: {} },
+  }), undefined);
+});
+
 test("ACP manager streams events, configures the session, and auto-approves only Somite tools", async (context) => {
   const root = await mkdtemp(join(tmpdir(), "somite-agent-transcript-"));
   const fixture = fileURLToPath(new URL("./fixtures/fake-acp-agent.ts", import.meta.url));
@@ -144,6 +190,31 @@ test("ACP manager streams events, configures the session, and auto-approves only
   await until(() => !manager.snapshot().connected && !manager.snapshot().connecting);
 });
 
+test("ACP manager contains Pixi and Nextflow tools in the disposable Agent workspace", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "somite-agent-contained-tools-"));
+  const fixture = fileURLToPath(new URL("./fixtures/fake-acp-agent.ts", import.meta.url));
+  const manager = new AgentManager("http://127.0.0.1:9", "test-capability", fixture, root);
+  context.after(async () => {
+    await manager.disconnect().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  });
+  const command = `${JSON.stringify(process.execPath)} --experimental-strip-types ${JSON.stringify(fixture)}`;
+  await manager.connect(command);
+  await until(() => manager.snapshot().connected);
+  const cursor = manager.snapshot().cursor;
+  await manager.prompt("[test:mcp-workspace-roots]");
+  await until(() => !manager.snapshot().busy);
+  const detail = manager.snapshot(cursor).events.find((event) => event.kind === "message" && event.detail?.startsWith("{"))?.detail;
+  assert.ok(detail);
+  const attached = JSON.parse(detail) as { cwd: string; servers: Array<{ name: string; args: string[] }> };
+  assert.notEqual(attached.cwd, root);
+  for (const name of ["Pixi", "Nextflow"]) {
+    const server = attached.servers.find((candidate) => candidate.name === name);
+    assert.ok(server);
+    assert.equal(server.args[server.args.indexOf("--workspace-root") + 1], attached.cwd);
+  }
+});
+
 test("ACP manager never auto-approves unknown Somite labels or shell actions", async (context) => {
   const root = await mkdtemp(join(tmpdir(), "somite-agent-permissions-"));
   const fixture = fileURLToPath(new URL("./fixtures/fake-acp-agent.ts", import.meta.url));
@@ -174,6 +245,30 @@ test("ACP manager never auto-approves unknown Somite labels or shell actions", a
     manager.answerPermission(waiting.permission_id);
     await until(() => !manager.snapshot().busy);
   }
+});
+
+test("ACP manager requires approval and redacts sensitive storage output", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "somite-agent-sensitive-output-"));
+  const fixture = fileURLToPath(new URL("./fixtures/fake-acp-agent.ts", import.meta.url));
+  const manager = new AgentManager("http://127.0.0.1:9", "test-capability", fixture, root);
+  context.after(async () => {
+    await manager.disconnect().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  });
+  const command = `${JSON.stringify(process.execPath)} --experimental-strip-types ${JSON.stringify(fixture)}`;
+  await manager.connect(command);
+  await until(() => manager.snapshot().connected);
+  await manager.prompt("[test:sensitive-storage-read]");
+  await until(() => manager.snapshot().events.some((event) => event.kind === "permission" && event.status === "waiting"));
+  const waiting = manager.snapshot().events.find((event) => event.kind === "permission" && event.status === "waiting");
+  assert.ok(waiting?.permission_id);
+  const allow = waiting.permission_choices?.find((choice) => choice.kind === "allow_once");
+  assert.ok(allow);
+  manager.answerPermission(waiting.permission_id, allow.option_id);
+  await until(() => !manager.snapshot().busy);
+  const transcript = manager.transcript();
+  assert.equal(transcript.tool_calls.at(-1)?.output, "[redacted sensitive tool output]");
+  assert.doesNotMatch(JSON.stringify(transcript), /should-never-persist/);
 });
 
 test("ACP manager correlates one canonical Somite update to Codex ACP's sparse permission request", async (context) => {

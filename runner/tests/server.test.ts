@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer, request as httpRequest } from "node:http";
-import { access, chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -193,6 +193,30 @@ test("the TypeScript runner serves the browser session, streaming uploads, and g
     const hostile = new FormData();
     hostile.set("file", new Blob(["hostile\n"]), "hostile.fastq");
     assert.equal((await fetch(`${base}/api/files`, { method: "POST", headers: { origin: "https://attacker.example" }, body: hostile })).status, 403);
+
+    const nextflowProject = new FormData();
+    nextflowProject.append("file", new Blob([[
+      "nextflow.enable.dsl=2",
+      "include { PREPARE } from './modules/prepare'",
+      "workflow { PREPARE() }",
+      "",
+    ].join("\n")]), "demo/main.nf");
+    nextflowProject.append("file", new Blob(["process PREPARE { script: \"\"\"touch ready\"\"\" }\n"]), "demo/modules/prepare.nf");
+    const droppedProjectResponse = await fetch(`${base}/api/projects/import`, {
+      method: "POST",
+      headers: { origin: "http://localhost:3000" },
+      body: nextflowProject,
+    });
+    assert.equal(droppedProjectResponse.status, 200, await droppedProjectResponse.clone().text());
+    const droppedProject = await droppedProjectResponse.json() as {
+      kind: string;
+      project_path: string;
+      graph: { nodes: Array<{ source_workflow?: { scopes?: Array<{ title: string }> } }> };
+    };
+    assert.equal(droppedProject.kind, "nextflow");
+    assert.equal(droppedProject.project_path, "demo");
+    assert.ok(droppedProject.graph.nodes[0]?.source_workflow?.scopes?.some((scope) => scope.title === "PREPARE"));
+    assert.deepEqual(await readdir(join(root, ".somite", "project-imports")), [], "browser project staging is removed after freezing");
 
     const originlessMutation = await fetch(`${base}/api/projects/open`, {
       method: "POST",

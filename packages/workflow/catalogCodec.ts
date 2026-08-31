@@ -135,10 +135,15 @@ function parseParamSpec(value: unknown, path: string): ParamSpec {
 
 function parseResolution(value: unknown, path: string): ResourceResolutionSpec {
   const raw = object(value, path);
-  knownFields(raw, path, ["id", "label", "detail", "kind", "recommended", "download_bytes", "stored_bytes", "scientific_effect"]);
+  knownFields(raw, path, ["id", "label", "detail", "kind", "recommended", "download_bytes", "stored_bytes", "scientific_effect", "source_url"]);
   const downloadBytes = optionalInteger(raw.download_bytes, `${path}.download_bytes`);
   const storedBytes = optionalInteger(raw.stored_bytes, `${path}.stored_bytes`);
   const scientificEffect = optionalString(raw.scientific_effect, `${path}.scientific_effect`);
+  const sourceUrl = optionalString(raw.source_url, `${path}.source_url`);
+  if (sourceUrl !== undefined) {
+    const parsed = new URL(sourceUrl);
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.hash) throw new Error(`${path}.source_url must be a credential-free HTTPS URL without a fragment`);
+  }
   return {
     id: string(raw.id, `${path}.id`),
     label: string(raw.label, `${path}.label`),
@@ -148,6 +153,7 @@ function parseResolution(value: unknown, path: string): ResourceResolutionSpec {
     ...(downloadBytes !== undefined ? { download_bytes: downloadBytes } : {}),
     ...(storedBytes !== undefined ? { stored_bytes: storedBytes } : {}),
     ...(scientificEffect !== undefined ? { scientific_effect: scientificEffect } : {}),
+    ...(sourceUrl !== undefined ? { source_url: sourceUrl } : {}),
   };
 }
 
@@ -334,6 +340,7 @@ function canonicalResource(spec: ResourceSpec) {
       download_bytes: resolution.download_bytes ?? null,
       stored_bytes: resolution.stored_bytes ?? null,
       scientific_effect: resolution.scientific_effect ?? null,
+      source_url: resolution.source_url ?? null,
     })),
   };
 }

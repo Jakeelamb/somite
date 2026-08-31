@@ -38,6 +38,22 @@ test("bundle planning shares assessment and includes replacement environments", 
   const sourcePlan = planFrozenPackage(source, catalog, { archiveName: "Source", platform: "linux-64" });
   assert.ok(sourcePlan.packages.includes("bioconda::fastqc"));
   assert.ok(sourcePlan.tools.some((tool) => tool.operator_id === "qc.fastqc" && tool.state === "installable"));
+
+  const exactSource = structuredClone(source);
+  const workflow = exactSource.nodes[0]!.source_workflow!;
+  workflow.parameters = [];
+  workflow.unsupported_required_parameters = [];
+  workflow.replacements = [];
+  workflow.capabilities = { ...workflow.capabilities, exact_execution: true, parameter_edits: true };
+  const exactSourcePlan = planFrozenPackage(exactSource, catalog, { archiveName: "Exact source", platform: "linux-64" });
+  assert.equal(exactSourcePlan.assessment.state, "ready");
+  assert.deepEqual(exactSourcePlan.tools, [{
+    operator_id: "workflow.source",
+    title: "nf-core/rnaseq",
+    packages: [],
+    state: "built_in",
+    detail: "Uses the immutable Pixi manifest and lock stored with this source workflow.",
+  }]);
 });
 
 test("frozen package is complete and archives deterministically", async () => {

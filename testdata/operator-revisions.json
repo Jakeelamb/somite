@@ -1,5 +1,5 @@
 {
-  "catalog_revision": "blake3:f6a6a2d52360dbc7f71bd690507aeb2c78a2d2580ddac2e93a74e93ccebeaed9",
+  "catalog_revision": "blake3:c7d5d3d0d42cac9dd6dfa178fccef45715096b11a5465b934f9757fcf98019c6",
   "operator_revisions": {
     "align.bowtie2": "blake3:f168b92d9daec4eef0b339520f74b8b220721012a01cf6b3d545951250b65022",
     "align.bowtie2_build": "blake3:8544639508e6ee61a02c675f1bce827c450d7357dc2b58d784e6b27093fe9f35",
@@ -15,7 +15,7 @@
     "asm.rascaf": "blake3:9b5d310078026066f84772b676e0c04900e3038d7c26db01f833a8897b902448",
     "asm.rascaf_join": "blake3:4fcdfac2740a012e29b76cc103f495260a14d96a86aec2241b620a7fde1f8057",
     "asm.yahs": "blake3:2b0453141eb2e883ec3931a63502bbe46a6acc0b6f49a6be1e22ea11ab1675c7",
-    "class.kraken2": "blake3:a370d1ec6ecdb21cd42a98c021b849eeda1fe1e9ddea97587cf51d2104453768",
+    "class.kraken2": "blake3:a41eda6b13cc31f2b5a90b36b600e5efa75c86d228eabb379efdd11507469113",
     "diff.deseq2": "blake3:92563011add658d716aa18cac44f3427d3e9aca82f99c7df6482d1985f419f0c",
     "ensembl.fasta": "blake3:9197d78c071226797b0e120f7efe373989811c5447859a389f418b5e41ce9239",
     "ensembl.gtf": "blake3:a0c6c035b79f5f8fbeb978a5e769e39e60c05ee14ffd11de53332039fde08c3e",

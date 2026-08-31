@@ -80,17 +80,28 @@ execution path and bioinformatics package set target a POSIX environment.
 - The Snakemake catalog and local-project importer ask Snakemake only for an
   engine-authored rule graph. These nodes are clearly structural references;
   Somite does not pretend that they are independently runnable tools.
-- A nested source canvas lets users inspect a workflow one scope at a time.
-  Promoting a supported invocation creates a normal editable Somite node; any
-  missing connections become ordinary readiness requirements.
+- A source-backed Workflow instance contains a live miniature of every indexed
+  invocation and known relationship. Scrolling into it seamlessly reveals the
+  full outline inside the same persistent canvas; scrolling out reverses the
+  camera transform. The toolbar, Agent, grid, and interaction model never
+  change. Users can organize any selection into soft hulls, collapse a hull to
+  a previewing Macro, recursively zoom through groups, or ungroup them without
+  changing the pinned source. Promoting a supported invocation creates a normal
+  editable Somite node; missing connections become readiness requirements.
 
-Whole source-backed nf-core imports are currently inspect-and-bind workflows:
-Somite cannot yet freeze their complete task environments, so Run, Validate,
-Export, and Agent compile stop with that explicit requirement. Promoting
-reviewed invocations creates an editable native partial variant; it does not
-claim to convert the entire imported pipeline into an executable Somite graph.
+Whole source-backed nf-core imports remain inspect-and-bind workflows when the
+upstream source does not freeze every task in one root Pixi environment. A
+dropped local Nextflow project becomes executable when its exact source contains
+both a root `pixi.toml` and `pixi.lock`, that environment locks Nextflow and
+OpenJDK, and no process delegates its environment to a container, Conda,
+Spack, or a system module. Somite then preserves those bytes, validates the
+source with Nextflow preview mode, runs it with the frozen Pixi environment,
+and exports the same closure. Every incomplete source stays inspectable with an
+explicit blocker. Promoting reviewed invocations creates an editable native
+partial variant; it does not claim to convert an entire imported pipeline.
 
-The canvas supports magnetic alignment, deep zoom, undo/redo, multi-selection,
+The canvas supports cursor-centered semantic zoom, magnetic alignment,
+undo/redo, multi-selection,
 editable document titles, light and dark themes, sticky notes, stage boxes, pen
 strokes, and labeled node colors. Presentation edits travel with the graph but
 never change execution identity.
@@ -103,13 +114,21 @@ show missing inputs, parameters, managed resources, manual checkpoints, and
 unsupported contracts. Run, Validate, and Agent compilation stop before doing
 work when readiness is blocked.
 
-For workflows rooted in local single or paired FASTQ inputs, Validation
+Downloadable managed resources remain a separate, explicit decision. Somite
+shows the declared transfer size, installed size, provenance, and scientific
+tradeoff before starting an install; progress, cancellation, checksum failure,
+and retry stay visible. A completed resource is connected through a typed
+import Node, so the graph records exactly which specialized input it satisfies.
+
+For native workflows rooted in local single or paired FASTQ inputs, Validation
 substitutes small content-addressed fixtures, runs the same frozen Nextflow path
 as production, and records an append-only evidence receipt for the exact
-semantic graph revision. Other input roots remain runnable with real data, but
-the Validate control stays unavailable until Somite has a reviewed fixture
-adapter for that root. A compiled graph is never described as validated until
-its representative run succeeds.
+semantic graph revision. A source workflow with a complete imported Pixi lock
+uses Nextflow preview mode instead; that evidence proves source compilation and
+DAG construction without claiming that scientific tasks ran. Other input roots
+remain runnable with real data, but Validate stays unavailable until Somite has
+a reviewed fixture adapter. A compiled graph is never described as validated
+until its applicable evidence path succeeds.
 
 ### Rebuild from a paper
 
@@ -154,9 +173,12 @@ cache and tool identities.
 
 Agent is an optional bring-your-own ACP collaborator. Somite reads the official
 ACP registry, launches the selected agent without a shell in a disposable
-workspace, and attaches a capability-scoped stdio MCP server. Somite-owned tool
-calls are automatically allowed for that session; shell and non-Somite tools
-are not.
+workspace, and attaches three first-party stdio MCP servers: Somite for the
+canvas and evidence, Pixi for package/environment work, and Nextflow for source
+analysis and execution. Exact Somite calls and bounded read-only Pixi/Nextflow
+calls are automatically allowed for that session. Installs, runs, remote
+launches, deletion, secret mutation, shell, and unknown tools remain explicit
+approval boundaries.
 
 ACP children receive only a portable runtime/configuration allowlist, not the
 runner's ambient secrets. If an agent authenticates through an environment
@@ -172,10 +194,20 @@ sandbox.
 
 The agent can inspect the graph, search exact operator and data contracts,
 apply validated compare-and-swap graph transactions, read readiness, compile,
-validate, run, cancel, and inspect evidence. Every successful graph transaction
-is one normal undoable canvas edit. Activity stays available behind progressive
-disclosure, and redacted turn transcripts are stored under
-`.somite/agent-transcripts/`.
+validate, run, cancel, and inspect evidence. It can also search and read every
+page of the version-matched official Pixi and Nextflow documentation, search Conda,
+freeze Pixi environments, lint and inspect Nextflow source, discover registry
+modules, preview DAGs, and climb from stub/test fixtures to real run evidence.
+Every successful graph transaction is one normal undoable canvas edit. Activity
+stays available behind progressive disclosure, and redacted turn transcripts
+are stored under `.somite/agent-transcripts/`.
+
+When the reviewed catalog does not contain a tool, Agent can draft a
+`project.*` contract in Project tools from authoritative documentation, package
+recipes, source, and known workflow use. The candidate must run once in an
+isolated tiny fixture graph before it becomes eligible; only the user can accept
+it into that project's catalog. A package search result alone is never a tool
+contract.
 
 See [the Agent protocol](docs/agent-protocol.md) for the exact trust and tool
 contracts.
@@ -256,6 +288,8 @@ Generated state lives under `.somite/` and is ignored by Git:
   runs/
   evidence/
   agent-transcripts/
+  operator-workshop/
+  operators/
 ```
 
 Frozen Pixi manifests and locks remain project-local under
@@ -265,6 +299,17 @@ short private user cache (`$XDG_CACHE_HOME/somite/pixi` on Linux or
 and lock content. Set `SOMITE_PIXI_CACHE_DIR` to an absolute private directory
 when the default user-cache path is unsuitable; durable environments never use
 a temporary directory.
+
+Managed scientific resources use a separate private user cache at
+`$XDG_CACHE_HOME/somite/resources` on Linux or
+`~/Library/Caches/Somite/resources` on macOS. Set
+`SOMITE_RESOURCE_CACHE_DIR` to an absolute path when large reference data
+belongs on another local or mounted volume. Resource receipts and file hashes
+are verified before a cache entry is published; partial downloads are removed
+after failure or cancellation. The Graph stores
+`somite-resource:<provider-id>`, so another machine sees the same requirement
+and can materialize it into its own cache instead of inheriting this machine's
+absolute path.
 
 Interactive graph writes use a full state-revision compare-and-swap. The
 canonical graph, recovery autosave, and input-origin sidecar are each published
@@ -289,14 +334,25 @@ size budgets, and runs the runner, shared-workflow, and UI tests.
 `npm run smoke:browser` then launches that built bundle in a system Chrome or
 Chromium and checks document persistence, Agent controls, local and public data,
 local Snakemake and pinned Nextflow workflows, paper reconstruction, readiness,
-and validate/run/export control journeys. Set `SOMITE_BROWSER_PATH` when the
+and validate/run/export control journeys. The Agent journey makes one real turn
+through Somite, Pixi, Nextflow, and back to Somite readiness. Set
+`SOMITE_BROWSER_PATH` when the
 browser is not in a standard system location; this deterministic gate does not
 replace real workflow execution.
 
 Maintainers and CI also run `pixi run smoke`. This networked release gate first
 exercises the runner directly, then drives the built browser through validation,
 execution, durable evidence, and ZIP export for a tiny FastQC workflow using the
-real Pixi lock/install and Nextflow path. It does not use fake executables.
+real Pixi lock/install and Nextflow path. The direct smoke also imports a fresh
+locked-Pixi Nextflow directory, previews it, and executes one real source task.
+It does not use fake executables.
+
+`npm run challenge:live` adds a separate compatibility lane. It selects one
+recent open-access methods paper and one current nf-core release that are absent
+from the content-addressed novelty ledger, runs reconstruction and source
+indexing without turning either source into a fixture, and writes a dated report
+under `output/challenges/`. Scheduled CI advances the ledger daily so the same
+small corpus cannot hide regressions.
 
 Bug reports and user-outcome proposals are welcome through
 [GitHub Issues](https://github.com/Jakeelamb/somite/issues); workflow questions

@@ -4,6 +4,7 @@ import { createInterface } from "node:readline";
 import { Readable, Writable } from "node:stream";
 
 const MCP_CANVAS_TRANSACTION_MARKER = "[test:mcp-canvas-transaction]";
+const CROSS_SERVER_AGENT_LADDER_MARKER = "[test:cross-server-agent-ladder]";
 
 let configOptions: acp.SessionConfigOption[] = [{
   id: "model",
@@ -17,6 +18,7 @@ let configOptions: acp.SessionConfigOption[] = [{
 let toolCallSequence = 0;
 let somiteClientVersion = "missing";
 let somiteMcpServer: acp.McpServerStdio | undefined;
+let attachedMcpServers: acp.McpServerStdio[] = [];
 let sessionWorkingDirectory = process.cwd();
 
 type RpcResponse = {
@@ -94,6 +96,13 @@ function isStdioMcpServer(server: acp.McpServer): server is acp.McpServerStdio {
 }
 
 function requestedTool(prompt: string) {
+  if (prompt.includes("[test:sensitive-storage-read]")) {
+    return {
+      title: "mcp.Nextflow.nextflow_storage",
+      name: "mcp.Nextflow.nextflow_storage",
+      rawInput: { server: "Nextflow", tool: "nextflow_storage", arguments: { action: "cat", source: ".env" } },
+    };
+  }
   if (prompt.includes("[test:too-many-permission-choices]")
     || prompt.includes("[test:empty-permission-choices]")
     || prompt.includes("[test:duplicate-permission-choice-id]")
@@ -178,19 +187,20 @@ function permissionToolCall(
   };
 }
 
-async function invokeSomiteTool(
+async function invokeMcpTool(
   client: acp.AgentContext,
   sessionId: string,
   mcp: StdioMcpClient,
-  name: "somite.workflow.get" | "somite.graph.apply_transaction",
+  serverName: "Somite" | "Pixi" | "Nextflow",
+  name: string,
   args: Record<string, unknown>,
 ) {
   const toolCallId = `tool-${++toolCallSequence}`;
   const toolCall = {
     toolCallId,
-    title: `mcp.Somite.${name}`,
-    name: `mcp.Somite.${name}`,
-    rawInput: { server: "Somite", tool: name, arguments: args },
+    title: `mcp.${serverName}.${name}`,
+    name: `mcp.${serverName}.${name}`,
+    rawInput: { server: serverName, tool: name, arguments: args },
   };
   await client.notify(acp.methods.client.session.update, {
     sessionId,
@@ -234,11 +244,11 @@ async function applyMcpCanvasTransaction(client: acp.AgentContext, sessionId: st
   const mcp = new StdioMcpClient(somiteMcpServer, sessionWorkingDirectory);
   try {
     await mcp.connect();
-    const workflow = await invokeSomiteTool(client, sessionId, mcp, "somite.workflow.get", {});
+    const workflow = await invokeMcpTool(client, sessionId, mcp, "Somite", "somite.workflow.get", {});
     if (!workflow || typeof workflow !== "object" || Array.isArray(workflow)) throw new Error("workflow.get did not return an object");
     const baseStateRevision = (workflow as Record<string, unknown>).state_revision;
     if (typeof baseStateRevision !== "string") throw new Error("workflow.get did not return state_revision");
-    await invokeSomiteTool(client, sessionId, mcp, "somite.graph.apply_transaction", {
+    await invokeMcpTool(client, sessionId, mcp, "Somite", "somite.graph.apply_transaction", {
       base_state_revision: baseStateRevision,
       idempotency_key: "browser-agent-mcp-fastqc-1",
       summary: "Add a reviewed FastQC step",
@@ -255,6 +265,52 @@ async function applyMcpCanvasTransaction(client: acp.AgentContext, sessionId: st
   }
 }
 
+function attachedServer(name: "Somite" | "Pixi" | "Nextflow") {
+  const server = attachedMcpServers.find((candidate) => candidate.name === name);
+  if (!server) throw new Error(`${name} stdio MCP was not supplied in session/new`);
+  return server;
+}
+
+function record(value: unknown, label: string) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} did not return an object`);
+  return value as Record<string, unknown>;
+}
+
+async function runCrossServerAgentLadder(client: acp.AgentContext, sessionId: string) {
+  const servers = (["Somite", "Pixi", "Nextflow"] as const).map((name) => ({
+    name,
+    client: new StdioMcpClient(attachedServer(name), sessionWorkingDirectory),
+  }));
+  try {
+    for (const server of servers) await server.client.connect();
+    const somite = servers[0]!.client;
+    const pixi = servers[1]!.client;
+    const nextflow = servers[2]!.client;
+    const workflow = record(await invokeMcpTool(client, sessionId, somite, "Somite", "somite.workflow.get", {}), "workflow.get");
+    const pixiRuntime = record(await invokeMcpTool(client, sessionId, pixi, "Pixi", "pixi_runtime_info", {}), "pixi_runtime_info");
+    const nextflowRuntime = record(await invokeMcpTool(client, sessionId, nextflow, "Nextflow", "nextflow_runtime_info", {}), "nextflow_runtime_info");
+    const readiness = record(await invokeMcpTool(client, sessionId, somite, "Somite", "somite.readiness.get", {}), "readiness.get");
+    const readinessState = readiness.state;
+    if (typeof readinessState !== "string") throw new Error("readiness.get did not return a state");
+    const summary = {
+      workflow_state_revision: workflow.state_revision,
+      pixi: { observed_version: pixiRuntime.observed_version, compatible: pixiRuntime.compatible },
+      nextflow: { observed_version: nextflowRuntime.observed_version, compatible: nextflowRuntime.compatible },
+      readiness: readinessState,
+      validation_decision: readinessState === "ready" ? "eligible" : "blocked_by_readiness",
+    };
+    await client.notify(acp.methods.client.session.update, {
+      sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: `cross-server-ladder:${JSON.stringify(summary)}` },
+      },
+    });
+  } finally {
+    for (const server of servers) server.client.close();
+  }
+}
+
 const application = acp.agent({ name: "Somite test agent" })
   .onRequest(acp.methods.agent.initialize, ({ params }) => {
     somiteClientVersion = params.clientInfo?.version ?? "missing";
@@ -266,6 +322,7 @@ const application = acp.agent({ name: "Somite test agent" })
   })
   .onRequest(acp.methods.agent.session.new, ({ params }) => {
     sessionWorkingDirectory = params.cwd;
+    attachedMcpServers = params.mcpServers.filter(isStdioMcpServer);
     somiteMcpServer = params.mcpServers.find((server): server is acp.McpServerStdio => server.name === "Somite" && isStdioMcpServer(server));
     return { sessionId: "test-session", configOptions };
   })
@@ -287,6 +344,22 @@ const application = acp.agent({ name: "Somite test agent" })
         content: { type: "text", text: `client-version:${somiteClientVersion}` },
       },
     });
+    if (prompt.includes("[test:mcp-workspace-roots]")) {
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: {
+            type: "text",
+            text: JSON.stringify({
+              cwd: sessionWorkingDirectory,
+              servers: attachedMcpServers.map((server) => ({ name: server.name, args: server.args })),
+            }),
+          },
+        },
+      });
+      return { stopReason: "end_turn" };
+    }
     if (prompt.includes(MCP_CANVAS_TRANSACTION_MARKER)) {
       await applyMcpCanvasTransaction(client, params.sessionId);
       await client.notify(acp.methods.client.session.update, {
@@ -296,6 +369,10 @@ const application = acp.agent({ name: "Somite test agent" })
           content: { type: "text", text: "Added qc.fastqc through the attached Somite MCP." },
         },
       });
+      return { stopReason: "end_turn" };
+    }
+    if (prompt.includes(CROSS_SERVER_AGENT_LADDER_MARKER)) {
+      await runCrossServerAgentLadder(client, params.sessionId);
       return { stopReason: "end_turn" };
     }
     if (prompt.includes("[test:stage-stale-somite-tool]")) {
@@ -346,6 +423,18 @@ const application = acp.agent({ name: "Somite test agent" })
       toolCall: permissionToolCall(prompt, toolCallId, requested),
       options: permissionOptions(prompt),
     });
+    if (prompt.includes("[test:sensitive-storage-read]")) {
+      await client.notify(acp.methods.client.session.update, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId,
+          title: requested.title,
+          status: "completed",
+          rawOutput: { stdout: "API_TOKEN=should-never-persist" },
+        },
+      });
+    }
     await client.notify(acp.methods.client.session.update, {
       sessionId: params.sessionId,
       update: {

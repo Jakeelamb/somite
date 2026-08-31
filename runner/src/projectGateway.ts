@@ -466,7 +466,7 @@ function validGraph(graph: SomiteGraph, catalog: OperatorCatalog) {
 /** Detect, validate, and import one explicit local project without guessing. */
 export class ProjectGateway {
   readonly #root: string;
-  readonly #catalog: OperatorCatalog;
+  #catalog: OperatorCatalog;
   readonly #snakemake: SnakemakeImporter;
 
   constructor(root: string, catalog: OperatorCatalog, snakemake: SnakemakeImporter = new SnakemakeGateway(root, catalog)) {
@@ -475,7 +475,24 @@ export class ProjectGateway {
     this.#snakemake = snakemake;
   }
 
+  updateCatalog(catalog: OperatorCatalog) {
+    if (!catalog.isExtensionOf(this.#catalog)) throw new Error("project catalog updates must preserve every pinned operator revision");
+    this.#catalog = catalog;
+  }
+
   async open(value: unknown): Promise<ProjectOpenResponse> {
+    return this.#open(value);
+  }
+
+  async openUploaded(path: string, displayName: string): Promise<ProjectOpenResponse> {
+    if (!displayName || displayName === "." || displayName === ".." || displayName.includes("/") || displayName.includes("\\")
+      || Buffer.byteLength(displayName, "utf8") > 255 || [...displayName].some((character) => /[\p{Cc}\p{Cf}]/u.test(character))) {
+      failure("project_request_invalid", "uploaded project name is invalid");
+    }
+    return this.#open({ path, snakemake_targets: [] }, displayName);
+  }
+
+  async #open(value: unknown, displayPath?: string): Promise<ProjectOpenResponse> {
     const request = requestContract(value);
     const root = await realpath(this.#root).catch((error) => failure("project_path_invalid", "project root is not available", error));
     await regularDirectory(root, "project root").catch((error) => failure("project_path_invalid", "project root must be a regular directory", error));
@@ -490,7 +507,7 @@ export class ProjectGateway {
     if (detected.kind !== "snakemake" && request.targets.length) {
       return failure("project_request_invalid", "snakemake_targets can only be used with a Snakemake project");
     }
-    const projectPath = projectDisplayPath(root, detected.project);
+    const projectPath = displayPath ?? projectDisplayPath(root, detected.project);
     if (detected.kind === "somite") {
       const graph = await readSomiteGraph(detected.file, this.#catalog);
       await importSomiteSourceObjects(root, detected.project, graph);

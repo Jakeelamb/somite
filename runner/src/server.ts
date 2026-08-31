@@ -10,7 +10,7 @@ import { AgentTransactionError, applyGraphTransaction, parseGraphTransaction, ty
 import { assessWorkflow } from "@somite/workflow/assessment";
 import { planFrozenPackage } from "@somite/workflow/bundle";
 import { OperatorCatalog, operatorPorts, type PinnedOperator } from "@somite/workflow/catalog";
-import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
+import { loadOperatorCatalogDirectories } from "@somite/workflow/catalog.node";
 import { canonicalJsonDigest } from "@somite/workflow/contentIdentity";
 import { parseGraph, parseParameterRecord, parseWorkflowBinding } from "@somite/workflow/graphCodec";
 import { RepresentativeValidationError } from "@somite/workflow/fixtures";
@@ -18,7 +18,7 @@ import type { SomiteGraph } from "@somite/workflow/model";
 import { PaperReviewLimitError, paperAccessionKind, reconstructPaper, type PaperResourceCitation } from "@somite/workflow/paper";
 import {
   applySourceWorkflowEdits,
-  promoteSourceInvocation,
+  promoteSourceInvocations,
   restoreSourceWorkflow,
   sourceWorkflowEditResponse,
   type SourceWorkflowEdit,
@@ -31,13 +31,16 @@ import { AgentManager, AgentManagerError } from "./agentManager.ts";
 import { InputOriginError, InputOrigins } from "./inputOrigins.ts";
 import { FrozenPackageSizeError, RunManager } from "./jobs.ts";
 import { LiteratureGateway } from "./literatureGateway.ts";
+import { ManagedResourceManager } from "./managedResources.ts";
 import { NfcoreGateway } from "./nfcoreGateway.ts";
+import { OperatorWorkshop, type OperatorEvidenceSource } from "./operatorWorkshop.ts";
 import { PaperExtractionError } from "./paperExtractor.ts";
 import { paperIntakeConfigFromEnvironment } from "./paperConfig.ts";
 import { PaperManager } from "./paperManager.ts";
 import { PaperStoreError } from "./paperStore.ts";
 import { PaperToolchainError } from "./paperToolchain.ts";
 import { ProjectGateway, ProjectGatewayError } from "./projectGateway.ts";
+import { ProjectUploadStore } from "./projectUploadStore.ts";
 import { SnakemakeGateway } from "./snakemakeGateway.ts";
 import { SourceSearchGateway } from "./sourceSearchGateway.ts";
 import { SourceWorkflowTrustError, verifyGraphSourceWorkflowTrust } from "./sourceWorkflowTrust.ts";
@@ -65,11 +68,14 @@ type ProjectState = {
   nfcore: NfcoreGateway;
   snakemake: SnakemakeGateway;
   projects: ProjectGateway;
+  projectUploads: ProjectUploadStore;
   inputOrigins: InputOrigins;
   sourceSearch: SourceSearchGateway;
   uploads: UploadStore;
   papers: PaperManager;
   literature: LiteratureGateway;
+  operatorWorkshop: OperatorWorkshop;
+  resources: ManagedResourceManager;
   graph: SomiteGraph;
   recoveredAutosave: boolean;
   autosaveRecoveryWarning: string | null;
@@ -307,7 +313,8 @@ async function initializeProject(serverUrl: string, options: ServerOptions): Pro
   const projectState = await ensurePrivateDirectory(root, ".somite");
   const configuredGraph = options.graph ?? process.env.SOMITE_GRAPH;
   const graphPath = await projectGraphPath(root, configuredGraph ?? join(projectState, "web.somite.json"), "workflow graph");
-  const catalogLoaded = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+  const catalogDirectories = [join(repositoryRoot, "operators"), join(projectState, "operators")];
+  const catalogLoaded = await loadOperatorCatalogDirectories(catalogDirectories);
   const recovery = await projectGraphPath(root, autosavePath(root, graphPath), "workflow autosave");
   let graph: SomiteGraph;
   let recoveredAutosave = false;
@@ -342,8 +349,23 @@ async function initializeProject(serverUrl: string, options: ServerOptions): Pro
   }
   const agentCapability = configuredCapability ?? randomBytes(32).toString("hex");
   const snakemake = new SnakemakeGateway(root, catalogLoaded.catalog);
+  const projects = new ProjectGateway(root, catalogLoaded.catalog, snakemake);
   const inputOrigins = await InputOrigins.open(root, graphPath, dirname(graphPath), graph);
-  return {
+  const resources = new ManagedResourceManager(root);
+  const runs = new RunManager(root, repositoryRoot, catalogLoaded.catalog, dirname(graphPath), {
+    assessmentContext: () => resources.assessmentContext(),
+    managedResourceResolver: (reference) => resources.resolve(reference),
+  });
+  const nfcore = new NfcoreGateway(root, catalogLoaded.catalog);
+  const papers = new PaperManager(root, catalogLoaded.catalog, catalogLoaded.revision, paperConfiguration);
+  let project!: ProjectState;
+  const operatorWorkshop = new OperatorWorkshop({
+    root,
+    repositoryRoot,
+    catalog: catalogLoaded.catalog,
+    onAccept: async () => refreshProjectCatalog(project, catalogDirectories),
+  });
+  project = {
     root,
     graphPath,
     autosavePath: recovery,
@@ -352,15 +374,18 @@ async function initializeProject(serverUrl: string, options: ServerOptions): Pro
     catalogRevision: catalogLoaded.revision,
     operators: [...catalogLoaded.catalog.values()].filter((operator) => !operator.id.startsWith("nf.") && !operator.id.startsWith("smk.")),
     availableBinaries,
-    runs: new RunManager(root, repositoryRoot, catalogLoaded.catalog, dirname(graphPath)),
-    nfcore: new NfcoreGateway(root, catalogLoaded.catalog),
+    runs,
+    nfcore,
     snakemake,
-    projects: new ProjectGateway(root, catalogLoaded.catalog, snakemake),
+    projects,
+    projectUploads: new ProjectUploadStore(root, projects),
     inputOrigins,
     sourceSearch: new SourceSearchGateway(),
     uploads: new UploadStore(root),
-    papers: new PaperManager(root, catalogLoaded.catalog, catalogLoaded.revision, paperConfiguration),
+    papers,
     literature: new LiteratureGateway(root),
+    operatorWorkshop,
+    resources,
     graph,
     recoveredAutosave,
     autosaveRecoveryWarning: recoveryWarning,
@@ -371,6 +396,28 @@ async function initializeProject(serverUrl: string, options: ServerOptions): Pro
     transactionReplays: new Map(),
     transactionSequence: 0,
   };
+  return project;
+}
+
+async function refreshProjectCatalog(state: ProjectState, directories: readonly string[]) {
+  const loaded = await loadOperatorCatalogDirectories(directories);
+  if (!loaded.catalog.isExtensionOf(state.catalog)) throw new Error("project-local catalog acceptance cannot replace a pinned operator revision");
+  const verified = loaded.catalog.verifyGraph(state.graph);
+  if (!verified.ok) throw new Error(`project-local catalog would invalidate the current graph: ${verified.issue.message}`);
+  const availableBinaries = new Set(state.availableBinaries);
+  await Promise.all([...loaded.catalog.values()].map(async (operator) => {
+    if (operator.bin && await executablePath(state.root, operator.bin)) availableBinaries.add(operator.bin);
+  }));
+  state.operatorWorkshop.updateCatalog(loaded.catalog);
+  state.catalog = loaded.catalog;
+  state.catalogRevision = loaded.revision;
+  state.operators = [...loaded.catalog.values()].filter((operator) => !operator.id.startsWith("nf.") && !operator.id.startsWith("smk."));
+  state.availableBinaries = availableBinaries;
+  state.runs.updateCatalog(loaded.catalog);
+  state.nfcore.updateCatalog(loaded.catalog);
+  state.snakemake.updateCatalog(loaded.catalog);
+  state.projects.updateCatalog(loaded.catalog);
+  state.papers.updateCatalog(loaded.catalog, loaded.revision);
 }
 
 function displayedPath(root: string, path: string) {
@@ -471,6 +518,54 @@ function parseSourceWorkflowEdits(value: unknown): SourceWorkflowEdit[] {
       return { kind, invocation_id: requiredString(edit.invocation_id, `edits[${index}].invocation_id`) };
     }
     throw new HttpError(400, `edits[${index}].kind is not supported`);
+  });
+}
+
+function promotionInvocationIds(body: Record<string, unknown>) {
+  const single = body.invocation_id;
+  const multiple = body.invocation_ids;
+  if (single !== undefined && multiple !== undefined) throw new HttpError(400, "use invocation_id or invocation_ids, not both");
+  const ids = single !== undefined
+    ? [requiredString(single, "invocation_id")]
+    : Array.isArray(multiple)
+      ? multiple.map((value, index) => requiredString(value, `invocation_ids[${index}]`))
+      : [];
+  if (!ids.length || ids.length > 64) throw new HttpError(400, "source promotion requires between 1 and 64 invocation ids");
+  if (new Set(ids).size !== ids.length) throw new HttpError(400, "source promotion contains a duplicate invocation id");
+  return ids;
+}
+
+function editGraphSourceWorkflow(graph: SomiteGraph, workflowRevision: string, edits: readonly SourceWorkflowEdit[]) {
+  if (graph.variant_origin) {
+    const promoted = graph.variant_origin.promoted_invocations ?? {};
+    const promotedEdit = edits.find((edit) => "invocation_id" in edit && promoted[edit.invocation_id]);
+    if (promotedEdit && "invocation_id" in promotedEdit) {
+      throw new Error(`source invocation ${promotedEdit.invocation_id} is already editable on the native canvas`);
+    }
+    const source = graph.variant_origin.source_node;
+    if (!source.source_workflow) throw new Error("native variant has no retained source workflow");
+    return {
+      ...graph,
+      variant_origin: {
+        ...graph.variant_origin,
+        source_node: { ...source, source_workflow: applySourceWorkflowEdits(source.source_workflow, workflowRevision, edits) },
+      },
+    };
+  }
+  const sources = graph.nodes.filter((node) => node.source_workflow);
+  if (sources.length !== 1 || graph.nodes.length !== 1 || graph.edges.length) throw new Error("source workflow edits require one source-backed node and no edges");
+  const source = sources[0]!;
+  return { ...graph, nodes: [{ ...source, source_workflow: applySourceWorkflowEdits(source.source_workflow!, workflowRevision, edits) }] };
+}
+
+function operatorEvidenceSources(value: unknown): OperatorEvidenceSource[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 8) throw new HttpError(400, "operator sources must contain between 1 and 8 entries");
+  return value.map((candidate, index) => {
+    const source = object(candidate, `sources[${index}]`);
+    knownFields(source, `sources[${index}]`, ["kind", "url"]);
+    const kind = requiredString(source.kind, `sources[${index}].kind`);
+    if (!["official_docs", "source", "package_recipe", "workflow_use"].includes(kind)) throw new HttpError(400, `sources[${index}].kind is not supported`);
+    return { kind: kind as OperatorEvidenceSource["kind"], url: requiredString(source.url, `sources[${index}].url`) };
   });
 }
 
@@ -708,24 +803,19 @@ async function editAgentSourceWorkflow(state: ProjectState, value: unknown) {
   const fields = agentEditFields(body);
   const workflowRevision = requiredString(body.workflow_revision, "workflow_revision");
   const edits = parseSourceWorkflowEdits(body.edits);
-  return commitAgentMutation(state, { ...fields, requestDigest: canonicalJsonDigest(body) }, (graph) => {
-    const sources = graph.nodes.filter((node) => node.source_workflow);
-    if (sources.length !== 1 || graph.nodes.length !== 1 || graph.edges.length) throw new HttpError(422, "current canvas does not contain one editable source workflow");
-    const source = sources[0]!;
-    return { ...graph, nodes: [{ ...source, source_workflow: applySourceWorkflowEdits(source.source_workflow!, workflowRevision, edits) }] };
-  });
+  return commitAgentMutation(state, { ...fields, requestDigest: canonicalJsonDigest(body) }, (graph) => editGraphSourceWorkflow(graph, workflowRevision, edits));
 }
 
 async function promoteAgentSourceWorkflow(state: ProjectState, value: unknown) {
   const body = object(value, "agent source workflow promotion");
-  knownFields(body, "agent source workflow promotion", ["base_state_revision", "workflow_revision", "invocation_id", "idempotency_key", "summary"]);
+  knownFields(body, "agent source workflow promotion", ["base_state_revision", "workflow_revision", "invocation_id", "invocation_ids", "idempotency_key", "summary"]);
   const fields = agentEditFields(body);
   const workflowRevision = requiredString(body.workflow_revision, "workflow_revision");
-  const invocationId = requiredString(body.invocation_id, "invocation_id");
-  return commitAgentMutation(state, { ...fields, requestDigest: canonicalJsonDigest(body) }, (graph) => promoteSourceInvocation(
+  const invocationIds = promotionInvocationIds(body);
+  return commitAgentMutation(state, { ...fields, requestDigest: canonicalJsonDigest(body) }, (graph) => promoteSourceInvocations(
     graph,
     workflowRevision,
-    invocationId,
+    invocationIds,
     state.catalog,
   ));
 }
@@ -893,6 +983,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
       autosave_recovery_warning: state.autosaveRecoveryWarning,
       input_origin_warning: state.inputOrigins.warning,
       input_origin_id: state.inputOrigins.currentId,
+      ...(await state.resources.assessmentContext()),
       agent_cursor: 0,
       state_revision: projectStateRevision(state),
     });
@@ -928,6 +1019,82 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
   }
   if (request.method === "GET" && url.pathname === "/api/agent/transcript") {
     return json(state.agent.transcript());
+  }
+  if (request.method === "GET" && url.pathname === "/api/operator-workshop/candidates") {
+    return json({ candidates: await state.operatorWorkshop.list() });
+  }
+  if (request.method === "GET" && url.pathname === "/api/resources/providers") {
+    return json({ providers: state.resources.providers(), ...(await state.resources.assessmentContext()) });
+  }
+  if (request.method === "POST" && url.pathname === "/api/resources/install") {
+    const body = object(await requestJson(request), "managed resource install request");
+    knownFields(body, "managed resource install request", ["profile", "resolution", "idempotency_key"]);
+    try {
+      return json(await state.resources.start(
+        requiredString(body.profile, "profile"),
+        requiredString(body.resolution, "resolution"),
+        requiredString(body.idempotency_key, "idempotency_key"),
+      ), { status: 202 });
+    } catch (error) {
+      throw new HttpError(422, error instanceof Error ? error.message : String(error));
+    }
+  }
+  const resourceStatus = url.pathname.match(/^\/api\/resources\/jobs\/([^/]+)$/);
+  if (request.method === "GET" && resourceStatus) {
+    const wait = Number(url.searchParams.get("wait_ms") ?? 0);
+    try {
+      return json(await state.resources.status(decodeURIComponent(resourceStatus[1]!), Number.isFinite(wait) ? wait : 0));
+    } catch (error) {
+      throw new HttpError(404, error instanceof Error ? error.message : String(error));
+    }
+  }
+  const resourceCancel = url.pathname.match(/^\/api\/resources\/jobs\/([^/]+)\/cancel$/);
+  if (request.method === "POST" && resourceCancel) {
+    try {
+      return json(await state.resources.cancel(decodeURIComponent(resourceCancel[1]!)));
+    } catch (error) {
+      throw new HttpError(404, error instanceof Error ? error.message : String(error));
+    }
+  }
+  if (request.method === "POST" && url.pathname === "/api/operator-workshop/candidates") {
+    const body = object(await requestJson(request), "operator candidate request");
+    knownFields(body, "operator candidate request", ["operator", "sources"]);
+    try {
+      return json(await state.operatorWorkshop.draft(body.operator, operatorEvidenceSources(body.sources)), { status: 201 });
+    } catch (error) {
+      throw new HttpError(422, error instanceof Error ? error.message : String(error));
+    }
+  }
+  const operatorProof = url.pathname.match(/^\/api\/operator-workshop\/candidates\/([^/]+)\/proofs$/);
+  if (request.method === "POST" && operatorProof) {
+    const body = object(await requestJson(request), "operator proof request");
+    knownFields(body, "operator proof request", ["graph", "idempotency_key"]);
+    try {
+      return json(await state.operatorWorkshop.startProof(
+        decodeURIComponent(operatorProof[1]!),
+        parseGraph(body.graph),
+        requiredString(body.idempotency_key, "idempotency_key"),
+      ), { status: 202 });
+    } catch (error) {
+      throw new HttpError(422, error instanceof Error ? error.message : String(error));
+    }
+  }
+  const proofStatus = url.pathname.match(/^\/api\/operator-workshop\/proofs\/([^/]+)$/);
+  if (request.method === "GET" && proofStatus) {
+    try {
+      const wait = Number(url.searchParams.get("wait_ms") ?? 0);
+      return json(await state.operatorWorkshop.proofStatus(decodeURIComponent(proofStatus[1]!), Number.isFinite(wait) ? wait : 0));
+    } catch (error) {
+      throw new HttpError(404, error instanceof Error ? error.message : String(error));
+    }
+  }
+  const operatorAccept = url.pathname.match(/^\/api\/operator-workshop\/candidates\/([^/]+)\/accept$/);
+  if (request.method === "POST" && operatorAccept) {
+    try {
+      return json(await state.operatorWorkshop.accept(decodeURIComponent(operatorAccept[1]!)));
+    } catch (error) {
+      throw new HttpError(422, error instanceof Error ? error.message : String(error));
+    }
   }
   const permissionMatch = url.pathname.match(/^\/api\/agent\/permissions\/([^/]+)$/);
   if (request.method === "POST" && permissionMatch) {
@@ -976,7 +1143,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     requireAgentCapability(request, state);
     await state.writeChain;
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, state.graph);
-    return json(assessWorkflow(state.graph, state.catalog));
+    return json(assessWorkflow(state.graph, state.catalog, await state.resources.assessmentContext()));
   }
   if (request.method === "POST" && url.pathname === "/api/agent/compile") {
     requireAgentCapability(request, state);
@@ -1164,11 +1331,7 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     const edits = parseSourceWorkflowEdits(body.edits);
     try {
       return json(await mutateGraph(state, baseStateRevision, (graph) => {
-        const sources = graph.nodes.filter((node) => node.source_workflow);
-        if (sources.length !== 1 || graph.nodes.length !== 1 || graph.edges.length) throw new Error("source workflow edits require one source-backed node and no edges");
-        const source = sources[0]!;
-        const edited = applySourceWorkflowEdits(source.source_workflow!, workflowRevision, edits);
-        return { ...graph, nodes: [{ ...source, source_workflow: edited }] };
+        return editGraphSourceWorkflow(graph, workflowRevision, edits);
       }));
     } catch (error) {
       if (error instanceof HttpError || error instanceof SourceWorkflowTrustError) throw error;
@@ -1177,15 +1340,15 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
   }
   if (request.method === "POST" && url.pathname === "/api/source-workflows/promote") {
     const body = object(await requestJson(request), "source workflow promotion");
-    knownFields(body, "source workflow promotion", ["base_state_revision", "workflow_revision", "invocation_id"]);
+    knownFields(body, "source workflow promotion", ["base_state_revision", "workflow_revision", "invocation_id", "invocation_ids"]);
     try {
       return json(await mutateGraph(
         state,
         requiredString(body.base_state_revision, "base_state_revision"),
-        (graph) => promoteSourceInvocation(
+        (graph) => promoteSourceInvocations(
           graph,
           requiredString(body.workflow_revision, "workflow_revision"),
-          requiredString(body.invocation_id, "invocation_id"),
+          promotionInvocationIds(body),
           state.catalog,
         ),
       ));
@@ -1356,13 +1519,16 @@ export async function startServer(options: ServerOptions = {}) {
   const server = createServer(async (incoming, outgoing) => {
     const pathname = new URL(incoming.url ?? "/", `http://${incoming.headers.host ?? `127.0.0.1:${port}`}`).pathname;
     const isFileUpload = incoming.method === "POST" && pathname === "/api/files";
+    const isProjectUpload = incoming.method === "POST" && pathname === "/api/projects/import";
     const isPaperUpload = incoming.method === "POST" && pathname === "/api/papers/uploads";
-    const request = isFileUpload || isPaperUpload ? uploadRequest(incoming) : nodeRequest(incoming);
+    const request = isFileUpload || isProjectUpload || isPaperUpload ? uploadRequest(incoming) : nodeRequest(incoming);
     let response: Response;
     try {
       authorizeRequest(request, state);
       if (isFileUpload) {
         response = json(await state.uploads.receive(incoming));
+      } else if (isProjectUpload) {
+        response = json(await state.projectUploads.receive(incoming));
       } else if (isPaperUpload) {
         response = json(await state.papers.store.receive(incoming));
       } else response = await route(request, state);
@@ -1428,6 +1594,8 @@ export async function startServer(options: ServerOptions = {}) {
         await Promise.allSettled([
           state.runs.shutdown(),
           state.papers.shutdown(),
+          state.operatorWorkshop.shutdown(),
+          state.resources.shutdown(),
           state.agent.disconnect().catch(() => undefined),
         ]);
         server.closeAllConnections();

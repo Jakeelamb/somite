@@ -75,12 +75,9 @@ function decodeXml(value: string) {
     .replace(/&amp;/g, "&");
 }
 
-export function jatsText(xml: string) {
+export function articleJatsText(xml: string) {
   const lower = xml.toLocaleLowerCase("en-US");
   if (!lower.includes("<article")) throw new Error("full text is not available for this paper");
-  if (!lower.includes(">biorxiv</journal-id>") && !lower.includes(">biorxiv : the preprint server for biology</journal-title>")) {
-    throw new Error("the selected record is not a bioRxiv paper");
-  }
   const text = decodeXml(xml
     .replace(/<\/?(?:article-title|title|sec|p|abstract|kwd-group|list-item|caption|table-wrap|fig|ref-list)\b[^>]*>/gi, "\n")
     .replace(/<[^>]+>/g, " "))
@@ -90,6 +87,14 @@ export function jatsText(xml: string) {
     .trim();
   if (text.length < 200) throw new Error("full text is not available for this paper");
   return text;
+}
+
+export function jatsText(xml: string) {
+  const lower = xml.toLocaleLowerCase("en-US");
+  if (!lower.includes(">biorxiv</journal-id>") && !lower.includes(">biorxiv : the preprint server for biology</journal-title>")) {
+    throw new Error("the selected record is not a bioRxiv paper");
+  }
+  return articleJatsText(xml);
 }
 
 export class LiteratureGateway {

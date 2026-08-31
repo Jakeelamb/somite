@@ -249,6 +249,18 @@ export function mergeCanonicalSourceWorkflow(
   canonical: SomiteGraph,
   baseWorkflowRevision: string,
 ): SomiteGraph {
+  if (current.variant_origin && canonical.variant_origin) {
+    const currentSource = current.variant_origin.source_node;
+    const canonicalSource = canonical.variant_origin.source_node.source_workflow;
+    if (!currentSource.source_workflow || !canonicalSource || currentSource.source_workflow.workflow_revision !== baseWorkflowRevision) return current;
+    return {
+      ...current,
+      variant_origin: {
+        ...current.variant_origin,
+        source_node: { ...currentSource, source_workflow: canonicalSource },
+      },
+    };
+  }
   const currentSources = current.nodes.filter((node) => Boolean(node.source_workflow));
   const canonicalSources = canonical.nodes.filter((node) => Boolean(node.source_workflow));
   const currentSource = currentSources[0];

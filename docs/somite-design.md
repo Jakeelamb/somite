@@ -36,6 +36,8 @@ Somite application.
 web/
   app/                 browser interaction and presentation
   app/api.ts           fixed-origin, runtime-validated runner client
+  app/SourceWorkflowCanvas.tsx
+                        flat source graph and soft-hull React adapter
 
 packages/workflow/     @somite/workflow
   model.ts             persisted Graph vocabulary
@@ -47,6 +49,7 @@ packages/workflow/     @somite/workflow
   linker.ts            Run closure and evidence identity
   bundle.ts            deterministic frozen ZIP
   sourceWorkflow.ts    pinned workflow intent and promotion
+  sourceCanvas.ts      source projection and grouping semantics
   paper.ts             evidence-bound reconstruction
 
 runner/
@@ -82,8 +85,10 @@ developer assistance, not the trust boundary.
 
 The semantic Graph revision covers executable Nodes, ports, parameters, Edges,
 source pins, profiles, and bindings. Layout, notes, annotations, colors, and the
-document title are excluded. The Graph state revision includes that presentation
-state and is used for compare-and-swap persistence and Agent transactions.
+document title are excluded. Source-group membership, nesting, collapse, and
+placement are excluded as well. The Graph state revision includes that
+presentation state and is used for compare-and-swap persistence, undo, and
+Agent transactions.
 
 ### Operator catalog
 
@@ -127,6 +132,16 @@ pixi run --frozen --manifest-path <package>/pixi.toml run
 
 The freezer is shared by browser export, Run, Validate, and Agent compilation.
 
+A whole-source Nextflow workflow follows a separate conservative path. Its
+frozen source tree must contain a root `pixi.toml` and `pixi.lock` that include
+Nextflow and OpenJDK, and its tracked Nextflow/config files must not delegate
+task environments to containers, Conda, Spack, or system modules. Somite adopts
+those exact bytes without solving a replacement environment. Validate invokes
+Nextflow preview mode and records source-preview evidence; Run invokes the same
+entrypoint in the adopted frozen environment. Missing parameter editing support
+is an inspector limitation, not an execution blocker unless a required
+parameter is actually unresolved.
+
 ### Jobs and evidence
 
 A job moves through preparing, queued, running, cancelling, and terminal phases.
@@ -145,8 +160,36 @@ not.
 ### nf-core
 
 Somite resolves an exact release to an immutable Git commit and verified source
-tree. One outer source-backed Node opens a nested source canvas containing only
-the current scope and its immediate invocations. This is a source outline, not a
+tree. One outer source-backed Node shows a live miniature of every indexed
+invocation call and known relationship. Cursor-centered zoom crosses into that
+outline within the same persistent React Flow host; the canvas grid, controls,
+Agent, and tools remain unchanged. Zooming outward applies the exact inverse
+camera transform. Workflow, subworkflow, and process scopes remain quiet
+provenance and may drive grouping suggestions, but only an explicit user action
+creates a Source group.
+
+The workflow Module stores group membership as a presentation forest separate
+from source entities and executable Graph topology. The React adapter renders
+an expanded group as a soft hull overlay without `parentId`, member resizing, or
+React Flow containment. Collapsing a group substitutes a non-executable Macro
+and proxy relationships for presentation only. Each proxy retains the exact
+underlying relationship and member endpoints, so expansion is lossless and no
+visible relationship dangles.
+
+Soft hulls and collapsed Macros are recursive Semantic portals. Their members
+remain visible directly or as a live miniature; once a portal fills the
+viewport, the camera rebases into the same identities and outside relationships
+terminate at exact boundary portals. There is no alternate header, breadcrumb
+navigation, modal, or second canvas. Moving a member out, moving it back,
+renesting, and ungrouping update only presentation membership. Arbitrary depth,
+disclosure, and placement persist in Graph state revision and participate in
+undo/redo, but remain outside semantic Graph revision, Run closure, and
+Evidence receipt identity.
+
+Source-structure relationships are dashed and nonconnectable; they are not
+typed dataflow and cannot satisfy a Port. Each indexed invocation appears once;
+unresolved calls remain visible with their exact source anchors, and shared or
+cyclic scope metadata never duplicates a call. This is a source outline, not a
 fabricated process DAG.
 
 A catalog-pinned invocation replacement is editable intent. Promoting it creates
@@ -172,7 +215,13 @@ and conversion Nodes.
 
 Managed scientific resources such as Kraken2 databases are typed artifacts, not
 Pixi packages. Their profile, provenance, materialization, storage needs, and
-scientific tradeoffs belong in deterministic Requirements and Resolutions.
+scientific tradeoffs belong in deterministic Requirements and Resolutions. A
+reviewed provider is versioned by URL, archive checksum, required-file
+checksums, expected transfer/storage bounds, and a human-readable scientific
+effect. Installs stream into a private user cache, publish only after every
+check passes, and expose bounded progress, cancellation, idempotent retry, and
+one typed import Node. Somite never puts multi-gigabyte reference data into a
+disposable Pixi prefix or an untracked temporary directory.
 
 ## Paper reconstruction
 
@@ -221,11 +270,24 @@ Agent edits are short compare-and-swap transactions against a Graph state
 revision. Somite applies them to a clone, validates the complete result,
 serializes persistence, and presents each successful transaction as one
 undoable canvas edit.
-Only requests whose structured server and tool identities match the Somite MCP
-boundary and one of its exact advertised tool names are automatically allowed
-for the session. Prefix-shaped labels, conflicting identities, shell actions,
-and all other tools remain user-approved. Redacted normalized transcripts
-persist under `.somite/agent-transcripts/`.
+The ACP session receives separate Somite, Pixi, and Nextflow MCP servers. Somite
+owns canvas mutation and proof. Pixi owns its complete version-matched official documentation,
+package discovery, manifests, locks, environments, declared tasks, and global
+tools. Nextflow owns its complete version-matched official documentation, source inspection,
+lint/config/process analysis, modules, preview, execution, and evidence. Exact
+Somite requests and an explicit read-only allowlist from the toolchain servers
+are automatically allowed. Installs, execution, remote launch, cleanup, secret
+mutation, conflicting identities, shell actions, and other tools remain
+user-approved. Redacted transcripts persist under
+`.somite/agent-transcripts/`.
+
+Missing tool contracts cross one explicit workshop rather than growing an
+unreviewed global catalog. Agent may draft a `project.*` external Operator from
+authoritative evidence and prove it through the ordinary frozen RunManager in
+an isolated fixture graph. Passing proof changes the candidate to `proven`, not
+`accepted`. Only the human Project tools route can publish it into the project
+catalog; a failed live-catalog refresh removes the newly written file and leaves
+the candidate retryable.
 
 The launched Agent receives an explicit portable environment allowlist rather
 than `process.env`. Credential-shaped variables cross only when named through
@@ -250,6 +312,8 @@ response through the same bounded workflow envelope.
   runs/                 packages, logs, traces, work, and results
   evidence/             append-only receipts and index
   agent-transcripts/    redacted normalized turns
+  operator-workshop/    evidence, candidates, and proof receipts
+  operators/            user-accepted project-local Operator contracts
 ```
 
 Pixi lock provenance remains project-local under `.somite/pixi/locks/`.
@@ -258,6 +322,12 @@ cache so deeply nested projects do not exceed package relocation placeholders
 and identical frozen environments are reused across projects. The cache root is
 configurable with the absolute `SOMITE_PIXI_CACHE_DIR` path; temporary storage
 is not a durable environment adapter.
+
+Managed resources live outside the project in a separate private cache rooted
+at `SOMITE_RESOURCE_CACHE_DIR` or the platform user-cache directory. Their
+receipt binds the exact provider manifest and verified installed file metadata;
+the portable graph retains a `somite-resource:<provider-id>` import contract,
+which production materialization resolves to that machine's canonical cache.
 
 Portable Somite documents are bounded at 64 MiB. Only routes whose primary
 payload is a Graph receive that compatibility envelope (plus 64 KiB for scoped
@@ -314,3 +384,8 @@ User journeys that cross Modules require a spawned-runner or real-browser check.
 Export changes additionally require inspection of the live ZIP entries and a
 frozen launch. Paper recognition changes require the committed gold corpus and,
 when available, the ten-paper extraction corpus.
+
+The scheduled unseen-source challenge complements those deterministic gates.
+It content-deduplicates recent Europe PMC methods papers and current nf-core
+releases against a persistent novelty ledger, records structured outcomes, and
+never silently graduates a live source into the fixed test corpus.

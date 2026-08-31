@@ -96,6 +96,32 @@ test("deep projects share one short content-addressed Pixi environment while ret
   }
 });
 
+test("a source-owned Pixi lock is adopted byte-for-byte without solving it again", async () => {
+  const setup = await fixture();
+  const previousPath = process.env.PATH;
+  const previousCache = process.env.SOMITE_PIXI_CACHE_DIR;
+  process.env.PATH = setup.path;
+  process.env.SOMITE_PIXI_CACHE_DIR = setup.cache;
+  try {
+    const project = await setup.deepProject("adopted");
+    const cache = new PixiCache(project);
+    const manifest = new TextEncoder().encode("[workspace]\nname='adopted'\nplatforms=['linux-64']\n");
+    const lock = new TextEncoder().encode("version: 6\nenvironments: {}\n");
+    const adopted = await cache.adoptLock(manifest, lock);
+    assert.deepEqual(adopted.manifest, manifest);
+    assert.deepEqual(adopted.lock, lock);
+    await cache.environment(adopted, "linux-64");
+    const invocations = (await readFile(setup.log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(invocations.some(({ command }) => command === "lock"), false);
+    assert.equal(invocations.filter(({ command }) => command === "install").length, 1);
+  } finally {
+    process.env.PATH = previousPath;
+    if (previousCache === undefined) delete process.env.SOMITE_PIXI_CACHE_DIR;
+    else process.env.SOMITE_PIXI_CACHE_DIR = previousCache;
+    await rm(setup.root, { recursive: true, force: true });
+  }
+});
+
 test("the environment cache fails closed when content-addressed material is changed", async () => {
   const setup = await fixture();
   const previousPath = process.env.PATH;

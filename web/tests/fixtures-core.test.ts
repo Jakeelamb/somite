@@ -75,3 +75,40 @@ test("representative validation rejects unsupported root sources", async () => {
       && error.capability.unsupported_roots.join(",") === "sra.prefetch",
   );
 });
+
+test("a locked source workflow exposes static Nextflow preview validation", async () => {
+  const { graph } = await fixtureGraph();
+  const source: SomiteGraphNode = {
+    ...graph.nodes[0],
+    operator: "workflow.source",
+    ports: [],
+    params: {},
+    source_workflow: {
+      schema_version: 1,
+      workflow_revision: `blake3:${"a".repeat(64)}`,
+      source: {
+        provider: "local",
+        repository: "local:demo",
+        requested_revision: "working-tree",
+        resolved_revision: "b".repeat(64),
+        source_digest: `blake3:${"b".repeat(64)}`,
+        entrypoint: "main.nf",
+        file_count: 3,
+        source_bytes: 300,
+      },
+      capabilities: {
+        exact_execution: true,
+        parameter_edits: true,
+        hierarchy_indexed: true,
+        structural_edits: false,
+        channel_contracts: false,
+        source_edits: false,
+      },
+    },
+  };
+  assert.deepEqual(representativeValidationCapability({ ...graph, nodes: [source] }), {
+    supported: true,
+    kind: "source_preview",
+    fixture_pack: "somite.source.preview.v1",
+  });
+});

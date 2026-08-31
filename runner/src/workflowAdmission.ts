@@ -1,4 +1,4 @@
-import { assessWorkflow, type WorkflowAssessment } from "@somite/workflow/assessment";
+import { assessWorkflow, type WorkflowAssessment, type WorkflowAssessmentContext } from "@somite/workflow/assessment";
 import type { OperatorCatalog } from "@somite/workflow/catalog";
 import type { SomiteGraph } from "@somite/workflow/model";
 
@@ -17,8 +17,8 @@ export class WorkflowAdmissionError extends Error {
 }
 
 /** One honest execution/export admission boundary shared by every caller. */
-export function requireReadyWorkflow(graph: SomiteGraph, catalog: OperatorCatalog, action: string) {
-  const assessment = assessWorkflow(graph, catalog);
+export function requireReadyWorkflow(graph: SomiteGraph, catalog: OperatorCatalog, action: string, context: WorkflowAssessmentContext = {}) {
+  const assessment = assessWorkflow(graph, catalog, context);
   if (assessment.state !== "ready") throw new WorkflowAdmissionError(action, assessment);
   return assessment;
 }

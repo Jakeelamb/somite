@@ -148,6 +148,25 @@ export type SourceWorkflowInstance = {
   diagnostics?: SourceDiagnostic[];
 };
 
+/** One user-authored, presentation-only group in the flat source canvas. */
+export type SourceCanvasGroup = {
+  id: string;
+  title: string;
+  parent_group_id: string | null;
+  direct_entity_ids: string[];
+  collapsed: boolean;
+};
+
+/** Presentation-only state for the flat, user-groupable source canvas. */
+export type SourceCanvasView = {
+  schema_version: 2;
+  source_digest: string;
+  groups?: SourceCanvasGroup[];
+  positions?: Record<string, CanvasPoint>;
+  /** Per-item stack of prior direct groups consumed by Move back. */
+  move_history?: Record<string, string[]>;
+};
+
 export type SomiteGraphNode = {
   id: string;
   operator: string;
@@ -155,6 +174,7 @@ export type SomiteGraphNode = {
   ports: SomitePort[];
   params?: Record<string, ParamValue>;
   source_workflow?: SourceWorkflowInstance;
+  source_canvas?: SourceCanvasView;
   layout: { x: number; y: number };
   note?: string;
   color?: CanvasColor;

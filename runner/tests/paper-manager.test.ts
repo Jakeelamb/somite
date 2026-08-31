@@ -47,8 +47,10 @@ test("content-addressed paper intake is replayable, cached, and reconstructs typ
     assert.equal(duplicate.digest, artifact.digest);
     assert.equal(duplicate.reused, true);
 
-    const started = await manager.start(artifact.digest, "paper-test-one");
-    const replay = await manager.start(artifact.digest, "paper-test-one");
+    const [started, replay] = await Promise.all([
+      manager.start(artifact.digest, "paper-test-one"),
+      manager.start(artifact.digest, "paper-test-one"),
+    ]);
     assert.equal(replay.job_id, started.job_id);
     assert.equal(replay.replayed, true);
     const status = await completed(manager, started.job_id);

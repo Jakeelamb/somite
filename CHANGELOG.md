@@ -40,12 +40,32 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reconstruction, readiness, and validate/run/export control journeys.
 - Browser-to-runner release smoke that validates and runs a real frozen
   Nextflow package, records durable evidence, and downloads the exported ZIP.
+- Full browser directory import for local Nextflow trees, plus exact validation,
+  execution, compilation, and export when the source carries one complete root
+  Pixi lock without delegated task environments.
+- A daily unseen-source challenge that advances a content-addressed novelty
+  ledger across recent Europe PMC methods papers and current nf-core releases
+  and retains structured diagnostic reports without expanding the fixed corpus.
 - Enforced source and production-client size budgets, including rejection of
   tracked generated state and oversized browser chunks.
+- A project-local Operator Workshop where agents can draft evidence-backed
+  `project.*` contracts, prove them through isolated frozen fixture runs, and
+  leave final catalog acceptance to the user.
+- Checksum-pinned managed scientific resources with explicit transfer/storage
+  consent, scientific-effect disclosure, private cross-project caching,
+  progress, cancellation, retry, receipts, and typed graph insertion.
 - Security, contribution, conduct, and release-maintainer policies.
 
 ### Changed
 
+- Source-backed workflows now use cursor-centered semantic zoom in the one
+  persistent canvas. Workflow instances and collapsed Macros show live child
+  previews; zooming through them recursively rebases the camera without
+  changing the grid, tools, Agent, or interaction model, and zooming out applies
+  the exact inverse transform. Users can still nest arbitrary selections into
+  soft hulls, move members between groups, and ungroup them through persisted,
+  undoable presentation state. Proxy and Source-structure relationships remain
+  distinct from executable typed dataflow.
 - Completed the migration to one TypeScript web product. The browser and runner
   now share graph contracts, catalog loading, assessment, compilation, Pixi
   freezing, source-workflow handling, and paper reconstruction through
@@ -69,6 +89,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bounds, with actionable failures.
 - Kept all 15 concrete Agent result contracts while reducing their serialized
   discovery footprint from 87,874 to 24,042 bytes.
+- Deferred workspace panels into a bounded production chunk and reused the
+  immutable source-call index across semantic previews and edits.
 - Snakemake catalog intake now streams the current upstream catalog within
   aggregate wire, entry, and cache limits instead of buffering its full source.
 - Nextflow source indexing and parameter-schema projection now carry aggregate
@@ -111,5 +133,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Launcher shutdown now cancels active workflow, paper, and Agent process trees
   without leaving the local runner behind. Module paths and Pixi executable
   discovery use platform-appropriate layouts on supported direct platforms.
+- Lazy workspace-panel loading now exposes authoritative expanded state, and
+  semantic-zoom browser checks retain stable source invocation identities while
+  viewport rendering mounts only visible Nodes.
 
 [Unreleased]: https://github.com/Jakeelamb/somite/commits/main

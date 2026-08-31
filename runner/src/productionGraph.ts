@@ -2,6 +2,7 @@ import { lstat, realpath } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import type { OperatorCatalog } from "@somite/workflow/catalog";
+import { managedResourceReferenceId } from "@somite/workflow/assessment";
 import type { SomiteGraph, WorkflowBinding } from "@somite/workflow/model";
 import { operatorImportPaths } from "@somite/workflow/nextflow";
 
@@ -25,6 +26,8 @@ export type GraphInputLocation = Readonly<{
   graphBase: string;
   relativeInputOrder: "project_first" | "graph_first";
 }>;
+
+export type ManagedResourceResolver = (reference: string) => Promise<string>;
 
 function inside(root: string, path: string) {
   const fromRoot = relative(root, path);
@@ -63,12 +66,25 @@ async function resolveInputPath(
   graphBase: string,
   relativeInputOrder: GraphInputLocation["relativeInputOrder"],
   label: string,
+  managedResourceResolver?: ManagedResourceResolver,
 ) {
   if (!value || value.length > 4096 || [...value].some((character) => {
     const code = character.codePointAt(0) ?? 0;
     return code === 0 || code < 32 || code === 127;
   })) throw new ProductionInputError("input_path_invalid", `${label} is not a bounded printable path`);
   if (remoteIdentity(value)) return value;
+  if (managedResourceReferenceId(value)) {
+    if (expected !== "directory") throw new ProductionInputError("input_path_type", `${label} uses a managed resource where a file is required`);
+    if (!managedResourceResolver) throw new ProductionInputError("input_path_missing", `${label} requires ${value}, but no managed resource store is attached`);
+    return resolveInputPath(
+      await managedResourceResolver(value),
+      expected,
+      projectRoot,
+      graphBase,
+      relativeInputOrder,
+      label,
+    );
+  }
 
   let candidates: string[];
   if (isAbsolute(value)) candidates = [resolve(value)];
@@ -136,6 +152,7 @@ export async function materializeProductionGraph(
   catalog: OperatorCatalog,
   projectRootValue: string,
   graphLocation: string | GraphInputLocation = projectRootValue,
+  managedResourceResolver?: ManagedResourceResolver,
 ) {
   const graphBaseValue = typeof graphLocation === "string" ? graphLocation : graphLocation.graphBase;
   const relativeInputOrder = typeof graphLocation === "string" ? "project_first" : graphLocation.relativeInputOrder;
@@ -158,6 +175,7 @@ export async function materializeProductionGraph(
         graphBase,
         relativeInputOrder,
         `${operator.title} ${contract.parameter}`,
+        managedResourceResolver,
       );
     }
     if (!node.source_workflow?.bindings) continue;

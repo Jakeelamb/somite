@@ -43,34 +43,55 @@ not a promise that Somite manually maintains every bioinformatics package.
 | `samtools.index` | BAM to BAI |
 | `class.kraken2` | reads plus a required local Kraken2 database directory to a classification table |
 
-The scalable catalog path is contract generation and audit:
+The scalable catalog path is the Project tools Operator Workshop:
 
 1. inspect a binary's `--help`, package recipe, and trusted workflow uses;
 2. propose typed ports, parameters, argv tokens, outputs, and Pixi packages;
 3. run a tiny fixture in an isolated Pixi environment;
 4. inspect artifacts and record the evidence receipt; and
-5. review before promotion into `operators/`.
+5. let the user accept the proven candidate into `.somite/operators/`.
 
 The first automated fixture pack covers local single- and paired-end FASTQ
 graphs. It is deliberately not a universal biological test corpus: unsupported
 source kinds remain unvalidated until a representative pack and binding policy
 are added.
 
-Agents can perform steps 1 through 4 in parallel. A package name or generated
-guess alone never passes step 5.
+Agents can perform steps 1 through 4 through the bounded Somite, Pixi, and
+Nextflow MCP surfaces. Acceptance is human-only. A package name, inferred argv,
+or generated guess alone never passes step 5. Checked-in `operators/` remains
+the reviewed distribution catalog; a project-local contract never silently
+changes another project or a built-in revision.
 
 ## nf-core Pipeline catalog
 
 The Pipeline panel searches released nf-core workflows. Dropping one resolves
 its selected revision to an immutable Git commit, verifies the complete tracked
-source tree, and inserts one `workflow.source` Node. The clean outer card opens
-into a nested, source-anchored outline of workflows, subworkflows, processes,
-and invocations.
+source tree, and inserts one `workflow.source` Node. The outer card contains a
+live miniature of the source-anchored outline. Cursor-centered zoom grows that
+preview until the same persistent canvas rebases into every indexed invocation
+call and known relationship; zooming out performs the exact inverse. No second
+canvas, alternate toolbar, breadcrumb strip, or open button is introduced.
+Workflow, subworkflow, and process scopes remain quiet provenance and may offer
+grouping suggestions, but accepting one performs the same explicit, undoable
+action as grouping any other user selection.
 
-The outline is a navigation and editing lens, not a process DAG. Nextflow
-channel transforms, composite values, conditions, and task environments remain
-in the exact source unless Somite has their complete structured contract. DOT
-output is never used as execution truth.
+An expanded Source group is a soft hull overlay; it does not shrink its members
+or turn them into child Nodes. A collapsed group is a non-executable Macro with
+a live child preview whose proxy relationships retain their exact underlying
+member endpoints. Soft hulls and Macros are recursive Semantic portals: when
+one fills the viewport, its members become the active level of detail without
+replacing the canvas. Moving members out, moving them back, renesting, and
+ungrouping are lossless presentation changes. Arbitrarily deep membership
+persists with the document but does not change source, execution, or evidence
+identity.
+
+Dashed Source-structure relationships are nonconnectable and never typed
+dataflow. Each indexed invocation appears once; unresolved calls remain
+explicit, and shared or cyclic scope metadata never duplicates a call. The
+outline is an inspection and editing lens, not a process DAG. Nextflow channel
+transforms, composite values, conditions, and task environments remain in the
+exact source unless Somite has their complete structured contract. DOT output
+is never used as execution truth.
 
 The first supported source-backed form is a whole-root workflow with no
 fabricated ports or Edges. Required public parameters come from the workflow's

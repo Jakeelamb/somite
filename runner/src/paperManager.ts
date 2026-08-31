@@ -57,6 +57,13 @@ type PaperJob = {
   waiters: Set<() => void>;
 };
 
+type PaperStart = Readonly<{
+  job_id: string;
+  source_digest: string;
+  phase: PaperIntakePhase;
+  replayed: boolean;
+}>;
+
 type ExtractionCache = Readonly<{
   schema_version: 3;
   source_digest: string;
@@ -120,10 +127,10 @@ export class PaperManager {
   readonly paperTools: PaperToolchain;
   readonly configuration: PaperIntakeConfig;
   readonly #root: string;
-  readonly #catalog: OperatorCatalog;
-  readonly #catalogRevision: string;
+  #catalog: OperatorCatalog;
+  #catalogRevision: string;
   readonly #jobs = new Map<string, PaperJob>();
-  readonly #replays = new Map<string, { digest: string; jobId: string }>();
+  readonly #replays = new Map<string, { digest: string; pending: Promise<PaperStart>; jobId?: string }>();
   readonly #reconstructionCache = new Map<string, { review: PaperReview; bytes: number }>();
   readonly #pending: PaperJob[] = [];
   readonly #executions = new Set<Promise<void>>();
@@ -146,6 +153,12 @@ export class PaperManager {
     this.paperTools = new PaperToolchain(root, { ocrLanguages: configuration.ocrLanguages });
   }
 
+  updateCatalog(catalog: OperatorCatalog, catalogRevision: string) {
+    if (!catalog.isExtensionOf(this.#catalog)) throw new Error("paper catalog updates must preserve every pinned operator revision");
+    this.#catalog = catalog;
+    this.#catalogRevision = catalogRevision;
+  }
+
   extract(bytes: Uint8Array, mediaKind: PaperMediaKind) {
     return extractPaper(bytes, mediaKind, this.#extractionOptions());
   }
@@ -166,17 +179,34 @@ export class PaperManager {
     } as const;
   }
 
-  async start(digest: string, idempotencyKey?: string) {
+  async start(digest: string, idempotencyKey?: string): Promise<PaperStart> {
     if (idempotencyKey && !validIdempotencyKey(idempotencyKey)) throw new Error("invalid paper idempotency key");
     if (idempotencyKey) {
       const replay = this.#replays.get(idempotencyKey);
       if (replay) {
         if (replay.digest !== digest) throw new Error("paper idempotency key was already used for another source");
-        const job = this.#jobs.get(replay.jobId);
-        if (job) return { job_id: job.status.job_id, source_digest: digest, phase: job.status.phase, replayed: true };
+        const original = await replay.pending;
+        const job = this.#jobs.get(original.job_id);
+        if (job) return { ...original, phase: job.status.phase, replayed: true };
         this.#replays.delete(idempotencyKey);
       }
     }
+    const pending = this.#launch(digest);
+    if (idempotencyKey) this.#replays.set(idempotencyKey, { digest, pending });
+    try {
+      const result = await pending;
+      if (idempotencyKey) {
+        const replay = this.#replays.get(idempotencyKey);
+        if (replay?.pending === pending) replay.jobId = result.job_id;
+      }
+      return result;
+    } catch (cause) {
+      if (idempotencyKey && this.#replays.get(idempotencyKey)?.pending === pending) this.#replays.delete(idempotencyKey);
+      throw cause;
+    }
+  }
+
+  async #launch(digest: string): Promise<PaperStart> {
     const artifact = await this.store.resolveDigestPath(digest);
     this.#prune();
     const jobCapacity = Math.max(DEFAULT_MAX_RETAINED_JOBS, this.configuration.maxActiveJobs);
@@ -198,7 +228,6 @@ export class PaperManager {
       waiters: new Set(),
     };
     this.#jobs.set(jobId, job);
-    if (idempotencyKey) this.#replays.set(idempotencyKey, { digest, jobId });
     this.#pending.push(job);
     queueMicrotask(() => this.#pump());
     return { job_id: jobId, source_digest: digest, phase: "queued" as const, replayed: false };

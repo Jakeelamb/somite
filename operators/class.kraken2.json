@@ -35,12 +35,13 @@
             {
               "id": "standard-8",
               "label": "Download Standard-8",
-              "detail": "A compact prebuilt database for machines with limited disk and memory.",
+              "detail": "The checksum-pinned June 2026 Standard collection capped at 8 GB for machines with limited disk and memory.",
               "kind": "download",
               "recommended": true,
               "download_bytes": 5500000000,
               "stored_bytes": 7500000000,
-              "scientific_effect": "Smaller reference coverage than Standard, with much lower storage and memory requirements."
+              "scientific_effect": "Smaller reference coverage than Standard, with much lower storage and memory requirements.",
+              "source_url": "https://benlangmead.github.io/aws-indexes/k2"
             },
             {
               "id": "standard",

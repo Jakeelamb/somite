@@ -6,6 +6,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
+import { operatorPorts } from "@somite/workflow/catalog";
 import type { SomiteGraph } from "@somite/workflow/model";
 import { materializeProductionGraph, ProductionInputError } from "../src/productionGraph.ts";
 
@@ -103,5 +104,37 @@ test("production inputs preserve remote identities and validate local type and c
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("managed resource references stay portable and resolve through the attached verified store", async () => {
+  const root = await mkdtemp(join(tmpdir(), "somite-production-managed-"));
+  try {
+    const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+    const operator = catalog.get("files.import_kraken2_database")!;
+    const database = join(root, "managed", "kraken");
+    await mkdir(database, { recursive: true });
+    const reference = "somite-resource:kraken2-standard-8-20260626";
+    const graph: SomiteGraph = {
+      schema_version: 3,
+      nodes: [{
+        id: "database",
+        operator: operator.id,
+        operator_revision: operator.revision,
+        ports: operatorPorts(operator),
+        params: { path: reference },
+        layout: { x: 0, y: 0 },
+      }],
+      edges: [],
+    };
+    await assert.rejects(materializeProductionGraph(graph, catalog, root), /no managed resource store is attached/);
+    const materialized = await materializeProductionGraph(graph, catalog, root, root, async (requested) => {
+      assert.equal(requested, reference);
+      return database;
+    });
+    assert.equal(materialized.nodes[0]?.params?.path, database);
+    assert.equal(graph.nodes[0]?.params?.path, reference, "materialization must retain the portable provider identity on the canvas");
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });

@@ -278,7 +278,7 @@ async function sourceRevision(project: string) {
 
 export class SnakemakeGateway {
   readonly #root: string;
-  readonly #catalog: OperatorCatalog;
+  #catalog: OperatorCatalog;
   readonly #fetcher: typeof fetch;
   #snapshot?: Promise<{ workflows: SnakemakeWorkflow[]; cached: boolean }>;
 
@@ -286,6 +286,11 @@ export class SnakemakeGateway {
     this.#root = root;
     this.#catalog = catalog;
     this.#fetcher = fetcher;
+  }
+
+  updateCatalog(catalog: OperatorCatalog) {
+    if (!catalog.isExtensionOf(this.#catalog)) throw new Error("Snakemake catalog updates must preserve every pinned operator revision");
+    this.#catalog = catalog;
   }
 
   async catalogResponse() {

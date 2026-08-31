@@ -251,6 +251,25 @@ test("paper resource extraction is bounded, explicit, and page-linear", () => {
   assert.ok(Buffer.byteLength(JSON.stringify(review)) <= MAX_PAPER_REVIEW_BYTES);
 });
 
+test("paper reconstruction retains a novel repository-backed method as a typed adapter gap", () => {
+  const review = reconstructPaper(catalog, [
+    "SNooPy: a statistical framework for long-read metagenomic variant calling",
+    "Materials and methods",
+    "SNooPy processes BAM files through a sliding window. Candidate SNP groups are validated and output in a VCF file.",
+    "Data availability",
+    "SNooPy is freely available at https://github.com/rolandfaure/SNooPy.",
+  ].join("\n"), "jats");
+
+  const mention = review.mentions.find((item) => item.normalized_name === "snoopy");
+  assert.equal(mention?.support, "unsupported");
+  assert.equal(mention?.operation_class, "variant_calling");
+  assert.deepEqual(review.candidates.map((candidate) => candidate.assay), ["variants"]);
+  assert.ok(review.candidates.length > 0);
+  const gap = review.candidates.flatMap((candidate) => candidate.graph.nodes).find((node) => node.operator === "gap.missing" && node.params?.tool === "SNooPy");
+  assert.deepEqual(gap?.ports.map((port) => ({ dir: port.dir, ty: port.ty })), [{ dir: "in", ty: "Bam" }, { dir: "out", ty: "Vcf" }]);
+  assert.ok(review.candidates.some((candidate) => candidate.assessment.items.some((item) => item.kind === "adapter")));
+});
+
 test("paper method recognition stays bounded for repeated aliases and retains the exact PDF page", { timeout: 30_000 }, () => {
   const script = String.raw`
     import path from "node:path";

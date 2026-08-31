@@ -47,7 +47,7 @@ test("validation evidence runs only for graphs that support representative input
   assert.equal(validationEvidenceRequestPath({ sessionReady: true, activeIntent: false, workflowReady: true, graph: { ...nativeGraph, nodes: [] } }), null);
 });
 
-test("source-backed and unsupported-source workflows never request representative validation evidence", () => {
+test("unsupported source workflows never request validation evidence", () => {
   const sourceBacked: SomiteGraph = {
     schema_version: 3,
     nodes: [{
@@ -66,4 +66,20 @@ test("source-backed and unsupported-source workflows never request representativ
 
   assert.equal(validationEvidenceRequestPath({ sessionReady: true, activeIntent: false, workflowReady: true, graph: sourceBacked }), null);
   assert.equal(validationEvidenceRequestPath({ sessionReady: true, activeIntent: false, workflowReady: true, graph: remoteReads }), null);
+});
+
+test("an exact source workflow polls for its own preview evidence", () => {
+  const sourceBacked: SomiteGraph = {
+    schema_version: 3,
+    nodes: [{
+      ...inputNode,
+      id: "locked-source",
+      operator: "workflow.source",
+      source_workflow: {
+        capabilities: { exact_execution: true },
+      } as NonNullable<SomiteGraphNode["source_workflow"]>,
+    }],
+    edges: [],
+  };
+  assert.equal(validationEvidenceRequestPath({ sessionReady: true, activeIntent: false, workflowReady: true, graph: sourceBacked }), "/api/validations/status");
 });

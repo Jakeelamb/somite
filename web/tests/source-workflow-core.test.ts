@@ -8,6 +8,7 @@ import {
   applySourceWorkflowEdits,
   parseNextflowParameterSchema,
   promoteSourceInvocation,
+  promoteSourceInvocations,
   restoreSourceWorkflow,
   sourceWorkflowRevision,
 } from "@somite/workflow/sourceWorkflow";
@@ -17,6 +18,52 @@ test("the tracked source workflow has a stable semantic revision", async () => {
   const { workflow } = await trackedSourceWorkflowFixture();
   assert.equal(sourceWorkflowRevision(workflow), workflow.workflow_revision);
   assert.equal(workflow.workflow_revision, "blake3:dbec34d4268cc3b677bc590634a45272cb66dc8b0a4b123f18cf16e3706a56d7");
+});
+
+test("source invocations can be promoted incrementally into one editable native variant", async () => {
+  const { workflow } = await trackedSourceWorkflowFixture();
+  const invocations = workflow.invocations?.slice(0, 2) ?? [];
+  assert.equal(invocations.length, 2);
+  const { catalog } = await loadOperatorCatalog(fileURLToPath(new URL("../../operators/", import.meta.url)));
+  const imported = catalog.get("files.import")!;
+  const fastqc = catalog.get("qc.fastqc")!;
+  const edited = applySourceWorkflowEdits(workflow, workflow.workflow_revision, [{
+    kind: "replace_invocation",
+    invocation_id: invocations[0]!.id,
+    operator: imported.id,
+    operator_revision: imported.revision,
+    params: { path: "reads.fastq" },
+  }, {
+    kind: "replace_invocation",
+    invocation_id: invocations[1]!.id,
+    operator: fastqc.id,
+    operator_revision: fastqc.revision,
+    params: {},
+  }]);
+  const source = catalog.get("workflow.source")!;
+  const graph: SomiteGraph = {
+    schema_version: 3,
+    name: "Incremental variant",
+    nodes: [{
+      id: "source",
+      operator: source.id,
+      operator_revision: source.revision,
+      ports: [],
+      params: {},
+      source_workflow: edited,
+      layout: { x: 10, y: 20 },
+    }],
+    edges: [],
+  };
+  const first = promoteSourceInvocation(graph, edited.workflow_revision, invocations[0]!.id, catalog);
+  const second = promoteSourceInvocations(first, edited.workflow_revision, [invocations[1]!.id], catalog);
+  assert.deepEqual(second.nodes.map((node) => node.operator), ["files.import", "qc.fastqc"]);
+  assert.equal(Object.keys(second.variant_origin?.promoted_invocations ?? {}).length, 2);
+  assert.throws(
+    () => promoteSourceInvocation(second, edited.workflow_revision, invocations[0]!.id, catalog),
+    /already editable/,
+  );
+  assert.deepEqual(restoreSourceWorkflow(second, catalog).nodes, graph.nodes);
 });
 
 test("parameter projection preserves supported fields and isolates unsupported shapes", async () => {

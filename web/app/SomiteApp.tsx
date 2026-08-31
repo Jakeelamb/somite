@@ -20,20 +20,20 @@ import {
   type Node,
   type NodeProps,
   type OnConnectStartParams,
+  type OnSelectionChangeParams,
   type ReactFlowInstance,
 } from "@xyflow/react";
 import {
   Check,
   CheckCircle2,
   Bot,
-  ChevronLeft,
-  ChevronRight,
   CircleAlert,
   CloudUpload,
   Cpu,
   Eye,
   EyeOff,
   FileSearch,
+  FlaskConical,
   FolderOpen,
   LoaderCircle,
   Maximize2,
@@ -56,7 +56,9 @@ import {
 } from "lucide-react";
 import React, {
   createContext,
+  lazy,
   memo,
+  Suspense,
   useCallback,
   useDeferredValue,
   useEffect,
@@ -65,17 +67,8 @@ import React, {
   useRef,
   useState,
 } from "react";
-import {
-  AgentPanel,
-  InspectorPanel,
-  LibraryPanel,
-  MachinePanel,
-  PaperPanel,
-  ProjectPanel,
-  ReadinessPanel,
-  ToolchainPanel,
-} from "./WorkspacePanels";
 import { CanvasAnnotations } from "./CanvasAnnotations";
+import { OperatorWorkshopPanel } from "./OperatorWorkshopPanel";
 import type { SourceRequest, SourceSearchResult } from "./sourceBuilder";
 import { preventBrowserZoomOutsideCanvas } from "./canvasGestures";
 import { nextPaperReadSlot, paperCandidateDocument, paperCanvasUpdate, paperResolutionAgentPrompt, replacePaperReadSlot } from "./paperResolution";
@@ -103,6 +96,7 @@ import type {
   SomitePort,
   Operator,
   NfcoreCatalog,
+  ManagedResourceJob,
   SnakemakeCatalog,
   ParamValue,
   PaperCandidate,
@@ -119,6 +113,7 @@ import type {
   UploadResult,
   ValidationEvidenceResponse,
   SourceWorkflowVariantOrigin,
+  SourceCanvasView,
   WorkflowBinding,
 } from "./types";
 import { portColor } from "./visual";
@@ -126,11 +121,13 @@ import { edgeLifecycleState, evidenceNodeState } from "./validationState";
 import { GraphProjectionClock, type GraphProjectionInput } from "./graphProjection";
 import { JsonRequestError, createSomiteClient, type SomiteClient } from "./api";
 import { AGENT_POLL_DEGRADED_AFTER, AGENT_POLL_INTERVAL_MS, agentBatchMatchesAuthoritativeState, agentPollCursorAfterSnapshot, agentPollFailureState, compactConsumedAgentEvents, mergeAgentSnapshots, planAgentTransactions, retainAppliedAgentTransactionIds } from "./agentState";
-import { readinessAgentPrompt, readinessSummary } from "./readinessState";
+import { formatResourceBytes, readinessAgentPrompt, readinessSummary } from "./readinessState";
 import { appendStrokePoint, canvasColor as getCanvasColor, canvasPalette, createCanvasAnnotation, nextAnnotationId } from "./canvasPresentation";
 import type { CatalogExpansionActivity } from "./catalogExpansion";
-import { editableRequiredSourceFileParameters, mergeCanonicalSourceWorkflow, opaqueNfcoreFallback, sourceScopeTitle, sourceSpanLabel, sourceWorkflowCanAppendGraph, sourceWorkflowCanvasIsEmpty, sourceWorkflowProvider, sourceWorkflowReplacementCandidate, sourceWorkflowRevision, sourceWorkflowSetupLabel, sourceWorkflowTitle } from "./sourceWorkflowPresentation";
-import { projectSourceNetwork, sourceNetworkEnterPath, sourceNetworkExitPath } from "./sourceWorkflowNetwork";
+import { editableRequiredSourceFileParameters, mergeCanonicalSourceWorkflow, opaqueNfcoreFallback, sourceWorkflowCanAppendGraph, sourceWorkflowCanvasIsEmpty, sourceWorkflowProvider, sourceWorkflowRevision, sourceWorkflowSetupLabel, sourceWorkflowTitle } from "./sourceWorkflowPresentation";
+import { SourceGraphPreview, sourceProjectionBounds } from "./SourceGraphPreview";
+import { sourceNodeTypes, useSourceWorkflowScene, type SourceFlowEdge, type SourceFlowNode } from "./SourceWorkflowScene";
+import { childViewport, parentViewport, screenBounds, semanticZoomIntent, type CanvasBounds } from "./semanticZoom";
 import { canonicalRefreshAccepted, canonicalRefreshDisposition, captureGraphWrite, commitIfCanonicalEpochCurrent, enqueueGraphWrite, graphNodeSetChanged, type GraphWritePath, type GraphWriteSnapshot } from "./graphPersistence";
 import {
   openProjectDocument,
@@ -143,9 +140,21 @@ import {
 } from "./projectDocument";
 import { validationEvidenceRequestPath, workflowCatalogRequestPaths, type WorkflowCatalogLoadState } from "./backgroundRequests";
 import { planLocalInputs } from "./localInputPlanning";
+import { droppedProjectDirectory, type DroppedProjectFile } from "./projectImport";
 import { assessWorkflow } from "@somite/workflow/assessment";
 import { OperatorCatalog } from "@somite/workflow/catalog";
-import { representativeValidationCapability } from "@somite/workflow/fixtures";
+import { SOURCE_PREVIEW_PACK, representativeValidationCapability } from "@somite/workflow/fixtures";
+import { projectSourceCanvas } from "@somite/workflow/sourceCanvas";
+
+const workspacePanels = () => import("./WorkspacePanels");
+const AgentPanel = lazy(async () => ({ default: (await workspacePanels()).AgentPanel }));
+const InspectorPanel = lazy(async () => ({ default: (await workspacePanels()).InspectorPanel }));
+const LibraryPanel = lazy(async () => ({ default: (await workspacePanels()).LibraryPanel }));
+const MachinePanel = lazy(async () => ({ default: (await workspacePanels()).MachinePanel }));
+const PaperPanel = lazy(async () => ({ default: (await workspacePanels()).PaperPanel }));
+const ProjectPanel = lazy(async () => ({ default: (await workspacePanels()).ProjectPanel }));
+const ReadinessPanel = lazy(async () => ({ default: (await workspacePanels()).ReadinessPanel }));
+const ToolchainPanel = lazy(async () => ({ default: (await workspacePanels()).ToolchainPanel }));
 
 const SNAP: [number, number] = [20, 20];
 const HISTORY_LIMIT = 80;
@@ -161,12 +170,22 @@ type SomiteNodeData = Record<string, unknown> & {
 };
 type SomiteFlowNode = Node<SomiteNodeData, "somite">;
 type SomiteFlowEdge = Edge<{ somite: SomiteEdge; portType: string; validationState: "idle" | RunNodeState }, "typed">;
+type WorkspaceFlowNode = SomiteFlowNode | SourceFlowNode;
+type WorkspaceFlowEdge = SomiteFlowEdge | SourceFlowEdge;
 type History = WorkflowDocumentHistory;
 type Theme = "dark" | "light";
 type CanvasTool = "select" | "pen" | "sticky" | "box";
 type ContinueFromPort = (nodeId: string, port: SomitePort) => void;
-type SourceNetworkView = { nodeId: string; path: string[] } | null;
-type OpenNestedCanvas = (nodeId: string) => void;
+type SemanticFrame = Readonly<{
+  sourceNodeId: string;
+  focusGroupId: string | null;
+  portalBounds: CanvasBounds;
+  childBounds: CanvasBounds;
+}>;
+
+function pointInside(bounds: CanvasBounds, point: { x: number; y: number }) {
+  return point.x >= bounds.x && point.x <= bounds.x + bounds.width && point.y >= bounds.y && point.y <= bounds.y + bounds.height;
+}
 type SourceWorkflowSemanticEdit =
   | { kind: "set_parameter"; name: string; binding: WorkflowBinding }
   | { kind: "reset_parameter"; name: string }
@@ -174,130 +193,32 @@ type SourceWorkflowSemanticEdit =
   | { kind: "reset_invocation"; invocation_id: string };
 
 const ContinuationContext = createContext<ContinueFromPort | null>(null);
-const NestedCanvasContext = createContext<OpenNestedCanvas | null>(null);
 
 function SourceWorkflowCanvasCard({ graphNode, readinessItems }: {
   graphNode: SomiteGraphNode;
   readinessItems: ReadinessItem[];
 }) {
   const workflow = graphNode.source_workflow;
-  const openNestedCanvas = useContext(NestedCanvasContext);
   if (!workflow) return null;
   return (
     <div className="source-workflow-card">
       <header><span>{sourceWorkflowProvider(workflow)}</span><em>Workflow</em></header>
       <strong>{sourceWorkflowTitle(workflow)}</strong>
       <small>{sourceWorkflowRevision(workflow)} · {workflow.replacements?.length ? `${workflow.replacements.length} variant edit${workflow.replacements.length === 1 ? "" : "s"}` : "pinned source"}</small>
-      <footer><span>{sourceWorkflowSetupLabel(workflow, readinessItems.length)}</span><button type="button" className="nodrag nopan" onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); openNestedCanvas?.(graphNode.id); }}>Enter workflow<ChevronRight size={11} /></button></footer>
+      <SourceGraphPreview workflow={workflow} view={graphNode.source_canvas} />
+      <footer><span>{sourceWorkflowSetupLabel(workflow, readinessItems.length)}</span><span>Scroll to explore</span></footer>
     </div>
-  );
-}
-
-function NestedSourceCanvas({ graphNode, path, operators, onEnter, onExit, onOpenPath, onReplace, onPromote, onReset }: {
-  graphNode: SomiteGraphNode;
-  path: string[];
-  operators: Operator[];
-  onEnter: (scopeId: string) => void;
-  onExit: () => void;
-  onOpenPath: (path: string[]) => void;
-  onReplace: (invocationId: string, operator: Operator) => Promise<void>;
-  onPromote: (invocationId: string) => Promise<void>;
-  onReset: (invocationId: string) => Promise<void>;
-}) {
-  const [replaceTarget, setReplaceTarget] = useState<string | null>(null);
-  const [replacementQuery, setReplacementQuery] = useState("");
-  const [savingInvocation, setSavingInvocation] = useState<string | null>(null);
-  const workflow = graphNode.source_workflow;
-  if (!workflow) return null;
-  const projection = projectSourceNetwork(workflow, path);
-  const currentTitle = projection.current ? sourceScopeTitle(projection.current) : sourceWorkflowTitle(workflow);
-  const operatorMap = new Map(operators.map((operator) => [operator.id, operator]));
-  const targetCard = projection.cards.find((card) => card.id === replaceTarget);
-  const normalizedQuery = replacementQuery.trim().toLowerCase();
-  const replacementOperators = operators.filter((operator) =>
-    sourceWorkflowReplacementCandidate(operator)
-    && (!normalizedQuery || `${operator.title} ${operator.id} ${operator.palette.join(" ")}`.toLowerCase().includes(normalizedQuery))
-  );
-  const chooseReplacement = async (operator: Operator) => {
-    if (!targetCard) return;
-    setSavingInvocation(targetCard.invocation.id);
-    try {
-      await onReplace(targetCard.invocation.id, operator);
-      setReplaceTarget(null);
-      setReplacementQuery("");
-    } finally {
-      setSavingInvocation(null);
-    }
-  };
-  const promoteReplacement = async (invocationId: string) => {
-    setSavingInvocation(invocationId);
-    try {
-      await onPromote(invocationId);
-    } finally {
-      setSavingInvocation(null);
-    }
-  };
-
-  return (
-    <section className="nested-source-canvas" aria-label="Nested source canvas">
-      <header className="nested-source-head">
-        <button type="button" className="nested-source-return" onClick={onExit}><ChevronLeft size={15} />{projection.path.length > 1 ? "Back one layer" : "Return to main canvas"}</button>
-        <div><span>{sourceWorkflowProvider(workflow)} · {sourceWorkflowRevision(workflow)} · pinned</span><strong>{sourceWorkflowTitle(workflow)}</strong></div>
-        <em>{workflow.replacements?.length ? `Variant · ${workflow.replacements.length} edit${workflow.replacements.length === 1 ? "" : "s"}` : "Editable variant"}</em>
-      </header>
-      <nav className="nested-source-breadcrumbs" aria-label="Nested source canvas breadcrumbs">
-        {projection.breadcrumbs.map((scope, index) => <React.Fragment key={scope.id}>
-          {index > 0 && <ChevronRight size={11} aria-hidden="true" />}
-          <button type="button" aria-current={index === projection.breadcrumbs.length - 1 ? "page" : undefined} onClick={() => onOpenPath(projection.path.slice(0, index + 1))}>{sourceScopeTitle(scope)}</button>
-        </React.Fragment>)}
-      </nav>
-      <div className="nested-source-title"><span><strong>{currentTitle}</strong><small>{projection.current?.kind.replaceAll("_", " ") ?? "source workflow"}</small></span><em>{projection.cards.length} immediate call{projection.cards.length === 1 ? "" : "s"}</em></div>
-      <div className="nested-source-relation"><i aria-hidden="true" />Source invocations · not data wires</div>
-      <div className="nested-source-stage">
-        <div className="nested-source-origin"><span>Current scope</span><strong>{currentTitle}</strong></div>
-        <i className="nested-source-spine" aria-hidden="true" />
-        <section className="nested-source-nodes" aria-label={`Immediate children of ${currentTitle}`}>
-          {projection.cards.map((card) => {
-            const replacementOperator = card.replacement ? operatorMap.get(card.replacement.operator) : undefined;
-            const canEnter = card.canEnter && !card.replacement;
-            return <article key={card.id} className={`nested-source-node ${card.scope ? `kind-${card.scope.kind}` : "source-only"} ${canEnter ? "can-enter" : "leaf"} ${card.replacement ? "is-replaced" : ""}`} onDoubleClick={() => canEnter && card.scope && onEnter(card.scope.id)}>
-              <header><span>{card.replacement ? "Replacement" : card.scope?.kind.replaceAll("_", " ") ?? "Source call"}</span><em>{card.replacement ? "Unverified" : canEnter ? "Nested" : card.scope ? "Leaf" : "Unresolved"}</em></header>
-              <strong>{replacementOperator?.title ?? card.replacement?.operator ?? card.title}</strong>
-              {card.replacement && <small className="nested-replacement-origin">Replaces {card.title} · original retained</small>}
-              <code>{sourceSpanLabel(card.invocation.span)}</code>
-              {card.replacement && <small className="nested-replacement-check"><CircleAlert size={11} aria-hidden="true" />Connections need checking</small>}
-              {!card.replacement && !card.scope && <small>Exact call retained · no inferred node</small>}
-              <div className="nested-source-actions">
-                {canEnter && card.scope && <button type="button" onClick={() => onEnter(card.scope!.id)}>Enter<ChevronRight size={12} /></button>}
-                {card.replacement && <button type="button" className="nested-promote-action" disabled={savingInvocation !== null} onClick={() => void promoteReplacement(card.invocation.id)}>Edit on canvas<ChevronRight size={12} /></button>}
-                <button type="button" disabled={savingInvocation !== null} onClick={() => { setReplaceTarget(card.id); setReplacementQuery(""); }}>{card.replacement ? "Change tool" : "Replace tool"}</button>
-                {card.replacement && <button type="button" disabled={savingInvocation === card.invocation.id} onClick={() => void onReset(card.invocation.id)}>Reset</button>}
-              </div>
-              {card.replacement && <small className="nested-promote-note">Creates a native typed node · exact source provenance stays attached</small>}
-            </article>;
-          })}
-          {!projection.cards.length && <div className="nested-source-empty"><strong>No child scopes</strong><span>{projection.current ? sourceSpanLabel(projection.current.span) : "No indexed source"}</span></div>}
-        </section>
-      </div>
-      {targetCard && <aside className="nested-replacement-picker" role="dialog" aria-label="Replace source invocation">
-        <header><span><strong>Replace {targetCard.title}</strong><small>Choose freely · Somite will check what remains</small></span><button type="button" aria-label="Close replacement picker" onClick={() => setReplaceTarget(null)}><X size={14} /></button></header>
-        <input value={replacementQuery} onChange={(event) => setReplacementQuery(event.currentTarget.value)} placeholder="Search tools…" aria-label="Search replacement tools" />
-        <div>{replacementOperators.map((operator) => <button type="button" key={operator.id} disabled={savingInvocation !== null} onClick={() => void chooseReplacement(operator)}><span><strong>{operator.title}</strong><code>{operator.id}</code></span><small>{operator.ports.in.length} in · {operator.ports.out.length} out{operator.pixi?.length ? ` · Pixi ${operator.pixi.join(", ")}` : ""}</small></button>)}{!replacementOperators.length && <p>No matching tools.</p>}</div>
-      </aside>}
-      <footer><span>Editable workflow variant · original source preserved</span><span>Logic checks guide changes · validation proves them</span></footer>
-    </section>
   );
 }
 
 function SomiteNodeCardBase({ data, selected }: NodeProps<SomiteFlowNode>) {
   const { graphNode, title, viewerHidden, runState, readinessItems } = data;
   const sourceWorkflow = graphNode.source_workflow;
-  const openNestedCanvas = useContext(NestedCanvasContext);
   const nodeColor = graphNode.color ? getCanvasColor(graphNode.color) : null;
   const inputs = graphNode.ports.filter((port) => port.dir === "in");
   const outputs = graphNode.ports.filter((port) => port.dir === "out");
   return (
-    <article className={`somite-node state-${runState} ${selected ? "is-selected" : ""} ${viewerHidden ? "viewer-hidden" : ""} ${sourceWorkflow ? "source-workflow-node" : ""} ${readinessItems.length ? "needs-readiness" : ""} ${nodeColor ? "has-user-color" : ""}`} style={nodeColor ? { "--node-user-color": nodeColor.hex } as React.CSSProperties : undefined} onDoubleClick={sourceWorkflow && openNestedCanvas ? (event) => { event.stopPropagation(); openNestedCanvas(graphNode.id); } : undefined}>
+    <article className={`somite-node state-${runState} ${selected ? "is-selected" : ""} ${viewerHidden ? "viewer-hidden" : ""} ${sourceWorkflow ? "source-workflow-node" : ""} ${readinessItems.length ? "needs-readiness" : ""} ${nodeColor ? "has-user-color" : ""}`} style={nodeColor ? { "--node-user-color": nodeColor.hex } as React.CSSProperties : undefined}>
       <div className="node-floating-title"><i /><span>{title}</span>{nodeColor && <b className="node-stage-label">{nodeColor.label}</b>}{readinessItems.length > 0 ? <em className="node-requirement-badge">{readinessItems.length} needed</em> : runState !== "idle" && <em>{runState}</em>}</div>
       {sourceWorkflow ? (
         <SourceWorkflowCanvasCard graphNode={graphNode} readinessItems={readinessItems} />
@@ -386,7 +307,7 @@ function PortHandle({ nodeId, port, index, count, required = false }: { nodeId: 
   );
 }
 
-const nodeTypes = { somite: SomiteNodeCard };
+const nodeTypes = { somite: SomiteNodeCard, ...sourceNodeTypes };
 
 function TypedEdgeBase({
   sourceX,
@@ -418,6 +339,8 @@ function flowNode(node: SomiteGraphNode, operators: Map<string, Operator>, viewe
     id: node.id,
     type: "somite",
     position: node.layout,
+    initialWidth: node.source_workflow ? 320 : 194,
+    initialHeight: node.source_workflow ? 220 : 124,
     data: { graphNode: node, title: node.source_workflow ? sourceWorkflowTitle(node.source_workflow) : importedTitle ?? operator?.title ?? node.operator, cost: operator?.cost ?? "high", viewerHidden, runState, readinessItems },
   };
 }
@@ -562,7 +485,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
   const [paperToolsError, setPaperToolsError] = useState<string | null>(null);
   const [nodes, setNodes, onNodesChange] = useNodesState<SomiteFlowNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<SomiteFlowEdge>([]);
-  const [flow, setFlow] = useState<ReactFlowInstance<SomiteFlowNode, SomiteFlowEdge> | null>(null);
+  const [flow, setFlow] = useState<ReactFlowInstance<WorkspaceFlowNode, WorkspaceFlowEdge> | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [query, setQuery] = useState(initialQuery);
   const deferredQuery = useDeferredValue(query);
@@ -574,12 +497,14 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
   const [exportLoading, setExportLoading] = useState(false);
   const [exportDownloading, setExportDownloading] = useState(false);
   const [paperVisible, setPaperVisible] = useState(false);
+  const [operatorWorkshopVisible, setOperatorWorkshopVisible] = useState(false);
   const [agentVisible, setAgentVisible] = useState(false);
   const [canvasTool, setCanvasTool] = useState<CanvasTool>("select");
   const [activeCanvasColor, setActiveCanvasColor] = useState<CanvasColor>("yellow");
   const [annotations, setAnnotations] = useState<CanvasAnnotation[]>([]);
   const [selectedAnnotationId, setSelectedAnnotationId] = useState<string | null>(null);
   const [readinessVisible, setReadinessVisible] = useState(false);
+  const [managedResourceJob, setManagedResourceJob] = useState<ManagedResourceJob | null>(null);
   const [readiness, setReadiness] = useState<ReadinessSnapshot | null>(null);
   const [readinessError, setReadinessError] = useState<string | null>(null);
   const [readinessRetry, setReadinessRetry] = useState(0);
@@ -615,7 +540,10 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
   const [activeIntent, setActiveIntent] = useState<"run" | "validation" | null>(null);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
   const [zoom, setZoom] = useState(1);
-  const [sourceNetworkView, setSourceNetworkView] = useState<SourceNetworkView>(null);
+  const [openSourceNodeId, setOpenSourceNodeId] = useState<string | null>(null);
+  const [sourceFocusGroupId, setSourceFocusGroupId] = useState<string | null>(null);
+  const semanticFramesRef = useRef<SemanticFrame[]>([]);
+  const semanticWheelLockRef = useRef(false);
   const [variantOrigin, setVariantOrigin] = useState<SourceWorkflowVariantOrigin | undefined>();
   const [theme, setTheme] = useState<Theme>("dark");
   const [snapGuides, setSnapGuides] = useState<{ x?: number; y?: number }>({});
@@ -623,6 +551,13 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
   const [pendingConnection, setPendingConnection] = useState<PendingConnection | null>(null);
   const [pendingSourceFile, setPendingSourceFile] = useState<{ nodeId: string; file: File; parameterNames: string[] } | null>(null);
   const [history, setHistory] = useState<History>({ past: [], future: [] });
+  const historyRef = useRef(history);
+  const updateHistory = useCallback((update: History | ((current: History) => History)) => {
+    const next = typeof update === "function" ? update(historyRef.current) : update;
+    historyRef.current = next;
+    setHistory(next);
+    return next;
+  }, []);
   const [libraryStateLoaded, setLibraryStateLoaded] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const presentedPaperRequestRef = useRef(0);
@@ -742,7 +677,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     let cancelled = false;
     let outcome: { readiness: ReadinessSnapshot; error: null } | { readiness: null; error: string };
     try {
-      outcome = { readiness: assessWorkflow(graph, workflowCatalog), error: null };
+      outcome = { readiness: assessWorkflow(graph, workflowCatalog, { managed_resources: session?.managed_resources ?? [] }), error: null };
     } catch (error) {
       outcome = { readiness: null, error: errorMessage(error) };
     }
@@ -755,16 +690,16 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, readinessItems: itemsByNode.get(node.id) ?? [] } })));
     });
     return () => { cancelled = true; };
-  }, [activeIntent, readinessRetry, semanticKey, setNodes, workflowCatalog]);
+  }, [activeIntent, readinessRetry, semanticKey, session?.managed_resources, setNodes, workflowCatalog]);
 
   const remember = useCallback((graph = snapshot()) => {
-    setHistory((current) => rememberDocument(current, snapshotDocument(graph), HISTORY_LIMIT));
-  }, [snapshot, snapshotDocument]);
+    updateHistory((current) => rememberDocument(current, snapshotDocument(graph), HISTORY_LIMIT));
+  }, [snapshot, snapshotDocument, updateHistory]);
 
-  const fitGraph = useCallback((duration = 260) => {
+  const fitGraph = useCallback((duration = 260, targetNodes?: SomiteFlowNode[]) => {
     window.setTimeout(() => {
-      void flow?.fitView({ padding: .25, duration, maxZoom: 1 });
-    }, 0);
+      void flow?.fitView({ ...(targetNodes?.length ? { nodes: targetNodes } : {}), padding: .25, duration, maxZoom: 1 });
+    }, 48);
   }, [flow]);
 
   const restoreGraph = useCallback((
@@ -777,16 +712,17 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     const hidden = preservePresentation ? new Map(nodes.map((node) => [node.id, node.data.viewerHidden])) : new Map<string, boolean>();
     const states = preservePresentation ? new Map(nodes.map((node) => [node.id, node.data.runState])) : new Map<string, RunNodeState>();
     const requirements = preservePresentation ? new Map(nodes.map((node) => [node.id, node.data.readinessItems])) : new Map<string, ReadinessItem[]>();
+    const restoredNodes = graph.nodes.map((node) => flowNode(node, operatorMap, hidden.get(node.id) ?? false, states.get(node.id) ?? "idle", requirements.get(node.id) ?? []));
     if (inputOriginId) inputOriginIdRef.current = inputOriginId;
     setWorkflowTitle(graph.name ?? "Untitled workflow");
-    setNodes(graph.nodes.map((node) => flowNode(node, operatorMap, hidden.get(node.id) ?? false, states.get(node.id) ?? "idle", requirements.get(node.id) ?? [])));
+    setNodes(restoredNodes);
     setEdges(graph.edges.map((edge) => flowEdge(edge, graph.nodes)));
     setAnnotations(graph.annotations ?? []);
     setVariantOrigin(graph.variant_origin);
     setSelectedIds([]);
     setSelectedAnnotationId(null);
     setDirty(markDirty);
-    if (fitAfterRestore) fitGraph();
+    if (fitAfterRestore) fitGraph(260, restoredNodes);
   }, [fitGraph, nodes, operatorMap, setEdges, setNodes]);
 
   const writeBrowserGraph = useCallback((path: GraphWritePath, snapshot: GraphWriteSnapshot) => {
@@ -847,7 +783,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       setSession(loaded);
       if (disposition === "preserve_local") {
         if (localDiffers) {
-          setHistory((current) => ({
+          updateHistory((current) => ({
             past: [...current.past, workflowDocument(loaded.graph, loaded.input_origin_id)].slice(-HISTORY_LIMIT),
             future: [],
           }));
@@ -858,7 +794,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       }
 
       if (localDiffers) {
-        setHistory((current) => ({
+        updateHistory((current) => ({
           past: [...current.past, localDocument].slice(-HISTORY_LIMIT),
           future: [],
         }));
@@ -869,7 +805,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     } finally {
       reconcilingGraphRef.current = false;
     }
-  }, [client, markCanonicalGraph, restoreGraph, snapshotDocument]);
+  }, [client, markCanonicalGraph, restoreGraph, snapshotDocument, updateHistory]);
 
   const reconcileGraphConflict = useCallback(async (error: unknown) => {
     if (!(error instanceof JsonRequestError) || error.status !== 409) return false;
@@ -1049,7 +985,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
             graph: nextGraph,
           } : current);
           if (hasLocalDraft) {
-            setHistory((current) => ({
+            updateHistory((current) => ({
               past: [...current.past, ...transactions.map((transaction) => snapshotDocument(transaction.graph))].slice(-HISTORY_LIMIT),
               future: [],
             }));
@@ -1057,7 +993,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
             setDirty(true);
             setStatus(`Agent finished “${last.summary}” · kept your newer canvas edits · Agent result is available in Undo`);
           } else {
-            setHistory((current) => ({
+            updateHistory((current) => ({
               past: [...current.past, ...precedingGraphs.map((graph) => snapshotDocument(graph))].slice(-HISTORY_LIMIT),
               future: [],
             }));
@@ -1100,16 +1036,16 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       stopped = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [agentSnapshot.connected, agentSnapshot.connecting, agentVisible, client, markCanonicalGraph, mergeAgentSnapshot, refreshCanonicalSession, restoreGraph, session, snapshotDocument]);
+  }, [agentSnapshot.connected, agentSnapshot.connecting, agentVisible, client, markCanonicalGraph, mergeAgentSnapshot, refreshCanonicalSession, restoreGraph, session, snapshotDocument, updateHistory]);
 
   const undo = useCallback(() => {
     const current = snapshotDocument();
-    const transition = undoDocument(history, current, HISTORY_LIMIT);
+    const transition = undoDocument(historyRef.current, current, HISTORY_LIMIT);
     if (!transition) {
       setStatus("Nothing to undo");
       return;
     }
-    setHistory(transition.history);
+    updateHistory(transition.history);
     restoreGraph(
       transition.document.graph,
       true,
@@ -1117,16 +1053,16 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       transition.document.input_origin_id,
     );
     setStatus("Undid edit");
-  }, [history, restoreGraph, snapshotDocument]);
+  }, [restoreGraph, snapshotDocument, updateHistory]);
 
   const redo = useCallback(() => {
     const current = snapshotDocument();
-    const transition = redoDocument(history, current, HISTORY_LIMIT);
+    const transition = redoDocument(historyRef.current, current, HISTORY_LIMIT);
     if (!transition) {
       setStatus("Nothing to redo");
       return;
     }
-    setHistory(transition.history);
+    updateHistory(transition.history);
     restoreGraph(
       transition.document.graph,
       true,
@@ -1134,7 +1070,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       transition.document.input_origin_id,
     );
     setStatus("Redid edit");
-  }, [history, restoreGraph, snapshotDocument]);
+  }, [restoreGraph, snapshotDocument, updateHistory]);
 
   useEffect(() => {
     const stored = window.localStorage.getItem("somite.theme.v1");
@@ -1177,7 +1113,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
         inputOriginIdRef.current = loaded.input_origin_id;
         if (disposition === "preserve_local") {
           if (localDraft.nodes.length > 0) setLibraryVisible(false);
-          setHistory((current) => ({
+          updateHistory((current) => ({
             past: [...current.past, workflowDocument(loaded.graph, loaded.input_origin_id)].slice(-HISTORY_LIMIT),
             future: [],
           }));
@@ -1434,34 +1370,25 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     return flow.screenToFlowPosition({ x: window.innerWidth / 2, y: window.innerHeight / 2 }, { snapToGrid: true });
   }, [flow]);
 
-  const enterSourceNetwork = useCallback((nodeId: string, scopeId: string) => {
-    const workflow = graphSnapshotRef.current.nodes.find((node) => node.id === nodeId)?.source_workflow;
-    if (!workflow) return;
-    setSourceNetworkView((current) => ({
-      nodeId,
-      path: sourceNetworkEnterPath(workflow, current?.nodeId === nodeId ? current.path : [], scopeId),
-    }));
-  }, []);
-
-  const exitSourceNetwork = useCallback((nodeId: string) => {
-    setSourceNetworkView((current) => {
-      if (current?.nodeId !== nodeId) return null;
-      const path = sourceNetworkExitPath(current.path);
-      return path.length ? { nodeId, path } : null;
-    });
-  }, []);
-
-  const openSourceNetworkPath = useCallback((nodeId: string, path: string[]) => {
-    const workflow = graphSnapshotRef.current.nodes.find((node) => node.id === nodeId)?.source_workflow;
-    if (!workflow) return;
-    setSourceNetworkView({ nodeId, path: projectSourceNetwork(workflow, path).path });
-  }, []);
-
   const exploreSourceWorkflow = useCallback((nodeId: string) => {
     const node = nodes.find((candidate) => candidate.id === nodeId);
     const workflow = node?.data.graphNode.source_workflow;
-    if (!node || !workflow) return;
-    setSourceNetworkView({ nodeId, path: projectSourceNetwork(workflow, []).path });
+    if (!node || !workflow || !flow) return;
+    const result = projectSourceCanvas(workflow, node.data.graphNode.source_canvas, null);
+    if (!result.ok) { setStatus(`Could not explore source workflow — ${result.error.message}`); return; }
+    const childBounds = sourceProjectionBounds(result.projection);
+    if (!childBounds) { setStatus("Could not explore source workflow — no source calls were indexed"); return; }
+    const portalBounds = {
+      x: node.position.x,
+      y: node.position.y,
+      width: flow.getNode(node.id)?.measured?.width ?? 320,
+      height: flow.getNode(node.id)?.measured?.height ?? 220,
+    };
+    const frame = { sourceNodeId: nodeId, focusGroupId: null, portalBounds, childBounds };
+    const nextViewport = childViewport(flow.getViewport(), portalBounds, childBounds);
+    semanticFramesRef.current = [frame];
+    setSourceFocusGroupId(null);
+    setOpenSourceNodeId(nodeId);
     setSelectedIds([]);
     setCanvasTool("select");
     setSelectedAnnotationId(null);
@@ -1470,8 +1397,69 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     setProjectVisible(false);
     setPaperVisible(false);
     setToolchainVisible(false);
-    setStatus("Nested source canvas · showing immediate calls only");
-  }, [nodes, setNodes]);
+    setStatus(`Exploring ${countFormatter.format(workflow.invocations?.length ?? 0)} source calls · scroll out to return`);
+    window.requestAnimationFrame(() => { void flow.setViewport(nextViewport, { duration: 260 }); });
+  }, [flow, nodes, setNodes]);
+
+  const exploreVariantSourceWorkflow = useCallback(() => {
+    const sourceNode = graphSnapshotRef.current.variant_origin?.source_node;
+    const workflow = sourceNode?.source_workflow;
+    const host = document.getElementById("workflow-canvas");
+    if (!sourceNode || !workflow || !flow || !host) return;
+    const result = projectSourceCanvas(workflow, sourceNode.source_canvas, null);
+    if (!result.ok) { setStatus(`Could not explore retained source — ${result.error.message}`); return; }
+    const childBounds = sourceProjectionBounds(result.projection);
+    if (!childBounds) { setStatus("Could not explore retained source — no source calls were indexed"); return; }
+    const viewport = flow.getViewport();
+    const hostBounds = host.getBoundingClientRect();
+    const portalBounds = {
+      x: -viewport.x / viewport.zoom,
+      y: -viewport.y / viewport.zoom,
+      width: hostBounds.width / viewport.zoom,
+      height: hostBounds.height / viewport.zoom,
+    };
+    semanticFramesRef.current = [{ sourceNodeId: sourceNode.id, focusGroupId: null, portalBounds, childBounds }];
+    setSourceFocusGroupId(null);
+    setOpenSourceNodeId(sourceNode.id);
+    setSelectedIds([]);
+    setCanvasTool("select");
+    setSelectedAnnotationId(null);
+    setStatus(`Reviewing ${countFormatter.format(workflow.invocations?.length ?? 0)} retained source calls · promote another replacement or scroll out`);
+    window.requestAnimationFrame(() => { void flow.setViewport(childViewport(viewport, portalBounds, childBounds), { duration: 260 }); });
+  }, [flow]);
+
+  const updateSourceCanvasView = useCallback((nodeId: string, view: SourceCanvasView) => {
+    const previousGraph = graphSnapshotRef.current;
+    const sourceNode = previousGraph.nodes.find((node) => node.id === nodeId)
+      ?? (previousGraph.variant_origin?.source_node.id === nodeId ? previousGraph.variant_origin.source_node : undefined);
+    if (!sourceNode) throw new Error(`Source workflow node ${nodeId} is no longer on the canvas`);
+    const source = sourceNode.source_workflow;
+    if (!source) throw new Error(`Canvas node ${nodeId} is no longer a source-backed workflow`);
+    if (view.source_digest !== source.source.source_digest) {
+      throw new Error("Source presentation changed while this frame was open; zoom out and try again");
+    }
+    const nextGraph: SomiteGraph = previousGraph.variant_origin?.source_node.id === nodeId
+      ? {
+          ...previousGraph,
+          variant_origin: {
+            ...previousGraph.variant_origin,
+            source_node: { ...previousGraph.variant_origin.source_node, source_canvas: view },
+          },
+        }
+      : {
+          ...previousGraph,
+          nodes: previousGraph.nodes.map((node) => node.id === nodeId ? { ...node, source_canvas: view } : node),
+        };
+    remember(previousGraph);
+    graphSnapshotRef.current = nextGraph;
+    setNodes((current) => current.map((node) => node.id === nodeId ? {
+      ...node,
+      data: { ...node.data, graphNode: { ...node.data.graphNode, source_canvas: view } },
+    } : node));
+    setVariantOrigin(nextGraph.variant_origin);
+    setDirty(true);
+    setStatus("Nested view updated · pinned source and execution unchanged");
+  }, [remember, setNodes]);
 
   const openContinuation = useCallback<ContinueFromPort>((nodeId, port) => {
     if (port.dir === "in" && edges.some((edge) => edge.data?.somite.to_node === nodeId && edge.data.somite.to_port === port.name)) {
@@ -1504,6 +1492,94 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     setStatus(`${item.title} · ${item.node_id}.${item.field}`);
   }, [flow, nodes, setNodes, zoom]);
 
+  const connectKrakenDatabase = useCallback((item: ReadinessItem, path: string) => {
+    const currentGraph = graphSnapshotRef.current;
+    const target = currentGraph.nodes.find((candidate) => candidate.id === item.node_id);
+    const port = target?.ports.find((candidate) => candidate.dir === "in" && candidate.name === item.field);
+    if (!target || !port) {
+      setStatus("The workflow changed while the database was being prepared · the verified database remains available in the cache");
+      return false;
+    }
+    if (currentGraph.edges.some((edge) => edge.to_node === target.id && edge.to_port === port.name)) {
+      setStatus("The database finished preparing, but this input was already connected · no duplicate node was added");
+      return false;
+    }
+    const databaseOperator = operatorMap.get("files.import_kraken2_database");
+    if (!databaseOperator) {
+      setStatus("The reviewed Kraken2 database input is unavailable from this operator catalog");
+      return false;
+    }
+    const position = nextContinuationPosition(target.layout, "in", currentGraph.nodes.map((candidate) => candidate.layout));
+    const id = nextNodeId(databaseOperator, currentGraph.nodes.map((candidate) => flowNode(candidate, operatorMap)));
+    const graphNode = makeGraphNode(databaseOperator, id, position, { path });
+    const connected = continuationEdge(databaseOperator, graphNode, { nodeId: target.id, port, position, resourceProfile: item.resource_profile ?? undefined });
+    if (!connected) {
+      setStatus("The reviewed Kraken2 database contract cannot connect to this requirement");
+      return false;
+    }
+    remember(currentGraph);
+    const nextGraph = { ...currentGraph, nodes: [...currentGraph.nodes, graphNode], edges: [...currentGraph.edges, connected] };
+    graphSnapshotRef.current = nextGraph;
+    setNodes((current) => [
+      ...current.map((candidate) => ({ ...candidate, selected: false })),
+      { ...flowNode(graphNode, operatorMap), selected: true },
+    ]);
+    setEdges((current) => [...current, flowEdge(connected, nextGraph.nodes)]);
+    setSelectedIds([id]);
+    setReadinessVisible(false);
+    setDirty(true);
+    setStatus(path ? "Kraken2 Standard-8 downloaded, checksum-verified, and connected" : "Kraken2 database connected · enter the existing database directory path in the inspector");
+    return true;
+  }, [operatorMap, remember, setEdges, setNodes]);
+
+  const installManagedResource = useCallback(async (item: ReadinessItem, resolution: ReadinessItem["resolutions"][number]) => {
+    if (!item.resource_profile) return;
+    try {
+      setStatus(`Preparing ${resolution.label} · Somite will verify it before connecting anything`);
+      let current = await client.installManagedResource(item.resource_profile, resolution.id, `resource-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`);
+      setManagedResourceJob(current);
+      while (!["completed", "failed", "cancelled"].includes(current.phase)) {
+        current = await client.managedResourceStatus(current.job_id, 1_000);
+        setManagedResourceJob(current);
+        setStatus(`${current.progress.message} · ${formatResourceBytes(current.progress.completed) ?? "0 B"} of ${formatResourceBytes(current.progress.total) ?? "unknown"}`);
+      }
+      if (current.phase === "completed") {
+        setSession((existing) => existing ? {
+          ...existing,
+          managed_resources: existing.managed_resources.map((resource) => {
+            if (resource.provider_id !== current.provider_id) return resource;
+            const verified = { ...resource };
+            delete verified.error;
+            return { ...verified, available: true };
+          }),
+        } : existing);
+        const reference = `somite-resource:${current.provider_id}`;
+        const importNode = graphSnapshotRef.current.nodes.find((node) => node.id === item.node_id && node.operator === "files.import_kraken2_database");
+        if (importNode) {
+          setReadinessRetry((value) => value + 1);
+          setReadinessVisible(false);
+          setStatus("Kraken2 Standard-8 is downloaded, checksum-verified, and ready on this machine");
+        } else {
+          connectKrakenDatabase(item, reference);
+        }
+      } else {
+        setStatus(current.error ? `${resolution.label} could not be prepared — ${current.error}` : `${resolution.label} was cancelled · canvas unchanged`);
+      }
+    } catch (error) {
+      setStatus(`${resolution.label} could not be prepared — ${errorMessage(error)}`);
+    }
+  }, [client, connectKrakenDatabase]);
+
+  const cancelManagedResource = useCallback(async (jobId: string) => {
+    try {
+      const cancelled = await client.cancelManagedResource(jobId);
+      setManagedResourceJob(cancelled);
+      setStatus("Stopping the managed resource installation…");
+    } catch (error) {
+      setStatus(`Could not stop the resource installation — ${errorMessage(error)}`);
+    }
+  }, [client]);
+
   const resolveRequirement = useCallback((item: ReadinessItem, resolution?: ReadinessItem["resolutions"][number]) => {
     focusRequirement(item);
     const sourceNode = graphSnapshotRef.current.nodes.find((candidate) => candidate.id === item.node_id && candidate.source_workflow);
@@ -1523,49 +1599,24 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       setReadinessVisible(false);
       return;
     }
+    if (item.kind === "managed_resource" && resolution?.kind === "download") {
+      void installManagedResource(item, resolution);
+      return;
+    }
     const node = nodes.find((candidate) => candidate.id === item.node_id);
     const port = node?.data.graphNode.ports.find((candidate) => candidate.dir === "in" && candidate.name === item.field);
     if (!node || !port) return;
     if (item.kind === "managed_resource" && resolution && resolution.kind !== "use_existing") {
-      setStatus(`${resolution.label} is guidance only · Somite will not silently download or build a scientific database. Connect a reviewed existing database or ask Agent for setup help.`);
+      setStatus(`${resolution.label} needs an explicit reviewed provider before Somite can automate it · use Standard-8, connect an existing database, or ask Agent for help.`);
       return;
     }
     if (item.resource_profile === "kraken2-database" && (!resolution || resolution.kind === "use_existing")) {
-      const databaseOperator = operatorMap.get("files.import_kraken2_database");
-      if (!databaseOperator) {
-        setStatus("The reviewed Kraken2 database input is unavailable from this operator catalog");
-        return;
-      }
-      const position = nextContinuationPosition(node.position, "in", nodes.map((candidate) => candidate.position));
-      const id = nextNodeId(databaseOperator, nodes);
-      const graphNode = makeGraphNode(databaseOperator, id, position, { path: "" });
-      const pending: PendingConnection = {
-        nodeId: item.node_id,
-        port,
-        position,
-        resourceProfile: item.resource_profile,
-      };
-      const connected = continuationEdge(databaseOperator, graphNode, pending);
-      if (!connected) {
-        setStatus("The reviewed Kraken2 database contract cannot connect to this requirement");
-        return;
-      }
-      remember();
-      const graphNodes = [...nodes.map((candidate) => candidate.data.graphNode), graphNode];
-      setNodes((current) => [
-        ...current.map((candidate) => ({ ...candidate, selected: false })),
-        { ...flowNode(graphNode, operatorMap), selected: true },
-      ]);
-      setEdges((current) => [...current, flowEdge(connected, graphNodes)]);
-      setSelectedIds([id]);
-      setReadinessVisible(false);
-      setDirty(true);
-      setStatus("Kraken2 database connected · enter the existing database directory path in the inspector");
+      connectKrakenDatabase(item, "");
       return;
     }
     setReadinessVisible(false);
     openContinuation(item.node_id, port);
-  }, [exploreSourceWorkflow, focusRequirement, nodes, openContinuation, operatorMap, remember, setEdges, setNodes]);
+  }, [connectKrakenDatabase, exploreSourceWorkflow, focusRequirement, installManagedResource, nodes, openContinuation]);
 
   const askAssistantAboutRequirement = useCallback((item: ReadinessItem) => {
     focusRequirement(item);
@@ -1623,8 +1674,8 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     setPendingAddPosition(null);
     setPendingConnection(null);
     setDirty(true);
-    setStatus(sourceWorkflow ? `${title} · pinned source` : `${title} · ${created.length} rules · ${createdEdges.length} dependencies`);
-    window.setTimeout(() => void flow?.fitView({ nodes: createdFlowNodes, padding: 0.16, duration: 520, maxZoom: 0.9 }), 0);
+    setStatus(sourceWorkflow ? `${title} · pinned source · scroll into the workflow to explore` : `${title} · ${created.length} rules · ${createdEdges.length} dependencies`);
+    if (!sourceWorkflow) window.setTimeout(() => void flow?.fitView({ nodes: createdFlowNodes, padding: 0.16, duration: 520, maxZoom: 0.9 }), 0);
   }, [flow, operatorMap, remember, setEdges, setNodes]);
 
   const importLocalProject = useCallback(async (path: string) => {
@@ -1649,7 +1700,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       if (imported.kind === "somite") {
         await browserWriteChainRef.current;
         const currentDocument = snapshotDocument();
-        setHistory((current) => openProjectDocument(imported, currentDocument, current, HISTORY_LIMIT)!.history);
+        updateHistory((current) => openProjectDocument(imported, currentDocument, current, HISTORY_LIMIT)!.history);
         markCanonicalGraph(imported.graph);
         restoreGraph(imported.graph, true, true, imported.input_origin_id, false);
         setSession((current) => current ? { ...current, graph: imported.graph, input_origin_id: imported.input_origin_id } : current);
@@ -1661,7 +1712,9 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
         setReadinessVisible(false);
         setAgentVisible(false);
         setAgentDraft(null);
-        setSourceNetworkView(null);
+        semanticFramesRef.current = [];
+        setSourceFocusGroupId(null);
+        setOpenSourceNodeId(null);
         setPendingAddPosition(null);
         setPendingConnection(null);
         setPendingSourceFile(null);
@@ -1680,7 +1733,23 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       setStatus(`Could not open local project — ${errorMessage(error)}`);
       throw error;
     }
-  }, [canvasCenter, client, insertImportedGraph, markCanonicalGraph, pendingAddPosition, recoverInputOrigin, restoreGraph, session?.input_origin_warning, session?.project_name, snapshotDocument]);
+  }, [canvasCenter, client, insertImportedGraph, markCanonicalGraph, pendingAddPosition, recoverInputOrigin, restoreGraph, session?.input_origin_warning, session?.project_name, snapshotDocument, updateHistory]);
+
+  const importDroppedProject = useCallback(async (files: readonly DroppedProjectFile[], target: { x: number; y: number }) => {
+    const label = files[0]?.path.split("/")[0] ?? "Dropped workflow";
+    setStatus(`Copying and freezing ${label}…`);
+    try {
+      const imported = await client.importProject(files);
+      if (imported.kind !== "nextflow") throw new Error("the browser project importer returned a non-Nextflow project");
+      const exclusions = imported.exclusions?.count
+        ? ` · ${countFormatter.format(imported.exclusions.count)} runtime, sensitive, or unrelated item${imported.exclusions.count === 1 ? "" : "s"} left out`
+        : "";
+      insertImportedGraph(imported, target, `Opened ${label} · frozen Nextflow source${exclusions}`);
+      setProjectVisible(false);
+    } catch (error) {
+      setStatus(`Could not import workflow directory — ${errorMessage(error)}`);
+    }
+  }, [client, insertImportedGraph]);
 
   const addOperator = useCallback((operator: Operator, position?: { x: number; y: number }, params?: Record<string, ParamValue>) => {
     const liveGraph = graphSnapshotRef.current;
@@ -1833,7 +1902,9 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
   const persistSourceWorkflowEdit = useCallback(async (nodeId: string, edit: SourceWorkflowSemanticEdit) => {
     await synchronizeBrowserGraph();
     const operation = browserWriteChainRef.current.then(async () => {
-      const workflow = graphSnapshotRef.current.nodes.find((node) => node.id === nodeId)?.source_workflow;
+      const snapshot = graphSnapshotRef.current;
+      const workflow = snapshot.nodes.find((node) => node.id === nodeId)?.source_workflow
+        ?? (snapshot.variant_origin?.source_node.id === nodeId ? snapshot.variant_origin.source_node.source_workflow : undefined);
       if (!workflow) throw new Error("Selected node is not a source-backed workflow");
       const baseWorkflowRevision = workflow.workflow_revision;
       const requestEpoch = graphEpochRef.current;
@@ -1880,6 +1951,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       });
       setEdges(mergedGraph.edges.map((edge) => flowEdge(edge, mergedGraph.nodes)));
       setAnnotations(mergedGraph.annotations ?? []);
+      setVariantOrigin(mergedGraph.variant_origin);
       setDirty(true);
     });
     browserWriteChainRef.current = operation.catch(() => undefined);
@@ -1921,7 +1993,9 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
 
   const promoteSourceInvocation = useCallback(async (nodeId: string, invocationId: string) => {
     await synchronizeBrowserGraph();
-    const workflow = graphSnapshotRef.current.nodes.find((node) => node.id === nodeId)?.source_workflow;
+    const snapshot = graphSnapshotRef.current;
+    const workflow = snapshot.nodes.find((node) => node.id === nodeId)?.source_workflow
+      ?? (snapshot.variant_origin?.source_node.id === nodeId ? snapshot.variant_origin.source_node.source_workflow : undefined);
     if (!workflow) throw new Error("Selected node is not a source-backed workflow");
     const replacement = workflow.replacements?.find((candidate) => candidate.invocation_id === invocationId);
     if (!replacement) throw new Error("Choose a replacement tool before editing this call on the canvas");
@@ -1947,9 +2021,11 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
         setStatus("A newer canvas change arrived while promotion was running · kept the newer canvas");
         return;
       }
-      setHistory((current) => ({ past: [...current.past, snapshotDocument(previousGraph)].slice(-HISTORY_LIMIT), future: [] }));
+      updateHistory((current) => ({ past: [...current.past, snapshotDocument(previousGraph)].slice(-HISTORY_LIMIT), future: [] }));
       markCanonicalGraph(response.graph);
-      setSourceNetworkView(null);
+      semanticFramesRef.current = [];
+      setSourceFocusGroupId(null);
+      setOpenSourceNodeId(null);
       restoreGraph(response.graph, true, true);
       setStatus(`${title} is editable on the canvas · wire its typed inputs, then validate`);
     });
@@ -1961,7 +2037,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       setStatus(`Could not create the editable node — ${errorMessage(error)}`);
       throw error;
     }
-  }, [client, markCanonicalGraph, operatorMap, reconcileGraphConflict, restoreGraph, snapshotDocument, synchronizeBrowserGraph]);
+  }, [client, markCanonicalGraph, operatorMap, reconcileGraphConflict, restoreGraph, snapshotDocument, synchronizeBrowserGraph, updateHistory]);
 
   const restorePinnedSourceWorkflow = useCallback(async () => {
     const origin = graphSnapshotRef.current.variant_origin;
@@ -1986,9 +2062,11 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
         setStatus("A newer canvas change arrived while the source view was restoring · kept the newer canvas");
         return;
       }
-      setHistory((current) => ({ past: [...current.past, snapshotDocument(previousGraph)].slice(-HISTORY_LIMIT), future: [] }));
+      updateHistory((current) => ({ past: [...current.past, snapshotDocument(previousGraph)].slice(-HISTORY_LIMIT), future: [] }));
       markCanonicalGraph(response.graph);
-      setSourceNetworkView(null);
+      semanticFramesRef.current = [];
+      setSourceFocusGroupId(null);
+      setOpenSourceNodeId(null);
       restoreGraph(response.graph, true, true);
       setStatus("Pinned source workflow restored · the native variant is available in Undo");
     });
@@ -1999,7 +2077,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       await reconcileGraphConflict(error);
       setStatus(`Could not restore the pinned source — ${errorMessage(error)}`);
     }
-  }, [client, markCanonicalGraph, reconcileGraphConflict, restoreGraph, snapshotDocument, synchronizeBrowserGraph]);
+  }, [client, markCanonicalGraph, reconcileGraphConflict, restoreGraph, snapshotDocument, synchronizeBrowserGraph, updateHistory]);
 
   const attachRequirementFile = useCallback(async (item: ReadinessItem, field: string, file: File) => {
     const sourceNode = graphSnapshotRef.current.nodes.find((node) => node.id === item.node_id && node.source_workflow);
@@ -2321,13 +2399,20 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       if (operator) addOperator(operator, position);
       return;
     }
+    const projectDirectory = droppedProjectDirectory(event.dataTransfer.items);
+    if (projectDirectory) {
+      void projectDirectory.then((files) => importDroppedProject(files, position)).catch((error) => {
+        setStatus(`Could not read workflow directory — ${errorMessage(error)}`);
+      });
+      return;
+    }
     const droppedFiles = [...event.dataTransfer.files];
     if (droppedFiles.length === 1 && droppedFiles[0].name.toLowerCase().endsWith(".pdf")) {
       void rebuildPaper(droppedFiles[0]);
       return;
     }
     void addDroppedFiles(droppedFiles, position);
-  }, [addDroppedFiles, addOperator, flow, operatorMap, rebuildPaper]);
+  }, [addDroppedFiles, addOperator, flow, importDroppedProject, operatorMap, rebuildPaper]);
 
   const onConnect = useCallback(async (connection: { source: string | null; sourceHandle: string | null; target: string | null; targetHandle: string | null }) => {
     if (!connection.source || !connection.sourceHandle || !connection.target || !connection.targetHandle) return;
@@ -2480,17 +2565,18 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     }
     const requestedKey = semanticKey;
     const graph = snapshot();
+    const validationCapability = intent === "validation" ? representativeValidationCapability(graph) : undefined;
+    const sourcePreview = validationCapability?.supported && validationCapability.fixture_pack === SOURCE_PREVIEW_PACK;
     if (intent === "validation") {
-      const capability = representativeValidationCapability(graph);
-      if (!capability.supported) {
-        setStatus(capability.reason);
+      if (!validationCapability?.supported) {
+        setStatus(validationCapability?.reason ?? "This workflow cannot be validated yet");
         if (readiness) setReadinessVisible(true);
         return;
       }
     }
     try {
       if (!workflowCatalog) throw new Error("operator catalog is not ready");
-      const latest = assessWorkflow(graph, workflowCatalog);
+      const latest = assessWorkflow(graph, workflowCatalog, { managed_resources: session?.managed_resources ?? [] });
       if (semanticKeyRef.current !== requestedKey) return;
       setReadiness(latest);
       const itemsByNode = new Map<string, ReadinessItem[]>();
@@ -2508,7 +2594,9 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       return;
     }
     setActiveIntent(intent);
-    setStatus(intent === "validation" ? "Binding representative FASTQ fixtures…" : "Freezing the exact Pixi environment…");
+    setStatus(intent === "validation"
+      ? sourcePreview ? "Checking the frozen Nextflow source…" : "Binding representative FASTQ fixtures…"
+      : "Freezing the exact Pixi environment…");
     setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, runState: "queued" } })));
     setEdges((current) => current.map((edge) => ({ ...edge, animated: true, data: intent === "validation" && edge.data ? { ...edge.data, validationState: "queued" } : edge.data })));
     try {
@@ -2528,14 +2616,18 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
         setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, runState: report.states[node.id] ?? node.data.runState } })));
         if (intent === "validation") setEdges((current) => current.map((edge) => ({ ...edge, data: edge.data ? { ...edge.data, validationState: edgeLifecycleState(edge.data.somite, report.states) } : edge.data })));
         const counts = Object.values(report.states).reduce<Record<string, number>>((result, state) => ({ ...result, [state]: (result[state] ?? 0) + 1 }), {});
-        if (report.phase === "preparing") setStatus(intent === "validation" ? "Freezing the fixture-bound validation closure…" : "Freezing the exact Pixi environment…");
-        else if (report.phase === "running") setStatus(`${intent === "validation" ? "Validating" : "Nextflow running"} · ${counts.done ?? 0} done · ${counts.running ?? 0} active · ${counts.queued ?? 0} queued`);
+        if (report.phase === "preparing") setStatus(intent === "validation"
+          ? sourcePreview ? "Restoring the immutable source and Pixi lock…" : "Freezing the fixture-bound validation closure…"
+          : "Freezing the exact Pixi environment…");
+        else if (report.phase === "running") setStatus(`${intent === "validation" ? sourcePreview ? "Checking source in Nextflow preview mode" : "Validating" : "Nextflow running"} · ${counts.done ?? 0} done · ${counts.running ?? 0} active · ${counts.queued ?? 0} queued`);
         else if (report.phase === "finalizing") setStatus("Recording scoped evidence receipt…");
         else if (report.phase === "cancelling") setStatus("Stopping Nextflow…");
       } while (!(["completed", "failed", "cancelled"] as const).includes(report.phase as "completed" | "failed" | "cancelled"));
 
       const counts = Object.values(report.states).reduce<Record<string, number>>((result, state) => ({ ...result, [state]: (result[state] ?? 0) + 1 }), {});
-      if (report.phase === "completed" && intent === "validation") setStatus(`Validated with ${report.evidence_receipt?.fixture_digests.length ?? 0} fixture${report.evidence_receipt?.fixture_digests.length === 1 ? "" : "s"} · ${counts.done ?? 0} nodes passed`);
+      if (report.phase === "completed" && intent === "validation") setStatus(sourcePreview
+        ? "Source preview validated · Nextflow compiled the workflow without running tasks"
+        : `Validated with ${report.evidence_receipt?.fixture_digests.length ?? 0} fixture${report.evidence_receipt?.fixture_digests.length === 1 ? "" : "s"} · ${counts.done ?? 0} nodes passed`);
       else if (report.phase === "completed") setStatus(`Run complete · ${counts.done ?? 0} done · ${counts.cached ?? 0} cached`);
       else if (report.phase === "cancelled") setStatus(`${intent === "validation" ? "Validation" : "Run"} cancelled`);
       else setStatus(`${intent === "validation" ? "Validation" : "Run"} failed — ${report.error?.split("\n").at(-1) ?? `exit ${report.exit_code ?? "unknown"}`}`);
@@ -2548,7 +2640,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       setActiveRunId(null);
       setActiveIntent(null);
     }
-  }, [client, focusRequirement, graphRequest, readiness, running, semanticKey, session?.input_origin_warning, setEdges, setNodes, snapshot, workflowCatalog]);
+  }, [client, focusRequirement, graphRequest, readiness, running, semanticKey, session?.input_origin_warning, session?.managed_resources, setEdges, setNodes, snapshot, workflowCatalog]);
 
   const runGraph = useCallback(() => executeGraph("run"), [executeGraph]);
   const validateGraphWithFixtures = useCallback(() => executeGraph("validation"), [executeGraph]);
@@ -2854,8 +2946,11 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
         setCanvasTool("box");
         setSelectedAnnotationId(null);
       } else if (event.key === "Escape") {
-        if (sourceNetworkView) {
-          exitSourceNetwork(sourceNetworkView.nodeId);
+        if (openSourceNodeId) {
+          semanticFramesRef.current = [];
+          setSourceFocusGroupId(null);
+          setOpenSourceNodeId(null);
+          setStatus("Returned to main canvas");
           return;
         }
         setCanvasTool("select");
@@ -2868,10 +2963,136 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [duplicateSelected, exitSourceNetwork, flow, redo, removeAnnotation, runGraph, save, selectedAnnotationId, sourceNetworkView, undo]);
+  }, [duplicateSelected, flow, openSourceNodeId, redo, removeAnnotation, runGraph, save, selectedAnnotationId, undo]);
 
   const selectedNode = nodes.find((node) => node.id === selectedIds.at(-1)) ?? null;
-  const nestedSourceNode = sourceNetworkView ? nodes.find((node) => node.id === sourceNetworkView.nodeId && node.data.graphNode.source_workflow) ?? null : null;
+  const promotedSourceInvocationIds = useMemo(
+    () => new Set(Object.keys(variantOrigin?.promoted_invocations ?? {})),
+    [variantOrigin],
+  );
+  const nestedSourceNode = openSourceNodeId
+    ? nodes.find((node) => node.id === openSourceNodeId && node.data.graphNode.source_workflow)
+      ?? (variantOrigin?.source_node.id === openSourceNodeId ? flowNode(variantOrigin.source_node, operatorMap) : null)
+    : null;
+  const sourceCanvasOpen = Boolean(openSourceNodeId && nestedSourceNode);
+  const changeOpenSourceCanvasView = useCallback((view: SourceCanvasView) => {
+    if (!openSourceNodeId) throw new Error("The source workflow is no longer open");
+    updateSourceCanvasView(openSourceNodeId, view);
+  }, [openSourceNodeId, updateSourceCanvasView]);
+  const replaceOpenSourceInvocation = useCallback((invocationId: string, operator: Operator) => {
+    if (!openSourceNodeId) throw new Error("The source workflow is no longer open");
+    return replaceSourceInvocation(openSourceNodeId, invocationId, operator);
+  }, [openSourceNodeId, replaceSourceInvocation]);
+  const promoteOpenSourceInvocation = useCallback((invocationId: string) => {
+    if (!openSourceNodeId) throw new Error("The source workflow is no longer open");
+    return promoteSourceInvocation(openSourceNodeId, invocationId);
+  }, [openSourceNodeId, promoteSourceInvocation]);
+  const resetOpenSourceInvocation = useCallback((invocationId: string) => {
+    if (!openSourceNodeId) throw new Error("The source workflow is no longer open");
+    return resetSourceInvocation(openSourceNodeId, invocationId);
+  }, [openSourceNodeId, resetSourceInvocation]);
+  const sourceScene = useSourceWorkflowScene({
+    graphNode: nestedSourceNode?.data.graphNode ?? null,
+    focusGroupId: sourceFocusGroupId,
+    operators: availableOperators,
+    promotedInvocationIds: promotedSourceInvocationIds,
+    onFocusChange: setSourceFocusGroupId,
+    onViewChange: changeOpenSourceCanvasView,
+    onReplace: replaceOpenSourceInvocation,
+    onPromote: promoteOpenSourceInvocation,
+    onReset: resetOpenSourceInvocation,
+  });
+  const canvasNodes: WorkspaceFlowNode[] = sourceCanvasOpen ? sourceScene.nodes : nodes;
+  const canvasEdges: WorkspaceFlowEdge[] = sourceCanvasOpen ? sourceScene.edges : edges;
+
+  const onSemanticWheel = useCallback((event: React.WheelEvent<HTMLElement>) => {
+    if (!flow || semanticWheelLockRef.current || Math.abs(event.deltaX) > Math.abs(event.deltaY)) return;
+    const host = document.getElementById("workflow-canvas");
+    if (!host) return;
+    const hostRect = host.getBoundingClientRect();
+    const viewport = flow.getViewport();
+    const point = flow.screenToFlowPosition({ x: event.clientX, y: event.clientY });
+
+    const crossFrame = (nextViewport: ReturnType<typeof childViewport>, work: () => void) => {
+      event.stopPropagation();
+      semanticWheelLockRef.current = true;
+      work();
+      window.requestAnimationFrame(() => { void flow.setViewport(nextViewport, { duration: 0 }); });
+      window.setTimeout(() => { semanticWheelLockRef.current = false; }, 180);
+    };
+
+    if (!sourceCanvasOpen && event.deltaY < 0) {
+      const sourceNode = nodes.find((node) => node.data.graphNode.source_workflow && pointInside({
+        x: node.position.x,
+        y: node.position.y,
+        width: flow.getNode(node.id)?.measured?.width ?? 320,
+        height: flow.getNode(node.id)?.measured?.height ?? 220,
+      }, point));
+      const workflow = sourceNode?.data.graphNode.source_workflow;
+      if (!sourceNode || !workflow) return;
+      const result = projectSourceCanvas(workflow, sourceNode.data.graphNode.source_canvas, null);
+      if (!result.ok) return;
+      const childBounds = sourceProjectionBounds(result.projection);
+      if (!childBounds) return;
+      const portalBounds = {
+        x: sourceNode.position.x,
+        y: sourceNode.position.y,
+        width: flow.getNode(sourceNode.id)?.measured?.width ?? 320,
+        height: flow.getNode(sourceNode.id)?.measured?.height ?? 220,
+      };
+      if (semanticZoomIntent({ direction: "in", deltaX: event.deltaX, deltaY: event.deltaY, visibleBounds: screenBounds(portalBounds, viewport), host: hostRect }) !== "enter") return;
+      const frame = { sourceNodeId: sourceNode.id, focusGroupId: null, portalBounds, childBounds };
+      crossFrame(childViewport(viewport, portalBounds, childBounds), () => {
+        semanticFramesRef.current = [frame];
+        setOpenSourceNodeId(sourceNode.id);
+        setSourceFocusGroupId(null);
+        setSelectedIds([]);
+        setCanvasTool("select");
+        setStatus(`Exploring ${countFormatter.format(workflow.invocations?.length ?? 0)} source calls · scroll out to return`);
+      });
+      return;
+    }
+
+    if (!sourceCanvasOpen || !nestedSourceNode?.data.graphNode.source_workflow) return;
+    const workflow = nestedSourceNode.data.graphNode.source_workflow;
+    if (event.deltaY < 0 && sourceScene.projection) {
+      const candidates = [
+        ...sourceScene.projection.groups.map((group) => ({ id: group.id, bounds: group.bounds })),
+        ...sourceScene.projection.portals.filter((portal) => portal.kind === "collapsed_group").map((portal) => ({ id: portal.group_id, bounds: portal.bounds })),
+      ].filter((candidate) => pointInside(candidate.bounds, point)).sort((left, right) => left.bounds.width * left.bounds.height - right.bounds.width * right.bounds.height);
+      const candidate = candidates[0];
+      if (!candidate) return;
+      const childResult = projectSourceCanvas(workflow, sourceScene.view, candidate.id);
+      if (!childResult.ok) return;
+      const childBounds = sourceProjectionBounds(childResult.projection);
+      if (!childBounds) return;
+      if (semanticZoomIntent({ direction: "in", deltaX: event.deltaX, deltaY: event.deltaY, visibleBounds: screenBounds(candidate.bounds, viewport), host: hostRect }) !== "enter") return;
+      const frame = { sourceNodeId: nestedSourceNode.id, focusGroupId: candidate.id, portalBounds: candidate.bounds, childBounds };
+      crossFrame(childViewport(viewport, candidate.bounds, childBounds), () => {
+        semanticFramesRef.current = [...semanticFramesRef.current, frame];
+        setSourceFocusGroupId(candidate.id);
+        setStatus(`Inside ${childResult.projection.breadcrumbs.at(-1)?.title ?? "container"} · scroll out to return`);
+      });
+      return;
+    }
+
+    if (event.deltaY > 0) {
+      const frame = semanticFramesRef.current.at(-1);
+      if (!frame || semanticZoomIntent({ direction: "out", deltaX: event.deltaX, deltaY: event.deltaY, visibleBounds: screenBounds(frame.childBounds, viewport), host: hostRect }) !== "exit") return;
+      const nextFrames = semanticFramesRef.current.slice(0, -1);
+      crossFrame(parentViewport(viewport, frame.portalBounds, frame.childBounds), () => {
+        semanticFramesRef.current = nextFrames;
+        if (!nextFrames.length) {
+          setOpenSourceNodeId(null);
+          setSourceFocusGroupId(null);
+          setStatus("Returned to the main workflow");
+        } else {
+          setSourceFocusGroupId(nextFrames.at(-1)?.focusGroupId ?? null);
+          setStatus("Returned to the parent workflow container");
+        }
+      });
+    }
+  }, [flow, nestedSourceNode, nodes, sourceCanvasOpen, sourceScene.projection, sourceScene.view]);
   const selectedOperator = selectedNode ? operatorMap.get(selectedNode.data.graphNode.operator) : undefined;
   const selectedHiddenCount = nodes.filter((node) => selectedIds.includes(node.id) && node.data.viewerHidden).length;
   const allViewersHidden = nodes.length > 0 && nodes.every((node) => node.data.viewerHidden);
@@ -2921,6 +3142,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
             </div>
             {variantOrigin && <div className="workflow-variant-badge" title="This canvas is a native editable variant of a pinned source workflow">
               <span><strong>Native variant</strong><small>{Object.keys(variantOrigin.promoted_invocations ?? {}).length} promoted call{Object.keys(variantOrigin.promoted_invocations ?? {}).length === 1 ? "" : "s"}</small></span>
+              <button type="button" onClick={exploreVariantSourceWorkflow}>Review source calls</button>
               <button type="button" onClick={() => void restorePinnedSourceWorkflow()}>Return to pinned source</button>
             </div>}
             {dirty && <span className="unsaved-dot" title="Unsaved changes" />}
@@ -2931,7 +3153,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
             <button type="button" className="studio-button theme-toggle" aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`} title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`} onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun size={14} aria-hidden="true" /> : <Moon size={14} aria-hidden="true" />}</button>
             <button type="button" className="studio-button" onClick={() => void save()} disabled={saving || !dirty || inputOriginRecoveryRequired} title={inputOriginBlockedReason ?? "Save workflow"}>{saving ? <span className="spin"><LoaderCircle size={14} /></span> : inputOriginRecoveryRequired ? <CircleAlert size={14} /> : dirty ? <Save size={14} /> : <Check size={14} />}<span>{saving ? "Saving…" : inputOriginRecoveryRequired ? "Paused" : dirty ? "Save" : "Saved"}</span></button>
             <button type="button" className={`studio-button ${toolchainVisible ? "active" : ""}`} onClick={() => void toggleToolchain()} disabled={inputOriginRecoveryRequired} title={inputOriginBlockedReason ?? "Environment and Export"}><PackageOpen size={14} aria-hidden="true" /><span>Export</span></button>
-            <button type="button" className="studio-button validation-button" disabled={inputOriginRecoveryRequired || running || !validationCapability.supported} onClick={() => void validateGraphWithFixtures()} title={inputOriginBlockedReason ?? (validationCapability.supported ? "Validate with small representative FASTQ fixtures" : validationCapability.reason)}>{activeIntent === "validation" ? <span className="spin"><LoaderCircle size={14} /></span> : <ShieldCheck size={14} />}<span>{activeIntent === "validation" ? "Validating…" : "Validate"}</span></button>
+            <button type="button" className="studio-button validation-button" disabled={inputOriginRecoveryRequired || running || !validationCapability.supported} onClick={() => void validateGraphWithFixtures()} title={inputOriginBlockedReason ?? (validationCapability.supported ? validationCapability.fixture_pack === SOURCE_PREVIEW_PACK ? "Check this frozen source workflow in Nextflow preview mode" : "Validate with small representative FASTQ fixtures" : validationCapability.reason)}>{activeIntent === "validation" ? <span className="spin"><LoaderCircle size={14} /></span> : <ShieldCheck size={14} />}<span>{activeIntent === "validation" ? "Validating…" : "Validate"}</span></button>
             <button type="button" className={`run-button ${running ? "is-running" : ""}`} disabled={(!running && inputOriginRecoveryRequired) || (running && !activeRunId)} onClick={() => void (running ? cancelRun() : runGraph())} title={inputOriginBlockedReason ?? (running ? "Cancel active Nextflow run" : "Run workflow (F5 or Ctrl/Cmd Enter)")}>{running ? activeRunId ? <><Square size={12} fill="currentColor" />Cancel</> : <><span className="spin"><LoaderCircle size={14} /></span>Preparing…</> : <><Play size={14} />Run</>}</button>
           </div>
         </header>
@@ -2945,7 +3167,8 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
           </div>
         </section>}
 
-        <section id="workflow-canvas" aria-label="Workflow Canvas" className={`canvas-wrap studio-canvas tool-${canvasTool}`} onDrop={onDrop} onDragOver={(event) => event.preventDefault()} onPointerDownCapture={beginStroke} onPointerMove={continueStroke} onPointerUp={finishStroke} onPointerCancel={finishStroke} onDoubleClick={(event) => {
+        <section id="workflow-canvas" aria-label="Workflow Canvas" className={`canvas-wrap studio-canvas tool-${canvasTool} ${sourceCanvasOpen ? "semantic-source-frame" : ""}`} data-semantic-depth={semanticFramesRef.current.length} onWheelCapture={onSemanticWheel} onDrop={onDrop} onDragOver={(event) => event.preventDefault()} onPointerDownCapture={beginStroke} onPointerMove={continueStroke} onPointerUp={finishStroke} onPointerCancel={finishStroke} onDoubleClick={(event) => {
+          if (sourceCanvasOpen) return;
           if (canvasTool !== "select" || !flow || !(event.target instanceof Element) || !event.target.closest(".react-flow__pane")) return;
           setPendingConnection(null);
           setPendingAddPosition(flow.screenToFlowPosition({ x: event.clientX, y: event.clientY }, { snapToGrid: true }));
@@ -2961,40 +3184,36 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
           if (paperVisible) setPaperVisible(false);
           if (toolchainVisible) setToolchainVisible(false);
         }}>
-          {nestedSourceNode && sourceNetworkView ? <NestedSourceCanvas
-            graphNode={nestedSourceNode.data.graphNode}
-            path={sourceNetworkView.path}
-            operators={availableOperators}
-            onEnter={(scopeId) => enterSourceNetwork(sourceNetworkView.nodeId, scopeId)}
-            onExit={() => exitSourceNetwork(sourceNetworkView.nodeId)}
-            onOpenPath={(path) => openSourceNetworkPath(sourceNetworkView.nodeId, path)}
-            onReplace={(invocationId, operator) => replaceSourceInvocation(sourceNetworkView.nodeId, invocationId, operator)}
-            onPromote={(invocationId) => promoteSourceInvocation(sourceNetworkView.nodeId, invocationId)}
-            onReset={(invocationId) => resetSourceInvocation(sourceNetworkView.nodeId, invocationId)}
-          /> : <>
-          {snapGuides.x !== undefined && <div className="snap-guide vertical" style={{ left: snapGuides.x }} />}
-          {snapGuides.y !== undefined && <div className="snap-guide horizontal" style={{ top: snapGuides.y }} />}
-          <NestedCanvasContext.Provider value={exploreSourceWorkflow}>
+          {!sourceCanvasOpen && snapGuides.x !== undefined && <div className="snap-guide vertical" style={{ left: snapGuides.x }} />}
+          {!sourceCanvasOpen && snapGuides.y !== undefined && <div className="snap-guide horizontal" style={{ top: snapGuides.y }} />}
           <ContinuationContext.Provider value={openContinuation}>
-          <ReactFlow<SomiteFlowNode, SomiteFlowEdge>
-            nodes={nodes}
-            edges={edges}
+          <ReactFlow<WorkspaceFlowNode, WorkspaceFlowEdge>
+            nodes={canvasNodes}
+            edges={canvasEdges}
             nodeTypes={nodeTypes}
             edgeTypes={edgeTypes}
             onInit={setFlow}
             onNodesChange={(changes) => {
+              if (sourceCanvasOpen) {
+                sourceScene.onNodesChange(changes as Parameters<typeof sourceScene.onNodesChange>[0]);
+                return;
+              }
               if (changes.some((change) => change.type === "remove")) remember();
-              onNodesChange(changes);
+              onNodesChange(changes as Parameters<typeof onNodesChange>[0]);
               if (changes.some((change) => change.type === "remove")) setDirty(true);
             }}
             onEdgesChange={(changes) => {
+              if (sourceCanvasOpen) {
+                sourceScene.onEdgesChange(changes as Parameters<typeof sourceScene.onEdgesChange>[0]);
+                return;
+              }
               if (changes.some((change) => change.type === "remove")) remember();
-              onEdgesChange(changes);
+              onEdgesChange(changes as Parameters<typeof onEdgesChange>[0]);
               if (changes.some((change) => change.type === "remove")) setDirty(true);
             }}
-            onNodeDragStart={() => { dragSnapshotRef.current = snapshot(); }}
+            onNodeDragStart={() => { if (!sourceCanvasOpen) dragSnapshotRef.current = snapshot(); }}
             onNodeDrag={(_, node) => {
-              if (!flow) return;
+              if (!flow || sourceCanvasOpen || node.type !== "somite") return;
               const guide = neighborAlignment(node, nodes);
               const canvas = document.getElementById("workflow-canvas")?.getBoundingClientRect();
               if (!canvas) return;
@@ -3004,6 +3223,11 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
               });
             }}
             onNodeDragStop={(_, node) => {
+              if (sourceCanvasOpen) {
+                sourceScene.onNodeDragStop(node as SourceFlowNode);
+                return;
+              }
+              if (node.type !== "somite") return;
               const guide = neighborAlignment(node, nodes);
               if (guide.x !== undefined || guide.y !== undefined) {
                 setNodes((current) => current.map((candidate) => candidate.id === node.id ? { ...candidate, position: { x: guide.x ?? candidate.position.x, y: guide.y ?? candidate.position.y } } : candidate));
@@ -3013,11 +3237,16 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
               dragSnapshotRef.current = null;
               setDirty(true);
             }}
-            onConnect={(connection) => void onConnect(connection)}
-            onConnectStart={onConnectStart}
-            onConnectEnd={onConnectEnd}
-            onPaneClick={placeCanvasAnnotation}
-            onSelectionChange={({ nodes: selected }) => {
+            onConnect={(connection) => { if (!sourceCanvasOpen) void onConnect(connection); }}
+            onConnectStart={(event, params) => { if (!sourceCanvasOpen) onConnectStart(event, params); }}
+            onConnectEnd={(event, state) => { if (!sourceCanvasOpen) onConnectEnd(event, state); }}
+            onPaneClick={(event) => { if (sourceCanvasOpen) sourceScene.onPaneClick(); else placeCanvasAnnotation(event); }}
+            onSelectionChange={(selection) => {
+              if (sourceCanvasOpen) {
+                sourceScene.onSelectionChange(selection as OnSelectionChangeParams<SourceFlowNode, SourceFlowEdge>);
+                return;
+              }
+              const selected = selection.nodes.filter((node): node is SomiteFlowNode => node.type === "somite");
               const next = selected.map((node) => node.id);
               setSelectedIds((current) => current.length === next.length && current.every((id, index) => id === next[index]) ? current : next);
               if (next.length) setSelectedAnnotationId(null);
@@ -3031,43 +3260,46 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
             snapToGrid
             snapGrid={SNAP}
             minZoom={.02}
-            maxZoom={2.8}
+            maxZoom={16}
             deleteKeyCode={["Backspace", "Delete"]}
-            multiSelectionKeyCode={["Meta", "Control"]}
+            multiSelectionKeyCode={sourceCanvasOpen ? ["Meta", "Control", "Shift"] : ["Meta", "Control"]}
             selectionOnDrag
-            panOnScroll
-            zoomOnScroll={false}
+            panOnScroll={false}
+            zoomOnScroll
+            preventScrolling
             zoomOnDoubleClick={false}
             zoomOnPinch
             zoomActivationKeyCode={["Meta", "Control"]}
             panOnDrag={canvasTool === "select" ? [1, 2] : false}
             nodesDraggable={canvasTool === "select"}
+            nodesConnectable={!sourceCanvasOpen}
+            edgesReconnectable={!sourceCanvasOpen}
             panActivationKeyCode="Space"
             connectionRadius={28}
+            onlyRenderVisibleElements
             proOptions={{ hideAttribution: true }}
           >
             <Background variant={BackgroundVariant.Lines} gap={20} size={1} color="var(--grid)" />
-            <ViewportPortal>
+            {!sourceCanvasOpen && <ViewportPortal>
               <CanvasAnnotations annotations={annotations} zoom={zoom} selectedId={selectedAnnotationId} onSelect={(id) => { setSelectedAnnotationId(id); if (id) { setSelectedIds([]); setNodes((current) => current.map((node) => ({ ...node, selected: false }))); } }} onBeginChange={beginAnnotationChange} onChange={updateAnnotation} onRemove={removeAnnotation} />
-            </ViewportPortal>
+            </ViewportPortal>}
           </ReactFlow>
           </ContinuationContext.Provider>
-          </NestedCanvasContext.Provider>
-          <div className="drop-hint"><CloudUpload size={14} aria-hidden="true" />Drop FASTQ pairs, local files, or workflow directories</div>
-          </>}
+          {sourceCanvasOpen ? sourceScene.overlays : <div className="drop-hint"><CloudUpload size={14} aria-hidden="true" />Drop FASTQ pairs, local files, or workflow directories</div>}
         </section>
 
-        {!sourceNetworkView && <aside className="tool-rail" aria-label="Workspace Tools">
-          <button type="button" className={libraryVisible ? "primary active" : "primary"} aria-label="Add to Canvas" title="Add to Canvas" onClick={(event) => { event.stopPropagation(); const opening = !libraryVisible; setProjectVisible(false); setPaperVisible(false); setToolchainVisible(false); setPendingConnection(null); setLibraryVisible(opening); if (opening) window.setTimeout(() => searchInputRef.current?.focus(), 0); }}><Plus size={19} aria-hidden="true" /></button>
-          <button type="button" className={projectVisible ? "active" : ""} aria-label="Project" title="Project" onClick={(event) => { event.stopPropagation(); const opening = !projectVisible; setLibraryVisible(false); setPaperVisible(false); setToolchainVisible(false); setPendingConnection(null); setProjectVisible(opening); }}><FolderOpen size={16} aria-hidden="true" /></button>
+        <aside className="tool-rail" aria-label="Workspace Tools">
+          <button type="button" className={libraryVisible ? "primary active" : "primary"} aria-label="Add to Canvas" aria-expanded={libraryVisible} title="Add to Canvas" onClick={(event) => { event.stopPropagation(); const opening = !libraryVisible; setProjectVisible(false); setPaperVisible(false); setOperatorWorkshopVisible(false); setToolchainVisible(false); setPendingConnection(null); setLibraryVisible(opening); if (opening) window.setTimeout(() => searchInputRef.current?.focus(), 0); }}><Plus size={19} aria-hidden="true" /></button>
+          <button type="button" className={projectVisible ? "active" : ""} aria-label="Project" title="Project" onClick={(event) => { event.stopPropagation(); const opening = !projectVisible; setLibraryVisible(false); setPaperVisible(false); setOperatorWorkshopVisible(false); setToolchainVisible(false); setPendingConnection(null); setProjectVisible(opening); }}><FolderOpen size={16} aria-hidden="true" /></button>
           <div className="tool-rail-divider" />
-          <button type="button" className={paperVisible ? "active" : ""} aria-label="Rebuild from a Paper" title="Paper Reconstruction" onClick={(event) => { event.stopPropagation(); const opening = !paperVisible; setPendingConnection(null); setLibraryVisible(false); setProjectVisible(false); setToolchainVisible(false); setPaperVisible(opening); }}><FileSearch size={16} aria-hidden="true" /></button>
-        </aside>}
+          <button type="button" className={paperVisible ? "active" : ""} aria-label="Rebuild from a Paper" title="Paper Reconstruction" onClick={(event) => { event.stopPropagation(); const opening = !paperVisible; setPendingConnection(null); setLibraryVisible(false); setProjectVisible(false); setOperatorWorkshopVisible(false); setToolchainVisible(false); setPaperVisible(opening); }}><FileSearch size={16} aria-hidden="true" /></button>
+          <button type="button" className={operatorWorkshopVisible ? "active" : ""} aria-label="Project tools" title="Project tools" onClick={(event) => { event.stopPropagation(); const opening = !operatorWorkshopVisible; setPendingConnection(null); setLibraryVisible(false); setProjectVisible(false); setPaperVisible(false); setToolchainVisible(false); setOperatorWorkshopVisible(opening); }}><FlaskConical size={16} aria-hidden="true" /></button>
+        </aside>
 
         {!agentVisible && <button type="button" className="agent-edge-launcher" aria-label="Open Agent" title={agentTransportError ? "Agent connection interrupted" : "Open Agent"} onClick={(event) => { event.stopPropagation(); setAgentDraft(null); setAgentVisible(true); if (!agentSnapshot.connected && !agentDiscovery && !agentDiscoveryLoading) void refreshAgentDiscovery(); }}><Bot size={16} aria-hidden="true" /><span>Agent</span>{(agentSnapshot.connected || agentSnapshot.connecting) && <i className={agentTransportError ? "error" : agentSnapshot.busy ? "busy" : "ready"} />}</button>}
 
-        {!sourceNetworkView && <div className="canvas-toolbar" aria-label="Canvas Tools" onPointerDown={(event) => event.stopPropagation()}>
-          <button type="button" className={libraryVisible ? "primary active" : "primary"} aria-label="Add Anything" title="Add anything (Ctrl K)" onClick={() => { setProjectVisible(false); setPaperVisible(false); setToolchainVisible(false); setPendingConnection(null); setLibraryVisible(true); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}><Plus size={17} aria-hidden="true" /><span>Add</span></button>
+        <div className="canvas-toolbar" aria-label="Canvas Tools" onPointerDown={(event) => event.stopPropagation()}>
+          <button type="button" className={libraryVisible ? "primary active" : "primary"} aria-label="Add Anything" aria-expanded={libraryVisible} title="Add anything (Ctrl K)" onClick={() => { setProjectVisible(false); setPaperVisible(false); setToolchainVisible(false); setPendingConnection(null); setLibraryVisible(true); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}><Plus size={17} aria-hidden="true" /><span>Add</span></button>
           <label className="canvas-tool" title="Import local files"><CloudUpload size={16} aria-hidden="true" /><span>Import files</span><input type="file" multiple aria-label="Import local files" onChange={(event) => { const files = [...(event.currentTarget.files ?? [])]; event.currentTarget.value = ""; void addDroppedFiles(files, canvasCenter()); }} /></label>
           <i className="canvas-toolbar-divider" />
           <button type="button" className={canvasTool === "select" ? "active" : ""} aria-label="Select Tool" title="Select (Esc)" onClick={() => setCanvasTool("select")}><MousePointer2 size={15} aria-hidden="true" /></button>
@@ -3078,11 +3310,14 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
           <i className="canvas-toolbar-divider" />
           <button type="button" aria-label="Fit Workflow" title="Fit workflow (F)" onClick={() => void flow?.fitView({ padding: .22, duration: 260, maxZoom: 1 })}><Maximize2 size={16} aria-hidden="true" /></button>
           <button type="button" aria-label={allViewersHidden ? "Show All Viewers" : "Hide All Viewers"} title={allViewersHidden ? "Show all viewers" : "Hide all viewers"} disabled={!nodes.length} onClick={toggleAllViewers}>{allViewersHidden ? <Eye size={16} aria-hidden="true" /> : <EyeOff size={16} aria-hidden="true" />}</button>
-        </div>}
+        </div>
 
+        <Suspense fallback={<div className="workspace-panel-loading" role="status"><LoaderCircle size={16} className="spin" />Opening workspace tool…</div>}>
         {libraryVisible && <div className="panel-layer" onPointerDown={(event) => event.stopPropagation()}><LibraryPanel client={client} operators={availableOperators} query={query} filterQuery={deferredQuery} favorites={favorites} recent={recent} categoryOpen={categoryOpen} searchInputRef={searchInputRef} continuation={pendingConnection} catalogExpansion={catalogExpansion} workflowCatalogState={workflowCatalogState} onQuery={setQuery} onClose={() => { setLibraryVisible(false); setPendingConnection(null); setCatalogExpansion(null); }} onAddOperator={addOperator} onAddSource={addSource} onImportFiles={(files) => addDroppedFiles(files, canvasCenter())} onToggleFavorite={(id) => setFavorites((current) => { const next = new Set(current); if (next.has(id)) next.delete(id); else next.add(id); return next; })} onToggleCategory={(title, open) => setCategoryOpen((current) => ({ ...current, [title]: open }))} onRetryWorkflowCatalogs={retryWorkflowCatalogs} onDismissCatalogExpansion={() => { setStatus(`${catalogExpansion?.title ?? "Workflow"} was not added · canvas unchanged`); setCatalogExpansion(null); }} /></div>}
 
         {projectVisible && <div className={`project-layer ${inputOriginRecoveryRequired ? "recovery" : ""}`} onPointerDown={(event) => event.stopPropagation()}><ProjectPanel projectName={session.project_name} graphPath={session.graph_path} recoveryMode={inputOriginRecoveryRequired} onImportProject={importLocalProject} onClose={() => setProjectVisible(false)} /></div>}
+
+        {operatorWorkshopVisible && <div className="operator-workshop-layer" onPointerDown={(event) => event.stopPropagation()}><OperatorWorkshopPanel client={client} onAccepted={async (candidate) => { await refreshCanonicalSession(); setStatus(`${candidate.operator.title} is proven and available in this project`); }} onClose={() => setOperatorWorkshopVisible(false)} /></div>}
 
         {selectedNode && selectedOperator && <div className="inspector-layer" onPointerDown={(event) => event.stopPropagation()}><InspectorPanel key={selectedNode.id} node={selectedNode.data.graphNode} selectedCount={selectedIds.length} operator={selectedOperator} hiddenViewerCount={selectedHiddenCount} setupCount={selectedNode.data.readinessItems.length} updateParam={updateParam} updateSourceBinding={updateSourceWorkflowBinding} browseSourceBinding={browseSourceWorkflowBinding} pendingSourceFile={pendingSourceFile?.nodeId === selectedNode.id ? pendingSourceFile : undefined} bindPendingSourceFile={bindPendingSourceFile} dismissPendingSourceFile={() => setPendingSourceFile(null)} beginParamEdit={beginParamEdit} browseParam={browseParam} rename={renameSelected} toggleViewers={toggleSelectedViewers} exploreSource={() => exploreSourceWorkflow(selectedNode.id)} close={() => { setSelectedIds([]); flow?.setNodes((current) => current.map((node) => ({ ...node, selected: false }))); }} /></div>}
 
@@ -3092,9 +3327,10 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
 
         {paperVisible && <div className="paper-layer" onPointerDown={(event) => event.stopPropagation()}><PaperPanel client={client} intake={paperIntake} active={activePaperCandidate} applied={appliedPaperCandidate} preparingField={paperPreparingField} onFile={rebuildPaper} onRetry={retryPaper} onCancel={cancelPaper} onExample={openExamplePaper} onReconstruct={rebuildBiorxivPaper} onSelect={setActivePaperCandidate} onApply={(index) => { const candidate = paperReview?.candidates[index]; if (candidate) installPaperCandidate(candidate, index); }} onUseResource={usePaperResource} onAttachInput={attachPaperInput} onSetInput={setPaperInput} onEscalate={askAgentAboutPaperItem} onEvidence={focusPaperEvidence} onClose={() => setPaperVisible(false)} /></div>}
 
-        {readinessVisible && readiness && <div className={`readiness-layer ${agentVisible ? "with-agent" : ""}`} onPointerDown={(event) => event.stopPropagation()}><ReadinessPanel snapshot={readiness} evidence={validationEvidence} validationCapability={validationCapability} onResolve={resolveRequirement} onFocus={focusRequirement} onAttachFile={attachRequirementFile} onAskAssistant={askAssistantAboutRequirement} onClose={() => setReadinessVisible(false)} /></div>}
+        {readinessVisible && readiness && <div className={`readiness-layer ${agentVisible ? "with-agent" : ""}`} onPointerDown={(event) => event.stopPropagation()}><ReadinessPanel snapshot={readiness} evidence={validationEvidence} validationCapability={validationCapability} managedResourceJob={managedResourceJob} onResolve={resolveRequirement} onCancelManagedResource={cancelManagedResource} onFocus={focusRequirement} onAttachFile={attachRequirementFile} onAskAssistant={askAssistantAboutRequirement} onClose={() => setReadinessVisible(false)} /></div>}
 
         {agentVisible && <div className="agent-layer" onPointerDown={(event) => event.stopPropagation()}><AgentPanel key={agentDraft?.id ?? "agent"} snapshot={agentSnapshot} transportError={agentTransportError} blockedReason={inputOriginBlockedReason} discovery={agentDiscovery} discoveryLoading={agentDiscoveryLoading} draft={agentDraft} onRefreshDiscovery={refreshAgentDiscovery} onConnect={connectAgent} onConfig={configureAgent} onPrompt={promptAgent} onCancel={cancelAgent} onDisconnect={disconnectAgent} onPermission={answerAgentPermission} onClose={() => { setAgentVisible(false); setAgentDraft(null); }} /></div>}
+        </Suspense>
 
         <footer className="statusbar studio-statusbar" aria-live="polite">
           <span className={`engine-light ${statusError ? "error" : ""}`} />
@@ -3103,15 +3339,15 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
           <button type="button" className={`readiness-status tone-${readinessStatus.tone} ${readinessVisible ? "active" : ""}`} title={readinessStatus.detail} aria-expanded={readinessVisible} onClick={(event) => { event.stopPropagation(); if (readinessError) { setReadinessError(null); setReadinessRetry((current) => current + 1); setStatus("Retrying readiness checks…"); } else if (readiness) setReadinessVisible((visible) => !visible); }}>
             {readinessStatus.tone === "ready" || readinessStatus.tone === "validated" ? <CheckCircle2 size={12} aria-hidden="true" /> : <CircleAlert size={12} aria-hidden="true" />}{readinessStatus.label}
           </button>
-          {sourceNetworkView && nestedSourceNode?.data.graphNode.source_workflow
-            ? <><span>{countFormatter.format(projectSourceNetwork(nestedSourceNode.data.graphNode.source_workflow, sourceNetworkView.path).cards.length)} source calls</span><span>1 visible layer</span></>
+          {sourceCanvasOpen && nestedSourceNode?.data.graphNode.source_workflow
+            ? <><span>{countFormatter.format(nestedSourceNode.data.graphNode.source_workflow.invocations?.length ?? 0)} source calls</span><span>source frame</span></>
             : <><span>{countFormatter.format(nodes.length)} nodes</span><span>{countFormatter.format(edges.length)} wires</span></>}
           <button type="button" className={machineVisible ? "active" : ""} onClick={(event) => { event.stopPropagation(); setToolchainVisible(false); setProjectVisible(false); const opening = !machineVisible; setMachineVisible(opening); if (opening) void refreshStorage(); }}><Cpu size={12} aria-hidden="true" />Machine</button>
-          {!sourceNetworkView && <div className="zoom-cluster">
+          <div className="zoom-cluster">
             <button type="button" aria-label="Zoom Out" onClick={() => void flow?.zoomOut({ duration: 120 })}><Minus size={13} /></button>
             <button type="button" aria-label="Reset Zoom to 100%" onClick={() => void flow?.zoomTo(1, { duration: 160 })}>{Math.round(zoom * 100)}%</button>
             <button type="button" aria-label="Zoom In" onClick={() => void flow?.zoomIn({ duration: 120 })}><Plus size={13} /></button>
-          </div>}
+          </div>
         </footer>
       </main>
     </>

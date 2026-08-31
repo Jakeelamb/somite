@@ -32,7 +32,15 @@ const WORKFLOW_AGENT_CONTRACT = `You are the Agent embedded in Somite. The curre
 
 Work through the Somite MCP tools immediately. Do not inspect or modify the Somite repository, run shell commands, read project files directly, or create workflow JSON by hand. Do not use developer tools to discover capabilities that Somite already exposes.
 
+Pixi and Nextflow are attached as dedicated first-party MCP servers with version-matched official manuals. For a Native workflow, Somite compile, validation, Run, and Evidence remain authoritative; do not create a parallel hand-authored workflow package. Use Pixi package search to resolve package questions before editing, and use its workspace/lock/environment tools only for an explicit local or compiled package. Use Nextflow project/analyze/module tools for Source-backed workflows and compiled packages. Check runtime compatibility once, then use the cheapest honest ladder: lint and config, preview without processes, reviewed stubs, an explicitly bound real fixture, then full execution. Preview and stubs never count as real process validation.
+
+Managed scientific resources are separate from Pixi packages. Use only resolutions returned by Somite readiness. Before starting a resource install, clearly state its declared download size, stored size, and scientific effect and obtain explicit user agreement; then use somite.resource and poll it rather than scripting a download yourself.
+
+Prefer structured inspection and known tool schemas. Search the cached Pixi or Nextflow manual only when a command contract, diagnostic, or runtime behavior remains unclear; do not search documentation reflexively on every turn. Use these native manuals before generic web research. Read their policy and validation resources when an execution boundary is unclear.
+
 Begin by inspecting the current workflow. Search exact catalog contracts instead of inventing operator ids, ports, parameters, or revisions. Use short single-concept catalog queries. Discover exact nf-core repositories and releases through Somite's nf-core source search, then import through its source workflow resolver; never fabricate nf.* execution operators or add the bare workflow.source infrastructure operator. Edit source-backed intent only through its typed source editor. If the user wants to rewire a selected invocation replacement, promote that call to the native canvas first, then use ordinary typed graph edits. When current NCBI or Ensembl data is relevant, use Somite source search before leaving the application.
+
+When no reviewed Operator exists, use Pixi and Nextflow discovery to gather authoritative evidence, then submit a project.* Operator Workshop candidate through Somite. Prove it with one ready tiny fixture graph and poll the proof to terminal status. A passing proof is still a candidate: only the user can accept it into the project catalog. Never bypass review by writing catalog files directly.
 
 Generic web research is allowed only when the request genuinely requires current external evidence that no Somite tool can provide. Return immediately to Somite tools. Never use generic web research to inspect Somite's repository or operator contracts.
 
@@ -283,7 +291,7 @@ function toolAction(tool: acp.ToolCallUpdate) {
     ? tool.rawInput as Record<string, unknown>
     : undefined;
   const rawTool = typeof input?.tool === "string" ? input.tool : undefined;
-  const presented = (tool.name ?? tool.title)?.replace(/^mcp\.Somite\./, "");
+  const presented = (tool.name ?? tool.title)?.replace(/^mcp\.(?:Somite|Pixi|Nextflow)\./, "");
   if (rawTool && presented && rawTool !== presented) return `${presented} (claims ${rawTool})`;
   return rawTool ?? presented ?? `Tool ${tool.toolCallId}`;
 }
@@ -304,6 +312,65 @@ export function trustedSomiteMcpPermissionTool(tool: acp.ToolCallUpdate): Somite
     ? presentedSomiteToolName(tool.title)
     : presentedSomiteToolName(tool.name);
   return presented === input.tool ? input.tool : undefined;
+}
+
+const AUTOMATIC_PIXI_TOOLS = new Set(["pixi_docs_search", "pixi_docs_read", "pixi_runtime_info", "pixi_inspect", "pixi_package_search"]);
+const AUTOMATIC_NEXTFLOW_TOOLS = new Set(["nextflow_docs_search", "nextflow_docs_read", "nextflow_runtime_info"]);
+const SENSITIVE_LOCAL_PATH = /(?:^|\/)(?:\.env(?:\.[^/]*)?|\.ssh|\.aws|\.kube|credentials?(?:\.[^/]*)?|secrets?(?:\.[^/]*)?|id_(?:rsa|dsa|ecdsa|ed25519)|[^/]+\.(?:key|pem|p12|pfx|jks|kdbx|keystore))(?:\/|$)/i;
+
+function automaticallyReadableLocalPath(value: unknown) {
+  if (typeof value !== "string" || /^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return false;
+  return !SENSITIVE_LOCAL_PATH.test(value.replaceAll("\\", "/"));
+}
+
+function sensitiveStorageRead(tool: acp.ToolCallUpdate) {
+  const input = tool.rawInput && typeof tool.rawInput === "object" && !Array.isArray(tool.rawInput)
+    ? tool.rawInput as Record<string, unknown>
+    : undefined;
+  const argumentsValue = input?.arguments && typeof input.arguments === "object" && !Array.isArray(input.arguments)
+    ? input.arguments as Record<string, unknown>
+    : undefined;
+  return input?.server === "Nextflow"
+    && input.tool === "nextflow_storage"
+    && ["stat", "cat"].includes(String(argumentsValue?.action))
+    && typeof argumentsValue?.source === "string"
+    && !automaticallyReadableLocalPath(argumentsValue.source);
+}
+
+function exactPresentedTool(tool: acp.ToolCallUpdate, server: string, rawTool: string) {
+  const presented = tool.name ?? tool.title;
+  return typeof presented === "string" && presented.replace(new RegExp(`^mcp\\.${server}\\.`), "") === rawTool;
+}
+
+/** Trust only exact, read-only tools from Somite's bundled MCP servers. */
+export function trustedAutomaticMcpPermissionTool(tool: acp.ToolCallUpdate): string | undefined {
+  const input = tool.rawInput && typeof tool.rawInput === "object" && !Array.isArray(tool.rawInput)
+    ? tool.rawInput as Record<string, unknown>
+    : undefined;
+  if (input?.server === "Somite") return trustedSomiteMcpPermissionTool(tool);
+  if ((input?.server !== "Pixi" && input?.server !== "Nextflow") || typeof input.tool !== "string" || !exactPresentedTool(tool, input.server, input.tool)) return undefined;
+  const argumentsValue = input.arguments && typeof input.arguments === "object" && !Array.isArray(input.arguments)
+    ? input.arguments as Record<string, unknown>
+    : {};
+  if (input.server === "Pixi") {
+    if (AUTOMATIC_PIXI_TOOLS.has(input.tool)) return input.tool;
+    if (input.tool === "pixi_lock" && argumentsValue.action === "check") return input.tool;
+    if (input.tool === "pixi_task" && argumentsValue.action === "list") return input.tool;
+    if (input.tool === "pixi_global" && (argumentsValue.action === "list" || argumentsValue.action === "tree")) return input.tool;
+  }
+  if (input.server === "Nextflow") {
+    if (AUTOMATIC_NEXTFLOW_TOOLS.has(input.tool)) return input.tool;
+    if (input.tool === "nextflow_project" && ["list", "info", "view"].includes(String(argumentsValue.action))) return input.tool;
+    if (input.tool === "nextflow_module" && ["search", "view", "list", "validate", "spec", "publish_preview"].includes(String(argumentsValue.action))) return input.tool;
+    if (input.tool === "nextflow_history" && argumentsValue.action !== "lineage_render") return input.tool;
+    if (input.tool === "nextflow_storage"
+      && ["list", "stat", "cat"].includes(String(argumentsValue.action))
+      && automaticallyReadableLocalPath(argumentsValue.source)) return input.tool;
+    if (input.tool === "nextflow_maintenance" && argumentsValue.action === "clean_preview") return input.tool;
+    if (input.tool === "nextflow_platform" && ["auth_status", "secrets_list"].includes(String(argumentsValue.action))) return input.tool;
+    if (input.tool === "nextflow_analyze" && argumentsValue.action === "lint") return input.tool;
+  }
+  return undefined;
 }
 
 function isCorrelationOnlyPermissionToolCall(tool: acp.ToolCallUpdate) {
@@ -347,6 +414,8 @@ export class AgentManager {
   readonly #serverUrl: string;
   readonly #mcpCapability: string;
   readonly #mcpPath: string;
+  readonly #pixiMcpPath = fileURLToPath(new URL("../../mcp/pixi/src/server.ts", import.meta.url));
+  readonly #nextflowMcpPath = fileURLToPath(new URL("../../mcp/nextflow/src/server.ts", import.meta.url));
   readonly #projectRoot?: string;
   #runtime?: Runtime;
   #generation = 0;
@@ -366,7 +435,8 @@ export class AgentManager {
   #configOptions: acp.SessionConfigOption[] = [];
   #permissionSequence = 0;
   #permissions = new Map<string, PendingPermission>();
-  #trustedPermissionTools = new Map<string, SomiteMcpToolName>();
+  #trustedPermissionTools = new Map<string, string>();
+  #sensitiveToolCalls = new Set<string>();
 
   constructor(
     serverUrl: string,
@@ -520,6 +590,7 @@ export class AgentManager {
     const trimmed = this.preflightPrompt(message);
     const runtime = this.#readyRuntime();
     this.#trustedPermissionTools.clear();
+    this.#sensitiveToolCalls.clear();
     this.#busy = true;
     this.#push({ kind: "user", title: "You", detail: trimmed });
     void this.#runPrompt(runtime, `${WORKFLOW_AGENT_CONTRACT}\n\n${trimmed}`);
@@ -610,6 +681,7 @@ export class AgentManager {
       clientInfo: { name: "somite", title: "Somite", version: SOMITE_VERSION },
     }), 30_000, "ACP initialization");
     if (initialized.protocolVersion !== acp.PROTOCOL_VERSION) throw new Error(`Somite supports stable ACP protocol version ${acp.PROTOCOL_VERSION}`);
+    const toolWorkspace = runtime.workspace;
     const session = await timeout(connection.agent.request(acp.methods.agent.session.new, {
       cwd: runtime.workspace,
       mcpServers: [{
@@ -617,6 +689,16 @@ export class AgentManager {
         command: process.execPath,
         args: ["--experimental-strip-types", this.#mcpPath, "--server-url", this.#serverUrl],
         env: [{ name: "SOMITE_MCP_RUNTIME_CAPABILITY", value: this.#mcpCapability }],
+      }, {
+        name: "Pixi",
+        command: process.execPath,
+        args: ["--experimental-strip-types", this.#pixiMcpPath, "--workspace-root", toolWorkspace],
+        env: [],
+      }, {
+        name: "Nextflow",
+        command: process.execPath,
+        args: ["--experimental-strip-types", this.#nextflowMcpPath, "--workspace-root", toolWorkspace],
+        env: [],
       }],
     }), 45_000, "ACP session creation");
     if (this.#runtime?.generation !== runtime.generation) return;
@@ -627,7 +709,7 @@ export class AgentManager {
     this.#agentName = boundedDetail(initialized.agentInfo?.title ?? initialized.agentInfo?.name ?? "ACP agent", this.#maximumDetailBytes);
     this.#connecting = false;
     this.#connected = true;
-    this.#push({ kind: "status", title: `${this.#agentName} connected`, detail: "Stable ACP v1 · Somite tools attached over stdio", status: "ready" });
+    this.#push({ kind: "status", title: `${this.#agentName} connected`, detail: "Stable ACP v1 · Somite, Pixi, and Nextflow tools attached over stdio", status: "ready" });
   }
 
   async #runPrompt(runtime: Runtime, prompt: string) {
@@ -643,6 +725,7 @@ export class AgentManager {
       if (this.#runtime?.generation === runtime.generation) {
         this.#busy = false;
         this.#trustedPermissionTools.clear();
+        this.#sensitiveToolCalls.clear();
       }
       void this.#persistTranscript().catch((cause) => this.#push({
         kind: "error",
@@ -664,11 +747,14 @@ export class AgentManager {
     if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
       this.#push({ kind: "message", title: "Agent", detail: boundedDetail(update.content.text, this.#maximumDetailBytes) });
     } else if (update.sessionUpdate === "tool_call") {
+      if (sensitiveStorageRead(update)) this.#sensitiveToolCalls.add(update.toolCallId);
       this.#rememberTrustedPermissionTool(update);
       this.#push({ kind: "tool", title: update.title, detail: boundedDetail(update.rawInput), status: update.status ?? "pending", tool_call_id: update.toolCallId });
     } else if (update.sessionUpdate === "tool_call_update") {
       if (update.status === "completed" || update.status === "failed") this.#trustedPermissionTools.delete(update.toolCallId);
-      this.#push({ kind: "tool", title: update.title ?? `Tool ${update.toolCallId}`, detail: boundedDetail(update.rawOutput), ...(update.status ? { status: update.status } : {}), tool_call_id: update.toolCallId });
+      const sensitive = this.#sensitiveToolCalls.has(update.toolCallId);
+      this.#push({ kind: "tool", title: update.title ?? `Tool ${update.toolCallId}`, detail: sensitive ? "[redacted sensitive tool output]" : boundedDetail(update.rawOutput), ...(update.status ? { status: update.status } : {}), tool_call_id: update.toolCallId });
+      if (update.status === "completed" || update.status === "failed") this.#sensitiveToolCalls.delete(update.toolCallId);
     } else if (update.sessionUpdate === "plan" || update.sessionUpdate === "plan_update") {
       this.#push({ kind: "status", title: "Agent plan updated", detail: boundedDetail(update), status: "planning" });
     } else if (update.sessionUpdate === "config_option_update") {
@@ -683,7 +769,7 @@ export class AgentManager {
   async #requestPermission(request: acp.RequestPermissionRequest): Promise<acp.RequestPermissionResponse> {
     const correlatedTool = this.#trustedPermissionTools.get(request.toolCall.toolCallId);
     this.#trustedPermissionTools.delete(request.toolCall.toolCallId);
-    const requestTool = trustedSomiteMcpPermissionTool(request.toolCall);
+    const requestTool = trustedAutomaticMcpPermissionTool(request.toolCall);
     const trustedTool = correlatedTool && (isCorrelationOnlyPermissionToolCall(request.toolCall) || requestTool === correlatedTool)
       ? correlatedTool
       : undefined;
@@ -745,6 +831,7 @@ export class AgentManager {
     }
     this.#permissions.clear();
     this.#trustedPermissionTools.clear();
+    this.#sensitiveToolCalls.clear();
   }
 
   #rememberTrustedPermissionTool(toolCall: acp.ToolCallUpdate) {
@@ -753,7 +840,7 @@ export class AgentManager {
       this.#trustedPermissionTools.delete(toolCallId);
       return;
     }
-    const trusted = trustedSomiteMcpPermissionTool(toolCall);
+    const trusted = trustedAutomaticMcpPermissionTool(toolCall);
     if (!trusted) {
       this.#trustedPermissionTools.delete(toolCallId);
       return;

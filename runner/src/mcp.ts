@@ -44,6 +44,24 @@ const noteSchema: JsonObject = {
   pattern: "^[^\\u0000]*$",
   description: "Node note text (at most 4,096 UTF-8 bytes), or null to remove it.",
 };
+const sourcePromotionSchema: JsonObject = {
+  ...objectSchema({
+    base_state_revision: stateSchema,
+    workflow_revision: stringSchema("Exact current source workflow revision."),
+    invocation_id: stringSchema("One exact source invocation id with a selected replacement."),
+    invocation_ids: {
+      type: "array",
+      minItems: 1,
+      maxItems: 64,
+      uniqueItems: true,
+      items: stringSchema("Exact source invocation id with a selected replacement."),
+      description: "One to 64 source calls to promote atomically into the current native variant.",
+    },
+    idempotency_key: keySchema,
+    summary: summarySchema,
+  }, ["base_state_revision", "workflow_revision", "idempotency_key", "summary"]),
+  oneOf: [{ required: ["invocation_id"] }, { required: ["invocation_ids"] }],
+};
 
 function identifierSchema(description: string): JsonObject {
   return stringSchema(description, { minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9_.-]+$" });
@@ -54,7 +72,7 @@ function parameterRecordSchema(description: string): JsonObject {
 }
 
 function taggedObjectSchema(
-  discriminator: "op" | "kind",
+  discriminator: "op" | "kind" | "action",
   tag: string,
   title: string,
   description: string,
@@ -201,17 +219,51 @@ const TOOLS: Tool[] = [
     summary: summarySchema,
     edits: { type: "array", minItems: 1, maxItems: 64, description: "One to 64 ordered typed source-workflow edits.", items: sourceWorkflowEditSchema },
   }, ["base_state_revision", "workflow_revision", "idempotency_key", "summary", "edits"]), { readOnlyHint: false, destructiveHint: true }),
-  tool(SOMITE_MCP_TOOL.sourceWorkflowPromote, "Promote source call", "Promote one selected source invocation replacement into an ordinary editable typed node.", objectSchema({
-    base_state_revision: stateSchema,
-    workflow_revision: stringSchema("Exact current source workflow revision."),
-    invocation_id: stringSchema("Exact source invocation id that has a selected replacement."),
-    idempotency_key: keySchema,
-    summary: summarySchema,
-  }, ["base_state_revision", "workflow_revision", "invocation_id", "idempotency_key", "summary"]), { readOnlyHint: false, destructiveHint: true }),
+  tool(SOMITE_MCP_TOOL.sourceWorkflowPromote, "Promote source calls", "Promote one or more selected source invocation replacements into ordinary editable typed nodes while retaining source provenance.", sourcePromotionSchema, { readOnlyHint: false, destructiveHint: true }),
   tool(SOMITE_MCP_TOOL.sourceSearch, "Search scientific sources", "Search current NCBI or Ensembl records for accessions, organisms, reads, assemblies, references, or genes.", objectSchema({
     query: stringSchema("Scientific entity, accession, organism, assembly, run, or gene.", { minLength: 2, maxLength: 120 }),
     provider: { type: "string", enum: ["ncbi", "ensembl"] },
   }, ["query", "provider"]), { openWorldHint: true }),
+  tool(SOMITE_MCP_TOOL.operatorCandidateDraft, "Draft project operator", "Submit one evidence-backed project-local external Operator candidate. This does not admit it to the executable catalog.", objectSchema({
+    operator: { type: "object", description: "Complete Operator contract using a project.* id, typed ports, argv, outputs, and Pixi requirements.", additionalProperties: true },
+    sources: {
+      type: "array",
+      minItems: 1,
+      maxItems: 8,
+      items: objectSchema({
+        kind: { type: "string", enum: ["official_docs", "source", "package_recipe", "workflow_use"] },
+        url: stringSchema("Credential-free authoritative HTTPS URL."),
+      }, ["kind", "url"]),
+    },
+  }, ["operator", "sources"]), { readOnlyHint: false, openWorldHint: true }),
+  tool(SOMITE_MCP_TOOL.operatorCandidateProve, "Test project operator", "Run one ready tiny fixture graph containing the exact draft candidate in an isolated Pixi-frozen Nextflow execution.", objectSchema({
+    candidate_id: stringSchema("Exact project.* candidate id."),
+    graph: { type: "object", description: "Complete ready Somite fixture graph containing the exact candidate once.", additionalProperties: true },
+    idempotency_key: keySchema,
+  }, ["candidate_id", "graph", "idempotency_key"]), { readOnlyHint: false, openWorldHint: true }),
+  tool(SOMITE_MCP_TOOL.operatorProofStatus, "Inspect operator proof", "Poll one Operator Workshop proof to terminal evidence.", objectSchema({
+    proof_id: stringSchema("Proof id returned by operator_candidate.prove."),
+    wait_ms: { type: "integer", minimum: 0, maximum: 25_000, default: 0 },
+  }, ["proof_id"])),
+  tool(SOMITE_MCP_TOOL.resource, "Manage scientific resource", "Install, inspect, or cancel one reviewed scientific resource. Before install, tell the user its declared download, stored size, and scientific effect from readiness and obtain explicit agreement.", {
+    type: "object",
+    additionalProperties: false,
+    description: "One managed-resource action, discriminated by action.",
+    oneOf: [
+      taggedObjectSchema("action", "install", "Install resource", "Start one reviewed, checksum-pinned provider after explicit user agreement.", {
+        profile: stringSchema("Exact resource profile from readiness."),
+        resolution: stringSchema("Exact downloadable resolution id from readiness."),
+        idempotency_key: keySchema,
+      }, ["profile", "resolution", "idempotency_key"]),
+      taggedObjectSchema("action", "status", "Inspect resource", "Wait for or inspect one managed-resource job.", {
+        job_id: stringSchema("Exact job id returned by install."),
+        wait_ms: { type: "integer", minimum: 0, maximum: 25_000, default: 0 },
+      }, ["job_id"]),
+      taggedObjectSchema("action", "cancel", "Cancel resource", "Cancel one active managed-resource job and remove its partial data.", {
+        job_id: stringSchema("Exact active job id."),
+      }, ["job_id"]),
+    ],
+  }, { readOnlyHint: false, openWorldHint: true }),
   tool(SOMITE_MCP_TOOL.graphApplyTransaction, "Edit Somite workflow", "Apply one small atomic typed graph edit against the latest state revision.", objectSchema({
     base_state_revision: stateSchema,
     idempotency_key: keySchema,
@@ -325,6 +377,17 @@ async function callTool(name: string, value: unknown, signal: AbortSignal) {
   if (name === SOMITE_MCP_TOOL.sourceWorkflowEdit) return http("POST", "/api/agent/source-workflows/edit", args, signal);
   if (name === SOMITE_MCP_TOOL.sourceWorkflowPromote) return http("POST", "/api/agent/source-workflows/promote", args, signal);
   if (name === SOMITE_MCP_TOOL.sourceSearch) return http("GET", query("/api/sources/search", { q: args.query, provider: args.provider }), undefined, signal);
+  if (name === SOMITE_MCP_TOOL.operatorCandidateDraft) return http("POST", "/api/operator-workshop/candidates", args, signal);
+  if (name === SOMITE_MCP_TOOL.operatorCandidateProve) return http("POST", `/api/operator-workshop/candidates/${encodeURIComponent(requiredString(args.candidate_id, "candidate_id"))}/proofs`, { graph: args.graph, idempotency_key: args.idempotency_key }, signal, 300_000);
+  if (name === SOMITE_MCP_TOOL.operatorProofStatus) return http("GET", query(`/api/operator-workshop/proofs/${encodeURIComponent(requiredString(args.proof_id, "proof_id"))}`, { wait_ms: args.wait_ms ?? 0 }), undefined, signal, 30_000);
+  if (name === SOMITE_MCP_TOOL.resource) {
+    const action = requiredString(args.action, "action");
+    if (action === "install") return http("POST", "/api/resources/install", { profile: args.profile, resolution: args.resolution, idempotency_key: args.idempotency_key }, signal, 300_000);
+    const jobId = encodeURIComponent(requiredString(args.job_id, "job_id"));
+    if (action === "status") return http("GET", query(`/api/resources/jobs/${jobId}`, { wait_ms: args.wait_ms ?? 0 }), undefined, signal, 30_000);
+    if (action === "cancel") return http("POST", `/api/resources/jobs/${jobId}/cancel`, {}, signal);
+    throw new Error(`unknown managed resource action ${action}`);
+  }
   if (name === SOMITE_MCP_TOOL.graphApplyTransaction) return http("POST", "/api/agent/transactions", args, signal);
   if (name === SOMITE_MCP_TOOL.workflowCompile) return http("POST", "/api/agent/compile", {}, signal, 300_000);
   if (name === SOMITE_MCP_TOOL.runStart || name === SOMITE_MCP_TOOL.validationStart) {

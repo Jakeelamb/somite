@@ -26,7 +26,9 @@ import {
   validateSourceWorkflow,
 } from "./workflow.ts";
 
-export const SOURCE_INDEXER_REVISION = "source-indexer-ts-v1";
+// Bump whenever immutable source-derived fields or capabilities change. This is
+// part of every cached source request identity, not a presentation version.
+export const SOURCE_INDEXER_REVISION = "source-indexer-ts-v2";
 const encoder = new TextEncoder();
 const MAX_SCHEMA_BYTES = 8 * 1024 * 1024;
 const MAX_SCHEMA_NODES = 100_000;
@@ -817,12 +819,106 @@ export function sourceWorkflowRevision(workflow: SourceWorkflowInstance) {
   })));
 }
 
+function sourceText(file: FrozenSourceFile) {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(file.bytes);
+  } catch {
+    return undefined;
+  }
+}
+
+function rootPixiDependencies(text: string) {
+  const dependencies = new Set<string>();
+  let section = "";
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.replace(/\s+#.*$/, "").trim();
+    const heading = /^\[([^\]]+)\]$/.exec(line);
+    if (heading) {
+      section = heading[1]!.trim();
+      continue;
+    }
+    if (section !== "dependencies") continue;
+    const assignment = /^([A-Za-z0-9_-]+)\s*=/.exec(line);
+    if (assignment) dependencies.add(assignment[1]!.toLocaleLowerCase("en-US"));
+  }
+  return dependencies;
+}
+
+function externalEnvironmentDirective(files: readonly FrozenSourceFile[]) {
+  const sourceFiles = files.filter((file) => file.path.endsWith(".nf") || file.path.endsWith(".config"));
+  for (const file of sourceFiles) {
+    const text = sourceText(file);
+    if (text === undefined) continue;
+    const lines = text.split("\n");
+    for (let index = 0; index < lines.length; index += 1) {
+      const line = lines[index]!.replace(/\/\/.*$/, "");
+      if (/\b(?:container|conda|spack|module)\s+(?:['"]|[A-Za-z_$])/.test(line)
+        || /\b(?:container|conda|spack|module)\s*=/.test(line)
+        || /\b(?:docker|podman|singularity|apptainer|wave|fusion)\.enabled\s*=\s*true\b/.test(line)) {
+        return { path: file.path, line: index + 1 };
+      }
+    }
+  }
+  return undefined;
+}
+
+function sourceExecutionCapability(files: readonly FrozenSourceFile[]) {
+  const diagnostics: SourceDiagnostic[] = [];
+  const manifestFile = files.find((file) => file.path === "pixi.toml");
+  const lockFile = files.find((file) => file.path === "pixi.lock");
+  const diagnostic = (code: string, message: string, path: string, line = 1) => diagnostics.push({
+    code,
+    message,
+    span: { path, start_line: line, end_line: line },
+  });
+  if (!manifestFile && !lockFile) {
+    diagnostic(
+      "source_pixi_environment_missing",
+      "Exact execution remains disabled because the source has no root pixi.toml and pixi.lock task environment.",
+      "main.nf",
+    );
+    return { exact: false, diagnostics };
+  }
+  if (!manifestFile || !lockFile) {
+    diagnostic(
+      "source_pixi_lock_incomplete",
+      "Exact execution remains disabled because the source must contain both root pixi.toml and pixi.lock files.",
+      manifestFile?.path ?? lockFile!.path,
+    );
+    return { exact: false, diagnostics };
+  }
+  const manifestText = sourceText(manifestFile);
+  const lockText = sourceText(lockFile);
+  const dependencies = manifestText === undefined ? new Set<string>() : rootPixiDependencies(manifestText);
+  if (!dependencies.has("nextflow") || !dependencies.has("openjdk")
+    || lockText === undefined || !/^version:\s*\d+/m.test(lockText) || !/^environments:\s*$/m.test(lockText)) {
+    diagnostic(
+      "source_pixi_runtime_incomplete",
+      "Exact execution remains disabled because the root Pixi environment must lock both Nextflow and OpenJDK.",
+      "pixi.toml",
+    );
+    return { exact: false, diagnostics };
+  }
+  const external = externalEnvironmentDirective(files);
+  if (external) {
+    diagnostic(
+      "source_external_task_environment",
+      "Exact execution remains disabled because this workflow delegates a process environment to a container, Conda, module, or external runtime instead of the locked root Pixi environment.",
+      external.path,
+      external.line,
+    );
+    return { exact: false, diagnostics };
+  }
+  return { exact: true, diagnostics };
+}
+
 export function deriveSourceWorkflow(files: readonly FrozenSourceFile[], source: Omit<SourceWorkflowInstance["source"], "source_digest" | "file_count" | "source_bytes">) {
   const manifest = buildSourceManifest(files);
   const projectionBudget = new DerivedProjectionBudget();
   const outline = indexNextflowSource(files, source.entrypoint, manifest.source_digest, projectionBudget);
   const schema = parseNextflowParameterSchema(files, projectionBudget);
-  const diagnostics = [...outline.diagnostics, ...schema.diagnostics].sort((left, right) =>
+  const execution = sourceExecutionCapability(files);
+  const diagnostics = [...outline.diagnostics, ...schema.diagnostics, ...execution.diagnostics].sort((left, right) =>
     (left.span?.path ?? "").localeCompare(right.span?.path ?? "")
     || (left.span?.start_line ?? 0) - (right.span?.start_line ?? 0)
     || left.code.localeCompare(right.code)
@@ -843,7 +939,7 @@ export function deriveSourceWorkflow(files: readonly FrozenSourceFile[], source:
     invocations: outline.invocations,
     replacements: [],
     capabilities: {
-      exact_execution: false,
+      exact_execution: execution.exact,
       parameter_edits: schema.parameterEdits,
       hierarchy_indexed: outline.scopes.length > 0,
       structural_edits: false,
@@ -917,36 +1013,63 @@ function promotedNodeId(operator: string, invocation: string) {
   return `${base}-${byteDigest(encoder.encode(invocation)).slice("blake3:".length, "blake3:".length + 8)}`;
 }
 
-export function promoteSourceInvocation(graph: SomiteGraph, workflowRevision: string, invocationId: string, catalog: OperatorCatalog) {
-  if (graph.nodes.length !== 1 || graph.edges.length || graph.variant_origin) throw new Error("invocation promotion requires one source-backed node and no edges");
-  const sourceNode = graph.nodes[0]!;
+function promotionSource(graph: SomiteGraph) {
+  if (graph.variant_origin) return graph.variant_origin.source_node;
+  if (graph.nodes.length !== 1 || graph.edges.length || !graph.nodes[0]?.source_workflow) {
+    throw new Error("invocation promotion requires one source-backed workflow or an existing native variant");
+  }
+  return graph.nodes[0];
+}
+
+function promotedLayout(sourceNode: SomiteGraphNode, invocationId: string, offset: number) {
+  const position = sourceNode.source_canvas?.positions?.[invocationId];
+  if (position) return { x: sourceNode.layout.x + position.x, y: sourceNode.layout.y + position.y };
+  return { x: sourceNode.layout.x + offset * 260, y: sourceNode.layout.y + (offset % 2) * 170 };
+}
+
+export function promoteSourceInvocations(graph: SomiteGraph, workflowRevision: string, invocationIds: readonly string[], catalog: OperatorCatalog) {
+  if (!invocationIds.length) throw new Error("at least one source invocation is required for promotion");
+  if (new Set(invocationIds).size !== invocationIds.length) throw new Error("source invocation promotion contains a duplicate invocation");
+  const sourceNode = promotionSource(graph);
   const workflow = sourceNode.source_workflow;
   if (!workflow || workflow.workflow_revision !== workflowRevision) throw new Error("source workflow revision is stale");
-  const replacement = workflow.replacements?.find((candidate) => candidate.invocation_id === invocationId);
-  if (!replacement) throw new Error(`source invocation ${invocationId} has no selected replacement to promote`);
-  const operator = catalog.get(replacement.operator);
-  if (!operator || operator.revision !== replacement.operator_revision) throw new Error(`replacement operator ${replacement.operator} is not in the pinned catalog`);
-  const node: SomiteGraphNode = {
-    id: promotedNodeId(operator.id, invocationId),
-    operator: operator.id,
-    operator_revision: operator.revision,
-    ports: operatorPorts(operator),
-    params: { ...(replacement.params ?? {}) },
-    layout: { ...sourceNode.layout },
-  };
+  const promotedInvocations = { ...(graph.variant_origin?.promoted_invocations ?? {}) };
+  const nodes = graph.variant_origin ? [...graph.nodes] : [];
+  for (const invocationId of invocationIds) {
+    if (promotedInvocations[invocationId]) throw new Error(`source invocation ${invocationId} is already editable`);
+    const replacement = workflow.replacements?.find((candidate) => candidate.invocation_id === invocationId);
+    if (!replacement) throw new Error(`source invocation ${invocationId} has no selected replacement to promote`);
+    const operator = catalog.get(replacement.operator);
+    if (!operator || operator.revision !== replacement.operator_revision) throw new Error(`replacement operator ${replacement.operator} is not in the pinned catalog`);
+    const node: SomiteGraphNode = {
+      id: promotedNodeId(operator.id, invocationId),
+      operator: operator.id,
+      operator_revision: operator.revision,
+      ports: operatorPorts(operator),
+      params: { ...(replacement.params ?? {}) },
+      layout: promotedLayout(sourceNode, invocationId, nodes.length),
+    };
+    if (nodes.some((candidate) => candidate.id === node.id)) throw new Error(`promoted Node id ${node.id} already exists`);
+    nodes.push(node);
+    promotedInvocations[invocationId] = node.id;
+  }
   const promoted: SomiteGraph = {
     schema_version: graph.schema_version,
     ...(graph.name ? { name: graph.name } : {}),
-    nodes: [node],
-    edges: [],
+    nodes,
+    edges: graph.variant_origin ? graph.edges : [],
     annotations: graph.annotations ?? [],
-    variant_origin: { source_node: sourceNode, promoted_invocations: { [invocationId]: node.id } },
+    variant_origin: { source_node: sourceNode, promoted_invocations: promotedInvocations },
   };
   const validation = validateGraph(promoted);
   if (!validation.ok) throw new Error(validation.issue.message);
   const verified = catalog.verifyGraph(promoted);
   if (!verified.ok) throw new Error(verified.issue.message);
   return promoted;
+}
+
+export function promoteSourceInvocation(graph: SomiteGraph, workflowRevision: string, invocationId: string, catalog: OperatorCatalog) {
+  return promoteSourceInvocations(graph, workflowRevision, [invocationId], catalog);
 }
 
 export function restoreSourceWorkflow(graph: SomiteGraph, catalog: OperatorCatalog) {

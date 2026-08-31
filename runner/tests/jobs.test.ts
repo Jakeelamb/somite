@@ -5,8 +5,11 @@ import { delimiter, join } from "node:path";
 import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { operatorPorts } from "@somite/workflow/catalog";
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
 import type { SomiteGraph } from "@somite/workflow/model";
+import type { FrozenSourceFile } from "@somite/workflow/nextflowSource";
+import { applySourceWorkflowEdits, deriveSourceWorkflow, promoteSourceInvocations } from "@somite/workflow/sourceWorkflow";
 import { SOMITE_TYPESCRIPT_RUNNER_IDENTITY } from "@somite/workflow/version";
 import {
   FrozenPackageSizeError,
@@ -30,6 +33,75 @@ after(async () => {
 async function graphFixture() {
   const cases = JSON.parse(await readFile(join(repositoryRoot, "testdata", "assessment-parity-graphs.json"), "utf8")) as Array<{ name: string; graph: SomiteGraph }>;
   return cases.find((candidate) => candidate.name === "connected local FastQC workflow is ready")!.graph;
+}
+
+async function promotedVariantFixture() {
+  const paths = [
+    "main.nf",
+    "modules/odgi_stats.nf",
+    "modules/wfmash.nf",
+    "nextflow_schema.json",
+    "subworkflows/odgi_qc.nf",
+    "workflows/pangenome.nf",
+  ];
+  const files = await Promise.all(paths.map(async (path): Promise<FrozenSourceFile> => ({
+    path,
+    mode: 0o100644,
+    bytes: await readFile(join(repositoryRoot, "testdata", "source-workflow", path)),
+  })));
+  const { workflow } = deriveSourceWorkflow(files, {
+    provider: "nf_core",
+    repository: "https://github.com/nf-core/pangenome",
+    requested_revision: "fixture",
+    resolved_revision: "0123456789abcdef0123456789abcdef01234567",
+    entrypoint: "main.nf",
+  });
+  const invocations = workflow.invocations?.slice(0, 2) ?? [];
+  assert.equal(invocations.length, 2);
+  const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+  const imported = catalog.get("files.import")!;
+  const fastqc = catalog.get("qc.fastqc")!;
+  const edited = applySourceWorkflowEdits(workflow, workflow.workflow_revision, [{
+    kind: "replace_invocation",
+    invocation_id: invocations[0]!.id,
+    operator: imported.id,
+    operator_revision: imported.revision,
+    params: { path: "data/reads.fastq" },
+  }, {
+    kind: "replace_invocation",
+    invocation_id: invocations[1]!.id,
+    operator: fastqc.id,
+    operator_revision: fastqc.revision,
+    params: {},
+  }]);
+  const source = catalog.get("workflow.source")!;
+  const promoted = promoteSourceInvocations({
+    schema_version: 3,
+    name: "Promoted source validation",
+    nodes: [{
+      id: "source",
+      operator: source.id,
+      operator_revision: source.revision,
+      ports: operatorPorts(source),
+      params: {},
+      source_workflow: edited,
+      layout: { x: 0, y: 0 },
+    }],
+    edges: [],
+  }, edited.workflow_revision, invocations.map((invocation) => invocation.id), catalog);
+  return {
+    catalog,
+    graph: {
+      ...promoted,
+      edges: [{
+        id: "reads-to-fastqc",
+        from_node: promoted.variant_origin!.promoted_invocations![invocations[0]!.id]!,
+        from_port: "file",
+        to_node: promoted.variant_origin!.promoted_invocations![invocations[1]!.id]!,
+        to_port: "fastq",
+      }],
+    } satisfies SomiteGraph,
+  };
 }
 
 async function mockProject() {
@@ -156,6 +228,57 @@ test("TypeScript runner freezes, executes, traces, validates, and exports one pa
     assert.equal(exported.filename, "RNA-seq.somite-run.zip");
     assert.deepEqual([...exported.bytes.slice(0, 4)], [0x50, 0x4b, 0x03, 0x04]);
     assert.deepEqual((await readFile(project.log, "utf8")).trim().split("\n").sort(), ["install", "lock", "run", "run"]);
+  } finally {
+    process.env.PATH = previousPath;
+    await rm(project.root, { recursive: true, force: true });
+  }
+});
+
+test("concurrent run retries reserve one idempotency key before preparation", async () => {
+  const project = await mockProject();
+  const previousPath = process.env.PATH;
+  process.env.PATH = project.path;
+  process.env.SOMITE_MOCK_LOCK_DELAY_MS = "100";
+  try {
+    const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+    const manager = new RunManager(project.root, repositoryRoot, catalog);
+    const graph = await graphFixture();
+    const [first, replay] = await Promise.all([
+      manager.start(graph, "run", "same-run-key"),
+      manager.start(graph, "run", "same-run-key"),
+    ]);
+    assert.equal(first.run_id, replay.run_id);
+    assert.deepEqual(new Set([first.replayed, replay.replayed]), new Set([false, true]));
+    await terminalStatus(manager, first.run_id);
+    await manager.shutdown();
+  } finally {
+    delete process.env.SOMITE_MOCK_LOCK_DELAY_MS;
+    process.env.PATH = previousPath;
+    await rm(project.root, { recursive: true, force: true });
+  }
+});
+
+test("a progressively promoted source variant validates and exports through the native runner with provenance", async () => {
+  const project = await mockProject();
+  const previousPath = process.env.PATH;
+  process.env.PATH = project.path;
+  try {
+    const { catalog, graph } = await promotedVariantFixture();
+    const manager = new RunManager(project.root, repositoryRoot, catalog);
+    const started = await manager.start(graph, "validation");
+    const validation = await terminalStatus(manager, started.run_id);
+    assert.equal(validation.phase, "completed", validation.error);
+    assert.equal(validation.evidence_receipt?.result, "passed");
+    const nodeMap = JSON.parse(await readFile(join(project.root, ".somite", "runs", started.run_id, "node-map.json"), "utf8")) as {
+      nodes: Record<string, { source?: { invocation_id: string; source_digest: string } }>;
+    };
+    const sourceEntries = Object.values(nodeMap.nodes).map((entry) => entry.source).filter(Boolean);
+    assert.equal(sourceEntries.length, 2);
+    assert.ok(sourceEntries.every((entry) => entry?.source_digest === graph.variant_origin?.source_node.source_workflow?.source.source_digest));
+    const exported = await manager.export(graph, { archiveName: "Promoted variant", platform: "linux-64" });
+    assert.equal(exported.filename, "Promoted-variant.somite-run.zip");
+    assert.deepEqual([...exported.bytes.slice(0, 4)], [0x50, 0x4b, 0x03, 0x04]);
+    await manager.shutdown();
   } finally {
     process.env.PATH = previousPath;
     await rm(project.root, { recursive: true, force: true });

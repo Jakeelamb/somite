@@ -23,9 +23,12 @@ test("server-renders the Somite web shell", async () => {
 });
 
 test("starter preview is removed and the real canvas is wired", async () => {
-  const [page, app, panels, api, paperIntake, paperIntakeApi, paperReading, catalogExpansion, css, packageJson] = await Promise.all([
+  const [page, app, sourceScene, sourcePreview, semanticZoom, panels, api, paperIntake, paperIntakeApi, paperReading, catalogExpansion, css, packageJson] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/SomiteApp.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/SourceWorkflowScene.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/SourceGraphPreview.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/semanticZoom.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/WorkspacePanels.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/api.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/paperIntake.ts", import.meta.url), "utf8"),
@@ -35,7 +38,7 @@ test("starter preview is removed and the real canvas is wired", async () => {
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
   ]);
-  assert.match(page, /<SomiteApp initialQuery=/);
+  assert.match(page, /<SomiteApp\s+initialQuery=/);
   assert.match(app, /ReactFlowProvider/);
   assert.match(app, /client\.validateGraph/);
   assert.match(app, /client\.startRun/);
@@ -131,30 +134,47 @@ test("starter preview is removed and the real canvas is wired", async () => {
   assert.match(panels, /Ask Agent/);
   assert.match(app, /maxLength=\{100\}/);
   assert.match(app, /Renamed workflow to/);
-  assert.match(app, /NestedSourceCanvas/);
-  assert.match(app, /aria-label="Nested source canvas"/);
-  assert.match(app, /Return to main canvas/);
-  assert.match(app, /Source invocations · not data wires/);
-  assert.match(app, /Replace tool/);
-  assert.match(app, /Replace source invocation/);
-  assert.match(app, /Connections need checking/);
-  assert.match(app, /Edit on canvas/);
+  assert.match(app, /useSourceWorkflowScene/);
+  assert.equal(app.match(/<ReactFlow</g)?.length, 1, "one persistent React Flow owns every semantic depth");
+  assert.match(app, /onWheelCapture=\{onSemanticWheel\}/);
+  assert.match(app, /childViewport/);
+  assert.match(app, /parentViewport/);
+  assert.doesNotMatch(app, /<SourceWorkflowCanvas\s|NestedCanvasContext/);
+  assert.match(sourcePreview, /source-graph-preview/);
+  assert.match(sourcePreview, /projectSourceCanvas/);
+  assert.match(semanticZoom, /exact same screen-space rectangle/);
+  assert.match(sourceScene, /Replace tool/);
+  assert.match(sourceScene, /Replace source invocation/);
+  assert.match(sourceScene, /Connections need checking/);
+  assert.match(sourceScene, /Make editable/);
+  assert.match(sourceScene, /Nest selection/);
+  assert.match(sourceScene, /Move out one level/);
+  assert.match(sourceScene, /Move back/);
+  assert.match(sourceScene, /Move into group/);
+  assert.match(sourceScene, /sourceGroupHull/);
+  assert.match(sourceScene, /sourceGroupPortal/);
+  assert.match(sourceScene, /sourceBoundaryPortal/);
+  assert.match(sourceScene, /data-source-entity-kind="invocation"/);
+  assert.match(sourceScene, /source-proxy-relation-/);
+  assert.match(sourceScene, /source-boundary-relation-/);
+  assert.doesNotMatch(sourceScene, /ReactFlowProvider|<ReactFlow|parentId|extent:\s*["']parent["']/);
+  assert.match(sourceScene, /projectSourceCanvas/);
+  assert.match(sourceScene, /editSourceCanvas/);
   assert.match(app, /client\.promoteSourceWorkflow/);
   assert.match(app, /client\.restoreSourceWorkflow/);
   assert.match(app, /Native variant/);
   assert.match(app, /Return to pinned source/);
   assert.match(app, /setVariantOrigin\(loaded\.graph\.variant_origin\)/);
   assert.match(app, /resetSourceInvocation/);
-  assert.match(app, /aria-label="Nested source canvas breadcrumbs"/);
-  assert.match(app, /sourceNetworkEnterPath/);
-  assert.match(app, /sourceNetworkExitPath/);
-  assert.match(panels, /Open editable nested canvas/);
+  assert.doesNotMatch(app, /Nested source canvas breadcrumbs|sourceNetworkEnterPath|sourceNetworkExitPath/);
+  assert.match(panels, /Open source workflow/);
   assert.match(panels, /Creative variants are available/);
-  assert.match(css, /\.nested-source-canvas/);
+  assert.match(css, /\.semantic-source-frame/);
+  assert.match(css, /\.source-graph-preview/);
   assert.match(css, /\.nested-replacement-picker/);
-  assert.match(css, /\.nested-promote-action/);
+  assert.match(css, /\.source-outline-promote/);
   assert.match(css, /\.workflow-variant-badge/);
-  assert.match(css, /\.somite-node\.source-workflow-node[^}]*width: 226px[^}]*min-height: 142px/);
+  assert.match(css, /\.somite-node\.source-workflow-node[^}]*width: 320px[^}]*min-height: 220px/);
   assert.doesNotMatch(app, /SourceNetworkContext|sourceNetworkZoomLevel|source-network-level/);
   assert.match(panels, /Show on canvas/);
   assert.match(app, /beforeunload/);

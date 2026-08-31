@@ -268,6 +268,30 @@ test("a source edit response does not resurrect a source node deleted while the 
   assert.equal(mergeCanonicalSourceWorkflow(current, canonical, sourceWorkflow.workflow_revision), current);
 });
 
+test("a canonical source edit updates retained provenance without replacing native variant wiring", () => {
+  const nativeNode = { ...node, id: "native-fastqc", operator: "qc.fastqc", source_workflow: undefined };
+  const current: SomiteGraph = {
+    schema_version: 3,
+    name: "Native title",
+    nodes: [nativeNode],
+    edges: [],
+    variant_origin: { source_node: node, promoted_invocations: { FASTQC: nativeNode.id } },
+  };
+  const canonicalWorkflow = {
+    ...sourceWorkflow,
+    workflow_revision: `blake3:${"d".repeat(64)}`,
+    bindings: { input: { kind: "project_file" as const, path: "inputs/genomes.fa.gz" } },
+  };
+  const canonical: SomiteGraph = {
+    ...current,
+    variant_origin: { ...current.variant_origin!, source_node: { ...node, source_workflow: canonicalWorkflow } },
+  };
+  const merged = mergeCanonicalSourceWorkflow(current, canonical, sourceWorkflow.workflow_revision);
+  assert.deepEqual(merged.nodes, current.nodes);
+  assert.deepEqual(merged.edges, current.edges);
+  assert.equal(merged.variant_origin?.source_node.source_workflow?.workflow_revision, canonicalWorkflow.workflow_revision);
+});
+
 test("a late source edit response cannot replace a different workflow restored by Undo", () => {
   const restoredWorkflow = {
     ...sourceWorkflow,

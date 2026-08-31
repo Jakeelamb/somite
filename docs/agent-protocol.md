@@ -13,15 +13,19 @@ session in one disposable empty workspace, sends prompts, renders streamed
 messages and tool activity, surfaces permission requests, and supports
 cancellation. This prevents repository instructions and direct filesystem
 inspection from silently displacing the native workflow tools. The real project
-remains reachable through Somite's capability surface, and normalized
-transcripts are still persisted there. The session receives Somite's MCP server
-in its `session/new` request, using ACP's mandatory stdio MCP transport.
+remains reachable through scoped capability surfaces, and normalized
+transcripts are still persisted there. The session receives Somite, Pixi, and
+Nextflow MCP servers in its `session/new` request, using ACP's mandatory stdio
+MCP transport.
 
-MCP is the capability boundary between the agent and Somite. The parent runner
-launches the small TypeScript stdio Adapter for the ACP session:
+MCP is the capability boundary between the agent and Somite's canvas and local
+toolchain. The parent runner launches three small TypeScript stdio adapters for
+the ACP session:
 
 ```bash
 node --experimental-strip-types runner/src/mcp.ts --server-url http://127.0.0.1:7310
+node --experimental-strip-types mcp/pixi/src/server.ts --workspace-root /path/to/project
+node --experimental-strip-types mcp/nextflow/src/server.ts --workspace-root /path/to/project
 ```
 
 This command is illustrative; a capability supplied only by the parent process
@@ -35,6 +39,18 @@ transaction, compile, and evidence routes reject requests without it even when
 the caller omits the MCP activity header. Human-facing run routes remain part
 of the loopback web application; this capability is not a sandbox for arbitrary
 local processes running as the same user.
+
+The Pixi and Nextflow servers use the official MCP TypeScript SDK v2. Each
+exposes the complete documentation catalog from the authoritative upstream tag
+matching Somite's proven CLI contract (Pixi 0.77.1 and Nextflow 26.04.6),
+on-demand Markdown reads, and full-text search across that versioned manual.
+Pages are persisted in the platform user cache rather than vendored into Somite
+or fetched again for every Agent session. CLI operations
+are intent-level typed tools with closed schemas, contained local paths, fixed
+argument arrays, bounded output, cancellation, structured results, and honest
+read/write/execution annotations. Their exact surfaces and exclusions are
+documented in [Pixi MCP](../mcp/pixi/README.md) and
+[Nextflow MCP](../mcp/nextflow/README.md).
 
 ## Automatic launcher and model selection
 
@@ -103,8 +119,12 @@ insufficient.
 | `somite.source_workflow.search_nfcore` | Search the official nf-core catalog for exact repository and release pairs. |
 | `somite.source_workflow.resolve_nfcore` | Resolve one exact nf-core release onto an unchanged empty canvas as a pinned source workflow. |
 | `somite.source_workflow.edit` | Apply typed parameter or invocation-replacement edits to a pinned source workflow. |
-| `somite.source_workflow.promote` | Promote one selected source invocation replacement into an ordinary editable typed node. |
+| `somite.source_workflow.promote` | Promote one or more selected source invocation replacements into ordinary editable typed nodes in one native variant. |
 | `somite.source.search` | Search current NCBI or Ensembl reads, reference assemblies, organisms, accessions, and genes with structured provenance and ordered native source-recipe operators. |
+| `somite.operator_candidate.draft` | Persist one evidence-backed `project.*` Operator candidate without admitting it to the catalog. |
+| `somite.operator_candidate.prove` | Run the exact candidate once in an isolated, ready tiny fixture graph. |
+| `somite.operator_proof.status` | Read the candidate proof through terminal run evidence. |
+| `somite.resource` | Install, inspect, or cancel one reviewed managed scientific resource after explicit size and scientific-effect consent. |
 | `somite.graph.apply_transaction` | Apply up to 64 graph operations as one validated compare-and-swap transaction. |
 | `somite.workflow.compile` | Freeze the current graph through the production Pixi/Nextflow compiler into a content-addressed package. |
 | `somite.run.start` | Start the production runner with configured inputs. |
@@ -130,6 +150,13 @@ can validate results without reconstructing the runner's HTTP contracts.
 Catalog matches include the immutable catalog revision, a deterministic score,
 the terms that matched, and an opaque continuation cursor. A cursor is valid
 only for the query and catalog revision that created it.
+
+Candidate acceptance is intentionally absent from MCP. A proof can establish
+that the proposed binary contract works on its exact fixture, but it cannot
+establish that the user wants to trust that contract in the project. The human
+Project tools panel owns the final acceptance action and publishes the contract
+under `.somite/operators/` only after the live catalog can load it without
+replacing any pinned revision.
 
 ## Compare-and-swap graph edits
 
@@ -208,11 +235,13 @@ one history entry for each, so normal Undo reverses them individually.
 - Agent messages, status, tool input/output, transactions, and permission
   prompts appear in one chronological feed.
 - Calls whose structured server and tool identities match the Somite MCP
-  boundary and one exact advertised tool name are automatically allowed for the
-  active agent session and remain visible and correlated by ACP tool-call id in
-  the activity feed and transcript. Prefix-shaped labels, conflicting
-  identities, shell commands, and other tools remain user-approved.
-- Non-Somite permission requests identify the exact tool-call id and block until
+  boundary and one exact advertised tool name are automatically allowed. Exact
+  read-only Pixi/Nextflow documentation, inspection, catalog, lint, and local
+  evidence calls have their own explicit automatic allowlist. All remain
+  visible and correlated by ACP tool-call id. Prefix-shaped labels, conflicting
+  identities, shell commands, installs, executions, remote launches, cleanup,
+  and other mutations remain user-approved.
+- Other permission requests identify the exact tool-call id and block until
   the user chooses an advertised ACP option, cancels it, or the five-minute
   timeout expires.
 - Disconnect and Stop remain available while the agent works. Canvas, run,
@@ -242,7 +271,10 @@ Tests cover strict, stale, replayed, and successful graph transactions;
 capability-authenticated loopback calls; transcript correlation and recursive
 secret redaction; a spawned ACP v1 subprocess turn; and the stdio MCP Adapter's
 modern discovery, legacy initialization, tool listing, structured calls, and
-cancellation. Web tests cover event de-duplication and exactly-once transaction
+cancellation. A production-browser turn calls the attached Somite workflow,
+Pixi runtime, Nextflow runtime, and Somite readiness tools in sequence and
+proves that incomplete readiness blocks validation rather than being relabeled
+as evidence. Web tests cover event de-duplication and exactly-once transaction
 delivery to canvas history.
 
 The repeatable live-agent harness runs the same blind task against a selected

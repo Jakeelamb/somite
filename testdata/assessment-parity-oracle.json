@@ -25,11 +25,11 @@
   },
   {
     "name": "scientific database is a distinct managed resource",
-    "graph_revision": "blake3:158cc272c8c0537c4cab9db04408bc62ce2952a2b2080b943948e97af56f4ce5",
+    "graph_revision": "blake3:ec194e819d33e696fb86195e744336c9bfb569619b59ea09a43caee2fe0ecc38",
     "state": "needs_action",
     "required_count": 2,
     "item_ids": ["input:kraken1:r1", "input:kraken1:db"],
-    "assessment_digest": "blake3:51ba300c0187d0614344cce454197d5c584d36059807b1e41b93b6004c7e0d58"
+    "assessment_digest": "blake3:6231078b6c07d64e67e845b06ba2dbecdb761045bdf6d9755970be9872027475"
   },
   {
     "name": "connected local FastQC workflow is ready",
@@ -67,14 +67,13 @@
     "name": "source workflow exposes every honest blocker",
     "graph_revision": "blake3:bfb5d1053c06a08008ea01bc202a7208aa397446c8bf92be87282a68f45bd916",
     "state": "needs_action",
-    "required_count": 5,
+    "required_count": 4,
     "item_ids": [
       "source-unsupported-parameter:source1:complex",
       "source-parameter:source1:input",
-      "source-schema:source1",
       "source-replacement:source1:invoke-fastqc",
       "source-environment:source1"
     ],
-    "assessment_digest": "blake3:16965dd8b5bf6359ba955198fe86bf5ab68973ddcaec24d64b19e90cd44fb6d2"
+    "assessment_digest": "blake3:262e10b9376d0374ce4a32943e4edaf76c47611c769bf74a80019cb4e92df0c5"
   }
 ]

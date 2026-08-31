@@ -113,6 +113,27 @@ test("the reviewed existing-database import provides the profile and lowers as a
   assert.equal(assessment.state, "ready");
   assert.equal(assessment.items.length, 0);
 
+  const portable = structuredClone(graph);
+  portable.nodes.find((candidate) => candidate.id === "database")!.params!.path = "somite-resource:kraken2-standard-8-20260626";
+  const missingManaged = assessWorkflow(portable, catalog);
+  assert.equal(missingManaged.state, "needs_action");
+  assert.equal(missingManaged.items[0]?.kind, "managed_resource");
+  assert.equal(missingManaged.items[0]?.field, "path");
+  const managedResource = {
+    reference: "somite-resource:kraken2-standard-8-20260626",
+    provider_id: "kraken2-standard-8-20260626",
+    profile: "kraken2-database",
+    resolution: "standard-8",
+    title: "Kraken2 Standard-8",
+    available: true,
+    detail: "Download and verify Standard-8.",
+    download_bytes: 5_500_000_000,
+    stored_bytes: 7_500_000_000,
+    scientific_effect: "Reduced reference coverage and memory use.",
+    source_url: "https://benlangmead.github.io/aws-indexes/k2",
+  } as const;
+  assert.equal(assessWorkflow(portable, catalog, { managed_resources: [managedResource] }).state, "ready");
+
   const compiled = compileNextflow(graph, catalog, {
     workflowName: "reviewed-kraken",
     outputDirectory: "results",

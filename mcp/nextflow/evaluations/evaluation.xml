@@ -1,0 +1,42 @@
+<evaluation>
+  <qa_pair>
+    <question>Rank Nextflow lint, preview with DAG, stub-run, and a small real fixture by what each can prove. Which is the first level that proves a process command actually executed?</question>
+    <answer>Lint proves syntax/style diagnostics; preview evaluates workflow construction and renders a DAG while skipping processes; stub-run executes declared stub bodies instead of real process scripts; a small real fixture executes actual process commands. The small real fixture is the first listed level that proves real process commands ran.</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>A pipeline is resumed after changing a script in bin, changing a process script, and changing only an input file timestamp. Explain which changes can invalidate cached tasks and how deep caching changes file comparison.</question>
+    <answer>Executable scripts in bin are part of task identity, so changing one can invalidate tasks that use it. A changed process script can also invalidate its task. Standard file caching uses path, size, and modification time; deep caching hashes contents, so a timestamp-only change does not invalidate under deep caching.</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Legacy and strict parsers receive profiles standard,cloud in that command-line order, but the profiles were declared in the opposite order. Which order is applied by each parser?</question>
+    <answer>The legacy parser applies profiles in configuration declaration order regardless of command-line order. The strict parser applies them in command-line order: standard, then cloud.</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>How do typed workflows and typed processes divide dataflow types from ordinary value types, and which component reports a take/emit mismatch before execution?</question>
+    <answer>Typed workflows model asynchronous values as Channel&lt;T&gt; or Value&lt;T&gt;, whose elements use ordinary standard types. Typed process inputs/outputs use ordinary standard types and exclude Channel/Value annotations. The Nextflow language server validates workflow take/emit contracts before execution.</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>An installed registry module was edited locally. Which metadata records its installed version, how does listing expose the edit, and what removal option preserves files while dropping registry tracking?</question>
+    <answer>The module directory's .module-info records installed version/integrity metadata. nextflow module list reports integrity status and local modification. nextflow module remove -keep-files removes .module-info while retaining module files.</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Why can a symlinked process input work on the host but fail in a Nextflow container, and what image-level commands must be available for execution and metrics?</question>
+    <answer>Nextflow mounts task inputs, but a symlink target outside the symlink directory tree may not be mounted and becomes inaccessible. The image needs Bash 3 or newer at /bin/bash as entrypoint, plus ps and metric helpers including awk, date, grep, sed, tail, and tee.</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Distinguish execution log, report, trace, timeline, DAG, and lineage as evidence. Which carry task resource metrics, and which can exist without executing tasks?</question>
+    <answer>The log indexes runs/tasks; the HTML report summarizes run, resources, and tasks; trace is tabular per-task timing/resource data; timeline visualizes task timing; DAG shows workflow structure; lineage records provenance when enabled. Report, trace, and timeline carry task execution/resource evidence. A preview DAG can exist without task execution.</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Under strict syntax, how should custom classes, top-level executable statements, untyped variables, and CLI boolean-looking legacy params be migrated?</question>
+    <answer>Move custom classes to lib or replace helpers with standalone functions; move executable top-level statements into the entry workflow; declare variables with def or supported local annotations; and do not rely on legacy CLI coercion—treat values as strings or use a typed params block.</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Compare Nextflow Conda package specs, environment YAML, explicit/lock files, and containers as task environments. Which two most directly freeze artifacts, and what portability caveat remains?</question>
+    <answer>Package specs and environment YAML normally require solving; explicit/lock files enumerate resolved package artifacts and may include hashes; containers package a filesystem behind an image reference. Explicit/lock files and digest-pinned container images freeze artifacts most directly, but remain platform-specific and require compatible runtimes.</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>In nextflow run, distinguish Nextflow options from pipeline parameters, including hyphen forms. How is a parameter named input-file passed?</question>
+    <answer>Nextflow runtime options use a single hyphen; pipeline parameters use a double hyphen and populate params. The parameter is passed as --input-file value, following the project invocation as documented.</answer>
+  </qa_pair>
+</evaluation>

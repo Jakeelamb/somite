@@ -60,7 +60,7 @@ async function sourcePaths(strictArchive: boolean) {
       throw error;
     });
   if (!hasGitMetadata) return archiveSourcePaths(strictArchive);
-  const output = execFileSync("git", ["ls-files", "-z"], {
+  const output = execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], {
     cwd: repository,
     encoding: "utf8",
     maxBuffer: 8 * MIB,
@@ -72,7 +72,14 @@ async function releaseSourceProfile(strictArchive = false) {
   const paths = await sourcePaths(strictArchive);
   const generated = paths.filter((path) => generatedPath.test(path));
   if (generated.length) throw new Error(`generated runtime state is tracked: ${generated.slice(0, 5).join(", ")}`);
-  const files = await Promise.all(paths.map(async (path) => ({ path, bytes: (await lstat(join(repository, path))).size })));
+  const inspected = await Promise.all(paths.map(async (path) => {
+    const metadata = await lstat(join(repository, path)).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return undefined;
+      throw error;
+    });
+    return metadata ? { path, bytes: metadata.size } : undefined;
+  }));
+  const files = inspected.filter((file): file is { path: string; bytes: number } => Boolean(file));
   for (const file of files) enforce(`tracked file ${file.path}`, file.bytes, limits.trackedFileBytes);
   const bytes = files.reduce((total, file) => total + file.bytes, 0);
   enforce("tracked source", bytes, limits.trackedBytes);

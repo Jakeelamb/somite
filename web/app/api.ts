@@ -23,6 +23,9 @@ import type {
   ExportPlan,
   GraphWriteResponse,
   NfcoreCatalog,
+  ManagedResourceJob,
+  ManagedResourceAvailability,
+  OperatorCandidate,
   PaperExtractionPreflight,
   PaperResourceResolution,
   PaperSearchResponse,
@@ -243,6 +246,65 @@ function evidenceResult(value: unknown, path: string): EvidenceResult {
   return oneOf(value, path, ["passed", "failed", "inconclusive"] as const);
 }
 
+function operatorProofReceipt(value: unknown, path: string): NonNullable<OperatorCandidate["proof"]> {
+  const raw = record(value, path);
+  if (integer(raw.schema_version, `${path}.schema_version`) !== 1) throw new Error(`${path}.schema_version must be 1`);
+  return {
+    schema_version: 1,
+    receipt_digest: text(raw.receipt_digest, `${path}.receipt_digest`),
+    candidate_id: text(raw.candidate_id, `${path}.candidate_id`),
+    operator_revision: text(raw.operator_revision, `${path}.operator_revision`),
+    graph_revision: text(raw.graph_revision, `${path}.graph_revision`),
+    run_id: text(raw.run_id, `${path}.run_id`),
+    closure_digest: nullableText(raw.closure_digest, `${path}.closure_digest`),
+    result: oneOf(raw.result, `${path}.result`, ["passed", "failed"] as const),
+    finished_at: text(raw.finished_at, `${path}.finished_at`),
+  };
+}
+
+function operatorCandidate(value: unknown, path: string): OperatorCandidate {
+  const raw = record(value, path);
+  if (integer(raw.schema_version, `${path}.schema_version`) !== 1) throw new Error(`${path}.schema_version must be 1`);
+  const proof = optional(raw.proof, `${path}.proof`, operatorProofReceipt);
+  return {
+    schema_version: 1,
+    candidate_id: text(raw.candidate_id, `${path}.candidate_id`),
+    operator: parsePinnedOperator(raw.operator, `${path}.operator`),
+    sources: list(raw.sources, `${path}.sources`, (source, sourcePath) => {
+      const item = record(source, sourcePath);
+      return {
+        kind: oneOf(item.kind, `${sourcePath}.kind`, ["official_docs", "source", "package_recipe", "workflow_use"] as const),
+        url: httpUrl(item.url, `${sourcePath}.url`),
+      };
+    }),
+    created_at: text(raw.created_at, `${path}.created_at`),
+    status: oneOf(raw.status, `${path}.status`, ["draft", "proven", "accepted"] as const),
+    ...(proof ? { proof } : {}),
+  };
+}
+
+function managedResourceJob(value: unknown, path: string): ManagedResourceJob {
+  const raw = record(value, path);
+  const progress = record(raw.progress, `${path}.progress`);
+  return {
+    job_id: text(raw.job_id, `${path}.job_id`),
+    provider_id: text(raw.provider_id, `${path}.provider_id`),
+    profile: text(raw.profile, `${path}.profile`),
+    resolution: text(raw.resolution, `${path}.resolution`),
+    phase: oneOf(raw.phase, `${path}.phase`, ["queued", "downloading", "verifying", "extracting", "completed", "failed", "cancelling", "cancelled"] as const),
+    progress: {
+      completed: nonnegative(progress.completed, `${path}.progress.completed`),
+      total: nonnegative(progress.total, `${path}.progress.total`),
+      unit: oneOf(progress.unit, `${path}.progress.unit`, ["bytes"] as const),
+      message: text(progress.message, `${path}.progress.message`),
+    },
+    ...(optionalText(raw.path, `${path}.path`) ? { path: text(raw.path, `${path}.path`) } : {}),
+    ...(optionalText(raw.receipt_digest, `${path}.receipt_digest`) ? { receipt_digest: text(raw.receipt_digest, `${path}.receipt_digest`) } : {}),
+    ...(optionalText(raw.error, `${path}.error`) ? { error: text(raw.error, `${path}.error`) } : {}),
+    ...(raw.replayed !== undefined ? { replayed: bool(raw.replayed, `${path}.replayed`) } : {}),
+  };
+}
+
 function evidenceReceipt(value: unknown, path: string): EvidenceReceipt {
   const raw = record(value, path);
   text(raw.receipt_digest, `${path}.receipt_digest`);
@@ -362,8 +424,27 @@ function projectSession(value: unknown, path: string): ProjectSession {
     autosave_recovery_warning: nullableText(raw.autosave_recovery_warning, `${path}.autosave_recovery_warning`),
     input_origin_warning: nullableText(raw.input_origin_warning, `${path}.input_origin_warning`),
     input_origin_id: text(raw.input_origin_id, `${path}.input_origin_id`),
+    managed_resources: list(raw.managed_resources, `${path}.managed_resources`, managedResourceAvailability),
     agent_cursor: nonnegative(raw.agent_cursor, `${path}.agent_cursor`),
     state_revision: text(raw.state_revision, `${path}.state_revision`),
+  };
+}
+
+function managedResourceAvailability(value: unknown, path: string): ManagedResourceAvailability {
+  const raw = record(value, path);
+  return {
+    reference: text(raw.reference, `${path}.reference`),
+    provider_id: text(raw.provider_id, `${path}.provider_id`),
+    profile: text(raw.profile, `${path}.profile`),
+    resolution: text(raw.resolution, `${path}.resolution`),
+    title: text(raw.title, `${path}.title`),
+    available: bool(raw.available, `${path}.available`),
+    detail: text(raw.detail, `${path}.detail`),
+    download_bytes: nonnegative(raw.download_bytes, `${path}.download_bytes`),
+    stored_bytes: nonnegative(raw.stored_bytes, `${path}.stored_bytes`),
+    scientific_effect: text(raw.scientific_effect, `${path}.scientific_effect`),
+    source_url: httpUrl(raw.source_url, `${path}.source_url`),
+    ...(optionalText(raw.error, `${path}.error`) ? { error: text(raw.error, `${path}.error`) } : {}),
   };
 }
 
@@ -918,6 +999,24 @@ export class SomiteClient {
   cancelAgent() { return this.#empty("/api/agent/cancel", { method: "POST" }); }
   disconnectAgent() { return this.#empty("/api/agent/disconnect", { method: "POST" }); }
   answerAgentPermission(permissionId: string, optionId?: string) { return this.#empty(`/api/agent/permissions/${encodeURIComponent(permissionId)}`, jsonInit("POST", { option_id: optionId })); }
+  operatorCandidates() {
+    return this.#json<OperatorCandidate[]>("/api/operator-workshop/candidates", (value, path) => {
+      const raw = record(value, path);
+      return list(raw.candidates, `${path}.candidates`, operatorCandidate);
+    });
+  }
+  acceptOperatorCandidate(candidateId: string) {
+    return this.#json(`/api/operator-workshop/candidates/${encodeURIComponent(candidateId)}/accept`, operatorCandidate, jsonInit("POST", {}));
+  }
+  installManagedResource(profile: string, resolution: string, idempotencyKey: string) {
+    return this.#json("/api/resources/install", managedResourceJob, jsonInit("POST", { profile, resolution, idempotency_key: idempotencyKey }));
+  }
+  managedResourceStatus(jobId: string, waitMs = 0) {
+    return this.#json(`/api/resources/jobs/${encodeURIComponent(jobId)}?wait_ms=${Math.max(0, Math.min(30_000, Math.round(waitMs)))}`, managedResourceJob);
+  }
+  cancelManagedResource(jobId: string) {
+    return this.#json(`/api/resources/jobs/${encodeURIComponent(jobId)}/cancel`, managedResourceJob, jsonInit("POST", {}));
+  }
   system() { return this.#json("/api/system", systemProfile); }
 
   workflowCatalog(engine: "nfcore"): Promise<NfcoreCatalog>;
@@ -941,6 +1040,11 @@ export class SomiteClient {
   }
 
   openProject(path: string) { return this.#json("/api/projects/open", projectOpen, jsonInit("POST", { path, snakemake_targets: [] }), MAX_DOCUMENT_RESPONSE_BYTES); }
+  importProject(files: readonly Readonly<{ path: string; file: File }>[]) {
+    const body = new FormData();
+    for (const entry of files) body.append("file", entry.file, entry.path);
+    return this.#json("/api/projects/import", projectOpen, { method: "POST", body }, MAX_DOCUMENT_RESPONSE_BYTES);
+  }
   expandWorkflow(engine: "nfcore" | "snakemake", workflow: string, revision: string) {
     return this.#json(engine === "nfcore" ? "/api/catalog/nfcore/expand" : "/api/catalog/snakemake/expand", workflowGraph, jsonInit("POST", { workflow, revision }), MAX_DOCUMENT_RESPONSE_BYTES);
   }

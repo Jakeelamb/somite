@@ -22,6 +22,7 @@ export type ResourceResolutionSpec = {
   download_bytes?: number | null;
   stored_bytes?: number | null;
   scientific_effect?: string;
+  source_url?: string;
 };
 
 export type ResourceSpec = {
@@ -237,6 +238,13 @@ export class OperatorCatalog {
 
   values() {
     return this.#operators.values();
+  }
+
+  isExtensionOf(previous: OperatorCatalog) {
+    for (const operator of previous.values()) {
+      if (this.#operators.get(operator.id)?.revision !== operator.revision) return false;
+    }
+    return true;
   }
 
   groups() {

@@ -9,6 +9,7 @@ export type {
   SomiteGraphNode,
   SomitePort,
   SourceCapabilities,
+  SourceCanvasView,
   SourceDiagnostic,
   SourceInvocation,
   SourceInvocationReplacement,
@@ -41,6 +42,7 @@ export type {
 } from "@somite/workflow/catalog";
 
 export type {
+  ManagedResourceAvailability,
   NodeAssessment,
   ReadinessItem,
   ReadinessResolution,
@@ -129,8 +131,49 @@ export type ProjectSession = {
   autosave_recovery_warning: string | null;
   input_origin_warning: string | null;
   input_origin_id: string;
+  managed_resources: import("@somite/workflow/assessment").ManagedResourceAvailability[];
   agent_cursor: number;
   state_revision: string;
+};
+
+export type OperatorEvidenceSource = {
+  kind: "official_docs" | "source" | "package_recipe" | "workflow_use";
+  url: string;
+};
+
+export type OperatorProofReceipt = {
+  schema_version: 1;
+  receipt_digest: string;
+  candidate_id: string;
+  operator_revision: string;
+  graph_revision: string;
+  run_id: string;
+  closure_digest: string | null;
+  result: "passed" | "failed";
+  finished_at: string;
+};
+
+export type OperatorCandidate = {
+  schema_version: 1;
+  candidate_id: string;
+  operator: Operator;
+  sources: OperatorEvidenceSource[];
+  created_at: string;
+  status: "draft" | "proven" | "accepted";
+  proof?: OperatorProofReceipt;
+};
+
+export type ManagedResourceJob = {
+  job_id: string;
+  provider_id: string;
+  profile: string;
+  resolution: string;
+  phase: "queued" | "downloading" | "verifying" | "extracting" | "completed" | "failed" | "cancelling" | "cancelled";
+  progress: { completed: number; total: number; unit: "bytes"; message: string };
+  path?: string;
+  receipt_digest?: string;
+  error?: string;
+  replayed?: boolean;
 };
 
 export type GraphWriteResponse = {

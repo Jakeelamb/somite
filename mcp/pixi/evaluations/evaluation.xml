@@ -1,0 +1,42 @@
+<evaluation>
+  <qa_pair>
+    <question>Compare Pixi's --frozen, --locked, and --no-install modes. For each, state whether an out-of-date manifest/lock pair is rejected, whether pixi.lock may be rewritten, and whether the environment may be changed.</question>
+    <answer>--frozen installs from the existing lock without updating it even when it is stale; --locked rejects a stale lock and installs only when it matches the manifest; --no-install may update only pixi.lock and does not modify the environment.</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>A security review claims that pixi lock --no-install cannot execute third-party code and pixi run is safe when post-link scripts are disabled. Is the claim true? Give the two distinct documented execution paths that refute or qualify it.</question>
+    <answer>False. Resolving source dependencies can invoke their arbitrary build backends even during lock, install, or update with --no-install, and pixi run normally executes Conda activation scripts. Post-link scripts are disabled by default, but that does not disable source builds or activation scripts.</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Design one production and one test environment that share exactly resolved production dependency versions while adding test-only dependencies. Which Pixi concepts provide reuse and shared solving, and how can production exclude the default feature?</question>
+    <answer>Put reusable dependencies in features, compose prod and test environments from those features, and give both environments the same solve-group so shared packages resolve to the same versions. Set no-default-feature = true on prod when it must exclude the default feature.</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Explain how Pixi global tools remain callable without activating an environment, where their desired state is recorded, and what pixi global sync repairs after the manifest and installed state diverge.</question>
+    <answer>Pixi exposes commands through trampolines placed on PATH; the global manifest records desired environments, dependencies, channels, platforms, and exposures; pixi global sync reconciles installed global environments and exposed commands with that manifest.</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>A cached Pixi task accepts a typed argument selecting an input file. What must its inputs and outputs use so different argument values get distinct cache keys, and what base directories do ordinary relative globs and init_cwd-relative globs use?</question>
+    <answer>Reference the task argument in declared input/output templates so each argument value selects its own files and cache entry. Ordinary relative globs are workspace-root relative; init_cwd-relative globs resolve from the directory where Pixi was invoked.</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>For a cross-compiled Pixi package, distinguish build, host, and run dependencies and state which platform each set targets.</question>
+    <answer>Build dependencies are tools executed on the build platform; host dependencies are linked or otherwise needed while building for the target/host platform; run dependencies are required when the resulting package executes on the target/host platform.</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Why is committing pixi.lock useful for an application but potentially undesirable for a library CI compatibility matrix? Include exact artifacts, checksums, speed, and the matrix tradeoff.</question>
+    <answer>For applications the lock records exact artifacts for every environment/platform, enables checksum verification for locked packages, prevents silent drift, and avoids repeated solving for faster CI. A library may regenerate the lock in compatibility jobs so it tests the range allowed by its manifest instead of only one frozen closure.</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Two Pixi features contribute channels to one environment. What controls whether channels concatenate rather than overwrite, and how is their ordering determined?</question>
+    <answer>Channel entries with priorities enable concatenation across features. Higher-priority channels are used first; lower-priority channels come later, with the default channels composed according to their declared/default priority.</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Contrast a Conda environment export with a Conda explicit-spec export. Which is the better interoperability artifact for editable human requirements, and which is the stricter recreation artifact?</question>
+    <answer>A Conda environment YAML is the editable human-facing interoperability artifact and can carry requirement-style dependencies; an explicit spec lists resolved platform-specific package URLs and optional hashes, making it the stricter recreation artifact.</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>State Pixi's configuration layering and explain the difference between --no-config and --config-file.</question>
+    <answer>Pixi merges broader system/user configuration with project-local .pixi/config.toml on top. --no-config skips system and user configuration but still loads project-local configuration; --config-file replaces normal system/user discovery with one specified global-layer file, then project-local configuration is merged on top.</answer>
+  </qa_pair>
+</evaluation>

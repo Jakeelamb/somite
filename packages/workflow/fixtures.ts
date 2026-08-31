@@ -2,6 +2,7 @@ import type { SomiteGraph } from "./model.ts";
 import { semanticGraphRevision, validateGraph } from "./workflow.ts";
 
 export const REPRESENTATIVE_FASTQ_PACK = "somite.fastq.paired.v1";
+export const SOURCE_PREVIEW_PACK = "somite.source.preview.v1";
 
 export type MaterializedFastqFixture = Readonly<{ path: string; digest: string }>;
 
@@ -15,6 +16,7 @@ export type FixtureBinding = Readonly<{
 
 export type RepresentativeValidationCapability =
   | Readonly<{ supported: true; fixture_pack: typeof REPRESENTATIVE_FASTQ_PACK }>
+  | Readonly<{ supported: true; kind: "source_preview"; fixture_pack: typeof SOURCE_PREVIEW_PACK }>
   | Readonly<{ supported: false; code: "representative_fixture_unsupported"; reason: string; unsupported_roots: string[] }>;
 
 export class RepresentativeValidationError extends Error {
@@ -38,6 +40,10 @@ function representativeSourceParametersAreBindable(node: SomiteGraph["nodes"][nu
 
 /** The exact fixture capability shared by browser affordances and the runner. */
 export function representativeValidationCapability(graph: SomiteGraph): RepresentativeValidationCapability {
+  const source = graph.nodes.length === 1 && graph.edges.length === 0 ? graph.nodes[0]?.source_workflow : undefined;
+  if (source?.capabilities?.exact_execution) {
+    return { supported: true, kind: "source_preview", fixture_pack: SOURCE_PREVIEW_PACK };
+  }
   const roots = graph.nodes.filter((node) => {
     const hasInbound = graph.edges.some((edge) => edge.to_node === node.id);
     const hasInputPort = node.ports.some((port) => port.dir === "in");
@@ -78,6 +84,9 @@ export function bindRepresentativeFastq(
   if (!validation.ok) throw new Error(`invalid graph: ${validation.issue.message}`);
   const capability = representativeValidationCapability(graph);
   if (!capability.supported) throw new RepresentativeValidationError(capability);
+  if (capability.fixture_pack !== REPRESENTATIVE_FASTQ_PACK) {
+    throw new Error(`${capability.fixture_pack} is not a representative FASTQ binding`);
+  }
   const runnable = cloneGraph(graph);
   const normalized = cloneGraph(graph);
   const digests = new Set<string>();

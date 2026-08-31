@@ -21,16 +21,40 @@ One placed use of a Workflow definition with its input bindings, parameter value
 _Avoid_: Pipeline node, launcher
 
 **Workflow outline**:
-A hierarchical, source-anchored projection of workflows, subworkflows, processes, and invocations. Somite presents one level of the outline at a time on a Nested source canvas; it is not independently executable truth.
+A source-anchored projection of indexed invocation calls and their known relationships. Workflow, subworkflow, and process scopes supply provenance and grouping suggestions without becoming automatic cards or containers; the outline is not independently executable truth.
 _Avoid_: Process DAG, preview graph
 
-**Nested source canvas**:
-A separate canvas entered from a Source-backed workflow that displays the current Source scope and only its immediate child invocations. Entering a child replaces the visible level; Back, breadcrumbs, or Escape returns outward.
-_Avoid_: Expanded node, inner graph, process DAG
+**Semantic frame**:
+One level of detail inside the persistent canvas. Zooming into a Workflow instance or Source group changes the active projection and rebases the camera without replacing the canvas, controls, or interaction model.
+_Avoid_: Nested canvas, separate editor, modal workflow
+
+**Source-structure relationship**:
+A dashed, nonconnectable relationship retained from imported Source structure. It explains known source organization and is never a typed dataflow Edge.
+_Avoid_: Wire, dependency Edge, channel contract
+
+**Source group**:
+An explicitly authored, presentation-only grouping made from selected Workflow-outline entities or relationships. Selecting a relationship groups its exact endpoints; Source scopes may suggest a group, but never create one automatically.
+_Avoid_: Source scope, executable Compound, AST ownership
+
+**Soft hull**:
+The expanded presentation of a Source group: a lightweight overlay around its members that leaves their cards and relationships readable at normal size.
+_Avoid_: Container Node, Source scope
+
+**Macro**:
+The collapsed presentation of a Source group. It contains a live miniature of its members and proxies their exact boundary relationships, but is neither executable nor connectable.
+_Avoid_: Compound, tool Node, subworkflow call
+
+**Semantic portal**:
+A Workflow instance, soft hull, or Macro whose live child preview becomes the active Semantic frame when it fills the viewport. Entry and exit are reversible camera transforms over the same persistent canvas.
+_Avoid_: Open button, breadcrumb navigation, second React Flow
+
+**Source-group presentation**:
+The undoable membership, nesting, disclosure, and placement state of Source groups. It is document presentation, not source, workflow, or execution identity.
+_Avoid_: Source edit, Graph semantics
 
 **Source scope**:
-A source-anchored workflow, subworkflow, or process displayed inside a Source-backed workflow. A Source scope may be replaced or rewired in a Workflow variant even when some connection semantics remain unresolved.
-_Avoid_: Read-only process card, fake node
+A source-anchored workflow, subworkflow, or process definition retained as provenance and grouping-suggestion metadata for invocation calls. It is not automatically a visible card or canvas container.
+_Avoid_: Group, process card, canvas ownership
 
 **Workflow variant**:
 A Workflow definition plus an explicit, provenance-retaining set of changes. The unchanged upstream definition remains identifiable.
@@ -59,3 +83,19 @@ _Avoid_: Edit gate, type approval
 **Source-only region**:
 Exact executable source that Somite preserves when it cannot completely project the region onto the canvas. Users may experiment around it, while Somite keeps every unknown and unvalidated consequence visible.
 _Avoid_: Locked region, unsupported node
+
+**Managed resource**:
+Versioned scientific data required by a tool but distinct from executable software and sample inputs. It carries a specialized Resource profile, provenance, and scientific effect.
+_Avoid_: Dependency, package, database path
+
+**Operator candidate**:
+A project-scoped proposed Operator contract supported by authoritative evidence but not yet present in the Catalog.
+_Avoid_: Generated tool, custom node, installed package
+
+**Operator proof**:
+Evidence that one exact Operator candidate completed one representative fixture workflow. It proves that fixture, not general scientific correctness or user trust.
+_Avoid_: Validation, acceptance, smoke test
+
+**Operator acceptance**:
+The human decision that admits a proven Operator candidate into one Project Catalog without changing the distributed Catalog.
+_Avoid_: Promotion, installation, automatic approval

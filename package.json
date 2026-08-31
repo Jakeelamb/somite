@@ -9,24 +9,28 @@
   "workspaces": [
     "web",
     "runner",
-    "packages/*"
+    "packages/*",
+    "mcp/*"
   ],
   "scripts": {
     "app": "npm start",
-    "build": "npm run build --workspace=somite-web && npm run check:size",
+    "build": "npm run build --workspace=@somite/pixi-mcp-server && npm run build --workspace=@somite/nextflow-mcp-server && npm run build --workspace=somite-web && npm run check:size",
     "check:size": "node --experimental-strip-types scripts/check-release-size.ts",
     "check:version": "node --experimental-strip-types scripts/check-version-contract.ts",
     "check": "npm run typecheck && npm run lint && npm test",
+    "challenge:live": "node --experimental-strip-types scripts/unseen-challenge.ts --all",
+    "challenge:paper": "node --experimental-strip-types scripts/unseen-challenge.ts --paper",
+    "challenge:workflow": "node --experimental-strip-types scripts/unseen-challenge.ts --workflow",
     "dev": "node --experimental-strip-types scripts/somite-web.ts",
     "dev:web": "npm run dev --workspace=somite-web",
     "lint": "npm run lint --workspace=somite-web",
     "smoke:browser": "node --experimental-strip-types --test --test-concurrency=1 runner/tests/production-browser.acceptance.ts",
     "smoke:browser:execution": "node --experimental-strip-types --test --test-concurrency=1 runner/tests/production-browser-execution.smoke.ts",
-    "smoke:execution": "node --experimental-strip-types --test --test-concurrency=1 runner/tests/production-launcher.smoke.ts runner/tests/pixi-nextflow.smoke.ts",
+    "smoke:execution": "node --experimental-strip-types --test --test-concurrency=1 mcp/pixi/tests/toolchain.smoke.ts mcp/nextflow/tests/toolchain.smoke.ts runner/tests/production-launcher.smoke.ts runner/tests/pixi-nextflow.smoke.ts",
     "smoke:release": "npm run smoke:execution && npm run smoke:browser:execution",
     "start": "node --experimental-strip-types scripts/somite-web.ts --production",
     "start:runner": "npm run start --workspace=somite-runner",
-    "test": "npm run check:version && npm run test --workspace=@somite/workflow && npm run test --workspace=somite-runner && npm run test --workspace=somite-web && npm run check:size",
+    "test": "npm run check:version && npm run test --workspace=@somite/mcp-runtime && npm run test --workspace=@somite/pixi-mcp-server && npm run test --workspace=@somite/nextflow-mcp-server && npm run test --workspace=@somite/workflow && npm run test --workspace=somite-runner && npm run test --workspace=somite-web && npm run check:size",
     "typecheck": "tsc --noEmit -p tsconfig.json && npm run typecheck --workspaces --if-present"
   },
   "devDependencies": {

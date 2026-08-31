@@ -1,0 +1,49 @@
+name: Unseen compatibility challenge
+
+on:
+  schedule:
+    - cron: "37 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unseen-compatibility-challenge
+  cancel-in-progress: false
+
+jobs:
+  challenge:
+    name: New paper and workflow
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - name: Restore novelty ledger
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .somite/challenges/ledger.json
+          key: unseen-challenge-${{ github.run_id }}
+          restore-keys: |
+            unseen-challenge-
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Exercise unseen live sources
+        run: npm run challenge:live
+      - name: Upload diagnostic report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unseen-challenge-${{ github.run_id }}
+          path: output/challenges/*.json
+          if-no-files-found: warn
+          retention-days: 30

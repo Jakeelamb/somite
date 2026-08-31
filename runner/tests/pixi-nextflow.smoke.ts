@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { lstat, mkdtemp, readFile, readdir, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
 import { byteDigest } from "@somite/workflow/contentIdentity";
 import type { SomiteGraph } from "@somite/workflow/model";
 import { RunManager, type RunStatus } from "../src/jobs.ts";
+import { ProjectGateway } from "../src/projectGateway.ts";
 import { pixiPlatform } from "../src/system.ts";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
@@ -78,4 +79,45 @@ test("RunManager completes representative validation through real Pixi and Nextf
   assert.equal(environment.platform, pixiPlatform());
   const trace = await readFile(join(packageRoot, ".somite", "trace.tsv"), "utf8");
   assert.match(trace, /COMPLETED|CACHED/);
+
+  const sourceRoot = join(projectRoot, "source-demo");
+  await mkdir(sourceRoot);
+  await Promise.all([
+    writeFile(join(sourceRoot, "main.nf"), [
+      "nextflow.enable.dsl=2",
+      "",
+      "process HELLO {",
+      "  output:",
+      "  path 'hello.txt'",
+      "",
+      "  script:",
+      "  \"\"\"",
+      "  printf 'hello from frozen source\\n' > hello.txt",
+      "  \"\"\"",
+      "}",
+      "",
+      "workflow { HELLO() }",
+      "",
+    ].join("\n")),
+    writeFile(join(sourceRoot, "pixi.toml"), await readFile(join(packageRoot, "pixi.toml"))),
+    writeFile(join(sourceRoot, "pixi.lock"), lockBytes),
+  ]);
+  const imported = await new ProjectGateway(projectRoot, catalog).open({ path: "source-demo" });
+  assert.equal(imported.kind, "nextflow");
+  assert.equal(imported.graph.nodes[0]?.source_workflow?.capabilities.exact_execution, true);
+
+  const sourceValidation = await manager.start(imported.graph, "validation", "source-preview-smoke");
+  const sourceValidationStatus = await terminalStatus(manager, sourceValidation.run_id);
+  assert.equal(sourceValidationStatus.phase, "completed", sourceValidationStatus.error);
+  assert.equal(sourceValidationStatus.exit_code, 0);
+  assert.equal(sourceValidationStatus.evidence_receipt?.kind, "source_preview_validation");
+  assert.equal(sourceValidationStatus.evidence_receipt?.scope, "nextflow_source_compile_and_dag");
+  assert.deepEqual(sourceValidationStatus.evidence_receipt?.fixture_digests, []);
+
+  const sourceRun = await manager.start(imported.graph, "run", "source-run-smoke");
+  const sourceRunStatus = await terminalStatus(manager, sourceRun.run_id);
+  assert.equal(sourceRunStatus.phase, "completed", sourceRunStatus.error);
+  assert.equal(sourceRunStatus.exit_code, 0);
+  assert.equal(sourceRunStatus.states[imported.graph.nodes[0]!.id], "done");
+  assert.match(await readFile(join(projectRoot, ".somite", "runs", sourceRun.run_id, ".nextflow.log"), "utf8"), /HELLO/);
 });

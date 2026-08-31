@@ -11,6 +11,7 @@ import type {
 } from "./model.ts";
 import { GRAPH_SCHEMA_VERSION } from "./model.ts";
 import { canonicalJsonDigest, jsonDigest } from "./contentIdentity.ts";
+import { validateSourceCanvasView } from "./sourceCanvas.ts";
 
 export const MAX_EXACT_JSON_INTEGER = 9_007_199_254_740_991;
 export const MAX_EXACT_JSON_INTEGER_BOUND = MAX_EXACT_JSON_INTEGER - 1;
@@ -37,6 +38,7 @@ export type WorkflowIssueCode =
   | "multiple_inputs"
   | "invalid_annotation"
   | "invalid_source_workflow"
+  | "invalid_source_canvas"
   | "invalid_parameter_value"
   | "invalid_variant_origin";
 
@@ -199,6 +201,15 @@ export function validateGraph(graph: SomiteGraph): WorkflowValidation {
         return invalid("invalid_source_workflow", `node ${node.id} has invalid source workflow: ${issue}`);
       }
     }
+    if (node.source_canvas && !node.source_workflow) {
+      return invalid("invalid_source_canvas", `node ${node.id} has a source canvas without a source workflow`);
+    }
+    if (node.source_canvas && node.source_workflow) {
+      const issue = validateSourceCanvasView(node.source_workflow, node.source_canvas);
+      if (issue) {
+        return invalid("invalid_source_canvas", `node ${node.id} has invalid source canvas: ${issue.message}`);
+      }
+    }
   }
 
   const boundInputs = new Set<string>();
@@ -251,6 +262,10 @@ export function validateGraph(graph: SomiteGraph): WorkflowValidation {
     }
     const sourceIssue = validateSourceWorkflow(sourceNode.source_workflow);
     if (sourceIssue) return invalid("invalid_variant_origin", `invalid native workflow variant origin: ${sourceIssue}`);
+    if (sourceNode.source_canvas) {
+      const issue = validateSourceCanvasView(sourceNode.source_workflow, sourceNode.source_canvas);
+      if (issue) return invalid("invalid_variant_origin", `invalid native workflow variant source canvas: ${issue.message}`);
+    }
     const invocations = new Set((sourceNode.source_workflow.invocations ?? []).map((invocation) => invocation.id));
     const promotedNodes = new Set<string>();
     for (const [invocation, node] of Object.entries(graph.variant_origin.promoted_invocations ?? {})) {

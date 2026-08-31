@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { jatsText, LiteratureGateway } from "../src/literatureGateway.ts";
+import { articleJatsText, jatsText, LiteratureGateway } from "../src/literatureGateway.ts";
 
 function jats(body: string, journal = "bioRxiv") {
   return `<?xml version="1.0"?><article><front><journal-meta><journal-id>${journal}</journal-id></journal-meta></front><body><sec><title>Methods</title><p>${body}</p></sec></body></article>`;
@@ -60,6 +60,16 @@ test("bioRxiv JATS is validated, cached, and converted into headed text", async 
 test("JATS validation rejects non-bioRxiv and tiny payloads", () => {
   assert.throws(() => jatsText(jats("short", "Other Journal")), /not a bioRxiv paper/);
   assert.throws(() => jatsText(jats("short")), /full text is not available/);
+});
+
+test("generic JATS conversion retains methods from full-text journal articles", () => {
+  const text = articleJatsText(jats(
+    "Samples used the ARTIC workflow and Freyja for variant calling. ".repeat(8),
+    "A peer-reviewed journal",
+  ));
+  assert.match(text, /^Methods/m);
+  assert.match(text, /ARTIC workflow/);
+  assert.match(text, /Freyja/);
 });
 
 test("literature search cancels a remotely advertised oversized response", async () => {

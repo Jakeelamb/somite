@@ -1,6 +1,9 @@
 /node_modules/
 /output/
+/mcp/*/dist/
 **/.somite/
+.module.log
+.nextflow.log*
 *.swp
 .DS_Store
 testdata/papers/pdf/

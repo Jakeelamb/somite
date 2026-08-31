@@ -104,13 +104,15 @@ function toolRequirement(
         detail: support.detail,
       };
     }
-    if (["input_required", "built_in", "manual_checkpoint", "method_details"].includes(support.kind)) {
+    if (["input_required", "source_workflow", "built_in", "manual_checkpoint", "method_details"].includes(support.kind)) {
       return {
         operator_id: operator.id,
         title,
         packages: [],
         state: "built_in",
-        detail: support.label,
+        detail: support.kind === "source_workflow"
+          ? "Uses the immutable Pixi manifest and lock stored with this source workflow."
+          : support.label,
       };
     }
   }

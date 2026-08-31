@@ -36,6 +36,7 @@ function session(overrides: Record<string, unknown> = {}) {
     input_origin_warning: null,
     input_origin_id: "origin-test",
     agent_cursor: 0,
+    managed_resources: [],
     state_revision: "state-test",
     ...overrides,
   };

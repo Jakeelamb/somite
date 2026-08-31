@@ -8,6 +8,8 @@ import type {
   SomiteGraphNode,
   SomitePort,
   SourceCapabilities,
+  SourceCanvasGroup,
+  SourceCanvasView,
   SourceDiagnostic,
   SourceInvocation,
   SourceInvocationReplacement,
@@ -96,6 +98,44 @@ function paramRecord(value: unknown, path: string) {
 function stringRecord(value: unknown, path: string) {
   if (value === undefined) return {};
   return Object.fromEntries(Object.entries(object(value, path)).map(([key, item]) => [key, string(item, `${path}.${key}`)]));
+}
+
+function sourceCanvasGroup(value: unknown, path: string): SourceCanvasGroup {
+  const raw = object(value, path);
+  knownFields(raw, path, ["id", "title", "parent_group_id", "direct_entity_ids", "collapsed"]);
+  if (raw.parent_group_id !== null && typeof raw.parent_group_id !== "string") {
+    throw new Error(`${path}.parent_group_id must be a string or null`);
+  }
+  if (typeof raw.collapsed !== "boolean") throw new Error(`${path}.collapsed must be a boolean`);
+  return {
+    id: string(raw.id, `${path}.id`),
+    title: string(raw.title, `${path}.title`),
+    parent_group_id: raw.parent_group_id,
+    direct_entity_ids: array(raw.direct_entity_ids, `${path}.direct_entity_ids`)
+      .map((item, index) => string(item, `${path}.direct_entity_ids[${index}]`)),
+    collapsed: raw.collapsed,
+  };
+}
+
+function sourceCanvasView(value: unknown, path: string): SourceCanvasView {
+  const raw = object(value, path);
+  knownFields(raw, path, ["schema_version", "source_digest", "groups", "positions", "move_history"]);
+  const schemaVersion = integer(raw.schema_version, `${path}.schema_version`);
+  if (schemaVersion !== 2) throw new Error(`${path}.schema_version must be 2`);
+  const groups = optionalArray(raw.groups, `${path}.groups`)
+    .map((item, index) => sourceCanvasGroup(item, `${path}.groups[${index}]`));
+  const positions = Object.fromEntries(Object.entries(raw.positions === undefined ? {} : object(raw.positions, `${path}.positions`))
+    .map(([id, value]) => [id, point(value, `${path}.positions.${id}`)]));
+  const moveHistory = Object.fromEntries(Object.entries(raw.move_history === undefined ? {} : object(raw.move_history, `${path}.move_history`))
+    .map(([id, value]) => [id, array(value, `${path}.move_history.${id}`)
+      .map((item, index) => string(item, `${path}.move_history.${id}[${index}]`))]));
+  return {
+    schema_version: 2,
+    source_digest: string(raw.source_digest, `${path}.source_digest`),
+    ...(groups.length ? { groups } : {}),
+    ...(Object.keys(positions).length ? { positions } : {}),
+    ...(Object.keys(moveHistory).length ? { move_history: moveHistory } : {}),
+  };
 }
 
 function point(value: unknown, path: string) {
@@ -294,7 +334,7 @@ function sourceWorkflow(value: unknown, path: string): SourceWorkflowInstance {
 
 function node(value: unknown, path: string): SomiteGraphNode {
   const raw = object(value, path);
-  knownFields(raw, path, ["id", "operator", "operator_revision", "ports", "params", "source_workflow", "layout", "note", "color"]);
+  knownFields(raw, path, ["id", "operator", "operator_revision", "ports", "params", "source_workflow", "source_canvas", "layout", "note", "color"]);
   const params = paramRecord(raw.params, `${path}.params`);
   const note = optionalString(raw.note, `${path}.note`);
   const color = raw.color === undefined || raw.color === null ? undefined : oneOf(raw.color, `${path}.color`, COLORS);
@@ -305,6 +345,7 @@ function node(value: unknown, path: string): SomiteGraphNode {
     ports: array(raw.ports, `${path}.ports`).map((item, index) => port(item, `${path}.ports[${index}]`)),
     ...(Object.keys(params).length ? { params } : {}),
     ...(raw.source_workflow !== undefined && raw.source_workflow !== null ? { source_workflow: sourceWorkflow(raw.source_workflow, `${path}.source_workflow`) } : {}),
+    ...(raw.source_canvas !== undefined && raw.source_canvas !== null ? { source_canvas: sourceCanvasView(raw.source_canvas, `${path}.source_canvas`) } : {}),
     layout: point(raw.layout, `${path}.layout`),
     ...(note !== undefined ? { note } : {}),
     ...(color !== undefined ? { color } : {}),
