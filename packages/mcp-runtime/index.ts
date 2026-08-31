@@ -1,7 +1,8 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { lstatSync } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_OUTPUT_BYTES = 1024 * 1024;
@@ -51,6 +52,53 @@ function boundedAppend(current: Buffer, chunk: Buffer, maximum: number) {
   return { bytes: Buffer.concat([current, chunk.subarray(0, remaining)]), truncated: true };
 }
 
+function signalCommandTree(child: ChildProcess, signal: NodeJS.Signals) {
+  if (child.pid === undefined) return;
+  try {
+    process.kill(-child.pid, signal);
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code !== "ESRCH") throw cause;
+  }
+}
+
+function commandTreeExists(child: ChildProcess) {
+  if (child.pid === undefined) return false;
+  try {
+    process.kill(-child.pid, 0);
+    return true;
+  } catch (cause) {
+    const code = (cause as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return false;
+    if (code === "EPERM") return true;
+    throw cause;
+  }
+}
+
+async function terminateCommandTree(child: ChildProcess): Promise<NodeJS.Signals> {
+  if (process.platform === "win32") {
+    if (child.pid === undefined) return "SIGTERM";
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      const killer = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { windowsHide: true, stdio: "ignore" });
+      killer.once("error", rejectPromise);
+      killer.once("close", () => resolvePromise());
+    });
+    return "SIGKILL";
+  }
+
+  signalCommandTree(child, "SIGTERM");
+  const gracefulDeadline = Date.now() + TERMINATION_GRACE_MS;
+  while (commandTreeExists(child) && Date.now() < gracefulDeadline) {
+    await delay(Math.min(25, Math.max(1, gracefulDeadline - Date.now())));
+  }
+  if (!commandTreeExists(child)) return "SIGTERM";
+
+  signalCommandTree(child, "SIGKILL");
+  const hardDeadline = Date.now() + TERMINATION_SETTLEMENT_MS;
+  while (commandTreeExists(child) && Date.now() < hardDeadline) await delay(10);
+  if (commandTreeExists(child)) throw new Error(`owned command process group ${child.pid} survived SIGKILL`);
+  return "SIGKILL";
+}
+
 export function safeChildEnvironment(source: NodeJS.ProcessEnv = process.env, additions: NodeJS.ProcessEnv = {}) {
   const result: NodeJS.ProcessEnv = {};
   for (const name of SAFE_ENVIRONMENT) {
@@ -68,91 +116,64 @@ export async function runCommand(binary: string, args: readonly string[], cwd: s
   const started = performance.now();
   const timeout = AbortSignal.timeout(options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
-  return await new Promise<CommandResult>((resolvePromise, rejectPromise) => {
-    const child = spawn(binary, [...args], {
-      cwd,
-      env: safeChildEnvironment(process.env, options.environment),
-      shell: false,
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: process.platform !== "win32",
-    });
-    let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
-    let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
-    let stdoutTruncated = false;
-    let stderrTruncated = false;
-    let settled = false;
-    let terminationSignal: NodeJS.Signals | null = null;
-    let hardKillTimer: NodeJS.Timeout | undefined;
-    let settlementTimer: NodeJS.Timeout | undefined;
-    const finish = (exitCode: number | null, exitSignal: NodeJS.Signals | null) => {
-      if (settled) return;
-      settled = true;
-      signal.removeEventListener("abort", terminate);
-      if (hardKillTimer) clearTimeout(hardKillTimer);
-      if (settlementTimer) clearTimeout(settlementTimer);
-      resolvePromise({
-        command: [basename(binary), ...args],
-        cwd,
-        exit_code: exitCode,
-        signal: exitSignal ?? terminationSignal,
-        stdout: stdout.toString("utf8"),
-        stderr: stderr.toString("utf8"),
-        stdout_truncated: stdoutTruncated,
-        stderr_truncated: stderrTruncated,
-        duration_ms: Math.round(performance.now() - started),
-        ok: exitCode === 0 && !signal.aborted,
-      });
-    };
-    const signalTree = (treeSignal: NodeJS.Signals) => {
-      if (child.pid === undefined) return;
-      try {
-        if (process.platform === "win32") child.kill(treeSignal);
-        else process.kill(-child.pid, treeSignal);
-      } catch (cause) {
-        if ((cause as NodeJS.ErrnoException).code !== "ESRCH") throw cause;
-      }
-    };
-    const terminate = () => {
-      if (settled || terminationSignal) return;
-      terminationSignal = "SIGTERM";
-      try { signalTree("SIGTERM"); } catch { child.kill("SIGTERM"); }
-      hardKillTimer = setTimeout(() => {
-        if (settled) return;
-        terminationSignal = "SIGKILL";
-        if (process.platform === "win32" && child.pid !== undefined) {
-          const killer = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
-            windowsHide: true,
-            stdio: "ignore",
-          });
-          killer.unref();
-        } else {
-          try { signalTree("SIGKILL"); } catch { child.kill("SIGKILL"); }
-        }
-        settlementTimer = setTimeout(() => finish(null, "SIGKILL"), TERMINATION_SETTLEMENT_MS);
-        settlementTimer.unref();
-      }, TERMINATION_GRACE_MS);
-      hardKillTimer.unref();
-    };
-    child.stdout.on("data", (value: Buffer) => {
-      const next = boundedAppend(stdout, value, maximum);
-      stdout = next.bytes;
-      stdoutTruncated ||= next.truncated;
-    });
-    child.stderr.on("data", (value: Buffer) => {
-      const next = boundedAppend(stderr, value, maximum);
-      stderr = next.bytes;
-      stderrTruncated ||= next.truncated;
-    });
-    child.once("error", (cause) => {
-      if (settled) return;
-      signal.removeEventListener("abort", terminate);
-      rejectPromise(cause);
-    });
-    child.once("close", finish);
-    signal.addEventListener("abort", terminate, { once: true });
-    if (signal.aborted) terminate();
+  const child = spawn(binary, [...args], {
+    cwd,
+    env: safeChildEnvironment(process.env, options.environment),
+    shell: false,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: process.platform !== "win32",
   });
+  let stdout: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+  let stderr: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+  let stdoutTruncated = false;
+  let stderrTruncated = false;
+  child.stdout.on("data", (value: Buffer) => {
+    const next = boundedAppend(stdout, value, maximum);
+    stdout = next.bytes;
+    stdoutTruncated ||= next.truncated;
+  });
+  child.stderr.on("data", (value: Buffer) => {
+    const next = boundedAppend(stderr, value, maximum);
+    stderr = next.bytes;
+    stderrTruncated ||= next.truncated;
+  });
+
+  const completion = new Promise<{ exitCode: number | null; exitSignal: NodeJS.Signals | null }>((resolvePromise, rejectPromise) => {
+    child.once("error", rejectPromise);
+    child.once("close", (exitCode, exitSignal) => resolvePromise({ exitCode, exitSignal }));
+  });
+  let rejectCleanup: (cause: unknown) => void = () => undefined;
+  const cleanupFailure = new Promise<never>((_, rejectPromise) => { rejectCleanup = rejectPromise; });
+  let termination: Promise<NodeJS.Signals> | undefined;
+  const terminate = () => {
+    if (!termination) {
+      termination = terminateCommandTree(child);
+      void termination.catch(rejectCleanup);
+    }
+    return termination;
+  };
+  signal.addEventListener("abort", terminate, { once: true });
+  if (signal.aborted) void terminate();
+
+  try {
+    const completed = await Promise.race([completion, cleanupFailure]);
+    const terminationSignal = signal.aborted ? await terminate() : null;
+    return {
+      command: [basename(binary), ...args],
+      cwd,
+      exit_code: completed.exitCode,
+      signal: terminationSignal ?? completed.exitSignal,
+      stdout: stdout.toString("utf8"),
+      stderr: stderr.toString("utf8"),
+      stdout_truncated: stdoutTruncated,
+      stderr_truncated: stderrTruncated,
+      duration_ms: Math.round(performance.now() - started),
+      ok: completed.exitCode === 0 && !signal.aborted,
+    };
+  } finally {
+    signal.removeEventListener("abort", terminate);
+  }
 }
 
 /** Run one exact CLI contract and fail closed when the installed binary drifts. */

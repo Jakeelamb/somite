@@ -671,6 +671,10 @@ test("production flagship canvas builds, annotates, saves, and restores a ready 
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
   context.after(() => page.close());
   const assertNoPageErrors = watchPage(page);
+  const browserWarnings: string[] = [];
+  page.on("console", (entry) => {
+    if (entry.type() === "warning") browserWarnings.push(entry.text());
+  });
   await emptyCatalogs(page, app);
 
   await page.goto(app.webUrl);
@@ -716,10 +720,26 @@ test("production flagship canvas builds, annotates, saves, and restores a ready 
   assert.ok(outputBox, "files.import.file output handle should be visible");
   assert.ok(inputBox, "qc.fastqc.fastq input handle should be visible");
   await page.mouse.move(outputBox.x + outputBox.width / 2, outputBox.y + outputBox.height / 2);
+  await page.waitForTimeout(75);
   await page.mouse.down();
-  await page.mouse.move(inputBox.x + inputBox.width / 2, inputBox.y + inputBox.height / 2, { steps: 12 });
+  await page.waitForTimeout(100);
+  await page.mouse.move(
+    (outputBox.x + inputBox.x) / 2,
+    (outputBox.y + inputBox.y) / 2,
+    { steps: 8 },
+  );
+  await page.waitForTimeout(50);
+  await page.mouse.move(inputBox.x + inputBox.width / 2, inputBox.y + inputBox.height / 2, { steps: 16 });
+  await page.waitForTimeout(100);
   await page.mouse.up();
-  await page.locator(".react-flow__edge").waitFor({ state: "attached" });
+  try {
+    await page.locator(".react-flow__edge").waitFor({ state: "attached", timeout: 10_000 });
+  } catch (error) {
+    const response = await fetch(`${app.runnerUrl}/api/session`);
+    const current = await response.json() as { graph?: { edges?: unknown[] } };
+    const currentStatus = await page.locator(".status-copy").textContent();
+    throw new Error(`connection gesture did not converge; status=${currentStatus}; server_edges=${current.graph?.edges?.length ?? "unknown"}`, { cause: error });
+  }
   assert.equal(await page.locator(".react-flow__edge").count(), 1);
   await page.locator(".status-copy").getByText("Connected file to fastq", { exact: true }).waitFor();
   await readiness.filter({ hasText: "Ready" }).waitFor();
@@ -737,13 +757,52 @@ test("production flagship canvas builds, annotates, saves, and restores a ready 
   const redo = page.getByRole("button", { name: "Redo", exact: true });
   await undo.click();
   assert.equal(await note.getAttribute("data-color"), "yellow");
+  await page.locator(".react-flow__edge").waitFor({ state: "attached" });
+  assert.equal(await page.locator(".react-flow__edge").count(), 1, "undoing an annotation color must preserve workflow edges");
   await redo.click();
   assert.equal(await note.getAttribute("data-color"), "violet");
+  await page.locator(".react-flow__edge").waitFor({ state: "attached" });
+  assert.equal(await page.locator(".react-flow__edge").count(), 1, "redoing an annotation color must preserve workflow edges");
 
+  let explicitSaveStarted = false;
+  let lateAutosaveRequests = 0;
+  page.on("request", (request) => {
+    if (explicitSaveStarted && request.method() === "PUT" && new URL(request.url()).pathname === "/api/graph/autosave") {
+      lateAutosaveRequests += 1;
+    }
+  });
+  await page.route(`${app.runnerUrl}/api/graph`, async (route) => {
+    if (route.request().method() === "PUT") await new Promise((resolvePromise) => setTimeout(resolvePromise, 900));
+    await route.continue();
+  });
+  await noteText.fill("Review FastQC evidence pending");
+  await noteText.fill("Review FastQC evidence");
+  explicitSaveStarted = true;
   await page.getByRole("button", { name: "Save", exact: true }).click();
   await page.getByRole("button", { name: "Saved", exact: true }).waitFor();
-  await page.reload();
-  await page.locator(".react-flow__node").nth(1).waitFor();
+  await page.waitForTimeout(900);
+  explicitSaveStarted = false;
+  assert.equal(lateAutosaveRequests, 0, "an older autosave must not run after an explicit canonical save begins");
+  const persisted = JSON.parse(await readFile(join(projectRoot, ".somite", "web.somite.json"), "utf8")) as { edges?: unknown[] };
+  assert.equal(persisted.edges?.length, 1, "the canonical saved graph must retain the workflow edge");
+  for (let reloadAttempt = 1; reloadAttempt <= 5; reloadAttempt += 1) {
+    await page.reload();
+    await page.locator(".react-flow__node").nth(1).waitFor();
+    try {
+      await page.locator(".react-flow__edge").waitFor({ state: "attached", timeout: 5_000 });
+    } catch (error) {
+      const response = await fetch(`${app.runnerUrl}/api/session`);
+      const current = await response.json() as { graph?: { edges?: unknown[] } };
+      const autosaved = JSON.parse(await readFile(join(projectRoot, ".somite", "autosave.somite.json"), "utf8")) as { edges?: unknown[] };
+      const canonical = JSON.parse(await readFile(join(projectRoot, ".somite", "web.somite.json"), "utf8")) as { edges?: unknown[] };
+      const geometry = await page.locator(".react-flow__node").evaluateAll((elements) => elements.map((element) => {
+        const bounds = element.getBoundingClientRect();
+        return { id: element.getAttribute("data-id"), x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height, handles: element.querySelectorAll(".react-flow__handle").length };
+      }));
+      const transform = await page.locator(".react-flow__viewport").getAttribute("style");
+      throw new Error(`saved connection did not restore on reload ${reloadAttempt}; session_edges=${current.graph?.edges?.length ?? "unknown"}; autosave_edges=${autosaved.edges?.length ?? "unknown"}; canonical_edges=${canonical.edges?.length ?? "unknown"}; geometry=${JSON.stringify(geometry)}; viewport=${transform}; warnings=${JSON.stringify(browserWarnings.slice(-8))}`, { cause: error });
+    }
+  }
   assert.equal(await page.locator(".react-flow__node").count(), 2);
   assert.equal(await page.locator(".react-flow__edge").count(), 1);
   assert.equal(await page.getByRole("textbox", { name: "Sticky note note-1" }).inputValue(), "Review FastQC evidence");

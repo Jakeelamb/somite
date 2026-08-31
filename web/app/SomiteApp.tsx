@@ -13,7 +13,9 @@ import {
   addEdge,
   getBezierPath,
   useEdgesState,
+  useNodesInitialized,
   useNodesState,
+  useUpdateNodeInternals,
   type Edge,
   type EdgeProps,
   type FinalConnectionState,
@@ -485,6 +487,8 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
   const [paperToolsError, setPaperToolsError] = useState<string | null>(null);
   const [nodes, setNodes, onNodesChange] = useNodesState<SomiteFlowNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<SomiteFlowEdge>([]);
+  const nodesInitialized = useNodesInitialized();
+  const updateNodeInternals = useUpdateNodeInternals();
   const [flow, setFlow] = useState<ReactFlowInstance<WorkspaceFlowNode, WorkspaceFlowEdge> | null>(null);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [query, setQuery] = useState(initialQuery);
@@ -581,6 +585,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
   const acknowledgedGraphRef = useRef("");
   const acknowledgedInputOriginIdRef = useRef("");
   const browserWriteChainRef = useRef<Promise<void>>(Promise.resolve());
+  const pendingAutosaveRef = useRef<number | null>(null);
   const reconcilingGraphRef = useRef(false);
   const titleEditStartRef = useRef<{ graph: SomiteGraph; dirty: boolean; title: string } | null>(null);
   const titleEditCancelledRef = useRef(false);
@@ -613,6 +618,13 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
   const semanticKey = projection.semanticKey;
   semanticKeyRef.current = semanticKey;
   const validationCapability = useMemo(() => representativeValidationCapability(renderedGraph), [renderedGraph]);
+
+  useEffect(() => {
+    const graph = graphSnapshotRef.current;
+    if (!nodesInitialized || !graph.nodes.length) return;
+    const frame = window.requestAnimationFrame(() => updateNodeInternals(graph.nodes.map((node) => node.id)));
+    return () => window.cancelAnimationFrame(frame);
+  }, [nodesInitialized, semanticKey, updateNodeInternals]);
 
   useEffect(() => {
     return paperIntakeCoordinator.subscribe((next) => {
@@ -740,6 +752,11 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       () => canonicalEpochRef.current,
     );
   }, [client]);
+
+  const cancelPendingAutosave = useCallback(() => {
+    if (pendingAutosaveRef.current !== null) window.clearTimeout(pendingAutosaveRef.current);
+    pendingAutosaveRef.current = null;
+  }, []);
 
   const markCanonicalGraph = useCallback((graph: SomiteGraph, preserveCurrentProjection = false) => {
     const primed = graphProjectionClockRef.current!.prime(
@@ -1353,17 +1370,25 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
   }, [query]);
 
   useEffect(() => {
-    if (!dirty || !session || session.input_origin_warning || titleEditing) return;
+    if (!dirty || !session || session.input_origin_warning || titleEditing || saving) {
+      cancelPendingAutosave();
+      return;
+    }
     const graphWrite = captureGraphWrite(snapshot(), graphEpochRef.current, inputOriginIdRef.current);
     const timeout = window.setTimeout(() => {
+      if (pendingAutosaveRef.current === timeout) pendingAutosaveRef.current = null;
       void writeBrowserGraph("/api/graph/autosave", graphWrite)
         .catch(async (error) => {
           if (await reconcileGraphConflict(error)) return;
           setStatus(`Autosave failed — ${errorMessage(error)}`);
         });
     }, 700);
-    return () => window.clearTimeout(timeout);
-  }, [dirty, nodes, edges, reconcileGraphConflict, session, snapshot, titleEditing, writeBrowserGraph]);
+    pendingAutosaveRef.current = timeout;
+    return () => {
+      window.clearTimeout(timeout);
+      if (pendingAutosaveRef.current === timeout) pendingAutosaveRef.current = null;
+    };
+  }, [cancelPendingAutosave, dirty, nodes, edges, reconcileGraphConflict, saving, session, snapshot, titleEditing, writeBrowserGraph]);
 
   const canvasCenter = useCallback(() => {
     if (!flow) return { x: 160, y: 160 };
@@ -2483,6 +2508,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       setStatus("Confirm the workflow input location before saving");
       return;
     }
+    cancelPendingAutosave();
     setSaving(true);
     setStatus("Validating and saving…");
     try {
@@ -2497,7 +2523,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     } finally {
       setSaving(false);
     }
-  }, [reconcileGraphConflict, session?.input_origin_warning, snapshot, writeBrowserGraph]);
+  }, [cancelPendingAutosave, reconcileGraphConflict, session?.input_origin_warning, snapshot, writeBrowserGraph]);
 
   const toggleToolchain = useCallback(async () => {
     if (session?.input_origin_warning) {

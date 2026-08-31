@@ -183,8 +183,14 @@ test("ACP manager streams events, configures the session, and auto-approves only
   assert.equal(transcript.tool_calls[0]?.title, "somite.workflow.get");
   assert.equal(transcript.tool_calls[0]?.permissions.length, 1);
   assert.deepEqual((transcript.tool_calls[0]?.input as { arguments?: unknown })?.arguments, { path: "reads.fastq", api_key: "[redacted]" });
-  await until(() => readdir(join(root, ".somite", "agent-transcripts")).then((files) => files.length === 1).catch(() => false));
-  const stored = JSON.parse(await readFile(join(root, ".somite", "agent-transcripts", (await readdir(join(root, ".somite", "agent-transcripts")))[0]!), "utf8"));
+  const transcriptDirectory = join(root, ".somite", "agent-transcripts");
+  let transcriptFilename: string | undefined;
+  await until(async () => {
+    const files = await readdir(transcriptDirectory).catch(() => []);
+    transcriptFilename = files.find((file) => /^turn-\d+-\d+\.json$/.test(file));
+    return transcriptFilename !== undefined;
+  });
+  const stored = JSON.parse(await readFile(join(transcriptDirectory, transcriptFilename!), "utf8"));
   assert.equal(stored.tool_calls[0].input.arguments.api_key, "[redacted]");
   await manager.disconnect();
   await until(() => !manager.snapshot().connected && !manager.snapshot().connecting);

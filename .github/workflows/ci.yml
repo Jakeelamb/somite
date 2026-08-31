@@ -40,6 +40,221 @@ jobs:
         run: npm test
       - name: Exercise production browser journeys
         run: npm run smoke:browser
+      - name: Measure deterministic outcomes on main
+        if: github.event_name == 'push'
+        run: npm run benchmark:quick
+      - name: Upload main benchmark receipt
+        if: always() && github.event_name == 'push'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: quick-benchmark-${{ github.sha }}
+          path: output/benchmarks/*-quick.json
+          if-no-files-found: error
+          retention-days: 30
+
+  benchmark-comparison:
+    name: Paired outcome benchmark
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      SOMITE_BENCHMARK_IMAGE: node:22.13.0-bookworm@sha256:fa54405993eaa6bab6b6e460f5f3e945a2e2f07942ba31c0e297a7d9c2041f62
+    steps:
+      - name: Check out baseline
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: benchmark-base
+          persist-credentials: false
+      - name: Check out candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: benchmark-candidate
+          persist-credentials: false
+      - name: Detect baseline benchmark contract
+        id: baseline_benchmark
+        run: |
+          if grep -Eq '"benchmark:quick"[[:space:]]*:' benchmark-base/package.json; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install baseline dependencies in isolation
+        if: steps.baseline_benchmark.outputs.available == 'true'
+        run: >-
+          docker run --rm
+          --hostname somite-benchmark
+          --user "$(id -u):$(id -g)"
+          --cpus 2 --memory 4g --pids-limit 512
+          --cap-drop ALL --security-opt no-new-privileges=true
+          --tmpfs /tmp:rw,nosuid,nodev,size=256m
+          --mount type=bind,src="${{ github.workspace }}/benchmark-base",dst=/workspace
+          --workdir /workspace
+          --env NPM_CONFIG_CACHE=/tmp/npm-cache
+          --env GIT_CONFIG_COUNT=1
+          --env GIT_CONFIG_KEY_0=safe.directory
+          --env GIT_CONFIG_VALUE_0=/workspace
+          "$SOMITE_BENCHMARK_IMAGE" npm ci
+      - name: Install candidate dependencies in isolation
+        run: >-
+          docker run --rm
+          --hostname somite-benchmark
+          --user "$(id -u):$(id -g)"
+          --cpus 2 --memory 4g --pids-limit 512
+          --cap-drop ALL --security-opt no-new-privileges=true
+          --tmpfs /tmp:rw,nosuid,nodev,size=256m
+          --mount type=bind,src="${{ github.workspace }}/benchmark-candidate",dst=/workspace
+          --workdir /workspace
+          --env NPM_CONFIG_CACHE=/tmp/npm-cache
+          --env GIT_CONFIG_COUNT=1
+          --env GIT_CONFIG_KEY_0=safe.directory
+          --env GIT_CONFIG_VALUE_0=/workspace
+          "$SOMITE_BENCHMARK_IMAGE" npm ci
+      - name: Measure baseline (AB order)
+        if: steps.baseline_benchmark.outputs.available == 'true'
+        run: >-
+          docker run --rm --network none
+          --hostname somite-benchmark
+          --user "$(id -u):$(id -g)"
+          --cpus 2 --memory 4g --pids-limit 512
+          --cap-drop ALL --security-opt no-new-privileges=true
+          --tmpfs /tmp:rw,nosuid,nodev,size=256m
+          --mount type=bind,src="${{ github.workspace }}/benchmark-base",dst=/workspace
+          --workdir /workspace
+          --env NPM_CONFIG_CACHE=/tmp/npm-cache
+          --env GIT_CONFIG_COUNT=1
+          --env GIT_CONFIG_KEY_0=safe.directory
+          --env GIT_CONFIG_VALUE_0=/workspace
+          "$SOMITE_BENCHMARK_IMAGE" npm run benchmark:quick --
+          --output output/benchmarks/baseline-a.json
+      - name: Measure candidate (AB order)
+        run: >-
+          docker run --rm --network none
+          --hostname somite-benchmark
+          --user "$(id -u):$(id -g)"
+          --cpus 2 --memory 4g --pids-limit 512
+          --cap-drop ALL --security-opt no-new-privileges=true
+          --tmpfs /tmp:rw,nosuid,nodev,size=256m
+          --mount type=bind,src="${{ github.workspace }}/benchmark-candidate",dst=/workspace
+          --workdir /workspace
+          --env NPM_CONFIG_CACHE=/tmp/npm-cache
+          --env GIT_CONFIG_COUNT=1
+          --env GIT_CONFIG_KEY_0=safe.directory
+          --env GIT_CONFIG_VALUE_0=/workspace
+          "$SOMITE_BENCHMARK_IMAGE" npm run benchmark:quick --
+          --output output/benchmarks/candidate-a.json
+      - name: Measure candidate (BA order)
+        run: >-
+          docker run --rm --network none
+          --hostname somite-benchmark
+          --user "$(id -u):$(id -g)"
+          --cpus 2 --memory 4g --pids-limit 512
+          --cap-drop ALL --security-opt no-new-privileges=true
+          --tmpfs /tmp:rw,nosuid,nodev,size=256m
+          --mount type=bind,src="${{ github.workspace }}/benchmark-candidate",dst=/workspace
+          --workdir /workspace
+          --env NPM_CONFIG_CACHE=/tmp/npm-cache
+          --env GIT_CONFIG_COUNT=1
+          --env GIT_CONFIG_KEY_0=safe.directory
+          --env GIT_CONFIG_VALUE_0=/workspace
+          "$SOMITE_BENCHMARK_IMAGE" npm run benchmark:quick --
+          --output output/benchmarks/candidate-b.json
+      - name: Measure baseline (BA order)
+        if: steps.baseline_benchmark.outputs.available == 'true'
+        run: >-
+          docker run --rm --network none
+          --hostname somite-benchmark
+          --user "$(id -u):$(id -g)"
+          --cpus 2 --memory 4g --pids-limit 512
+          --cap-drop ALL --security-opt no-new-privileges=true
+          --tmpfs /tmp:rw,nosuid,nodev,size=256m
+          --mount type=bind,src="${{ github.workspace }}/benchmark-base",dst=/workspace
+          --workdir /workspace
+          --env NPM_CONFIG_CACHE=/tmp/npm-cache
+          --env GIT_CONFIG_COUNT=1
+          --env GIT_CONFIG_KEY_0=safe.directory
+          --env GIT_CONFIG_VALUE_0=/workspace
+          "$SOMITE_BENCHMARK_IMAGE" npm run benchmark:quick --
+          --output output/benchmarks/baseline-b.json
+      - name: Report AB paired changes with baseline comparator
+        if: steps.baseline_benchmark.outputs.available == 'true' && !contains(github.event.pull_request.labels.*.name, 'benchmark-series-reset')
+        run: >-
+          docker run --rm --network none
+          --hostname somite-benchmark
+          --user "$(id -u):$(id -g)"
+          --cpus 2 --memory 4g --pids-limit 512
+          --cap-drop ALL --security-opt no-new-privileges=true
+          --tmpfs /tmp:rw,nosuid,nodev,size=256m
+          --mount type=bind,src="${{ github.workspace }}/benchmark-base",dst=/baseline,readonly
+          --mount type=bind,src="${{ github.workspace }}/benchmark-candidate/output/benchmarks",dst=/candidate,readonly
+          --workdir /baseline
+          --env NPM_CONFIG_CACHE=/tmp/npm-cache
+          "$SOMITE_BENCHMARK_IMAGE" npm run benchmark:compare --
+          output/benchmarks/baseline-a.json /candidate/candidate-a.json
+          --report-only
+      - name: Report BA paired changes with baseline comparator
+        if: steps.baseline_benchmark.outputs.available == 'true' && !contains(github.event.pull_request.labels.*.name, 'benchmark-series-reset')
+        run: >-
+          docker run --rm --network none
+          --hostname somite-benchmark
+          --user "$(id -u):$(id -g)"
+          --cpus 2 --memory 4g --pids-limit 512
+          --cap-drop ALL --security-opt no-new-privileges=true
+          --tmpfs /tmp:rw,nosuid,nodev,size=256m
+          --mount type=bind,src="${{ github.workspace }}/benchmark-base",dst=/baseline,readonly
+          --mount type=bind,src="${{ github.workspace }}/benchmark-candidate/output/benchmarks",dst=/candidate,readonly
+          --workdir /baseline
+          --env NPM_CONFIG_CACHE=/tmp/npm-cache
+          "$SOMITE_BENCHMARK_IMAGE" npm run benchmark:compare --
+          output/benchmarks/baseline-b.json /candidate/candidate-b.json
+          --report-only
+      - name: Confirm intentional AB performance-series reset
+        if: steps.baseline_benchmark.outputs.available == 'true' && contains(github.event.pull_request.labels.*.name, 'benchmark-series-reset')
+        run: >-
+          docker run --rm --network none
+          --hostname somite-benchmark
+          --user "$(id -u):$(id -g)"
+          --cpus 2 --memory 4g --pids-limit 512
+          --cap-drop ALL --security-opt no-new-privileges=true
+          --tmpfs /tmp:rw,nosuid,nodev,size=256m
+          --mount type=bind,src="${{ github.workspace }}/benchmark-base",dst=/baseline,readonly
+          --mount type=bind,src="${{ github.workspace }}/benchmark-candidate/output/benchmarks",dst=/candidate,readonly
+          --workdir /baseline
+          --env NPM_CONFIG_CACHE=/tmp/npm-cache
+          "$SOMITE_BENCHMARK_IMAGE" npm run benchmark:compare --
+          output/benchmarks/baseline-a.json /candidate/candidate-a.json
+          --expect-new-series
+      - name: Confirm intentional BA performance-series reset
+        if: steps.baseline_benchmark.outputs.available == 'true' && contains(github.event.pull_request.labels.*.name, 'benchmark-series-reset')
+        run: >-
+          docker run --rm --network none
+          --hostname somite-benchmark
+          --user "$(id -u):$(id -g)"
+          --cpus 2 --memory 4g --pids-limit 512
+          --cap-drop ALL --security-opt no-new-privileges=true
+          --tmpfs /tmp:rw,nosuid,nodev,size=256m
+          --mount type=bind,src="${{ github.workspace }}/benchmark-base",dst=/baseline,readonly
+          --mount type=bind,src="${{ github.workspace }}/benchmark-candidate/output/benchmarks",dst=/candidate,readonly
+          --workdir /baseline
+          --env NPM_CONFIG_CACHE=/tmp/npm-cache
+          "$SOMITE_BENCHMARK_IMAGE" npm run benchmark:compare --
+          output/benchmarks/baseline-b.json /candidate/candidate-b.json
+          --expect-new-series
+      - name: Establish first benchmark series
+        if: steps.baseline_benchmark.outputs.available != 'true'
+        run: echo 'The base revision has no benchmark contract; candidate outcome receipts establish the first series without a fabricated comparison.'
+      - name: Upload paired receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: paired-benchmark-${{ github.event.pull_request.number }}-${{ github.run_attempt }}
+          path: |
+            benchmark-base/output/benchmarks/baseline-a.json
+            benchmark-base/output/benchmarks/baseline-b.json
+            benchmark-candidate/output/benchmarks/candidate-a.json
+            benchmark-candidate/output/benchmarks/candidate-b.json
+          if-no-files-found: warn
+          retention-days: 30
 
   execution-smoke:
     name: Release smoke (${{ matrix.name }})

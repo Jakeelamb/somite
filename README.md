@@ -325,6 +325,7 @@ or confirms the project folder.
 npm ci
 npm run check
 npm run smoke:browser
+npm run benchmark:quick
 npm audit --audit-level=moderate
 ```
 
@@ -340,6 +341,15 @@ through Somite, Pixi, Nextflow, and back to Somite readiness. Set
 browser is not in a standard system location; this deterministic gate does not
 replace real workflow execution.
 
+`npm run benchmark:quick` adds repeatable CPU, wall-time, peak-memory, output,
+and adjudicated-outcome receipts for the graph, source-indexing, nested-canvas,
+compiler, and paper-reconstruction hot paths. The outcome assertions are the
+portable gate; timings are compared only as paired runs on the same host. The
+slower `npm run benchmark:release` lane measures the production build, bundle
+size, browser journeys, and real Pixi/Nextflow path. See
+[docs/benchmarks.md](docs/benchmarks.md) for profiling commands, comparison
+policy, and the committed-source install/build/start proof.
+
 Maintainers and CI also run `pixi run smoke`. This networked release gate first
 exercises the runner directly, then drives the built browser through validation,
 execution, durable evidence, and ZIP export for a tiny FastQC workflow using the
@@ -353,6 +363,11 @@ from the content-addressed novelty ledger, runs reconstruction and source
 indexing without turning either source into a fixture, and writes a dated report
 under `output/challenges/`. Scheduled CI advances the ledger daily so the same
 small corpus cannot hide regressions.
+
+Weekly benchmark CI retains deterministic and production-host JSON snapshots
+separately from that live challenge. Hosted runners are different performance
+series, so those snapshots are not compared automatically. Live papers and
+workflows are never used as performance baselines.
 
 Bug reports and user-outcome proposals are welcome through
 [GitHub Issues](https://github.com/Jakeelamb/somite/issues); workflow questions

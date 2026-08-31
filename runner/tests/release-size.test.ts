@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { copyFile, mkdir, mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -28,6 +28,21 @@ test("release size checking distinguishes a pristine archive from an installed t
   await writeFile(join(root, "web", "dist", "client", "app.js"), "export {};\n");
   const installed = spawnSync(process.execPath, ["--experimental-strip-types", join(root, "scripts", "check-release-size.ts")], { cwd: root, encoding: "utf8" });
   assert.equal(installed.status, 0, installed.stderr);
+  const machineReadable = spawnSync(process.execPath, ["--experimental-strip-types", join(root, "scripts", "check-release-size.ts"), "--json"], { cwd: root, encoding: "utf8" });
+  assert.equal(machineReadable.status, 0, machineReadable.stderr);
+  assert.deepEqual(JSON.parse(machineReadable.stdout), {
+    schema_version: 1,
+    source: { files: 2, bytes: 7 + (await lstat(join(root, "scripts", "check-release-size.ts"))).size },
+    bundle: { files: 1, bytes: 11, javascriptBytes: 11, cssBytes: 0, largestJavaScriptChunkBytes: 11 },
+    limits: {
+      trackedBytes: 4 * 1024 * 1024,
+      trackedFileBytes: 1024 * 1024,
+      clientBytes: 2 * 1024 * 1024,
+      clientJavaScriptBytes: 1_280 * 1024,
+      clientCssBytes: 256 * 1024,
+      clientChunkBytes: 512 * 1024,
+    },
+  });
 });
 
 test("release size checking profiles the working tree during an unstaged deletion", async (context) => {

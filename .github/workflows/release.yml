@@ -13,6 +13,9 @@ jobs:
     name: Verify tagged source
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    outputs:
+      tag_object: ${{ steps.release_identity.outputs.tag_object }}
+      commit: ${{ steps.release_identity.outputs.commit }}
     steps:
       - name: Check out tagged source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -20,6 +23,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Verify annotated tag is on main
+        id: release_identity
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           RELEASE_COMMIT: ${{ github.sha }}
@@ -32,6 +36,11 @@ jobs:
             echo "Release commit must be reachable from origin/main."
             exit 1
           }
+          tag_object="$(git rev-parse "$RELEASE_TAG^{tag}")"
+          commit="$(git rev-parse "$RELEASE_TAG^{commit}")"
+          test "$(git cat-file -t "$commit")" = commit
+          test "$(git rev-parse "$RELEASE_COMMIT^{commit}")" = "$commit"
+          printf 'tag_object=%s\ncommit=%s\n' "$tag_object" "$commit" >> "$GITHUB_OUTPUT"
       - name: Set up locked Pixi environment
         uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
         with:
@@ -52,14 +61,16 @@ jobs:
         run: npm run lint
       - name: Build and test product
         run: npm test
-      - name: Verify unpacked source archive contract
-        run: |
-          archive_root="$RUNNER_TEMP/somite-source"
-          mkdir "$archive_root"
-          git archive HEAD | tar -x -C "$archive_root"
-          node --experimental-strip-types "$archive_root/scripts/check-release-size.ts" --source-only
-          cp -R web/dist "$archive_root/web/dist"
-          node --experimental-strip-types "$archive_root/scripts/check-release-size.ts"
+      - name: Prove committed source installs, builds, and starts
+        run: npm run proof:source
+      - name: Upload clean-source proof
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: source-proof-${{ github.sha }}
+          path: output/benchmarks/source-proof-*.json
+          if-no-files-found: error
+          retention-days: 90
       - name: Exercise production browser journeys
         run: npm run smoke:browser
       - name: Exercise production startup and real workflow execution
@@ -76,12 +87,24 @@ jobs:
     steps:
       # GitHub's generated source archives are the only release artifacts. This
       # job intentionally has no checkout or third-party executable step.
-      - name: Create source-only GitHub release
+      - name: Publish the exact verified tag object
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "$GITHUB_REF_NAME"
-          --repo "$GITHUB_REPOSITORY"
-          --verify-tag
-          --generate-notes
-          --title "Somite $GITHUB_REF_NAME"
+          VERIFIED_TAG_OBJECT: ${{ needs.verify.outputs.tag_object }}
+          VERIFIED_COMMIT: ${{ needs.verify.outputs.commit }}
+        run: |
+          remote_ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq '.object.type + ":" + .object.sha')"
+          remote_target="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$VERIFIED_TAG_OBJECT" --jq '.object.type + ":" + .object.sha')"
+          test "$remote_ref" = "tag:$VERIFIED_TAG_OBJECT" || {
+            echo "Release tag moved after verification."
+            exit 1
+          }
+          test "$remote_target" = "commit:$VERIFIED_COMMIT" || {
+            echo "Verified tag no longer resolves to the tested commit."
+            exit 1
+          }
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --title "Somite $GITHUB_REF_NAME"

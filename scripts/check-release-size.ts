@@ -19,10 +19,12 @@ const client = join(repository, "web", "dist", "client");
 const generatedPath = /^(?:node_modules|target|coverage|\.somite|\.pixi|\.nextflow|\.next|\.vinext|\.wrangler|\.turbo|output|web\/dist)(?:\/|$)|\/(?:node_modules|target|coverage|\.somite|\.pixi|\.nextflow|\.next|\.vinext|\.wrangler|\.turbo)(?:\/|$)/;
 const MAX_SOURCE_FILES = 10_000;
 const argumentsList = process.argv.slice(2);
-if (argumentsList.some((argument) => argument !== "--source-only") || new Set(argumentsList).size !== argumentsList.length) {
-  throw new Error("usage: check-release-size.ts [--source-only]");
+const supportedArguments = new Set(["--source-only", "--json"]);
+if (argumentsList.some((argument) => !supportedArguments.has(argument)) || new Set(argumentsList).size !== argumentsList.length) {
+  throw new Error("usage: check-release-size.ts [--source-only] [--json]");
 }
 const sourceOnly = argumentsList.includes("--source-only");
+const json = argumentsList.includes("--json");
 
 function formatBytes(bytes: number) {
   return bytes < MIB ? `${(bytes / KIB).toFixed(1)} KiB` : `${(bytes / MIB).toFixed(2)} MiB`;
@@ -112,17 +114,27 @@ async function clientBundleProfile() {
   enforce("production client", bytes, limits.clientBytes);
   enforce("production client JavaScript", javascriptBytes, limits.clientJavaScriptBytes);
   enforce("production client CSS", cssBytes, limits.clientCssBytes);
-  return { files: files.length, bytes, javascriptBytes, cssBytes };
+  return {
+    files: files.length,
+    bytes,
+    javascriptBytes,
+    cssBytes,
+    largestJavaScriptChunkBytes: javascript.reduce((largest, file) => Math.max(largest, file.bytes), 0),
+  };
 }
 
 if (sourceOnly) {
   const source = await releaseSourceProfile(true);
-  process.stdout.write(`Release source size contract passed: ${source.files} source files / ${formatBytes(source.bytes)}\n`);
+  process.stdout.write(json
+    ? `${JSON.stringify({ schema_version: 1, source, bundle: null, limits })}\n`
+    : `Release source size contract passed: ${source.files} source files / ${formatBytes(source.bytes)}\n`);
 } else {
   const [source, bundle] = await Promise.all([releaseSourceProfile(), clientBundleProfile()]);
-  process.stdout.write([
-    `Release size contract passed: ${source.files} source files / ${formatBytes(source.bytes)}`,
-    `${bundle.files} client files / ${formatBytes(bundle.bytes)}`,
-    `${formatBytes(bundle.javascriptBytes)} JavaScript / ${formatBytes(bundle.cssBytes)} CSS`,
-  ].join("; ") + "\n");
+  process.stdout.write(json
+    ? `${JSON.stringify({ schema_version: 1, source, bundle, limits })}\n`
+    : [
+      `Release size contract passed: ${source.files} source files / ${formatBytes(source.bytes)}`,
+      `${bundle.files} client files / ${formatBytes(bundle.bytes)}`,
+      `${formatBytes(bundle.javascriptBytes)} JavaScript / ${formatBytes(bundle.cssBytes)} CSS`,
+    ].join("; ") + "\n");
 }

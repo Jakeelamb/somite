@@ -6,6 +6,8 @@ import test from "node:test";
 
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
 import { MAX_PAPER_RESOURCE_CITATIONS, MAX_PAPER_REVIEW_BYTES } from "@somite/workflow/limits";
+import type { SomiteGraph } from "@somite/workflow/model";
+import { hasOrderedPath, hasSharedRootBranch, matchingNodes } from "../../scripts/benchmark-paper-topology.ts";
 import {
   PaperReviewLimitError,
   enforcePaperReviewSize,
@@ -79,30 +81,55 @@ async function goldCases() {
   });
 }
 
-function matchingNodes(candidate: ReturnType<typeof reconstructPaper>["candidates"][number], selector: string) {
-  if (selector.startsWith("gap:")) {
-    const tool = selector.slice(4).toLocaleLowerCase("en-US").replace(/[^a-z0-9]/g, "");
-    return candidate.graph.nodes.filter((node) => node.operator === "gap.missing"
-      && String(node.params?.tool ?? "").toLocaleLowerCase("en-US").replace(/[^a-z0-9]/g, "") === tool);
-  }
-  return candidate.graph.nodes.filter((node) => node.operator === selector);
+function topologyGraph(nodes: ReadonlyArray<readonly [id: string, operator: string]>, edges: ReadonlyArray<readonly [from: string, to: string]>): SomiteGraph {
+  return {
+    schema_version: 3,
+    name: "Topology scoring fixture",
+    nodes: nodes.map(([id, operator], index) => ({
+      id,
+      operator,
+      operator_revision: "test",
+      ports: [],
+      params: {},
+      layout: { x: index * 100, y: 0 },
+    })),
+    edges: edges.map(([from, to], index) => ({
+      id: `edge-${index}`,
+      from_node: from,
+      from_port: "out",
+      to_node: to,
+      to_port: "in",
+    })),
+  };
 }
 
-function reaches(candidate: ReturnType<typeof reconstructPaper>["candidates"][number], from: string, to: string) {
-  const destinations = new Map<string, string[]>();
-  for (const edge of candidate.graph.edges) destinations.set(edge.from_node, [...(destinations.get(edge.from_node) ?? []), edge.to_node]);
-  const pending = [...matchingNodes(candidate, from).map((node) => node.id)];
-  const targets = new Set(matchingNodes(candidate, to).map((node) => node.id));
-  const seen = new Set<string>();
-  while (pending.length) {
-    const current = pending.shift()!;
-    if (targets.has(current)) return true;
-    if (seen.has(current)) continue;
-    seen.add(current);
-    pending.push(...(destinations.get(current) ?? []));
-  }
-  return false;
-}
+test("paper topology paths require one consistent chain of node instances", () => {
+  const nodes = [
+    ["source-a", "source"],
+    ["middle-a", "middle"],
+    ["middle-b", "middle"],
+    ["sink-a", "sink"],
+  ] as const;
+  const fragmented = topologyGraph(nodes, [["source-a", "middle-a"], ["middle-b", "sink-a"]]);
+  assert.equal(hasOrderedPath(fragmented, ["source", "middle", "sink"]), false);
+
+  const connected = topologyGraph(nodes, [["source-a", "middle-a"], ["middle-b", "sink-a"], ["middle-a", "sink-a"]]);
+  assert.equal(hasOrderedPath(connected, ["source", "middle", "sink"]), true);
+});
+
+test("paper topology branches require one shared root instance", () => {
+  const nodes = [
+    ["root-a", "root"],
+    ["root-b", "root"],
+    ["arm-a", "arm.a"],
+    ["arm-b", "arm.b"],
+  ] as const;
+  const splitRoots = topologyGraph(nodes, [["root-a", "arm-a"], ["root-b", "arm-b"]]);
+  assert.equal(hasSharedRootBranch(splitRoots, "root", ["arm.a", "arm.b"]), false);
+
+  const sharedRoot = topologyGraph(nodes, [["root-a", "arm-a"], ["root-b", "arm-b"], ["root-a", "arm-b"]]);
+  assert.equal(hasSharedRootBranch(sharedRoot, "root", ["arm.a", "arm.b"]), true);
+});
 
 test("paper reconstruction honors the committed evidence and graph gold corpus", async () => {
   const cases = await goldCases();
@@ -126,17 +153,17 @@ test("paper reconstruction honors the committed evidence and graph gold corpus",
     for (const operator of expected.forbiddenOperators) assert.ok(!operators.has(operator), `${expected.fixture}: forbidden operator ${operator}`);
     for (const entity of expected.unsupported) assert.ok(unsupported.has(entity), `${expected.fixture}: missing unsupported evidence ${entity}`);
     for (const path of expected.paths) {
-      assert.ok(review.candidates.some((candidate) => path.every((selector, index) => index === 0 || reaches(candidate, path[index - 1]!, selector))), `${expected.fixture}: missing path ${path.join(" > ")}`);
+      assert.ok(review.candidates.some((candidate) => hasOrderedPath(candidate.graph, path)), `${expected.fixture}: missing path ${path.join(" > ")}`);
     }
     for (const branch of expected.branches) {
-      assert.ok(review.candidates.some((candidate) => branch.arms.every((arm) => reaches(candidate, branch.root, arm))), `${expected.fixture}: missing branch ${branch.root} > ${branch.arms.join(" | ")}`);
+      assert.ok(review.candidates.some((candidate) => hasSharedRootBranch(candidate.graph, branch.root, branch.arms)), `${expected.fixture}: missing branch ${branch.root} > ${branch.arms.join(" | ")}`);
     }
     for (const alternatives of expected.alternatives) {
-      const placements = alternatives.map((selector) => review.candidates.flatMap((candidate, index) => matchingNodes(candidate, selector).length ? [index] : []));
+      const placements = alternatives.map((selector) => review.candidates.flatMap((candidate, index) => matchingNodes(candidate.graph, selector).length ? [index] : []));
       assert.ok(placements.every((indices) => indices.length === 1) && new Set(placements.flat()).size === alternatives.length, `${expected.fixture}: alternatives ${alternatives.join(" | ")} placements=${JSON.stringify(placements)}`);
     }
     for (const parameter of expected.parameters) {
-      assert.ok(review.candidates.some((candidate) => matchingNodes(candidate, parameter.selector).some((node) => String(node.params?.[parameter.name]) === parameter.value)), `${expected.fixture}: ${parameter.selector}:${parameter.name}=${parameter.value}`);
+      assert.ok(review.candidates.some((candidate) => matchingNodes(candidate.graph, parameter.selector).some((node) => String(node.params?.[parameter.name]) === parameter.value)), `${expected.fixture}: ${parameter.selector}:${parameter.name}=${parameter.value}`);
     }
     const evidenceCount = review.mentions.length + review.candidates.reduce((total, candidate) => total + candidate.evidence.length, 0);
     assert.ok(evidenceCount >= expected.minimumEvidence, `${expected.fixture}: evidence count ${evidenceCount} < ${expected.minimumEvidence}`);

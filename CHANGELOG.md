@@ -48,6 +48,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and retains structured diagnostic reports without expanding the fixed corpus.
 - Enforced source and production-client size budgets, including rejection of
   tracked generated state and oversized browser chunks.
+- Versioned deterministic and release-trend benchmark receipts with paired
+  same-host comparison, CPU and heap profiling tasks, adjudicated outcome
+  digests, and machine-readable bundle budgets.
+- A clean committed-source proof that installs, builds, launches, health-checks,
+  and shuts down the source archive before releases are published.
 - A project-local Operator Workshop where agents can draft evidence-backed
   `project.*` contracts, prove them through isolated frozen fixture runs, and
   leave final catalog acceptance to the user.

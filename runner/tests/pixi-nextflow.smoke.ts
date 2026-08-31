@@ -66,6 +66,7 @@ test("RunManager completes representative validation through real Pixi and Nextf
   assert.match(lock, /nextflow/);
   assert.match(lock, /openjdk/);
   const lockDigest = byteDigest(lockBytes).slice("blake3:".length);
+  process.stdout.write(`SOMITE_MANAGED_LOCK_DIGEST blake3:${lockDigest}\n`);
   const manifestDigest = byteDigest(await readFile(join(packageRoot, "pixi.toml"))).slice("blake3:".length);
   await assert.rejects(lstat(join(projectRoot, ".somite", "pixi", "environments")), { code: "ENOENT" });
   const platformRoot = join(cacheRoot, "v1", pixiPlatform());

@@ -42,28 +42,42 @@ test("commands use argument arrays and return bounded evidence", async () => {
   assert.equal(result.command[0], "node");
 });
 
-test("command cancellation kills an owned process tree and settles", { skip: process.platform === "win32", timeout: 8_000 }, async () => {
+test("command cancellation kills an owned process tree after its leader exits and settles", { skip: process.platform === "win32", timeout: 8_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "somite-command-tree-"));
   const pidFile = join(root, "descendant.pid");
   const controller = new AbortController();
+  let running: ReturnType<typeof runCommand> | undefined;
   try {
     const script = `
       const { spawn } = require("node:child_process");
       const { writeFileSync } = require("node:fs");
-      const child = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: "ignore" });
-      writeFileSync(${JSON.stringify(pidFile)}, String(child.pid));
-      process.on("SIGTERM", () => {});
+      process.on("SIGTERM", () => process.exit(0));
+      const child = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); process.stdout.write('ready'); setInterval(() => {}, 1000)"], { stdio: ["ignore", "pipe", "ignore"] });
+      child.stdout.once("data", () => writeFileSync(${JSON.stringify(pidFile)}, String(child.pid)));
       setInterval(() => {}, 1000);
     `;
-    const running = runCommand(process.execPath, ["-e", script], root, { signal: controller.signal, timeoutMs: 7_000 });
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    running = runCommand(process.execPath, ["-e", script], root, { signal: controller.signal, timeoutMs: 7_000 });
+    let descendant: number | undefined;
+    const readyDeadline = Date.now() + 3_000;
+    while (descendant === undefined) {
+      try {
+        descendant = Number(await readFile(pidFile, "utf8"));
+      } catch (cause) {
+        if ((cause as NodeJS.ErrnoException).code !== "ENOENT") throw cause;
+      }
+      if (descendant === undefined) {
+        if (Date.now() >= readyDeadline) throw new Error("stubborn command tree did not become ready");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
     controller.abort();
     const result = await running;
     assert.equal(result.ok, false);
     assert.equal(result.signal, "SIGKILL");
-    const descendant = Number(await readFile(pidFile, "utf8"));
     assert.throws(() => process.kill(descendant, 0), (cause: unknown) => (cause as NodeJS.ErrnoException).code === "ESRCH");
   } finally {
+    controller.abort();
+    await running?.catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   }
 });

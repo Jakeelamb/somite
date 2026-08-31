@@ -1,0 +1,49 @@
+name: Continuous benchmark snapshots
+
+on:
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: continuous-benchmarks
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    name: Outcome and release snapshot
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Set up locked Pixi environment
+        uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
+        with:
+          pixi-version: v0.77.1
+          locked: true
+          cache: true
+          cache-write: false
+          activate-environment: true
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Measure deterministic outcomes
+        run: npm run benchmark:quick
+      - name: Measure production and real-tool snapshot
+        run: npm run benchmark:release
+      - name: Prove the committed source archive
+        run: npm run proof:source
+      - name: Upload benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: continuous-benchmark-snapshots-${{ github.run_id }}-${{ github.run_attempt }}
+          path: output/benchmarks/*.json
+          if-no-files-found: warn
+          retention-days: 30

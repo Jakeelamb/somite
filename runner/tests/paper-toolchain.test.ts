@@ -48,8 +48,9 @@ async function processExited(pid: number) {
   return false;
 }
 
-async function recordedPids(path: string) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+async function recordedPids(path: string, timeoutMs = 5_000) {
+  const started = Date.now();
+  while (Date.now() - started <= timeoutMs) {
     try {
       return JSON.parse(await readFile(path, "utf8")) as { parent: number; child: number };
     } catch {
@@ -207,6 +208,8 @@ test("OCR cancellation terminates the process tree and removes private raster wo
   const root = await mkdtemp(join(tmpdir(), "somite-paper-ocr-cancel-"));
   const pidRecord = join(root, "pids.json");
   const prefixRecord = join(root, "prefix.txt");
+  const controller = new AbortController();
+  let extraction: ReturnType<typeof extractPaper> | undefined;
   try {
     const bin = join(root, ".somite", "tools", "paper", ".pixi", "envs", "default", "bin");
     await fakeOcrTools(bin, {
@@ -219,11 +222,11 @@ test("OCR cancellation terminates the process tree and removes private raster wo
         setInterval(() => {}, 1000);
       `,
     });
-    const controller = new AbortController();
-    const extraction = extractPaper(pdfWithText(""), "pdf", {
+    extraction = extractPaper(pdfWithText(""), "pdf", {
       signal: controller.signal,
       ocr: { toolchain: new PaperToolchain(root), commandTimeoutMs: 30_000 },
     });
+    void extraction.catch(() => undefined);
     const pids = await recordedPids(pidRecord);
     controller.abort();
     await assert.rejects(extraction, (error: unknown) => error instanceof PaperExtractionError && error.code === "paper_extraction_cancelled");
@@ -233,11 +236,13 @@ test("OCR cancellation terminates the process tree and removes private raster wo
     await assert.rejects(() => lstat(dirname(rasterPrefix)), /ENOENT/);
     await assert.rejects(() => readFile(`${rasterPrefix}.png`), /ENOENT/);
   } finally {
+    controller.abort();
+    await extraction?.catch(() => undefined);
     await rm(root, { recursive: true, force: true });
   }
 });
 
-test("OCR enforces a per-command timeout and kills the timed-out tool", { skip: process.platform === "win32" }, async () => {
+test("OCR enforces a per-command timeout and kills the timed-out tool", { skip: process.platform === "win32", timeout: 15_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "somite-paper-ocr-timeout-"));
   const pidRecord = join(root, "pids.json");
   try {
@@ -252,8 +257,8 @@ test("OCR enforces a per-command timeout and kills the timed-out tool", { skip: 
       `,
     });
     await assert.rejects(
-      () => extractPaper(pdfWithText(""), "pdf", { ocr: { toolchain: new PaperToolchain(root), commandTimeoutMs: 100 } }),
-      (error: unknown) => error instanceof PaperExtractionError && error.code === "paper_extraction_timeout",
+      () => extractPaper(pdfWithText(""), "pdf", { ocr: { toolchain: new PaperToolchain(root), commandTimeoutMs: 2_000 } }),
+      (error: unknown) => error instanceof PaperExtractionError && error.code === "paper_extraction_timeout" && /tesseract/i.test(error.message),
     );
     const pids = await recordedPids(pidRecord);
     assert.equal(await processExited(pids.parent), true, `timed-out OCR parent ${pids.parent} survived`);
