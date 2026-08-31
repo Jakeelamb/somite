@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -33,8 +33,8 @@ async function terminalStatus(manager: RunManager, id: string) {
 
 test("RunManager completes representative validation through real Pixi and Nextflow", { timeout: 20 * 60_000 }, async (context) => {
   assert.notEqual(process.platform, "win32", "the real execution smoke requires a supported POSIX host");
-  const projectRoot = await mkdtemp(join(tmpdir(), "somite-pixi-nextflow-smoke-"));
-  const cacheParent = await mkdtemp(join(tmpdir(), "somite-pixi-nextflow-cache-"));
+  const projectRoot = await realpath(await mkdtemp(join(tmpdir(), "somite-pixi-nextflow-smoke-")));
+  const cacheParent = await realpath(await mkdtemp(join(tmpdir(), "somite-pixi-nextflow-cache-")));
   const cacheRoot = join(cacheParent, "pixi");
   const previousCacheRoot = process.env.SOMITE_PIXI_CACHE_DIR;
   process.env.SOMITE_PIXI_CACHE_DIR = cacheRoot;

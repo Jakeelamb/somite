@@ -12,7 +12,10 @@ test("Nextflow server negotiates MCP v2 and advertises its complete typed surfac
   const client = new Client({ name: "nextflow-mcp-test", version: "1.0.0" });
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: ["--experimental-strip-types", new URL("../src/server.ts", import.meta.url).pathname, "--workspace-root", root],
+    args: [
+      "--experimental-strip-types", new URL("../src/server.ts", import.meta.url).pathname,
+      "--workspace-root", root, "--binary", join(root, "missing-nextflow"),
+    ],
     cwd: root,
     stderr: "pipe",
   });
@@ -33,6 +36,7 @@ test("Nextflow server negotiates MCP v2 and advertises its complete typed surfac
     "nextflow://docs/catalog", "nextflow://guidance/validation-ladder", "nextflow://policy/execution",
   ]);
   const result = await client.callTool({ name: "nextflow_runtime_info", arguments: {} });
-  assert.notEqual(result.isError, true);
+  assert.equal(result.isError, true);
   assert.equal(typeof result.structuredContent, "object");
+  assert.equal((result.structuredContent as { ok?: unknown }).ok, false);
 });

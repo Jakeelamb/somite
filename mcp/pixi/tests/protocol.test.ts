@@ -12,7 +12,10 @@ test("Pixi server negotiates MCP v2 and advertises its complete typed surface", 
   const client = new Client({ name: "pixi-mcp-test", version: "1.0.0" });
   const transport = new StdioClientTransport({
     command: process.execPath,
-    args: ["--experimental-strip-types", new URL("../src/server.ts", import.meta.url).pathname, "--workspace-root", root],
+    args: [
+      "--experimental-strip-types", new URL("../src/server.ts", import.meta.url).pathname,
+      "--workspace-root", root, "--binary", join(root, "missing-pixi"),
+    ],
     cwd: root,
     stderr: "pipe",
   });
@@ -29,6 +32,8 @@ test("Pixi server negotiates MCP v2 and advertises its complete typed surface", 
   assert.ok(tools.tools.every((tool) => tool.inputSchema && tool.outputSchema && tool.annotations));
   const resources = await client.listResources();
   assert.deepEqual(resources.resources.map((resource) => resource.uri).sort(), ["pixi://docs/catalog", "pixi://policy/execution"]);
-  const result = await client.callTool({ name: "pixi_inspect", arguments: { view: "global" } });
+  const result = await client.callTool({ name: "pixi_runtime_info", arguments: {} });
+  assert.equal(result.isError, true);
   assert.equal(typeof result.structuredContent, "object");
+  assert.equal((result.structuredContent as { ok?: unknown }).ok, false);
 });
