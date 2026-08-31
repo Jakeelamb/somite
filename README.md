@@ -340,7 +340,8 @@ and runs the runner, shared-workflow, and UI tests.
 Chromium and checks document persistence, Agent controls, local and public data,
 local Snakemake and pinned Nextflow workflows, paper reconstruction, readiness,
 and validate/run/export control journeys. The Agent journey makes one real turn
-through Somite, Pixi, Nextflow, and back to Somite readiness. Set
+through Somite and verifies cross-server ACP/MCP routing with exact Pixi and
+Nextflow version-contract fixtures before returning to Somite readiness. Set
 `SOMITE_BROWSER_PATH` when the
 browser is not in a standard system location; this deterministic gate does not
 replace real workflow execution.
@@ -359,7 +360,16 @@ exercises the runner directly, then drives the built browser through validation,
 execution, durable evidence, and ZIP export for a tiny FastQC workflow using the
 real Pixi lock/install and Nextflow path. The direct smoke also imports a fresh
 locked-Pixi Nextflow directory, previews it, and executes one real source task.
-It does not use fake executables.
+It does not use fake executables. The MCP-specific portion keeps documentation
+and discovery networks out of this gate; its Pixi proof uses a local task and
+its Nextflow fixture runs offline with version checks disabled.
+
+`npm run canary:mcp:live` is the separate upstream contract check. It searches
+and reads the complete pinned Pixi and Nextflow manuals, exercises Pixi package
+discovery plus a real solve/install/export, and checks Nextflow module discovery
+through the MCP servers. Scheduled CI runs it serially once a week, and it can
+also be dispatched manually; its result is operational evidence, not a release
+or performance gate.
 
 `npm run challenge:live` adds a separate compatibility lane. It selects one
 recent open-access methods paper and one current nf-core release that are absent

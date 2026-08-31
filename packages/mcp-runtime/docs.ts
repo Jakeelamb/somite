@@ -82,9 +82,11 @@ export class OfficialDocumentation {
   #corpus?: Promise<void>;
   readonly source: DocumentationSource;
   readonly #cacheDirectory: string;
+  readonly #fetch: typeof fetch;
 
-  constructor(source: DocumentationSource, cacheRoot = documentationCacheRoot()) {
+  constructor(source: DocumentationSource, cacheRoot = documentationCacheRoot(), fetcher: typeof fetch = globalThis.fetch) {
     this.source = source;
+    this.#fetch = fetcher;
     const key = createHash("sha256").update(JSON.stringify({
       schema: 1,
       repository: source.repository,
@@ -108,7 +110,7 @@ export class OfficialDocumentation {
         // A malformed public cache entry is ignored and replaced from upstream.
       }
     }
-    const response = await fetch(`https://api.github.com/repos/${this.source.repository}/git/trees/${encodeURIComponent(this.source.branch)}?recursive=1`, {
+    const response = await this.#fetch(`https://api.github.com/repos/${this.source.repository}/git/trees/${encodeURIComponent(this.source.branch)}?recursive=1`, {
       signal: fetchSignal(signal),
       headers: { Accept: "application/vnd.github+json", "User-Agent": "somite-mcp" },
     });
@@ -176,7 +178,7 @@ export class OfficialDocumentation {
     const cached = await this.readCache(cachePath, MAX_DOCUMENT_BYTES);
     if (cached !== undefined) return cached;
     const sourcePath = `${this.source.directory.replace(/\/$/, "")}/${path}`;
-    const response = await fetch(`https://raw.githubusercontent.com/${this.source.repository}/${encodeURIComponent(this.source.branch)}/${sourcePath}`, {
+    const response = await this.#fetch(`https://raw.githubusercontent.com/${this.source.repository}/${encodeURIComponent(this.source.branch)}/${sourcePath}`, {
       signal: fetchSignal(signal),
       headers: { "User-Agent": "somite-mcp" },
     });
@@ -238,3 +240,5 @@ export class OfficialDocumentation {
     return new URL(`${withoutExtension}${withoutExtension ? "/" : ""}`, this.source.website).toString();
   }
 }
+
+export type DocumentationProvider = Pick<OfficialDocumentation, "source" | "catalog" | "search" | "read">;

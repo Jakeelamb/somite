@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import test from "node:test";
 
 import { chromium, type Browser, type Locator, type Page, type Route } from "playwright-core";
@@ -99,8 +99,26 @@ test.after(async () => {
 });
 
 test("production workbench persists its name, applies one undoable Agent MCP edit, and adds searched public reads", { timeout: 90_000 }, async (context) => {
-  const app = await startProductionApp();
-  context.after(app.stop);
+  const toolchainRoot = await mkdtemp(join(tmpdir(), "somite-browser-agent-toolchain-"));
+  const toolchainBin = join(toolchainRoot, "bin");
+  await mkdir(toolchainBin);
+  const pixi = join(toolchainBin, "pixi");
+  const nextflow = join(toolchainBin, "nextflow");
+  await Promise.all([
+    writeFile(pixi, "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = \"--version\" ] || exit 64\nprintf '%s\\n' 'pixi 0.77.1'\n"),
+    writeFile(nextflow, "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = \"-version\" ] || exit 64\nprintf '%s\\n' 'nextflow version 26.04.6'\n"),
+  ]);
+  await Promise.all([chmod(pixi, 0o755), chmod(nextflow, 0o755)]);
+  const app = await startProductionApp({
+    environment: { PATH: `${toolchainBin}${process.env.PATH ? `${delimiter}${process.env.PATH}` : ""}` },
+  }).catch(async (cause) => {
+    await rm(toolchainRoot, { recursive: true, force: true });
+    throw cause;
+  });
+  context.after(async () => {
+    await app.stop();
+    await rm(toolchainRoot, { recursive: true, force: true });
+  });
   const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
   context.after(() => page.close());
   const assertNoPageErrors = watchPage(page);

@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
-import { OfficialDocumentation } from "@somite/mcp-runtime/docs";
+import { OfficialDocumentation, type DocumentationProvider } from "@somite/mcp-runtime/docs";
 import { VersionedCommandRunner, WorkspaceBoundary, jsonToolResult, parseServerOptions, toolResult } from "@somite/mcp-runtime";
 import { z } from "zod/v4";
 
@@ -10,6 +10,13 @@ import {
 } from "./commands.ts";
 
 export const SUPPORTED_NEXTFLOW_VERSION = "26.04.6";
+export const NEXTFLOW_DOCUMENTATION_SOURCE = {
+  name: "Nextflow",
+  repository: "nextflow-io/nextflow",
+  branch: `v${SUPPORTED_NEXTFLOW_VERSION}`,
+  directory: "docs",
+  website: "https://docs.seqera.io/nextflow/",
+} as const;
 
 const commandOutput = z.object({
   command: z.array(z.string()), cwd: z.string(), exit_code: z.number().int().nullable(), signal: z.string().nullable(),
@@ -33,26 +40,20 @@ const projectInput = z.discriminatedUnion("action", [
 ]);
 const params = z.record(identifier, z.union([z.string().max(4_096), z.number().finite(), z.boolean()]));
 
-const docs = new OfficialDocumentation({
-  name: "Nextflow",
-  repository: "nextflow-io/nextflow",
-  branch: `v${SUPPORTED_NEXTFLOW_VERSION}`,
-  directory: "docs",
-  website: "https://docs.seqera.io/nextflow/",
-});
+const defaultDocs = new OfficialDocumentation(NEXTFLOW_DOCUMENTATION_SOURCE);
 const readOnly = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
 const remoteRead = { ...readOnly, openWorldHint: true } as const;
 const execution = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true } as const;
 const destructive = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true } as const;
 
-export function createNextflowServer(boundary: WorkspaceBoundary, binary = "nextflow") {
+export function createNextflowServer(boundary: WorkspaceBoundary, binary = "nextflow", docs: DocumentationProvider = defaultDocs) {
   const server = new McpServer({ name: "somite-nextflow", title: "Nextflow", version: "0.1.0" });
   const runner = new VersionedCommandRunner({
     binary,
     cwd: boundary.root,
     supportedVersion: SUPPORTED_NEXTFLOW_VERSION,
     versionArgs: ["-version"],
-    environment: { NXF_AGENT_MODE: "true", NXF_ANSI_LOG: "false" },
+    environment: { NXF_AGENT_MODE: "true", NXF_ANSI_LOG: "false", NXF_DISABLE_CHECK_LATEST: "true" },
   });
   const execute = (args: string[], signal: AbortSignal, timeoutMs = 120_000) => runner.run(args, { signal, timeoutMs });
 

@@ -272,6 +272,11 @@ content, and scientific difficulty change from run to run. This is valuable
 compatibility evidence, but it is not a stable performance workload and must
 never be promoted into a baseline automatically.
 
+The scheduled `npm run canary:mcp:live` check follows the same boundary: it
+monitors official documentation, package discovery and installation, and module
+discovery, but none of its network time enters a benchmark series or release
+decision.
+
 Keep live unseen reports separate from `benchmark:quick`, `benchmark:release`,
 and `benchmark:compare`. Only a reviewed, pinned, versioned fixture with an
 explicit scorer may enter the benchmark corpus. Updating the fixture or scorer

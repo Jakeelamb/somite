@@ -55,18 +55,8 @@ test("Nextflow MCP lints, previews, executes a real fixture, and returns evidenc
   ]);
 
   await client.connect(transport);
-  const docs = await client.readResource({ uri: "nextflow://docs/catalog" });
-  const docsContent = docs.contents[0];
-  assert.ok(docsContent && "text" in docsContent);
-  const docsCatalog = JSON.parse(docsContent.text) as { revision?: string; pages?: string[] };
-  assert.equal(docsCatalog.revision, "v26.04.6");
-  assert.ok((docsCatalog.pages?.length ?? 0) >= 100);
-  const docsSearch = await call(client, "nextflow_docs_search", { query: "preview stub-run process execution", limit: 10 });
-  assert.match(JSON.stringify(docsSearch.structuredContent), /cli|execution|process/);
   const runtime = await call(client, "nextflow_runtime_info", {});
   assert.match(JSON.stringify(runtime.structuredContent), /26\.04\.6/);
-  const moduleSearch = await call(client, "nextflow_module", { action: "search", query: "fastqc", limit: 5 });
-  assert.match(JSON.stringify(moduleSearch.structuredContent), /nf-core\/fastqc/);
   await call(client, "nextflow_analyze", { action: "lint", source: "local", project: "." });
   await call(client, "nextflow_analyze", { action: "preview_dag", source: "local", project: ".", dag_file: "preview.html" });
   assert.ok((await stat(join(root, "preview.html"))).isFile());
@@ -77,6 +67,7 @@ test("Nextflow MCP lints, previews, executes a real fixture, and returns evidenc
     project: ".",
     parameters: { input: "fixture.txt" },
     run_name: "somite_mcp_fixture",
+    offline: true,
     work_dir: "work",
     trace_file: "trace.tsv",
     report_file: "report.html",

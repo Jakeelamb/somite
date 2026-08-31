@@ -117,6 +117,10 @@ import { appendFile, lstat, mkdir, readFile, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path";
 const args = process.argv.slice(2);
 await appendFile(join(dirname(process.argv[1]), "invocations.log"), args[0] + "\\n");
+if (args[0] === "run" && process.env.NXF_DISABLE_CHECK_LATEST !== "true") {
+  process.stderr.write("Nextflow latest-version check was not disabled\\n");
+  process.exit(42);
+}
 if (args[0] === "lock") {
   const manifest = args[args.indexOf("--manifest-path") + 1];
   const delay = Number(process.env.SOMITE_MOCK_LOCK_DELAY_MS ?? 0);

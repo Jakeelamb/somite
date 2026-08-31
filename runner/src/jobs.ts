@@ -719,6 +719,7 @@ export class RunManager {
           {
             cwd: job.packagePath,
             detached: process.platform !== "win32",
+            env: { ...process.env, NXF_DISABLE_CHECK_LATEST: "true" },
             windowsHide: true,
             stdio: ["ignore", stdout.fd, stderr.fd],
           },
@@ -787,6 +788,7 @@ export class RunManager {
         {
           cwd: job.packagePath,
           detached: process.platform !== "win32",
+          env: { ...process.env, NXF_DISABLE_CHECK_LATEST: "true" },
           windowsHide: true,
           stdio: ["ignore", stdout.fd, stderr.fd],
         },

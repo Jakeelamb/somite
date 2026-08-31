@@ -1,6 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
-import { OfficialDocumentation } from "@somite/mcp-runtime/docs";
+import { OfficialDocumentation, type DocumentationProvider } from "@somite/mcp-runtime/docs";
 import { VersionedCommandRunner, WorkspaceBoundary, jsonToolResult, parseServerOptions, toolResult } from "@somite/mcp-runtime";
 import { z } from "zod/v4";
 
@@ -17,6 +17,13 @@ import {
 } from "./commands.ts";
 
 export const SUPPORTED_PIXI_VERSION = "0.77.1";
+export const PIXI_DOCUMENTATION_SOURCE = {
+  name: "Pixi",
+  repository: "prefix-dev/pixi",
+  branch: `v${SUPPORTED_PIXI_VERSION}`,
+  directory: "docs",
+  website: "https://pixi.prefix.dev/latest/",
+} as const;
 
 const commandOutput = z.object({
   command: z.array(z.string()), cwd: z.string(), exit_code: z.number().int().nullable(), signal: z.string().nullable(),
@@ -34,19 +41,13 @@ const relativePath = z.string().min(1).max(1_024).describe("Path relative to the
 const identifier = z.string().regex(/^[A-Za-z0-9_.-]{1,128}$/);
 const manifestPath = relativePath.optional().describe("Workspace directory or pixi.toml/pyproject.toml path, relative to the configured root.");
 
-const docs = new OfficialDocumentation({
-  name: "Pixi",
-  repository: "prefix-dev/pixi",
-  branch: `v${SUPPORTED_PIXI_VERSION}`,
-  directory: "docs",
-  website: "https://pixi.prefix.dev/latest/",
-});
+const defaultDocs = new OfficialDocumentation(PIXI_DOCUMENTATION_SOURCE);
 
 const readOnly = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
 const localWrite = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
 const execution = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true } as const;
 
-export function createPixiServer(boundary: WorkspaceBoundary, binary = "pixi") {
+export function createPixiServer(boundary: WorkspaceBoundary, binary = "pixi", docs: DocumentationProvider = defaultDocs) {
   const server = new McpServer({ name: "somite-pixi", title: "Pixi", version: "0.1.0" });
   const runner = new VersionedCommandRunner({
     binary,

@@ -18,6 +18,6 @@ The execution modes are intentionally different:
 - `fixture` is a real execution and therefore requires explicit fixture parameters, a params file, or the conventional `test`/`test_full` profile.
 - `full` is an ordinary production-data execution.
 
-Nextflow 26.04.6 has no `logfile` command; raw `.nextflow.log` files are read through the contained storage tool. `self-update` is excluded because it would invalidate this version-matched contract. Interactive console, authentication configuration, Kubernetes login, secret reads, credential-bearing URLs, and arbitrary plugin commands are also excluded.
+Nextflow 26.04.6 has no `logfile` command; raw `.nextflow.log` files are read through the contained storage tool. `self-update` and the launcher's latest-version check are disabled because they would invalidate or add remote state to this pinned contract. Interactive console, authentication configuration, Kubernetes login, secret reads, credential-bearing URLs, and arbitrary plugin commands are also excluded.
 
-`npm run smoke:execution` drives a real MCP client through nf-core module discovery, lint, preview DAG construction, real fixture execution, trace/report/timeline generation, run-history lookup, and evidence-file reading.
+The Nextflow MCP case inside `npm run smoke:execution` drives a real client through local lint, preview DAG construction, offline fixture execution, trace/report/timeline generation, run-history lookup, and evidence-file reading. `npm run canary:mcp:live` separately checks the complete pinned manual and nf-core module discovery. CI runs that upstream canary only on its schedule or by manual dispatch, so registry availability does not decide a source release.
