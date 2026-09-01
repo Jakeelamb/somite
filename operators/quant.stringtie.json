@@ -21,10 +21,10 @@
   "argv": [
     "stringtie",
     "{input.bam}",
-    "-G", "{input.gtf}",
+    "?gtf:-G", "?gtf:{input.gtf}",
     "-o", "{work}/out/transcripts.gtf"
   ],
   "outputs": {
-    "abund": { "glob": "{work}/out/transcripts.gtf", "type": "Gtf", "optional": true }
+    "abund": { "glob": "{work}/out/transcripts.gtf", "type": "Gtf" }
   }
 }

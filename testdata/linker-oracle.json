@@ -1,12 +1,12 @@
 {
   "draft": {
     "schema_version": 1,
-    "graph_revision": "blake3:8faa17898bcf575f4fe387e975dc7cdd4095c9ca5bf296aabb63d442df945694",
+    "graph_revision": "blake3:abfa346b8ef0a356ea2bd933a8a0f278c6601131a99fa54d9d02f251f29a8a0c",
     "target_platform": "linux-64",
     "operators": [
       {
         "operator_id": "files.import",
-        "revision": "blake3:4919927a3059aa4543d45380fd700993964e3e239ceb9e3fda73b5956b89bc4a"
+        "revision": "blake3:7941f364ee2ab61ac7257b0c9874a0c2ba45352f74fe63c50d282469e7ed3883"
       },
       {
         "operator_id": "qc.fastqc",
@@ -20,13 +20,13 @@
   },
   "closure": {
     "schema_version": 1,
-    "closure_digest": "blake3:0dbd54c656207ebdcfa9d2d172eea2e971b55f3a5b35db95a463f9013c2b9bef",
-    "graph_revision": "blake3:8faa17898bcf575f4fe387e975dc7cdd4095c9ca5bf296aabb63d442df945694",
+    "closure_digest": "blake3:d1a1a602239780dedfc8e2f95fd716e279d70538068dcca3ea2b6ced80990372",
+    "graph_revision": "blake3:abfa346b8ef0a356ea2bd933a8a0f278c6601131a99fa54d9d02f251f29a8a0c",
     "target_platform": "linux-64",
     "operators": [
       {
         "operator_id": "files.import",
-        "revision": "blake3:4919927a3059aa4543d45380fd700993964e3e239ceb9e3fda73b5956b89bc4a"
+        "revision": "blake3:7941f364ee2ab61ac7257b0c9874a0c2ba45352f74fe63c50d282469e7ed3883"
       },
       {
         "operator_id": "qc.fastqc",
@@ -42,10 +42,10 @@
     "openjdk_identity": "openjdk@25.0.2"
   },
   "evidence": {
-    "receipt_digest": "blake3:a33261664df29c8d2466ef8e0bd1be1f0727d9b512a8388d94f0428ff2c04751",
+    "receipt_digest": "blake3:9cff4e644a44345e6a90627b2ef3e16e27da737687d58f7f3784e20982ce347d",
     "recorded_at_unix_ms": 1787718000000,
-    "subject_digest": "blake3:8faa17898bcf575f4fe387e975dc7cdd4095c9ca5bf296aabb63d442df945694",
-    "observed_closure_digest": "blake3:0dbd54c656207ebdcfa9d2d172eea2e971b55f3a5b35db95a463f9013c2b9bef",
+    "subject_digest": "blake3:abfa346b8ef0a356ea2bd933a8a0f278c6601131a99fa54d9d02f251f29a8a0c",
+    "observed_closure_digest": "blake3:d1a1a602239780dedfc8e2f95fd716e279d70538068dcca3ea2b6ced80990372",
     "kind": "configuration_validation",
     "scope": "graph_e2e",
     "configuration_digest": "blake3:fixture-config",
@@ -70,7 +70,7 @@
     ]
   },
   "operator_manifest_digests": {
-    "files.import": "blake3:a07af27d68dc8d73ca528e224b2a1620fba544a3ad9a5bece487e45102dcb5b2",
+    "files.import": "blake3:a3e6f8104a0feabae64207312715ae97abb0cef7dd9d2e590edb1207044a119a",
     "qc.fastqc": "blake3:868998a1859d3a579c02e80b91fe086de90f11493707e1e117450a315babba03"
   }
 }

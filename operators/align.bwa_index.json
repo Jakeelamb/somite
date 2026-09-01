@@ -1,0 +1,22 @@
+{
+  "id": "align.bwa_index",
+  "title": "Build BWA index",
+  "palette": ["Alignment"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "bwa",
+  "pixi": ["bioconda::bwa"],
+  "params": {},
+  "ports": {
+    "in": [{ "name": "ref", "type": "Fasta" }],
+    "out": [{ "name": "index", "type": "Directory", "resource_profile": "bwa-index" }]
+  },
+  "argv": [
+    "bwa", "index",
+    "-p", "{work}/out/index",
+    "{input.ref}"
+  ],
+  "outputs": {
+    "index": { "glob": "{work}/out", "type": "Directory" }
+  }
+}

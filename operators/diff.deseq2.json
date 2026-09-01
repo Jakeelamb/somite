@@ -5,12 +5,10 @@
   "paper": {
     "aliases": ["DESeq2"],
     "operation_class": "differential_expression",
-    "assays": ["rna-seq"]
+    "assays": ["rna-seq", "single-cell"]
   },
-  "kind": "external",
+  "kind": "reference",
   "cost": "high",
-  "bin": "Rscript",
-  "pixi": ["bioconda::bioconductor-deseq2"],
   "params": {
     "design": { "type": "string", "label": "Design", "page": "DESeq2", "default": "~ condition" }
   },
@@ -18,12 +16,24 @@
     "in": [{ "name": "counts", "type": "Table" }],
     "out": [{ "name": "results", "type": "Table" }]
   },
-  "argv": [
-    "Rscript",
-    "-e",
-    "message('DESeq2: counts at {input.counts}; write results under {work}/out')"
-  ],
-  "outputs": {
-    "results": { "glob": "{work}/out/*.csv", "type": "Table", "optional": true }
+  "resolution": {
+    "kind": "adapter",
+    "title": "Add a reviewed DESeq2 analysis adapter",
+    "detail": "A count table and design string are not enough to define a DESeq2 analysis. Somite retains this method without pretending that a placeholder R expression produces valid results.",
+    "action_label": "Ask Agent to add it",
+    "recipes": [
+      {
+        "id": "deseq2-analysis-adapter-v1",
+        "title": "Build a tested DESeq2 analysis",
+        "summary": "Define sample metadata, the design formula, contrasts, filtering, and emitted result tables as one reviewed contract.",
+        "version": "1",
+        "kind": "adapter_contract",
+        "steps": [
+          "Attach a sample metadata table whose rows match the count matrix columns.",
+          "Record the exact design formula, contrasts, and filtering choices.",
+          "Run a representative fixture and verify the emitted result schema before accepting the adapter."
+        ]
+      }
+    ]
   }
 }

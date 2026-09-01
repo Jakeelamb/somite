@@ -32,6 +32,7 @@ import { InputOriginError, InputOrigins } from "./inputOrigins.ts";
 import { FrozenPackageSizeError, RunManager } from "./jobs.ts";
 import { LiteratureGateway } from "./literatureGateway.ts";
 import { ManagedResourceManager } from "./managedResources.ts";
+import { GithubGateway } from "./githubGateway.ts";
 import { NfcoreGateway } from "./nfcoreGateway.ts";
 import { OperatorWorkshop, type OperatorEvidenceSource } from "./operatorWorkshop.ts";
 import { PaperExtractionError } from "./paperExtractor.ts";
@@ -65,6 +66,7 @@ type ProjectState = {
   operators: PinnedOperator[];
   availableBinaries: Set<string>;
   runs: RunManager;
+  github: GithubGateway;
   nfcore: NfcoreGateway;
   snakemake: SnakemakeGateway;
   projects: ProjectGateway;
@@ -357,6 +359,7 @@ async function initializeProject(serverUrl: string, options: ServerOptions): Pro
     managedResourceResolver: (reference) => resources.resolve(reference),
   });
   const nfcore = new NfcoreGateway(root, catalogLoaded.catalog);
+  const github = new GithubGateway(root, catalogLoaded.catalog);
   const papers = new PaperManager(root, catalogLoaded.catalog, catalogLoaded.revision, paperConfiguration);
   let project!: ProjectState;
   const operatorWorkshop = new OperatorWorkshop({
@@ -375,6 +378,7 @@ async function initializeProject(serverUrl: string, options: ServerOptions): Pro
     operators: [...catalogLoaded.catalog.values()].filter((operator) => !operator.id.startsWith("nf.") && !operator.id.startsWith("smk.")),
     availableBinaries,
     runs,
+    github,
     nfcore,
     snakemake,
     projects,
@@ -414,6 +418,7 @@ async function refreshProjectCatalog(state: ProjectState, directories: readonly 
   state.operators = [...loaded.catalog.values()].filter((operator) => !operator.id.startsWith("nf.") && !operator.id.startsWith("smk."));
   state.availableBinaries = availableBinaries;
   state.runs.updateCatalog(loaded.catalog);
+  state.github.updateCatalog(loaded.catalog);
   state.nfcore.updateCatalog(loaded.catalog);
   state.snakemake.updateCatalog(loaded.catalog);
   state.projects.updateCatalog(loaded.catalog);
@@ -433,6 +438,12 @@ function knownFields(value: Record<string, unknown>, label: string, allowed: rea
 
 function requiredString(value: unknown, label: string) {
   if (typeof value !== "string" || !value.trim()) throw new HttpError(400, `${label} must be a non-empty string`);
+  return value;
+}
+
+function optionalString(value: unknown, label: string) {
+  if (value === undefined) return "";
+  if (typeof value !== "string") throw new HttpError(400, `${label} must be a string`);
   return value;
 }
 
@@ -771,13 +782,12 @@ async function commitAgentMutation(
   return response!;
 }
 
-async function resolveAgentNfcore(state: ProjectState, value: unknown) {
-  const body = object(value, "agent nf-core import");
-  knownFields(body, "agent nf-core import", ["workflow", "revision", "base_state_revision", "idempotency_key", "summary"]);
-  const fields = agentEditFields(body);
-  const workflow = requiredString(body.workflow, "workflow");
-  const revision = requiredString(body.revision, "revision");
-  const requestDigest = canonicalJsonDigest(body);
+async function commitAgentSourceImport(
+  state: ProjectState,
+  fields: ReturnType<typeof agentEditFields>,
+  requestDigest: string,
+  load: () => Promise<Readonly<{ graph: SomiteGraph }>>,
+) {
   await state.writeChain;
   const replay = state.transactionReplays.get(fields.idempotencyKey);
   if (replay) {
@@ -789,12 +799,31 @@ async function resolveAgentNfcore(state: ProjectState, value: unknown) {
   if (fields.baseStateRevision !== currentRevision) throw new HttpError(409, "canvas changed since this import started", { state_revision: currentRevision });
   state.inputOrigins.requireRecovered();
   if (state.graph.nodes.length || state.graph.edges.length) throw new HttpError(422, "source workflow import requires an empty canvas");
-  const imported = await state.nfcore.import(workflow, revision);
+  const imported = await load();
   return commitAgentMutation(state, { ...fields, requestDigest }, (current) => ({
     ...imported.graph,
     ...(current.name ? { name: current.name } : {}),
     ...(current.annotations?.length ? { annotations: current.annotations } : {}),
   }));
+}
+
+async function resolveAgentNfcore(state: ProjectState, value: unknown) {
+  const body = object(value, "agent nf-core import");
+  knownFields(body, "agent nf-core import", ["workflow", "revision", "base_state_revision", "idempotency_key", "summary"]);
+  const fields = agentEditFields(body);
+  const workflow = requiredString(body.workflow, "workflow");
+  const revision = requiredString(body.revision, "revision");
+  const requestDigest = canonicalJsonDigest(body);
+  return commitAgentSourceImport(state, fields, requestDigest, () => state.nfcore.import(workflow, revision));
+}
+
+async function resolveAgentGithub(state: ProjectState, value: unknown) {
+  const body = object(value, "agent GitHub workflow import");
+  knownFields(body, "agent GitHub workflow import", ["repository", "revision", "base_state_revision", "idempotency_key", "summary"]);
+  const fields = agentEditFields(body);
+  const repository = requiredString(body.repository, "repository");
+  const revision = optionalString(body.revision, "revision");
+  return commitAgentSourceImport(state, fields, canonicalJsonDigest(body), () => state.github.import(repository, revision));
 }
 
 async function editAgentSourceWorkflow(state: ProjectState, value: unknown) {
@@ -928,9 +957,10 @@ async function resolvePaperResources(state: ProjectState, value: unknown) {
   const groups = [];
   for (const citation of resources) {
     const provider = citation.kind === "ensembl" ? "ensembl" : "ncbi";
-    const query = provider === "ncbi" && (citation.role === "reference" || citation.role === "annotation")
-      ? `${citation.accession} genome assembly`
-      : citation.accession;
+    // These citations were already classified and validated as exact stable
+    // accessions. Preserve that identity so provider routing cannot turn a
+    // GCA/GCF lookup into a fuzzy, reference-only organism search.
+    const query = citation.accession;
     try {
       const response = await state.sourceSearch.search(provider, query);
       groups.push({ citation, provider, status: response.results.length ? "available" : "unavailable", results: response.results.slice(0, 24) });
@@ -1131,6 +1161,10 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     requireAgentCapability(request, state);
     return json(await resolveAgentNfcore(state, await requestJson(request)));
   }
+  if (request.method === "POST" && url.pathname === "/api/agent/source-workflows/github/resolve") {
+    requireAgentCapability(request, state);
+    return json(await resolveAgentGithub(state, await requestJson(request)));
+  }
   if (request.method === "POST" && url.pathname === "/api/agent/source-workflows/edit") {
     requireAgentCapability(request, state);
     return json(await editAgentSourceWorkflow(state, await requestJson(request)));
@@ -1150,11 +1184,12 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
     await requestJson(request);
     await state.writeChain;
     await verifyGraphSourceWorkflowTrust(state.root, state.catalog, state.graph);
-    return json(await state.runs.compile(
+    const compiled = await state.runs.compile(
       state.graph,
       { archiveName: state.graph.name ?? basename(state.root), platform: pixiPlatform() },
       state.inputOrigins.executionLocation(),
-    ));
+    );
+    return json(await state.agent.attachCompiledArtifact(compiled));
   }
   if (request.method === "GET" && url.pathname === "/api/agent/evidence") {
     requireAgentCapability(request, state);
@@ -1216,6 +1251,18 @@ async function route(request: Request, state: ProjectState): Promise<Response> {
         requiredString(body.workflow, "workflow"),
         requiredString(body.revision, "revision"),
       ));
+    } catch (error) {
+      if (error instanceof SourceWorkflowTrustError) throw error;
+      throw new HttpError(422, error instanceof Error ? error.message : String(error));
+    }
+  }
+  if (request.method === "POST" && url.pathname === "/api/source-workflows/github/resolve") {
+    const body = object(await requestJson(request), "GitHub source request");
+    knownFields(body, "GitHub source request", ["repository", "revision"]);
+    const repository = requiredString(body.repository, "repository");
+    const revision = optionalString(body.revision, "revision");
+    try {
+      return json(await state.github.import(repository, revision));
     } catch (error) {
       if (error instanceof SourceWorkflowTrustError) throw error;
       throw new HttpError(422, error instanceof Error ? error.message : String(error));

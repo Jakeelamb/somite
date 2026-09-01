@@ -1,15 +1,15 @@
 {
   "id": "files.import_fasta",
-  "title": "Local genome assembly",
+  "title": "Local FASTA",
   "palette": ["Files"],
   "kind": "inprocess",
   "cost": "low",
   "params": {
-    "path": { "type": "string", "label": "Assembly FASTA", "page": "Input", "required": true }
+    "path": { "type": "string", "label": "FASTA path", "page": "Input", "required": true }
   },
   "ports": {
     "in": [],
-    "out": [{ "name": "assembly", "type": "Fasta" }]
+    "out": [{ "name": "assembly", "type": "Fasta", "import_param": "path" }]
   },
   "argv": [],
   "outputs": {}

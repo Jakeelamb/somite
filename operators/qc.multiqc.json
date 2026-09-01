@@ -1,0 +1,54 @@
+{
+  "id": "qc.multiqc",
+  "title": "MultiQC",
+  "palette": ["QC"],
+  "paper": {
+    "aliases": ["MultiQC"],
+    "operation_class": "aggregate_qc",
+    "assays": ["qc", "rna-seq", "variants", "metagenome"]
+  },
+  "kind": "external",
+  "cost": "low",
+  "bin": "multiqc",
+  "pixi": ["bioconda::multiqc=1.35"],
+  "params": {},
+  "ports": {
+    "in": [
+      {
+        "name": "reports",
+        "type": "Directory",
+        "stage_as": "multiqc_reports",
+        "resource": {
+          "profile": "multiqc-scan-directory",
+          "title": "MultiQC analysis reports directory",
+          "detail": "Connect one directory containing the tool logs and reports that MultiQC should scan.",
+          "resolutions": [
+            {
+              "id": "use-existing-reports",
+              "label": "Choose an existing reports directory",
+              "detail": "Add Existing MultiQC input directory and select the directory containing the reports to aggregate.",
+              "kind": "use_existing",
+              "recommended": true,
+              "source_url": "https://docs.seqera.io/multiqc/getting_started/running_multiqc/"
+            }
+          ]
+        }
+      }
+    ],
+    "out": [
+      { "name": "report", "type": "Html" },
+      { "name": "data", "type": "Directory" }
+    ]
+  },
+  "argv": [
+    "multiqc", "{input.reports}",
+    "--outdir", "{work}/out",
+    "--filename", "multiqc_report.html",
+    "--force",
+    "--data-dir"
+  ],
+  "outputs": {
+    "report": { "glob": "{work}/out/multiqc_report.html", "type": "Html" },
+    "data": { "glob": "{work}/out/multiqc_report_data", "type": "Directory" }
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "id": "align.star_index",
+  "title": "Build STAR index",
+  "palette": ["RNA"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "STAR",
+  "pixi": ["bioconda::star"],
+  "params": {
+    "threads": { "type": "int", "label": "Threads", "page": "STAR index", "default": 8, "min": 1, "max": 64 },
+    "genome_sa_index_nbases": { "type": "int", "label": "SA index bases", "page": "STAR index", "default": 14, "min": 1, "max": 14 }
+  },
+  "ports": {
+    "in": [{ "name": "ref", "type": "Fasta" }],
+    "out": [{ "name": "index", "type": "Directory", "resource_profile": "star-index" }]
+  },
+  "argv": [
+    "STAR",
+    "--runMode", "genomeGenerate",
+    "--runThreadN", "{param.threads}",
+    "--genomeDir", "{work}/out",
+    "--genomeFastaFiles", "{input.ref}",
+    "--genomeSAindexNbases", "{param.genome_sa_index_nbases}"
+  ],
+  "outputs": {
+    "index": { "glob": "{work}/out", "type": "Directory" }
+  }
+}

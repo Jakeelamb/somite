@@ -334,6 +334,17 @@ function validateParameterValue(parameter: WorkflowParameterField, value: ParamV
   if ((parameter.choices?.length ?? 0) > 0 && !parameter.choices!.some((choice) => schemaEqual(choice, value))) {
     return `parameter ${parameter.name} is not an allowed choice`;
   }
+  if (parameter.pattern && typeof value === "string") {
+    if (![...value].every((character) => {
+      const code = character.codePointAt(0) ?? 0;
+      return code >= 32 && code <= 126;
+    })) return `parameter ${parameter.name} violates its string pattern`;
+    try {
+      if (!new RegExp(parameter.pattern).test(value)) return `parameter ${parameter.name} violates its string pattern`;
+    } catch {
+      return `parameter ${parameter.name} has an invalid string pattern`;
+    }
+  }
   return null;
 }
 
@@ -359,8 +370,9 @@ export function validateSourceWorkflow(workflow: SourceWorkflowInstance): string
       return `${field} must be bounded, non-empty, and contain no control characters`;
     }
   }
-  if (workflow.source.provider === "nf_core" && !canonicalGitObjectId(workflow.source.resolved_revision)) {
-    return "nf-core resolved_revision must be a canonical lowercase full Git object ID";
+  if ((workflow.source.provider === "nf_core" || workflow.source.provider === "github")
+    && !canonicalGitObjectId(workflow.source.resolved_revision)) {
+    return `${workflow.source.provider === "nf_core" ? "nf-core" : "GitHub"} resolved_revision must be a canonical lowercase full Git object ID`;
   }
   if (workflow.source.provider === "local"
     && workflow.source.resolved_revision !== workflow.source.source_digest.slice("blake3:".length)) {
@@ -386,6 +398,14 @@ export function validateSourceWorkflow(workflow: SourceWorkflowInstance): string
       return "parameter names must be unique, non-empty, and printable";
     }
     parameterNames.add(parameter.name);
+    if (parameter.pattern !== undefined) {
+      if (parameter.type !== "string" || hasControl(parameter.pattern)) return `parameter ${parameter.name} has an invalid string pattern`;
+      try {
+        new RegExp(parameter.pattern);
+      } catch {
+        return `parameter ${parameter.name} has an invalid string pattern`;
+      }
+    }
     const bounds = [parameter.minimum, parameter.maximum].filter((value): value is number => value !== undefined);
     if (bounds.some((bound) => !Number.isFinite(bound) || Object.is(bound, -0)
       || bound < -MAX_EXACT_JSON_INTEGER_BOUND || bound > MAX_EXACT_JSON_INTEGER_BOUND)

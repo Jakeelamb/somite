@@ -92,16 +92,51 @@ execution path and bioinformatics package set target a POSIX environment.
   changing the pinned source. Promoting a supported invocation creates a normal
   editable Somite node; missing connections become readiness requirements.
 
-Whole source-backed nf-core imports remain inspect-and-bind workflows when the
-upstream source does not freeze every task in one root Pixi environment. A
-dropped local Nextflow project becomes executable when its exact source contains
-both a root `pixi.toml` and `pixi.lock`, that environment locks Nextflow and
-OpenJDK, and no process delegates its environment to a container, Conda,
-Spack, or a system module. Somite then preserves those bytes, validates the
-source with Nextflow preview mode, runs it with the frozen Pixi environment,
-and exports the same closure. Every incomplete source stays inspectable with an
-explicit blocker. Promoting reviewed invocations creates an editable native
-partial variant; it does not claim to convert an entire imported pipeline.
+Source-backed workflows have two exact environment paths. A dropped Nextflow
+project that contains both a root `pixi.toml` and `pixi.lock` keeps the existing
+root-lock path: that environment must lock Nextflow and OpenJDK, and tracked
+source must not delegate task environments to containers, Conda, Spack, or
+system modules. Somite adopts those bytes without solving a replacement lock.
+Supplying only one root Pixi file remains an error; Somite does not silently
+fall through to another strategy.
+
+When neither root Pixi file exists, Somite can freeze reachable processes whose
+source contains exactly one static Conda literal. It may be a source-relative
+environment file or a direct MatchSpec list in which every package names its
+channel. Byte-identical files and identical direct expressions share their own
+content-addressed named Pixi environments; different contents stay isolated,
+so conflicting tool versions across tasks remain valid. Dependency versions,
+builds, explicit channels, and case-sensitive channel order are retained. A
+file environment may prove the shared order for direct package channels;
+without one, multiple direct channels fail closed rather than receiving an
+invented priority. Conflicts inside one environment or different channel
+orders across reachable environments also fail closed. So do unresolved
+reachable calls, ambiguous process mappings, dynamic or missing environment
+files, unqualified or unsupported task-environment forms, config-level
+environment overrides, and dynamic, external, or missing `includeConfig`
+targets. Static configuration includes are inspected before execution; plugins
+and `withName` or `withLabel` selectors remain blockers because they can change
+the runtime closure after process discovery.
+
+Run installs the one frozen workspace and rewrites only a staged execution copy
+to verified host prefixes. Compile and Export never embed those machine paths;
+their staged copy uses portable
+`${projectDir}/.pixi/envs/<content-addressed-name>` literals. The immutable
+imported source remains provenance for both copies. Validate still invokes
+Nextflow preview mode, so its receipt proves compilation and DAG construction,
+not execution of the scientific processes. Whole imports outside either exact
+path remain inspectable with explicit blockers. Promoting reviewed invocations
+creates an editable native partial variant; it does not claim to convert an
+entire imported pipeline.
+
+Every admitted source run starts Nextflow with an explicit `-C` configuration
+set and a final Somite profile that uses the local executor and disables
+container, Wave, and Fusion engines. It also receives a package-private
+`NXF_HOME` in offline mode, so user-global Nextflow configuration cannot alter
+the frozen execution. Exported source packages retain project-relative input
+bindings and include an executable `./somite-run` launcher; after the named
+inputs are placed beside the extracted project, the launcher installs the
+exact lock with Pixi and runs that same policy.
 
 The canvas supports cursor-centered semantic zoom, magnetic alignment,
 undo/redo, multi-selection,
@@ -123,15 +158,20 @@ tradeoff before starting an install; progress, cancellation, checksum failure,
 and retry stay visible. A completed resource is connected through a typed
 import Node, so the graph records exactly which specialized input it satisfies.
 
-For native workflows rooted in local single or paired FASTQ inputs, Validation
-substitutes small content-addressed fixtures, runs the same frozen Nextflow path
-as production, and records an append-only evidence receipt for the exact
-semantic graph revision. A source workflow with a complete imported Pixi lock
-uses Nextflow preview mode instead; that evidence proves source compilation and
-DAG construction without claiming that scientific tasks ran. Other input roots
-remain runnable with real data, but Validate stays unavailable until Somite has
-a reviewed fixture adapter. A compiled graph is never described as validated
-until its applicable evidence path succeeds.
+For native workflows rooted in reviewed FASTQ, FASTA, BAM, GTF, or GFF3 inputs,
+Validation substitutes small content-addressed fixtures, runs the same frozen
+Nextflow path as production, and records an append-only evidence receipt for the
+exact semantic graph revision. Exact SRA, NCBI assembly, and Ensembl source
+shapes use the same pack without network downloads: their retrieval nodes are
+reported as skipped and inconclusive while connected downstream tools run.
+Tiny-data-only parameter changes, such as STAR index sizing, are disclosed and
+included in fixture-configuration identity. This proves only that scoped
+representative run, not retrieval, production-scale behavior, or scientific
+equivalence. A source workflow with a complete imported Pixi lock uses Nextflow
+preview mode instead; that evidence proves source compilation and DAG
+construction without claiming that scientific tasks ran. Unknown source shapes
+remain runnable with real data but fail validation capability closed until a
+reviewed fixture adapter exists.
 
 ### Rebuild from a paper
 
@@ -145,6 +185,15 @@ Cited SRA, BioProject, BioSample, assembly, and Ensembl identifiers are resolved
 through the same data search used by the canvas. Collections remain collections
 until the user chooses an exact run. Supported methods, unsupported methods,
 missing inputs, and extraction failures remain distinct outcomes.
+
+When the paper explicitly cites a public GitHub workflow or pipeline repository,
+Somite keeps that citation and page evidence beside the reconstruction. **Use
+cited workflow** resolves the repository to an immutable Git commit, downloads
+that exact source tree, and opens its indexed Nextflow structure on an unchanged
+empty canvas. This is separate from the prose-derived candidate: the cited
+source can be visualized even when Somite cannot infer an executable graph from
+the Methods text. Exact Run and Export remain gated by the source workflow's
+frozen environment evidence.
 
 For scanned or mixed PDFs, Somite identifies the exact pages that need OCR. The
 Machine panel can install a project-local, Pixi-locked Poppler and Tesseract
@@ -201,6 +250,9 @@ validate, run, cancel, and inspect evidence. It can also search and read every
 page of the version-matched official Pixi and Nextflow documentation, search Conda,
 freeze Pixi environments, lint and inspect Nextflow source, discover registry
 modules, preview DAGs, and climb from stub/test fixtures to real run evidence.
+Compilation leases the exact frozen closure into the shared confined Pixi and
+Nextflow workspace, so both tool servers inspect the artifact Somite actually
+produced without gaining access to unrelated project files.
 Every successful graph transaction is one normal undoable canvas edit. Activity
 stays available behind progressive disclosure, and redacted turn transcripts
 are stored under `.somite/agent-transcripts/`.
@@ -301,7 +353,22 @@ short private user cache (`$XDG_CACHE_HOME/somite/pixi` on Linux or
 `~/Library/Caches/Somite/pixi` on macOS), keyed by the exact platform, manifest,
 and lock content. Set `SOMITE_PIXI_CACHE_DIR` to an absolute private directory
 when the default user-cache path is unsuitable; durable environments never use
-a temporary directory.
+a temporary directory. Cache schema v3 gives each builder an ownership identity,
+never reaps a live builder only because it is old, and quarantines an unchanged
+stale entry before deletion so an older cleanup cannot remove its replacement.
+Publication also records a bounded digest receipt for every direct file or
+in-prefix symbolic-link target in each environment's executable directories
+(`bin`, or `Scripts` and `Library/bin`). Reuse rechecks that fixed receipt, so a
+deleted or modified recorded entrypoint fails closed without recursively
+scanning the environment tree. This is entrypoint integrity, not complete
+payload integrity: libraries, Python or R site packages, and other data below
+the prefix are not content-hashed by this receipt.
+
+Reusable compiled workflow directories have a separate complete package
+manifest. Before reuse or Agent attachment, Somite rejects extra directories,
+unlisted files, links, mode drift, changed bytes, or a Run-closure identity
+mismatch. A failed integrity check leaves the suspect directory untouched for
+inspection instead of silently replacing it.
 
 Managed scientific resources use a separate private user cache at
 `$XDG_CACHE_HOME/somite/resources` on Linux or
@@ -359,7 +426,9 @@ Maintainers and CI also run `pixi run smoke`. This networked release gate first
 exercises the runner directly, then drives the built browser through validation,
 execution, durable evidence, and ZIP export for a tiny FastQC workflow using the
 real Pixi lock/install and Nextflow path. The direct smoke also imports a fresh
-locked-Pixi Nextflow directory, previews it, and executes one real source task.
+locked-Pixi Nextflow directory, requests and hashes its real preview DAG,
+executes conflicting per-task tool versions, extracts the exported ZIP, and
+runs its executable `./somite-run` launcher.
 It does not use fake executables. The MCP-specific portion keeps documentation
 and discovery networks out of this gate; its Pixi proof uses a local task and
 its Nextflow fixture runs offline with version checks disabled.

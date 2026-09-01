@@ -1,0 +1,20 @@
+{
+  "id": "files.import_paired_gz",
+  "title": "Local compressed read pair",
+  "palette": ["Files"],
+  "kind": "inprocess",
+  "cost": "low",
+  "params": {
+    "r1": { "type": "string", "label": "Compressed R1 path", "page": "Reads", "required": true },
+    "r2": { "type": "string", "label": "Compressed R2 path", "page": "Reads", "required": true }
+  },
+  "ports": {
+    "in": [],
+    "out": [
+      { "name": "r1", "type": "FastqGz", "import_param": "r1" },
+      { "name": "r2", "type": "FastqGz", "import_param": "r2" }
+    ]
+  },
+  "argv": [],
+  "outputs": {}
+}

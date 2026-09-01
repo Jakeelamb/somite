@@ -1,14 +1,12 @@
-import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
-import { atomicWrite, ensurePrivateDirectory, pathExists } from "../runner/src/files.ts";
+import { atomicWrite, ensurePrivateDirectory } from "../runner/src/files.ts";
 import { NfcoreGateway } from "../runner/src/nfcoreGateway.ts";
+import { persistChallengeReport, readChallengeLedger } from "../runner/src/unseenChallengeLedger.ts";
 import {
-  decodeChallengeLedger,
   NoUnseenChallengeError,
-  recordChallenge,
   runUnseenPaperChallenge,
   runUnseenWorkflowChallenge,
   type ChallengeKind,
@@ -31,7 +29,7 @@ const startedAt = new Date().toISOString();
 const stateDirectory = await ensurePrivateDirectory(repositoryRoot, ".somite/challenges");
 const reportDirectory = await ensurePrivateDirectory(repositoryRoot, "output/challenges");
 const ledgerPath = join(stateDirectory, "ledger.json");
-let ledger = decodeChallengeLedger(await pathExists(ledgerPath) ? await readFile(ledgerPath, "utf8") : undefined);
+let ledger = await readChallengeLedger(ledgerPath);
 const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
 const gateway = new NfcoreGateway(repositoryRoot, catalog);
 const reports: ChallengeReport[] = [];
@@ -47,8 +45,7 @@ for (const kind of kinds) {
     if (report.quality.result === "failed") {
       failures.push({ kind, error: report.quality.issues.join(" ") });
     } else {
-      ledger = recordChallenge(ledger, report);
-      await atomicWrite(ledgerPath, `${JSON.stringify(ledger, null, 2)}\n`);
+      ledger = await persistChallengeReport(ledgerPath, report);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

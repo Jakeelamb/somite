@@ -1,23 +1,36 @@
 import * as acp from "@agentclientprotocol/sdk";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
+import { chmod, copyFile, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import type { AgentTransactionResult } from "@somite/workflow/agentTransaction";
+import { createByteDigester } from "@somite/workflow/contentIdentity";
 import {
   MAX_ACP_CONTROL_FRAME_BYTES,
   MAX_AGENT_CONFIG_BYTES,
   MAX_AGENT_EVENT_DETAIL_BYTES,
   MAX_AGENT_EVENT_LOG_BYTES,
+  MAX_FROZEN_PACKAGE_BYTES,
 } from "@somite/workflow/limits";
 import { SOMITE_VERSION } from "@somite/workflow/version";
 import { agentChildEnvironment } from "./agentEnvironment.ts";
 import { boundedNdjsonStream } from "./boundedNdjson.ts";
 import { atomicWrite, ensurePrivateDirectory } from "./files.ts";
 import { isSomiteMcpToolName, type SomiteMcpToolName } from "./mcpTools.ts";
+import {
+  MAX_AGENT_ARTIFACT_ENTRIES,
+  validatedCompiledArtifactManifest,
+  type CompiledArtifactFile,
+  type CompiledWorkflowArtifact,
+  type TrustedCompiledWorkflowArtifact,
+} from "./compiledArtifact.ts";
+
+export type { CompiledWorkflowArtifact } from "./compiledArtifact.ts";
 
 const EVENT_LIMIT = 4_096;
 const TRANSACTION_EVENT_LIMIT = 32;
@@ -34,11 +47,13 @@ Work through the Somite MCP tools immediately. Do not inspect or modify the Somi
 
 Pixi and Nextflow are attached as dedicated first-party MCP servers with version-matched official manuals. For a Native workflow, Somite compile, validation, Run, and Evidence remain authoritative; do not create a parallel hand-authored workflow package. Use Pixi package search to resolve package questions before editing, and use its workspace/lock/environment tools only for an explicit local or compiled package. Use Nextflow project/analyze/module tools for Source-backed workflows and compiled packages. Check runtime compatibility once, then use the cheapest honest ladder: lint and config, preview without processes, reviewed stubs, an explicitly bound real fixture, then full execution. Preview and stubs never count as real process validation.
 
+Somite compile returns the current frozen closure's path relative to the shared Pixi and Nextflow workspace. Pass that output_path unchanged as the local project or manifest prefix; do not search for, copy, or reconstruct the package elsewhere.
+
 Managed scientific resources are separate from Pixi packages. Use only resolutions returned by Somite readiness. Before starting a resource install, clearly state its declared download size, stored size, and scientific effect and obtain explicit user agreement; then use somite.resource and poll it rather than scripting a download yourself.
 
 Prefer structured inspection and known tool schemas. Search the cached Pixi or Nextflow manual only when a command contract, diagnostic, or runtime behavior remains unclear; do not search documentation reflexively on every turn. Use these native manuals before generic web research. Read their policy and validation resources when an execution boundary is unclear.
 
-Begin by inspecting the current workflow. Search exact catalog contracts instead of inventing operator ids, ports, parameters, or revisions. Use short single-concept catalog queries. Discover exact nf-core repositories and releases through Somite's nf-core source search, then import through its source workflow resolver; never fabricate nf.* execution operators or add the bare workflow.source infrastructure operator. Edit source-backed intent only through its typed source editor. If the user wants to rewire a selected invocation replacement, promote that call to the native canvas first, then use ordinary typed graph edits. When current NCBI or Ensembl data is relevant, use Somite source search before leaving the application.
+Begin by inspecting the current workflow. Search exact catalog contracts instead of inventing operator ids, ports, parameters, or revisions. Use short single-concept catalog queries. Discover exact nf-core repositories and releases through Somite's nf-core source search, then import through its nf-core resolver. When a paper or user supplies a public GitHub Nextflow repository, use the GitHub source resolver so Somite freezes the real commit instead of reconstructing it by hand. Never fabricate nf.* execution operators or add the bare workflow.source infrastructure operator. Edit source-backed intent only through its typed source editor. If the user wants to rewire a selected invocation replacement, promote that call to the native canvas first, then use ordinary typed graph edits. When current NCBI or Ensembl data is relevant, use Somite source search before leaving the application.
 
 When no reviewed Operator exists, use Pixi and Nextflow discovery to gather authoritative evidence, then submit a project.* Operator Workshop candidate through Somite. Prove it with one ready tiny fixture graph and poll the proof to terminal status. A passing proof is still a candidate: only the user can accept it into the project catalog. Never bypass review by writing catalog files directly.
 
@@ -136,12 +151,286 @@ type PendingPermission = {
 type Runtime = {
   generation: number;
   workspace: string;
+  toolWorkspace: string;
+  attachments: Set<Promise<unknown>>;
+  leasedBytes: number;
+  leaseCount: number;
+  cleanup?: Promise<void>;
   child: ChildProcess;
   connection?: acp.ClientConnection;
   sessionId?: string;
   shuttingDown: boolean;
   stderr: string;
 };
+
+const MAX_RUN_CLOSURE_BYTES = 1024 * 1024;
+const MAX_AGENT_SESSION_LEASES = 16;
+const MAX_AGENT_SESSION_LEASE_BYTES = MAX_FROZEN_PACKAGE_BYTES * 4;
+
+function closureHex(digest: string) {
+  const match = /^blake3:([a-f0-9]{64})$/.exec(digest);
+  if (!match) error("artifact_invalid", "compiled artifact closure digest is invalid");
+  return match[1]!;
+}
+
+const DIGEST = /^blake3:[a-f0-9]{64}$/;
+
+function exactFields(value: Record<string, unknown>, fields: readonly string[]) {
+  const actual = Object.keys(value).sort();
+  const expected = [...fields].sort();
+  return actual.length === expected.length && actual.every((field, index) => field === expected[index]);
+}
+
+function digest(value: unknown) {
+  return typeof value === "string" && DIGEST.test(value);
+}
+
+function boundedIdentity(value: unknown) {
+  return typeof value === "string" && value.length > 0 && value.length <= 1024 && !/[\0\r\n]/.test(value);
+}
+
+function validEnvironment(value: unknown) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value)
+    && exactFields(value as Record<string, unknown>, ["manifest_digest", "lock_digest"])
+    && digest((value as Record<string, unknown>).manifest_digest)
+    && digest((value as Record<string, unknown>).lock_digest));
+}
+
+function validSourceEnvironment(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const environment = value as Record<string, unknown>;
+  const generated = environment.mode === "generated_task_environments";
+  const expected = [
+    "mode",
+    "manifest_digest",
+    "lock_digest",
+    ...(generated ? ["source_plan_digest", "executed_source_digest"] : []),
+  ];
+  return (environment.mode === "root_lock" || generated)
+    && exactFields(environment, expected)
+    && digest(environment.manifest_digest)
+    && digest(environment.lock_digest)
+    && (!generated || (digest(environment.source_plan_digest) && digest(environment.executed_source_digest)));
+}
+
+function validSourcePackaging(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const packaging = value as Record<string, unknown>;
+  return exactFields(packaging, [
+    "revision", "execution_policy_digest", "launcher_digest", "portable_source_digest",
+  ]) && boundedIdentity(packaging.revision)
+    && digest(packaging.execution_policy_digest)
+    && digest(packaging.launcher_digest)
+    && digest(packaging.portable_source_digest);
+}
+
+function validateRunClosure(value: unknown, expectedDigest: string, expectedGraphRevision: string) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    error("artifact_invalid", "compiled artifact run closure does not match the canonical schema");
+  }
+  const closure = value as Record<string, unknown>;
+  if (closure.schema_version !== 1 || closure.closure_digest !== expectedDigest
+    || closure.graph_revision !== expectedGraphRevision || !digest(closure.graph_revision)) {
+    error("artifact_invalid", "compiled artifact run closure identity is invalid");
+  }
+  if (closure.kind === "source_workflow") {
+    if (!exactFields(closure, [
+      "schema_version", "kind", "closure_digest", "graph_revision", "workflow_revision", "source_digest", "environment", "packaging",
+    ]) || !digest(closure.workflow_revision) || !digest(closure.source_digest)
+      || !validSourceEnvironment(closure.environment) || !validSourcePackaging(closure.packaging)) {
+      error("artifact_invalid", "compiled source-workflow run closure does not match the canonical schema");
+    }
+    return;
+  }
+  if (!exactFields(closure, [
+    "schema_version", "closure_digest", "graph_revision", "target_platform", "operators", "environment",
+    "compiler_identity", "nextflow_identity", "openjdk_identity",
+  ]) || !boundedIdentity(closure.target_platform) || !Array.isArray(closure.operators)
+    || closure.operators.length > MAX_AGENT_ARTIFACT_ENTRIES || !validEnvironment(closure.environment)
+    || !boundedIdentity(closure.compiler_identity) || !boundedIdentity(closure.nextflow_identity)
+    || !boundedIdentity(closure.openjdk_identity)) {
+    error("artifact_invalid", "compiled native run closure does not match the canonical schema");
+  }
+  for (const operator of closure.operators) {
+    if (!operator || typeof operator !== "object" || Array.isArray(operator)
+      || !exactFields(operator as Record<string, unknown>, ["operator_id", "revision"])
+      || !boundedIdentity((operator as Record<string, unknown>).operator_id)
+      || !digest((operator as Record<string, unknown>).revision)) {
+      error("artifact_invalid", "compiled native run closure has an invalid operator pin");
+    }
+  }
+}
+
+async function scannedArtifactPaths(root: string) {
+  const files: string[] = [];
+  const directories: string[] = [];
+  let entries = 0;
+  async function scan(path: string) {
+    const metadata = await lstat(path);
+    entries += 1;
+    if (entries > MAX_AGENT_ARTIFACT_ENTRIES) error("artifact_invalid", "compiled artifact exceeds the Agent lease entry limit");
+    if (metadata.isSymbolicLink()) error("artifact_invalid", "compiled artifact contains a symbolic link");
+    const fromRoot = relative(root, path).split(sep).join("/");
+    if (metadata.isDirectory()) {
+      if (fromRoot) directories.push(fromRoot);
+      for (const name of (await readdir(path)).sort()) await scan(join(path, name));
+      return;
+    }
+    if (!metadata.isFile()) error("artifact_invalid", "compiled artifact contains a non-regular file");
+    if (metadata.nlink !== 1) error("artifact_invalid", "compiled artifact contains a hard-linked file");
+    files.push(fromRoot);
+  }
+  await scan(root);
+  return { files: files.sort(), directories: directories.sort() };
+}
+
+function expectedArtifactDirectories(files: readonly CompiledArtifactFile[]) {
+  const directories = new Set<string>();
+  for (const file of files) {
+    let current = dirname(file.path).split(sep).join("/");
+    while (current && current !== ".") {
+      directories.add(current);
+      current = dirname(current).split(sep).join("/");
+    }
+  }
+  return [...directories].sort();
+}
+
+async function verifiedFileDigest(path: string, expected: CompiledArtifactFile) {
+  const before = await lstat(path);
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1
+    || before.size !== expected.bytes || (before.mode & 0o777) !== expected.mode) {
+    error("artifact_invalid", `compiled artifact file ${expected.path} does not match its manifest`);
+  }
+  const noFollow = typeof fsConstants.O_NOFOLLOW === "number" ? fsConstants.O_NOFOLLOW : 0;
+  const handle = await open(path, fsConstants.O_RDONLY | noFollow);
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== before.dev || opened.ino !== before.ino
+      || opened.size !== before.size || opened.mtimeMs !== before.mtimeMs || opened.ctimeMs !== before.ctimeMs) {
+      error("artifact_invalid", `compiled artifact file ${expected.path} changed while it was verified`);
+    }
+    const digester = createByteDigester();
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let position = 0;
+    while (position < opened.size) {
+      const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.byteLength, opened.size - position), position);
+      if (bytesRead === 0) error("artifact_invalid", `compiled artifact file ${expected.path} changed while it was verified`);
+      digester.update(buffer.subarray(0, bytesRead));
+      position += bytesRead;
+    }
+    const after = await handle.stat();
+    if (after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs
+      || digester.digest() !== expected.digest) {
+      error("artifact_invalid", `compiled artifact file ${expected.path} does not match its content digest`);
+    }
+  } finally {
+    await handle.close();
+  }
+  const afterPath = await lstat(path);
+  if (afterPath.dev !== before.dev || afterPath.ino !== before.ino || afterPath.nlink !== 1
+    || afterPath.size !== before.size || afterPath.mtimeMs !== before.mtimeMs || afterPath.ctimeMs !== before.ctimeMs) {
+    error("artifact_invalid", `compiled artifact file ${expected.path} changed while it was verified`);
+  }
+}
+
+async function copyVerifiedArtifactTree(source: string, destination: string, files: readonly CompiledArtifactFile[]) {
+  const expectedPaths = files.map((file) => file.path).sort();
+  const expectedDirectories = expectedArtifactDirectories(files);
+  const sourcePaths = await scannedArtifactPaths(source);
+  if (JSON.stringify(sourcePaths.files) !== JSON.stringify(expectedPaths)
+    || JSON.stringify(sourcePaths.directories) !== JSON.stringify(expectedDirectories)) {
+    error("artifact_invalid", "compiled artifact files do not match the trusted package manifest");
+  }
+  await mkdir(destination, { mode: 0o700 });
+  for (const file of files) {
+    const from = join(source, file.path);
+    const to = join(destination, file.path);
+    if (await realpath(from) !== resolve(from)) error("artifact_invalid", `compiled artifact file ${file.path} crosses a symbolic link`);
+    await verifiedFileDigest(from, file);
+    await mkdir(dirname(to), { recursive: true, mode: 0o700 });
+    await copyFile(from, to, fsConstants.COPYFILE_FICLONE);
+    await chmod(to, file.mode);
+    await verifiedFileDigest(to, file);
+  }
+  const copiedPaths = await scannedArtifactPaths(destination);
+  if (JSON.stringify(copiedPaths.files) !== JSON.stringify(expectedPaths)
+    || JSON.stringify(copiedPaths.directories) !== JSON.stringify(expectedDirectories)) {
+    error("artifact_invalid", "leased artifact files do not match the trusted package manifest");
+  }
+}
+
+async function validateRunClosureFile(root: string, files: readonly CompiledArtifactFile[], expectedDigest: string, expectedGraphRevision: string) {
+  const path = files.some((file) => file.path === "run-closure.json")
+    ? "run-closure.json"
+    : ".somite/run/run-closure.json";
+  const file = files.find((candidate) => candidate.path === path);
+  if (!file || file.bytes > MAX_RUN_CLOSURE_BYTES) error("artifact_invalid", "compiled artifact run closure is invalid");
+  let closure: unknown;
+  try {
+    closure = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(await readFile(join(root, path))));
+  } catch {
+    error("artifact_invalid", "compiled artifact run closure is invalid JSON");
+  }
+  validateRunClosure(closure, expectedDigest, expectedGraphRevision);
+}
+
+async function makeWorkspaceRemovable(path: string): Promise<void> {
+  let metadata;
+  try {
+    metadata = await lstat(path);
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw cause;
+  }
+  if (metadata.isSymbolicLink()) return;
+  if (metadata.isDirectory()) {
+    await chmod(path, 0o700);
+    for (const name of await readdir(path)) await makeWorkspaceRemovable(join(path, name));
+  } else {
+    await chmod(path, 0o600).catch(() => undefined);
+  }
+}
+
+async function removePrivateWorkspace(path: string) {
+  try {
+    await rm(path, { recursive: true, force: true });
+  } catch {
+    await makeWorkspaceRemovable(path);
+    await rm(path, { recursive: true, force: true });
+  }
+}
+
+async function requireLeasePublishBoundary(runtime: Pick<Runtime, "workspace" | "toolWorkspace">) {
+  const compiled = join(runtime.toolWorkspace, "compiled");
+  let workspaceReal: string;
+  let toolWorkspaceReal: string;
+  let compiledReal: string;
+  try {
+    const [workspaceMetadata, toolWorkspaceMetadata, compiledMetadata] = await Promise.all([
+      lstat(runtime.workspace),
+      lstat(runtime.toolWorkspace),
+      lstat(compiled),
+    ]);
+    if (workspaceMetadata.isSymbolicLink() || !workspaceMetadata.isDirectory()
+      || toolWorkspaceMetadata.isSymbolicLink() || !toolWorkspaceMetadata.isDirectory()
+      || compiledMetadata.isSymbolicLink() || !compiledMetadata.isDirectory()) {
+      error("artifact_invalid", "Agent compiled-artifact publication directory is invalid");
+    }
+    [workspaceReal, toolWorkspaceReal, compiledReal] = await Promise.all([
+      realpath(runtime.workspace),
+      realpath(runtime.toolWorkspace),
+      realpath(compiled),
+    ]);
+  } catch (cause) {
+    if (cause instanceof AgentManagerError) throw cause;
+    error("artifact_invalid", "Agent compiled-artifact publication directory is unavailable");
+  }
+  if (toolWorkspaceReal !== join(workspaceReal, "tools")
+    || compiledReal !== join(toolWorkspaceReal, "compiled")) {
+    error("artifact_invalid", "Agent compiled-artifact publication directory escapes its private workspace");
+  }
+}
 
 export type AgentManagerLimits = Readonly<{
   eventBytes?: number;
@@ -437,6 +726,7 @@ export class AgentManager {
   #permissions = new Map<string, PendingPermission>();
   #trustedPermissionTools = new Map<string, string>();
   #sensitiveToolCalls = new Set<string>();
+  #artifactAttachment: Promise<void> = Promise.resolve();
 
   constructor(
     serverUrl: string,
@@ -560,6 +850,8 @@ export class AgentManager {
     const launch = parseAgentCommand(displayCommand);
     const childEnvironment = agentChildEnvironment(process.env);
     const workspace = await mkdtemp(join(tmpdir(), "somite-workflow-agent-"));
+    const toolWorkspace = join(workspace, "tools");
+    await mkdir(join(toolWorkspace, "compiled"), { recursive: true, mode: 0o700 });
     const generation = ++this.#generation;
     const child = spawn(launch.command, launch.args, {
       cwd: workspace,
@@ -568,13 +860,23 @@ export class AgentManager {
       stdio: ["pipe", "pipe", "pipe"],
       env: childEnvironment,
     });
-    const runtime: Runtime = { generation, workspace, child, shuttingDown: false, stderr: "" };
+    const runtime: Runtime = {
+      generation,
+      workspace,
+      toolWorkspace,
+      attachments: new Set(),
+      leasedBytes: 0,
+      leaseCount: 0,
+      child,
+      shuttingDown: false,
+      stderr: "",
+    };
     this.#runtime = runtime;
     child.stderr?.on("data", (chunk: Buffer) => { runtime.stderr = `${runtime.stderr}${chunk.toString("utf8")}`.slice(-64 * 1024); });
-    child.once("error", (cause) => this.#finishRuntime(runtime, cause));
+    child.once("error", (cause) => { void this.#finishRuntime(runtime, cause).catch(() => undefined); });
     child.once("close", (code, signal) => {
       const cause = runtime.shuttingDown ? undefined : new Error(runtime.stderr.trim() || `agent exited with ${code ?? signal ?? "unknown status"}`);
-      this.#finishRuntime(runtime, cause);
+      void this.#finishRuntime(runtime, cause).catch(() => undefined);
     });
     this.#connecting = true;
     this.#connected = false;
@@ -582,8 +884,79 @@ export class AgentManager {
     this.#agentName = undefined;
     this.#configOptions = [];
     this.#push({ kind: "status", title: "Connecting ACP agent", detail: "Somite is initializing the selected agent in an isolated workspace.", status: "connecting" });
-    void this.#bootstrap(runtime).catch((cause) => this.#finishRuntime(runtime, cause));
+    void this.#bootstrap(runtime).catch((cause) => this.#finishRuntime(runtime, cause).catch(() => undefined));
     return this.snapshot();
+  }
+
+  /**
+   * Copy one immutable Somite compilation into the active Agent's confined tool
+   * workspace. The returned path is relative to both attached Pixi and Nextflow
+   * MCP roots and identifies the same closure as the canonical project artifact.
+   */
+  async attachCompiledArtifact(compiled: TrustedCompiledWorkflowArtifact): Promise<CompiledWorkflowArtifact> {
+    const runtime = this.#readyRuntime();
+    let result!: CompiledWorkflowArtifact;
+    const operation = this.#artifactAttachment.then(async () => {
+      if (this.#runtime?.generation !== runtime.generation || runtime.shuttingDown) {
+        error("not_connected", "the Agent session that requested this artifact is no longer connected");
+      }
+      if (!this.#projectRoot) error("artifact_unavailable", "compiled artifacts require a project root");
+      await requireLeasePublishBoundary(runtime);
+      const digestHex = closureHex(compiled.closure_digest);
+      const manifest = validatedCompiledArtifactManifest(
+        compiled.artifact_manifest,
+        compiled.closure_digest,
+        compiled.compiled_graph_revision,
+      );
+      if (!manifest) error("artifact_invalid", "compiled artifact manifest is invalid");
+      const artifactBytes = manifest.files.reduce((total, file) => total + file.bytes, 0);
+      if (runtime.leaseCount >= MAX_AGENT_SESSION_LEASES
+        || runtime.leasedBytes + artifactBytes > MAX_AGENT_SESSION_LEASE_BYTES) {
+        error("artifact_limit", "the Agent session reached its compiled-artifact lease limit; reconnect before attaching another package");
+      }
+      const canonicalProjectRoot = await realpath(this.#projectRoot);
+      const source = join(canonicalProjectRoot, ".somite", "compiled", digestHex);
+      const supplied = resolve(canonicalProjectRoot, compiled.output_path);
+      if (supplied !== source || await realpath(source) !== source) {
+        error("artifact_invalid", "compiled artifact path does not match its content-addressed closure");
+      }
+      const leaseName = `${digestHex}-${randomUUID()}`;
+      const stagedArtifact = join(runtime.workspace, `.compiled-${leaseName}.partial`);
+      const publishedArtifact = join(runtime.toolWorkspace, "compiled", leaseName);
+      let published = false;
+      try {
+        await copyVerifiedArtifactTree(source, stagedArtifact, manifest.files);
+        await validateRunClosureFile(
+          stagedArtifact,
+          manifest.files,
+          compiled.closure_digest,
+          compiled.compiled_graph_revision,
+        );
+        if (this.#runtime?.generation !== runtime.generation || runtime.shuttingDown) {
+          error("not_connected", "the Agent session that requested this artifact is no longer connected");
+        }
+        await requireLeasePublishBoundary(runtime);
+        await rename(stagedArtifact, publishedArtifact);
+        published = true;
+        runtime.leaseCount += 1;
+        runtime.leasedBytes += artifactBytes;
+      } catch (cause) {
+        if (!published) await removePrivateWorkspace(stagedArtifact).catch(() => undefined);
+        throw cause;
+      }
+      result = {
+        source_graph_revision: compiled.source_graph_revision,
+        closure_digest: compiled.closure_digest,
+        compiled_graph_revision: compiled.compiled_graph_revision,
+        output_path: `compiled/${leaseName}`,
+        reused: compiled.reused,
+      };
+    });
+    this.#artifactAttachment = operation.then(() => undefined, () => undefined);
+    runtime.attachments.add(operation);
+    void operation.finally(() => runtime.attachments.delete(operation)).catch(() => undefined);
+    await operation;
+    return result;
   }
 
   async prompt(message: string) {
@@ -641,6 +1014,7 @@ export class AgentManager {
     this.#cancelPermissions();
     terminateTree(runtime.child);
     await timeout(closed, 4_000, "Agent shutdown").catch(() => undefined);
+    await this.#finishRuntime(runtime);
   }
 
   answerPermission(permissionId: string, optionId?: string) {
@@ -661,7 +1035,7 @@ export class AgentManager {
       .onRequest(acp.methods.client.session.requestPermission, ({ params }) => this.#requestPermission(params))
       .onNotification(acp.methods.client.session.update, ({ params }) => this.#recordUpdate(params.update));
     const framedStdout = stdout.pipe(boundedNdjsonStream(this.#maximumAcpFrameBytes));
-    framedStdout.once("error", (cause) => this.#finishRuntime(runtime, cause));
+    framedStdout.once("error", (cause) => { void this.#finishRuntime(runtime, cause).catch(() => undefined); });
     const connection = app.connect(acp.ndJsonStream(
       Writable.toWeb(stdin) as WritableStream<Uint8Array>,
       Readable.toWeb(framedStdout) as ReadableStream<Uint8Array>,
@@ -670,10 +1044,11 @@ export class AgentManager {
     void connection.closed.then(
       () => {
         if (this.#runtime?.generation === runtime.generation) {
-          this.#finishRuntime(runtime, runtime.shuttingDown ? undefined : new Error(runtime.stderr.trim() || "ACP connection closed"));
+          void this.#finishRuntime(runtime, runtime.shuttingDown ? undefined : new Error(runtime.stderr.trim() || "ACP connection closed"))
+            .catch(() => undefined);
         }
       },
-      (cause) => this.#finishRuntime(runtime, cause),
+      (cause) => { void this.#finishRuntime(runtime, cause).catch(() => undefined); },
     );
     const initialized = await timeout(connection.agent.request(acp.methods.agent.initialize, {
       protocolVersion: acp.PROTOCOL_VERSION,
@@ -681,7 +1056,7 @@ export class AgentManager {
       clientInfo: { name: "somite", title: "Somite", version: SOMITE_VERSION },
     }), 30_000, "ACP initialization");
     if (initialized.protocolVersion !== acp.PROTOCOL_VERSION) throw new Error(`Somite supports stable ACP protocol version ${acp.PROTOCOL_VERSION}`);
-    const toolWorkspace = runtime.workspace;
+    const toolWorkspace = runtime.toolWorkspace;
     const session = await timeout(connection.agent.request(acp.methods.agent.session.new, {
       cwd: runtime.workspace,
       mcpServers: [{
@@ -820,7 +1195,9 @@ export class AgentManager {
 
   #readyRuntime() {
     const runtime = this.#runtime;
-    if (!runtime || !this.#connected || !runtime.connection || !runtime.sessionId) error("not_connected", "agent is not connected");
+    if (!runtime || runtime.shuttingDown || !this.#connected || !runtime.connection || !runtime.sessionId) {
+      error("not_connected", "agent is not connected");
+    }
     return runtime;
   }
 
@@ -932,19 +1309,40 @@ export class AgentManager {
     while (this.#events.length && this.#retainedEventBytes + 1 > this.#maximumEventBytes) this.#removeEvent(0);
   }
 
-  #finishRuntime(runtime: Runtime, cause?: unknown) {
-    if (this.#runtime?.generation !== runtime.generation) return;
-    this.#runtime = undefined;
-    this.#connecting = false;
-    this.#connected = false;
-    this.#busy = false;
-    this.#agentName = undefined;
-    this.#configOptions = [];
-    this.#cancelPermissions();
+  #finishRuntime(runtime: Runtime, cause?: unknown): Promise<void> {
+    if (runtime.cleanup) return runtime.cleanup;
+    runtime.shuttingDown = true;
+    const wasCurrent = this.#runtime?.generation === runtime.generation;
+    if (wasCurrent) {
+      this.#runtime = undefined;
+      this.#connecting = false;
+      this.#connected = false;
+      this.#busy = false;
+      this.#agentName = undefined;
+      this.#configOptions = [];
+      this.#cancelPermissions();
+    }
     runtime.connection?.close();
     terminateTree(runtime.child);
-    void rm(runtime.workspace, { recursive: true, force: true });
-    if (cause) this.#push({ kind: "error", title: "ACP agent stopped", detail: cause instanceof Error ? cause.message : String(cause), status: "failed" });
-    else this.#push({ kind: "status", title: "ACP agent disconnected", detail: "The canvas and Somite tools remain available.", status: "disconnected" });
+    runtime.cleanup = (async () => {
+      await Promise.allSettled([...runtime.attachments]);
+      await removePrivateWorkspace(runtime.workspace);
+      if (!wasCurrent) return;
+      if (cause) {
+        this.#push({ kind: "error", title: "ACP agent stopped", detail: cause instanceof Error ? cause.message : String(cause), status: "failed" });
+      } else {
+        this.#push({ kind: "status", title: "ACP agent disconnected", detail: "The canvas and Somite tools remain available.", status: "disconnected" });
+      }
+    })().catch((cleanupCause) => {
+      const message = cleanupCause instanceof Error ? cleanupCause.message : String(cleanupCause);
+      this.#push({
+        kind: "error",
+        title: "Agent workspace cleanup failed",
+        detail: `Somite could not remove the private Agent workspace: ${message}`,
+        status: "failed",
+      });
+      throw new AgentManagerError("cleanup_failed", `Agent workspace cleanup failed: ${message}`);
+    });
+    return runtime.cleanup;
   }
 }

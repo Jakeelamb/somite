@@ -15,7 +15,7 @@
   },
   "ports": {
     "in": [{ "name": "variants", "type": "Vcf", "union": ["Vcf", "VcfGz"], "optional": true }],
-    "out": [{ "name": "map", "type": "Table" }]
+    "out": [{ "name": "map", "type": "Table", "import_param": "path" }]
   },
   "argv": [],
   "outputs": {},

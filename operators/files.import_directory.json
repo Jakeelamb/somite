@@ -9,7 +9,7 @@
   },
   "ports": {
     "in": [],
-    "out": [{ "name": "directory", "type": "Directory" }]
+    "out": [{ "name": "directory", "type": "Directory", "import_param": "path" }]
   },
   "argv": [],
   "outputs": {}

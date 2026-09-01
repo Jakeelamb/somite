@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import { gzipSync } from "node:zlib";
 
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
+import { MAX_SOURCE_FILES } from "@somite/workflow/nextflowSource";
+import { SOURCE_INDEXER_REVISION } from "@somite/workflow/sourceWorkflow";
 import { NfcoreGateway, extractGithubTarGz, readSourceObject } from "../src/nfcoreGateway.ts";
 import { nfcoreCatalogFixture, nfcoreSourceArchive, tarEntry } from "./helpers/nfcoreFixture.ts";
 
@@ -18,6 +20,12 @@ test("GitHub archive reader strips one root and rejects links", async () => {
 
   const linked = gzipSync(Buffer.concat([tarEntry("demo/link", "", "2"), Buffer.alloc(1024)]));
   await assert.rejects(extractGithubTarGz(linked), /unsupported linked entry/);
+});
+
+test("GitHub archive reader rejects excessive regular-file cardinality before source derivation", async () => {
+  const entries = Array.from({ length: MAX_SOURCE_FILES + 1 }, (_, index) => tarEntry(`demo/file-${index}.nf`, ""));
+  const archive = gzipSync(Buffer.concat([...entries, Buffer.alloc(1024)]));
+  await assert.rejects(extractGithubTarGz(archive), new RegExp(`exceeds ${MAX_SOURCE_FILES} regular files`));
 });
 
 test("nf-core gateway catalogs, pins, indexes, stores, and reuses exact source", async () => {
@@ -54,6 +62,19 @@ test("nf-core gateway catalogs, pins, indexes, stores, and reuses exact source",
     assert.equal(cached.cached, true);
     assert.equal(catalogRequests, 1);
     assert.equal(sourceRequests, 1);
+
+    const requestRoot = join(root, ".somite/source-workflows/requests-ts");
+    const [request] = await readdir(requestRoot);
+    assert.ok(request);
+    await writeFile(join(requestRoot, request), JSON.stringify({
+      schema_version: 1,
+      indexer_revision: SOURCE_INDEXER_REVISION,
+      workflow: { source: null },
+    }));
+    await assert.rejects(
+      gateway.import("nf-core/demo", "1.0.0"),
+      /cached nf-core source request\.workflow/,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }

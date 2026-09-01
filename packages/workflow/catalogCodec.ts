@@ -24,7 +24,11 @@ const PORT_TYPES = new Set<PortType>([
   "Gff3",
   "Sam",
   "Bam",
+  "ReadGroupedBam",
+  "GatkReadyBam",
   "Bai",
+  "Fai",
+  "Dict",
   "Vcf",
   "VcfGz",
   "Bed",
@@ -172,7 +176,7 @@ function parseResource(value: unknown, path: string): ResourceSpec {
 
 function parsePort(value: unknown, path: string): PortSpec {
   const raw = object(value, path);
-  knownFields(raw, path, ["name", "type", "union", "optional", "resource", "resource_profile", "stage_as", "import_param"]);
+  knownFields(raw, path, ["name", "type", "union", "optional", "resource", "resource_profile", "stage_as", "import_param", "implicit_sidecar"]);
   const resource = raw.resource === undefined || raw.resource === null ? undefined : parseResource(raw.resource, `${path}.resource`);
   const providedResourceProfile = optionalResourceProfile(raw.resource_profile, `${path}.resource_profile`);
   const stageAs = optionalString(raw.stage_as, `${path}.stage_as`);
@@ -186,6 +190,7 @@ function parsePort(value: unknown, path: string): PortSpec {
     ...(providedResourceProfile !== undefined ? { resource_profile: providedResourceProfile } : {}),
     ...(stageAs !== undefined ? { stage_as: stageAs } : {}),
     ...(importParam !== undefined ? { import_param: importParam } : {}),
+    implicit_sidecar: boolean(raw.implicit_sidecar, `${path}.implicit_sidecar`),
   };
 }
 
@@ -323,6 +328,7 @@ function canonicalPort(spec: PortSpec) {
     ...(spec.resource_profile !== undefined ? { resource_profile: spec.resource_profile } : {}),
     ...(spec.stage_as !== undefined ? { stage_as: spec.stage_as } : {}),
     ...(spec.import_param !== undefined ? { import_param: spec.import_param } : {}),
+    ...(spec.implicit_sidecar ? { implicit_sidecar: true } : {}),
   };
 }
 

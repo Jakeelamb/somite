@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import test, { after } from "node:test";
 import { fileURLToPath } from "node:url";
+import { gzipSync, gunzipSync } from "node:zlib";
 
 import { operatorPorts } from "@somite/workflow/catalog";
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
@@ -18,7 +19,9 @@ import {
   enforceFrozenArchiveSize,
   enforceFrozenPackageFiles,
 } from "../src/jobs.ts";
+import { CompiledArtifactIntegrityError } from "../src/compiledArtifact.ts";
 import { PixiCache } from "../src/pixiCache.ts";
+import { ProjectGateway } from "../src/projectGateway.ts";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 const testCacheParent = await mkdtemp(join(tmpdir(), "somite-ts-jobs-cache-"));
@@ -154,6 +157,30 @@ await writeFile(join(process.cwd(), "results", "output.txt"), "ok\\n");
   return { root, path: `${bin}${delimiter}${process.env.PATH ?? ""}`, log: join(bin, "invocations.log") };
 }
 
+async function exactSourceGraphFixture(projectRoot: string) {
+  const sourceRoot = join(projectRoot, "compiled-source-fixture");
+  await mkdir(sourceRoot);
+  await Promise.all([
+    writeFile(join(sourceRoot, "main.nf"), "nextflow.enable.dsl=2\nworkflow {}\n"),
+    writeFile(join(sourceRoot, "pixi.toml"), [
+      "[workspace]",
+      "channels = [\"conda-forge\"]",
+      "platforms = [\"linux-64\"]",
+      "",
+      "[dependencies]",
+      "nextflow = \"=25.04.7\"",
+      "openjdk = \"=17\"",
+      "",
+    ].join("\n")),
+    writeFile(join(sourceRoot, "pixi.lock"), "version: 6\nenvironments:\n  default: {}\n"),
+  ]);
+  const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+  const imported = await new ProjectGateway(projectRoot, catalog).open({ path: "compiled-source-fixture" });
+  assert.equal(imported.kind, "nextflow");
+  assert.equal(imported.graph.nodes[0]?.source_workflow?.capabilities.exact_execution, true);
+  return { catalog, graph: imported.graph };
+}
+
 async function terminalStatus(manager: RunManager, id: string) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
@@ -228,7 +255,7 @@ test("TypeScript runner freezes, executes, traces, validates, and exports one pa
       `${validation.evidence_receipt!.receipt_digest.slice("blake3:".length)}.json`,
     );
     assert.equal(JSON.parse(await readFile(receiptPath, "utf8")).receipt_digest, validation.evidence_receipt?.receipt_digest);
-    const environmentRoot = join(testCacheRoot, "v1");
+    const environmentRoot = join(testCacheRoot, "v3");
     const platforms = await readdir(environmentRoot);
     assert.equal(platforms.length, 1);
     assert.equal((await readdir(join(environmentRoot, platforms[0]!))).length, 1, "one exact lock must reuse one Pixi environment");
@@ -239,6 +266,188 @@ test("TypeScript runner freezes, executes, traces, validates, and exports one pa
     assert.equal(exported.filename, "RNA-seq.somite-run.zip");
     assert.deepEqual([...exported.bytes.slice(0, 4)], [0x50, 0x4b, 0x03, 0x04]);
     assert.deepEqual((await readFile(project.log, "utf8")).trim().split("\n").sort(), ["install", "lock", "run", "run"]);
+  } finally {
+    process.env.PATH = previousPath;
+    await rm(project.root, { recursive: true, force: true });
+  }
+});
+
+test("public SRA validation runs downstream tools locally and records retrieval as unexercised", async () => {
+  const project = await mockProject();
+  const previousPath = process.env.PATH;
+  process.env.PATH = project.path;
+  try {
+    const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+    const prefetch = catalog.get("sra.prefetch")!;
+    const fasterq = catalog.get("sra.fasterq_dump_single")!;
+    const fastqc = catalog.get("qc.fastqc")!;
+    const graph: SomiteGraph = {
+      schema_version: 3,
+      name: "SRA downstream fixture validation",
+      nodes: [
+        { id: "fetch", operator: prefetch.id, operator_revision: prefetch.revision, ports: operatorPorts(prefetch), params: { accession: "SRR000001" }, layout: { x: 0, y: 0 } },
+        { id: "convert", operator: fasterq.id, operator_revision: fasterq.revision, ports: operatorPorts(fasterq), params: { threads: 1 }, layout: { x: 240, y: 0 } },
+        { id: "qc", operator: fastqc.id, operator_revision: fastqc.revision, ports: operatorPorts(fastqc), params: {}, layout: { x: 480, y: 0 } },
+      ],
+      edges: [
+        { id: "fetch-convert", from_node: "fetch", from_port: "sra", to_node: "convert", to_port: "sra" },
+        { id: "convert-qc", from_node: "convert", from_port: "reads", to_node: "qc", to_port: "fastq" },
+      ],
+    };
+    const manager = new RunManager(project.root, repositoryRoot, catalog);
+    const started = await manager.start(graph, "validation");
+    const status = await terminalStatus(manager, started.run_id);
+    assert.equal(status.phase, "completed", status.error);
+    assert.equal(status.states.fetch, "skipped");
+    assert.equal(status.states.convert, "skipped");
+    assert.equal(status.evidence_receipt?.result, "passed");
+    assert.equal(status.evidence_receipt?.scope, "graph_e2e_public_retrieval_not_exercised");
+    assert.deepEqual(status.evidence_receipt?.node_results, {
+      convert: "inconclusive",
+      fetch: "inconclusive",
+      qc: "passed",
+    });
+    const manifest = await readFile(join(project.root, ".somite", "runs", started.run_id, "pixi.toml"), "utf8");
+    assert.doesNotMatch(manifest, /sra-tools|prefetch|fasterq/);
+    await manager.shutdown();
+  } finally {
+    process.env.PATH = previousPath;
+    await rm(project.root, { recursive: true, force: true });
+  }
+});
+
+test("compressed local validation materializes real gzip bytes and exercises decompression", async () => {
+  const project = await mockProject();
+  const previousPath = process.env.PATH;
+  process.env.PATH = project.path;
+  try {
+    const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+    const compressed = catalog.get("files.import_fastq_gz")!;
+    const decompress = catalog.get("archive.gunzip_fastq")!;
+    const fastqc = catalog.get("qc.fastqc")!;
+    const graph: SomiteGraph = {
+      schema_version: 3,
+      name: "Compressed local fixture validation",
+      nodes: [
+        { id: "reads", operator: compressed.id, operator_revision: compressed.revision, ports: operatorPorts(compressed), params: { path: "sample.fastq.gz" }, layout: { x: 0, y: 0 } },
+        { id: "decompress", operator: decompress.id, operator_revision: decompress.revision, ports: operatorPorts(decompress), params: {}, layout: { x: 240, y: 0 } },
+        { id: "qc", operator: fastqc.id, operator_revision: fastqc.revision, ports: operatorPorts(fastqc), params: {}, layout: { x: 480, y: 0 } },
+      ],
+      edges: [
+        { id: "compressed-decompress", from_node: "reads", from_port: "reads", to_node: "decompress", to_port: "compressed" },
+        { id: "decompress-qc", from_node: "decompress", from_port: "fastq", to_node: "qc", to_port: "fastq" },
+      ],
+    };
+    const manager = new RunManager(project.root, repositoryRoot, catalog);
+    const started = await manager.start(graph, "validation");
+    const status = await terminalStatus(manager, started.run_id);
+    assert.equal(status.phase, "completed", status.error);
+    assert.deepEqual(status.evidence_receipt?.node_results, {
+      decompress: "passed",
+      qc: "passed",
+      reads: "passed",
+    });
+    assert.equal(status.evidence_receipt?.scope, "graph_e2e");
+    const params = JSON.parse(await readFile(join(project.root, ".somite", "runs", started.run_id, "params.json"), "utf8")) as {
+      inputs: Record<string, string>;
+    };
+    const [fixturePath] = Object.values(params.inputs);
+    const compressedBytes = await readFile(fixturePath!);
+    const reviewedReads = await readFile(join(repositoryRoot, "fixtures", "fastq", "v1", "reads_R1.fastq"));
+    assert.deepEqual([...compressedBytes.subarray(0, 3)], [0x1f, 0x8b, 0x08]);
+    assert.deepEqual(gunzipSync(compressedBytes), reviewedReads);
+    assert.deepEqual(status.evidence_receipt?.fixture_digests, [byteDigest(gzipSync(reviewedReads, { level: 9 }))]);
+    await manager.shutdown();
+  } finally {
+    process.env.PATH = previousPath;
+    await rm(project.root, { recursive: true, force: true });
+  }
+});
+
+test("local BAM validation materializes the reviewed BAM bytes with exact digest binding", async () => {
+  const project = await mockProject();
+  const previousPath = process.env.PATH;
+  process.env.PATH = project.path;
+  try {
+    const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+    const input = catalog.get("files.import_bam")!;
+    const readGroups = catalog.get("align.gatk_add_read_groups")!;
+    const graph: SomiteGraph = {
+      schema_version: 3,
+      name: "Local BAM fixture validation",
+      nodes: [
+        { id: "input", operator: input.id, operator_revision: input.revision, ports: operatorPorts(input), params: { path: "sample.bam" }, layout: { x: 0, y: 0 } },
+        {
+          id: "read-groups",
+          operator: readGroups.id,
+          operator_revision: readGroups.revision,
+          ports: operatorPorts(readGroups),
+          params: {
+            read_group_id: "sample-1",
+            library: "library-1",
+            platform: "ILLUMINA",
+            platform_unit: "unit-1",
+            sample: "sample-1",
+          },
+          layout: { x: 240, y: 0 },
+        },
+      ],
+      edges: [{ id: "input-read-groups", from_node: "input", from_port: "bam", to_node: "read-groups", to_port: "bam" }],
+    };
+    const manager = new RunManager(project.root, repositoryRoot, catalog);
+    const started = await manager.start(graph, "validation");
+    const status = await terminalStatus(manager, started.run_id);
+    assert.equal(status.phase, "completed", status.error);
+    assert.equal(status.evidence_receipt?.scope, "graph_e2e");
+    assert.deepEqual(status.evidence_receipt?.node_results, { input: "passed", "read-groups": "passed" });
+    const params = JSON.parse(await readFile(join(project.root, ".somite", "runs", started.run_id, "params.json"), "utf8")) as {
+      inputs: Record<string, string>;
+    };
+    const [fixturePath] = Object.values(params.inputs);
+    const bytes = await readFile(fixturePath!);
+    assert.equal(byteDigest(bytes), "blake3:d437257e3a74d0ecee3663900482960e429074c4698ab9fe82785fcc06cd5719");
+    assert.deepEqual([...gunzipSync(bytes).subarray(0, 4)], [0x42, 0x41, 0x4d, 0x01]);
+    assert.deepEqual(status.evidence_receipt?.fixture_digests, [byteDigest(bytes)]);
+    await manager.shutdown();
+  } finally {
+    process.env.PATH = previousPath;
+    await rm(project.root, { recursive: true, force: true });
+  }
+});
+
+test("public assembly validation materializes a tiny FASTA instead of downloading NCBI data", async () => {
+  const project = await mockProject();
+  const previousPath = process.env.PATH;
+  process.env.PATH = project.path;
+  try {
+    const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+    const download = catalog.get("ncbi.datasets_assembly")!;
+    const extract = catalog.get("ncbi.datasets_extract_assembly")!;
+    const index = catalog.get("align.bwa_index")!;
+    const graph: SomiteGraph = {
+      schema_version: 3,
+      name: "NCBI reference fixture validation",
+      nodes: [
+        { id: "download", operator: download.id, operator_revision: download.revision, ports: operatorPorts(download), params: { accession: "GCF_000001405.40" }, layout: { x: 0, y: 0 } },
+        { id: "extract", operator: extract.id, operator_revision: extract.revision, ports: operatorPorts(extract), params: {}, layout: { x: 240, y: 0 } },
+        { id: "index", operator: index.id, operator_revision: index.revision, ports: operatorPorts(index), params: {}, layout: { x: 480, y: 0 } },
+      ],
+      edges: [
+        { id: "package", from_node: "download", from_port: "package", to_node: "extract", to_port: "package" },
+        { id: "reference", from_node: "extract", from_port: "genome", to_node: "index", to_port: "ref" },
+      ],
+    };
+    const manager = new RunManager(project.root, repositoryRoot, catalog);
+    const started = await manager.start(graph, "validation");
+    const status = await terminalStatus(manager, started.run_id);
+    assert.equal(status.phase, "completed", status.error);
+    assert.equal(status.evidence_receipt?.fixture_digests.length, 1);
+    assert.equal(status.evidence_receipt?.node_results.index, "passed");
+    assert.equal(status.evidence_receipt?.node_results.download, "inconclusive");
+    const manifest = await readFile(join(project.root, ".somite", "runs", started.run_id, "pixi.toml"), "utf8");
+    assert.doesNotMatch(manifest, /ncbi-datasets|unzip/);
+    assert.match(manifest, /"bwa" = \{ version = "\*", channel = "bioconda" \}/);
+    await manager.shutdown();
   } finally {
     process.env.PATH = previousPath;
     await rm(project.root, { recursive: true, force: true });
@@ -441,6 +650,96 @@ test("cancelling one Pixi cache waiter does not cancel another", async () => {
     assert.equal((await readFile(project.log, "utf8")).trim().split("\n").filter((command) => command === "lock").length, 2);
   } finally {
     delete process.env.SOMITE_MOCK_LOCK_DELAY_MS;
+    process.env.PATH = previousPath;
+    await rm(project.root, { recursive: true, force: true });
+  }
+});
+
+test("compiled source cache rejects stale policy bytes without deleting the cached artifact", async () => {
+  const project = await mockProject();
+  const previousPath = process.env.PATH;
+  process.env.PATH = project.path;
+  try {
+    const { catalog, graph } = await exactSourceGraphFixture(project.root);
+    const manager = new RunManager(project.root, repositoryRoot, catalog);
+    const first = await manager.compile(graph, { archiveName: "source", platform: "linux-64" });
+    assert.equal(first.reused, false);
+    const reused = await manager.compile(graph, { archiveName: "source", platform: "linux-64" });
+    assert.equal(reused.reused, true);
+    assert.deepEqual(reused.artifact_manifest, first.artifact_manifest);
+    const root = join(project.root, first.output_path);
+    const policy = join(root, ".somite", "run", "source-task-nextflow.config");
+    const stale = await readFile(policy);
+    stale[Math.floor(stale.byteLength / 2)]! ^= 1;
+    await writeFile(policy, stale);
+
+    await assert.rejects(
+      manager.compile(graph, { archiveName: "source", platform: "linux-64" }),
+      (error: unknown) => error instanceof CompiledArtifactIntegrityError
+        && /source-task-nextflow\.config/.test(error.message)
+        && /digest/.test(error.message),
+    );
+    assert.deepEqual(await readFile(policy), stale);
+    assert.ok((await lstat(root)).isDirectory());
+  } finally {
+    process.env.PATH = previousPath;
+    await rm(project.root, { recursive: true, force: true });
+  }
+});
+
+test("compiled source cache rejects an extra file without deleting the cached artifact", async () => {
+  const project = await mockProject();
+  const previousPath = process.env.PATH;
+  process.env.PATH = project.path;
+  try {
+    const { catalog, graph } = await exactSourceGraphFixture(project.root);
+    const manager = new RunManager(project.root, repositoryRoot, catalog);
+    const first = await manager.compile(graph, { archiveName: "source", platform: "linux-64" });
+    const root = join(project.root, first.output_path);
+    const unexpected = join(root, "stale-output.txt");
+    await writeFile(unexpected, "stale\n");
+
+    await assert.rejects(
+      manager.compile(graph, { archiveName: "source", platform: "linux-64" }),
+      (error: unknown) => error instanceof CompiledArtifactIntegrityError
+        && /unexpected file.*stale-output\.txt/.test(error.message),
+    );
+    assert.equal(await readFile(unexpected, "utf8"), "stale\n");
+    assert.ok((await lstat(root)).isDirectory());
+  } finally {
+    process.env.PATH = previousPath;
+    await rm(project.root, { recursive: true, force: true });
+  }
+});
+
+test("compiled native cache is fully verified before reuse", async () => {
+  const project = await mockProject();
+  const previousPath = process.env.PATH;
+  process.env.PATH = project.path;
+  try {
+    const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+    const graph = await graphFixture();
+    const manager = new RunManager(project.root, repositoryRoot, catalog);
+    const first = await manager.compile(graph, { archiveName: "native", platform: "linux-64" });
+    assert.equal(first.reused, false);
+    const reused = await manager.compile(graph, { archiveName: "native", platform: "linux-64" });
+    assert.equal(reused.reused, true);
+    assert.deepEqual(reused.artifact_manifest, first.artifact_manifest);
+
+    const root = join(project.root, first.output_path);
+    const entrypoint = join(root, "main.nf");
+    const stale = await readFile(entrypoint);
+    stale[Math.floor(stale.byteLength / 2)]! ^= 1;
+    await writeFile(entrypoint, stale);
+    await assert.rejects(
+      manager.compile(graph, { archiveName: "native", platform: "linux-64" }),
+      (error: unknown) => error instanceof CompiledArtifactIntegrityError
+        && /main\.nf/.test(error.message)
+        && /digest/.test(error.message),
+    );
+    assert.deepEqual(await readFile(entrypoint), stale);
+    assert.ok((await lstat(root)).isDirectory());
+  } finally {
     process.env.PATH = previousPath;
     await rm(project.root, { recursive: true, force: true });
   }

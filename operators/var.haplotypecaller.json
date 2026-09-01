@@ -13,8 +13,11 @@
   "pixi": ["bioconda::gatk4"],
   "ports": {
     "in": [
-      { "name": "bam", "type": "Bam" },
-      { "name": "ref", "type": "Fasta", "union": ["Fasta", "FastaGz"] }
+      { "name": "bam", "type": "GatkReadyBam", "stage_as": "sample.bam" },
+      { "name": "bai", "type": "Bai", "stage_as": "sample.bam.bai", "implicit_sidecar": true },
+      { "name": "ref", "type": "Fasta", "stage_as": "reference.fa" },
+      { "name": "fai", "type": "Fai", "stage_as": "reference.fa.fai", "implicit_sidecar": true },
+      { "name": "dict", "type": "Dict", "stage_as": "reference.dict", "implicit_sidecar": true }
     ],
     "out": [{ "name": "vcf", "type": "Vcf" }]
   },
@@ -25,6 +28,6 @@
     "-O", "{work}/out/calls.vcf"
   ],
   "outputs": {
-    "vcf": { "glob": "{work}/out/calls.vcf", "type": "Vcf", "optional": true }
+    "vcf": { "glob": "{work}/out/calls.vcf", "type": "Vcf" }
   }
 }

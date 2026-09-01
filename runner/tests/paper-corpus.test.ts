@@ -40,14 +40,14 @@ type FullPaperCase = {
 const fullPaperCases: FullPaperCase[] = [
   { path: "pdf/love_f1000.pdf", outcome: "drafts_ready", assays: ["rna_seq"], required: ["align.star", "quant.featurecounts", "diff.deseq2"], forbidden: ["nf.rnaseq"], unsupported: [], text_digest: "1947f0e5f0b66e600dda02bccb9edffa63c097699625f2f165338e67e16bda37" },
   { path: "raw/pertea_hisat.txt", outcome: "drafts_ready", assays: ["rna_seq"], required: ["align.hisat2", "quant.stringtie"], forbidden: ["align.bwa", "nf.rnaseq"], unsupported: ["ballgown"] },
-  { path: "raw/gatk_best_practices.txt", outcome: "drafts_ready", assays: ["variants"], required: ["align.bwa", "var.haplotypecaller"], forbidden: ["nf.sarek", "align.hisat2"], unsupported: ["picard"] },
+  { path: "raw/gatk_best_practices.txt", outcome: "drafts_ready", assays: ["variants"], required: ["align.bwa", "align.samtools_sort", "align.picard_mark_duplicates", "var.haplotypecaller"], forbidden: ["nf.sarek", "align.hisat2"], unsupported: [] },
   { path: "pdf/cheng_hifiasm.pdf", outcome: "drafts_ready", assays: ["assembly"], required: ["asm.hifiasm"], forbidden: ["nf.rnaseq"], unsupported: [] },
   { path: "pdf/rhie_vgp.pdf", outcome: "drafts_ready", assays: ["assembly"], required: ["qc.busco"], forbidden: ["nf.rnaseq"], unsupported: ["falcon", "purgedups", "salsa"], text_digest: "d9dc361329643ae08de254b15ccf3b94e94f6b07fe0621f3163385dc3226e4bd" },
   { path: "pdf/wood_kraken2.pdf", outcome: "drafts_ready", assays: ["metagenome"], required: ["class.kraken2"], forbidden: ["align.minimap2", "nf.taxprofiler"], unsupported: [] },
   { path: "raw/cwl_workflows_pmc.txt", outcome: "drafts_ready", assays: ["rna_seq", "variants"], required: ["align.hisat2", "align.bwa", "quant.stringtie", "var.haplotypecaller"], forbidden: ["nf.rnaseq", "nf.sarek"], unsupported: [] },
   { path: "raw/sarek_pmc.txt", outcome: "drafts_ready", assays: ["variants"], required: ["nf.sarek"], forbidden: ["align.bwa", "var.haplotypecaller"], unsupported: [] },
   { path: "raw/minto_pmc.txt", outcome: "drafts_ready", assays: ["metagenome", "rna_seq"], required: [], forbidden: ["nf.mag", "nf.taxprofiler"], unsupported: ["trimmomatic", "custom-script"] },
-  { path: "raw/scrnabox_pmc.txt", outcome: "drafts_ready", assays: ["single_cell", "rna_seq"], required: [], forbidden: ["nf.rnaseq"], unsupported: ["cellranger", "soupx", "seurat", "doubletfinder"] },
+  { path: "raw/scrnabox_pmc.txt", outcome: "drafts_ready", assays: ["single_cell"], required: ["diff.deseq2"], forbidden: ["nf.rnaseq"], unsupported: ["cellranger", "soupx", "seurat", "doubletfinder", "seurataggregateexpression"] },
 ];
 
 function list(value: string) {

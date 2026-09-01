@@ -16,6 +16,20 @@ import { SOMITE_NEXTFLOW_COMPILER_IDENTITY } from "@somite/workflow/version";
 
 const encoder = new TextEncoder();
 
+function archivedMode(archive: Uint8Array, target: string) {
+  const view = new DataView(archive.buffer, archive.byteOffset, archive.byteLength);
+  for (let offset = 0; offset + 46 <= archive.byteLength; offset += 1) {
+    if (view.getUint32(offset, true) !== 0x02014b50) continue;
+    const nameBytes = view.getUint16(offset + 28, true);
+    const extraBytes = view.getUint16(offset + 30, true);
+    const commentBytes = view.getUint16(offset + 32, true);
+    const name = new TextDecoder().decode(archive.subarray(offset + 46, offset + 46 + nameBytes));
+    if (name === target) return (view.getUint32(offset + 38, true) >>> 16) & 0xffff;
+    offset += 45 + nameBytes + extraBytes + commentBytes;
+  }
+  throw new Error(`archive entry ${target} was not found`);
+}
+
 async function fixtures() {
   const cases = JSON.parse(await readFile(new URL("../../testdata/assessment-parity-graphs.json", import.meta.url), "utf8")) as Array<{ name: string; graph: SomiteGraph }>;
   const { catalog } = await loadOperatorCatalog(fileURLToPath(new URL("../../operators/", import.meta.url)));
@@ -92,4 +106,17 @@ test("frozen package is complete and archives deterministically", async () => {
 test("archive names are safe and never empty", () => {
   assert.equal(safeArchiveName(" DNA / RNA "), "DNA---RNA");
   assert.equal(safeArchiveName("🧬"), "somite-workflow");
+});
+
+test("archive entries preserve reviewed executable modes", () => {
+  const files = new Map([
+    ["somite-run", encoder.encode("#!/bin/sh\n")],
+    ["params.json", encoder.encode("{}\n")],
+  ]);
+  const archive = archiveFrozenPackage(files, new Map([
+    ["somite-run", 0o755],
+    ["params.json", 0o644],
+  ]));
+  assert.equal(archivedMode(archive, "somite-run"), 0o755);
+  assert.equal(archivedMode(archive, "params.json"), 0o644);
 });

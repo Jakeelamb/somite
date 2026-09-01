@@ -34,8 +34,28 @@ test("SRA summaries become one actionable result per run", () => {
       result: "SRA download → separate R1 / R2 FASTQ streams",
       action: "Add Reads",
       operator_ids: ["sra.prefetch", "sra.fasterq_dump"],
+      read_layout: "paired",
     },
   });
+
+  const single = sraResults({
+    runs: '<Run acc="SRR10000003"/>',
+    expxml: "<Title>Single-end RNA reads</Title><Organism ScientificName=\"Homo sapiens\"/><LIBRARY_STRATEGY>RNA-Seq</LIBRARY_STRATEGY><SINGLE/>",
+  });
+  assert.deepEqual(single[0]?.tags, ["RNA-Seq", "Single"]);
+  assert.deepEqual(single[0]?.request, {
+    kind: "sra",
+    value: "SRR10000003",
+    provider: "NCBI SRA",
+    result: "SRA download → one FASTQ stream",
+    action: "Add Reads",
+    operator_ids: ["sra.prefetch", "sra.fasterq_dump_single"],
+    read_layout: "single",
+  });
+  assert.deepEqual(sraResults({
+    runs: '<Run acc="SRR10000004"/>',
+    expxml: "<Title>Incomplete record</Title><Organism ScientificName=\"Homo sapiens\"/><LIBRARY_STRATEGY>RNA-Seq</LIBRARY_STRATEGY>",
+  }), [], "Somite must not invent a library layout when NCBI omits it");
 });
 
 test("NCBI and Ensembl records retain executable source identities", () => {
@@ -45,7 +65,7 @@ test("NCBI and Ensembl records retain executable source identities", () => {
     assemblyname: "GRCh38.p14",
     organism: "Homo sapiens",
     assemblystatus: "Chromosome",
-  })?.request.operator_ids, ["ncbi.datasets_assembly", "archive.unzip"]);
+  })?.request.operator_ids, ["ncbi.datasets_assembly", "ncbi.datasets_extract_assembly"]);
   assert.deepEqual(ensemblGenomeResult({
     assembly_accession: "GCA_009914755.4",
     display_name: "Human",
@@ -77,14 +97,34 @@ test("NCBI search performs ESearch then ESummary and preserves the user query", 
     }
     return Response.json({ result: { "123": {
       runs: '<Run acc="SRR12345678"/>',
-      expxml: "<Title>RNA reads</Title><Organism ScientificName=\"Homo sapiens\"/><LIBRARY_STRATEGY>RNA-Seq</LIBRARY_STRATEGY>",
+      expxml: "<Title>RNA reads</Title><Organism ScientificName=\"Homo sapiens\"/><LIBRARY_STRATEGY>RNA-Seq</LIBRARY_STRATEGY><SINGLE/>",
     } } });
   };
   const results = await searchNcbi("SRR12345678", fetcher);
   assert.equal(results[0]?.accession, "SRR12345678");
   assert.deepEqual(urls.map((url) => url.pathname.split("/").at(-1)), ["esearch.fcgi", "esummary.fcgi"]);
   assert.equal(urls[0]?.searchParams.get("db"), "sra");
-  assert.match(urls[0]?.searchParams.get("term") ?? "", /SRR12345678/);
+  assert.equal(urls[0]?.searchParams.get("term"), "SRR12345678[Accession]");
+});
+
+test("exact NCBI assembly accessions use the assembly accession field without a reference-only filter", async () => {
+  const urls: URL[] = [];
+  const fetcher: typeof fetch = async (input) => {
+    const url = new URL(String(input));
+    urls.push(url);
+    if (url.pathname.endsWith("esearch.fcgi")) return Response.json({ esearchresult: { idlist: ["456"] } });
+    return Response.json({ result: { "456": {
+      assemblyaccession: "GCF_009914755.1",
+      synonym: { genbank: "GCA_009914755.4", refseq: "GCF_009914755.1" },
+      assemblyname: "T2T-CHM13v2.0",
+      organism: "Homo sapiens",
+      assemblystatus: "Chromosome",
+    } } });
+  };
+  const results = await searchNcbi("GCA_009914755.4", fetcher);
+  assert.equal(results[0]?.accession, "GCA_009914755.4");
+  assert.equal(urls[0]?.searchParams.get("db"), "assembly");
+  assert.equal(urls[0]?.searchParams.get("term"), "GCA_009914755.4[Assembly Accession]");
 });
 
 test("Ensembl lookup is tolerant only of authoritative provider misses", async () => {
@@ -107,6 +147,24 @@ test("Ensembl lookup is tolerant only of authoritative provider misses", async (
   assert.deepEqual(missingGenome, []);
   const emptyTaxonomy = await searchEnsembl("unknown species", async () => Response.json([]));
   assert.deepEqual(emptyTaxonomy, []);
+});
+
+test("exact Ensembl stable IDs use lookup by ID rather than symbol or taxonomy search", async () => {
+  const urls: URL[] = [];
+  const result = await searchEnsembl("ENST00000357654.9", async (input) => {
+    const url = new URL(String(input));
+    urls.push(url);
+    return Response.json({
+      id: "ENST00000357654",
+      object_type: "Transcript",
+      display_name: "BRCA1-201",
+      description: "BRCA1 transcript",
+    });
+  });
+  assert.equal(urls.length, 1);
+  assert.match(urls[0]!.pathname, /lookup\/id\/ENST00000357654$/);
+  assert.equal(result[0]?.request.kind, "ensembl-transcript");
+  assert.equal(result[0]?.request.sequence_type, "cdna");
 });
 
 test("Ensembl search propagates provider and transport failures", async (context) => {

@@ -25,7 +25,7 @@
     "accession",
     "{param.accession}",
     "--include",
-    "genome,gff3,gtf,protein,seq-report",
+    "genome,gff3,gtf,seq-report",
     "--filename",
     "{work}/out/assembly.zip",
     "--no-progressbar"

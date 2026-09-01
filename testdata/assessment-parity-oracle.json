@@ -9,11 +9,11 @@
   },
   {
     "name": "local input still needs a path",
-    "graph_revision": "blake3:27185804ef7f020503624ad993252a8bb9c182e0c98a0d9670af46c5de1d732a",
+    "graph_revision": "blake3:dfed1ef5a159bd24e08d743168626ac3f2485c8d7623299d852c5523b44160d2",
     "state": "building",
     "required_count": 1,
     "item_ids": ["parameter:input1:path"],
-    "assessment_digest": "blake3:689326bfe355642a59db140e0a32a7d1fe9ca057f198f71b58ccc3367f032cff"
+    "assessment_digest": "blake3:540f585722c2b289b174e4186033c759883dc87db547faf9e7b8a7c8adbbbf75"
   },
   {
     "name": "managed tool still needs an input",
@@ -25,19 +25,19 @@
   },
   {
     "name": "scientific database is a distinct managed resource",
-    "graph_revision": "blake3:ec194e819d33e696fb86195e744336c9bfb569619b59ea09a43caee2fe0ecc38",
+    "graph_revision": "blake3:6a28734ec10501d7826dc896eae72e7e577e4b03ea46c88ec6b371b108a18bc4",
     "state": "needs_action",
     "required_count": 2,
     "item_ids": ["input:kraken1:r1", "input:kraken1:db"],
-    "assessment_digest": "blake3:6231078b6c07d64e67e845b06ba2dbecdb761045bdf6d9755970be9872027475"
+    "assessment_digest": "blake3:c95fe2ea68e3ddf4cc39378ab327ee39611877fc4dd63c8c3e0f4796536098af"
   },
   {
     "name": "connected local FastQC workflow is ready",
-    "graph_revision": "blake3:8faa17898bcf575f4fe387e975dc7cdd4095c9ca5bf296aabb63d442df945694",
+    "graph_revision": "blake3:abfa346b8ef0a356ea2bd933a8a0f278c6601131a99fa54d9d02f251f29a8a0c",
     "state": "ready",
     "required_count": 0,
     "item_ids": [],
-    "assessment_digest": "blake3:ea8a3e4c0fd9943abaf0969ec7955b86ff1e8b478e5552b9dc517804750eb1ca"
+    "assessment_digest": "blake3:fba75e0e168481c9bd0c6dbc77c0f4061182198bfaebfb10673ed3015517c9ef"
   },
   {
     "name": "paper gap retains a reviewed adapter action",
@@ -49,19 +49,19 @@
   },
   {
     "name": "manual checkpoint is unresolved until its artifact is attached",
-    "graph_revision": "blake3:a52212a8f5b59d891d185379eab985bd76abfbd3ece7c49d4ecb2f8d92a70495",
+    "graph_revision": "blake3:17f2a7d9b8518243515a81680ed130f0ccd7637197a09f0cea9dda99ab2326aa",
     "state": "needs_action",
     "required_count": 1,
     "item_ids": ["resolution:joinmap1:attach"],
-    "assessment_digest": "blake3:d4707410e5bec8d6d612d7b747445a253b8141754c17de4506c9211887e3934a"
+    "assessment_digest": "blake3:9c5a091080e4b50b9c5d87a410b0f3f70d1fe2acf3f15bb31a84a9ea784e0859"
   },
   {
     "name": "manual checkpoint becomes ready after attachment",
-    "graph_revision": "blake3:f99148ca0b1ce1f42801a3b08af84e88b6cefb88b8738028017e2048bad6ae6b",
+    "graph_revision": "blake3:cc48928e737d74c80cca6e46d23a5334bc7ccd30a3204e0b8993cebff5d282bc",
     "state": "ready",
     "required_count": 0,
     "item_ids": [],
-    "assessment_digest": "blake3:2491110b40e958d118ee032dc8647e2382078fef64a27cbe364fd42d67942d93"
+    "assessment_digest": "blake3:b59c64c29487b775146c5b58b030e297745cb6e54db402268f50f6bb179b7eb3"
   },
   {
     "name": "source workflow exposes every honest blocker",

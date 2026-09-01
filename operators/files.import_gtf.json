@@ -1,0 +1,16 @@
+{
+  "id": "files.import_gtf",
+  "title": "Local GTF annotation",
+  "palette": ["Files"],
+  "kind": "inprocess",
+  "cost": "low",
+  "params": {
+    "path": { "type": "string", "label": "GTF path", "page": "Input", "required": true }
+  },
+  "ports": {
+    "in": [],
+    "out": [{ "name": "gtf", "type": "Gtf", "import_param": "path" }]
+  },
+  "argv": [],
+  "outputs": {}
+}

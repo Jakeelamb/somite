@@ -212,6 +212,13 @@ const TOOLS: Tool[] = [
     idempotency_key: keySchema,
     summary: summarySchema,
   }, ["workflow", "revision", "base_state_revision", "idempotency_key", "summary"]), { readOnlyHint: false, openWorldHint: true }),
+  tool(SOMITE_MCP_TOOL.sourceWorkflowResolveGithub, "Resolve GitHub workflow", "Resolve a public GitHub Nextflow repository to an immutable commit and place its pinned source on an unchanged empty canvas.", objectSchema({
+    repository: stringSchema("Canonical public repository URL such as https://github.com/owner/workflow."),
+    revision: stringSchema("Optional branch, tag, or full commit. Omit to pin the current default-branch commit."),
+    base_state_revision: stateSchema,
+    idempotency_key: keySchema,
+    summary: summarySchema,
+  }, ["repository", "base_state_revision", "idempotency_key", "summary"]), { readOnlyHint: false, openWorldHint: true }),
   tool(SOMITE_MCP_TOOL.sourceWorkflowEdit, "Edit source workflow", "Apply typed parameter or invocation-replacement edits to a pinned source workflow.", objectSchema({
     base_state_revision: stateSchema,
     workflow_revision: stringSchema("Exact current source workflow revision."),
@@ -276,7 +283,7 @@ const TOOLS: Tool[] = [
       items: graphOperationSchema,
     },
   }, ["base_state_revision", "idempotency_key", "summary", "operations"]), { readOnlyHint: false, destructiveHint: true }),
-  tool(SOMITE_MCP_TOOL.workflowCompile, "Compile Somite workflow", "Freeze the ready graph into content-addressed Nextflow and Pixi artifacts.", objectSchema(), { readOnlyHint: false, openWorldHint: true }),
+  tool(SOMITE_MCP_TOOL.workflowCompile, "Compile Somite workflow", "Freeze the ready graph into one content-addressed Nextflow/Pixi artifact and attach that exact closure to both tool servers. The returned output_path is relative to their shared workspace root.", objectSchema(), { readOnlyHint: false, openWorldHint: true }),
   tool(SOMITE_MCP_TOOL.runStart, "Run Somite workflow", "Start a real Nextflow run through the Pixi-frozen runtime.", objectSchema({ idempotency_key: keySchema }, ["idempotency_key"]), { readOnlyHint: false, openWorldHint: true }),
   tool(SOMITE_MCP_TOOL.validationStart, "Validate Somite workflow", "Start representative-data validation and produce immutable evidence.", objectSchema({ idempotency_key: keySchema }, ["idempotency_key"]), { readOnlyHint: false, openWorldHint: true }),
   tool(SOMITE_MCP_TOOL.runStatus, "Inspect Somite run", "Read run lifecycle, node states, closure identity, and evidence.", objectSchema({
@@ -374,6 +381,7 @@ async function callTool(name: string, value: unknown, signal: AbortSignal) {
   if (name === SOMITE_MCP_TOOL.catalogSearch) return http("GET", query("/api/agent/catalog", { q: args.query, limit: args.limit ?? 12, cursor: args.cursor }), undefined, signal);
   if (name === SOMITE_MCP_TOOL.sourceWorkflowSearchNfcore) return http("GET", query("/api/source-workflows/nfcore/search", { q: args.query, limit: args.limit ?? 12 }), undefined, signal);
   if (name === SOMITE_MCP_TOOL.sourceWorkflowResolveNfcore) return http("POST", "/api/agent/source-workflows/nfcore/resolve", args, signal, 300_000);
+  if (name === SOMITE_MCP_TOOL.sourceWorkflowResolveGithub) return http("POST", "/api/agent/source-workflows/github/resolve", args, signal, 300_000);
   if (name === SOMITE_MCP_TOOL.sourceWorkflowEdit) return http("POST", "/api/agent/source-workflows/edit", args, signal);
   if (name === SOMITE_MCP_TOOL.sourceWorkflowPromote) return http("POST", "/api/agent/source-workflows/promote", args, signal);
   if (name === SOMITE_MCP_TOOL.sourceSearch) return http("GET", query("/api/sources/search", { q: args.query, provider: args.provider }), undefined, signal);

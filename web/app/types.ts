@@ -74,6 +74,7 @@ export type {
   PaperReconstructionOutcome,
   PaperResourceCitation,
   PaperReview,
+  PaperWorkflowCitation,
 } from "@somite/workflow/paper";
 
 import type { SomiteGraph } from "@somite/workflow/model";

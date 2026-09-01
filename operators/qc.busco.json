@@ -16,7 +16,7 @@
     "mode": { "type": "string", "label": "Mode", "page": "BUSCO", "default": "genome" }
   },
   "ports": {
-    "in": [{ "name": "fasta", "type": "Fasta", "union": ["Fasta", "FastaGz", "Directory"] }],
+    "in": [{ "name": "fasta", "type": "Fasta", "union": ["Fasta", "FastaGz"] }],
     "out": [{ "name": "report", "type": "Directory" }]
   },
   "argv": [
@@ -33,6 +33,6 @@
     "{work}/out"
   ],
   "outputs": {
-    "report": { "glob": "{work}/out", "type": "Directory", "optional": true }
+    "report": { "glob": "{work}/out", "type": "Directory" }
   }
 }

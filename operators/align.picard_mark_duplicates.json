@@ -1,0 +1,52 @@
+{
+  "id": "align.picard_mark_duplicates",
+  "title": "Picard MarkDuplicates",
+  "palette": ["Alignment preparation"],
+  "paper": {
+    "aliases": ["Picard MarkDuplicates", "MarkDuplicates"],
+    "operation_class": "bam_processing",
+    "assays": ["rna-seq", "variants"]
+  },
+  "kind": "external",
+  "cost": "high",
+  "bin": "picard",
+  "pixi": ["bioconda::picard=3.5.0"],
+  "params": {},
+  "ports": {
+    "in": [
+      {
+        "name": "bam",
+        "type": "Bam",
+        "resource": {
+          "profile": "coordinate-sorted-bam",
+          "title": "Coordinate-sorted BAM",
+          "detail": "Picard MarkDuplicates requires a coordinate-sorted SAM or BAM input.",
+          "resolutions": [
+            {
+              "id": "coordinate-sort-bam",
+              "label": "Coordinate-sort the BAM",
+              "detail": "Add SAMtools coordinate sort before Picard MarkDuplicates.",
+              "kind": "build",
+              "recommended": true,
+              "source_url": "https://gatk.broadinstitute.org/hc/en-us/articles/4414602398747-MarkDuplicates-Picard"
+            }
+          ]
+        }
+      }
+    ],
+    "out": [
+      { "name": "bam", "type": "Bam", "resource_profile": "coordinate-sorted-bam" },
+      { "name": "metrics", "type": "Table" }
+    ]
+  },
+  "argv": [
+    "picard", "MarkDuplicates",
+    "--INPUT", "{input.bam}",
+    "--OUTPUT", "{work}/out/marked-duplicates.bam",
+    "--METRICS_FILE", "{work}/out/duplication-metrics.txt"
+  ],
+  "outputs": {
+    "bam": { "glob": "{work}/out/marked-duplicates.bam", "type": "Bam" },
+    "metrics": { "glob": "{work}/out/duplication-metrics.txt", "type": "Table" }
+  }
+}

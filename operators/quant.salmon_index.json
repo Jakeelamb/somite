@@ -1,0 +1,25 @@
+{
+  "id": "quant.salmon_index",
+  "title": "Build Salmon transcriptome index",
+  "palette": ["RNA"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "salmon",
+  "pixi": ["bioconda::salmon"],
+  "params": {
+    "kmer": { "type": "int", "label": "K-mer length", "page": "Salmon index", "default": 31, "min": 1, "max": 31 }
+  },
+  "ports": {
+    "in": [{ "name": "transcripts", "type": "Fasta" }],
+    "out": [{ "name": "index", "type": "Directory", "resource_profile": "salmon-index" }]
+  },
+  "argv": [
+    "salmon", "index",
+    "-t", "{input.transcripts}",
+    "-i", "{work}/out/index",
+    "-k", "{param.kmer}"
+  ],
+  "outputs": {
+    "index": { "glob": "{work}/out/index", "type": "Directory" }
+  }
+}

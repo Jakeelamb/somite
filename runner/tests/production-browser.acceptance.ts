@@ -5,7 +5,9 @@ import { delimiter, join } from "node:path";
 import test from "node:test";
 
 import { chromium, type Browser, type Locator, type Page, type Route } from "playwright-core";
+import { operatorPorts } from "@somite/workflow/catalog";
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
+import type { SomiteGraph } from "@somite/workflow/model";
 import { InputOrigins } from "../src/inputOrigins.ts";
 import { NfcoreGateway } from "../src/nfcoreGateway.ts";
 import { nfcoreCatalogFixture, nfcoreGroupableSourceArchive } from "./helpers/nfcoreFixture.ts";
@@ -147,6 +149,7 @@ test("production workbench persists its name, applies one undoable Agent MCP edi
           provider: "NCBI SRA",
           result: "SRA download → separate R1 / R2 FASTQ streams",
           action: "Add Reads",
+          read_layout: "paired",
         },
       }],
     } : { query: "SRR123456", provider: "ensembl", results: [] });
@@ -341,6 +344,19 @@ test("production Nextflow workflow uses one continuous semantic-zoom canvas", { 
 
   const invocations = canvas.locator("[data-source-entity-kind='invocation']");
   await invocations.nth(0).click();
+  await page.keyboard.press("Delete");
+  await page.waitForTimeout(100);
+  assert.equal(await invocations.count(), 4, "immutable source calls cannot disappear through React Flow deletion");
+  await canvas.locator(".react-flow__pane").click({ position: { x: 700, y: 700 }, force: true });
+  const sourceRelations = canvas.locator("[data-testid^='source-relation-']");
+  const sourceRelationCount = await sourceRelations.count();
+  assert.ok(sourceRelationCount > 0);
+  await sourceRelations.first().click({ force: true });
+  await canvas.getByRole("toolbar", { name: "Source frame selection actions" }).waitFor();
+  await page.keyboard.press("Delete");
+  await page.waitForTimeout(100);
+  assert.equal(await sourceRelations.count(), sourceRelationCount, "immutable source relationships cannot disappear through React Flow deletion");
+  await invocations.nth(0).click();
   await invocations.nth(1).click({ modifiers: ["Control"] });
   await invocations.nth(2).click({ modifiers: ["Control"] });
   await canvas.getByRole("button", { name: "Nest selection", exact: true }).click();
@@ -359,18 +375,59 @@ test("production Nextflow workflow uses one continuous semantic-zoom canvas", { 
   assert.equal(await canvas.locator("[data-source-entity-kind='invocation']").count(), 3);
   assert.equal(await flowHost.getAttribute("data-persistent-flow"), "semantic-host");
 
+  const sourceProjectionScreenBounds = async () => {
+    const projectedNodes = canvas.locator([
+      ".react-flow__node-sourceEntity",
+      ".react-flow__node-sourceGroupHull",
+      ".react-flow__node-sourceGroupPortal",
+      ".react-flow__node-sourceBoundaryPortal",
+    ].join(", "));
+    const boxes = await Promise.all((await projectedNodes.all()).map((node) => node.boundingBox()));
+    const present = boxes.filter((box): box is NonNullable<typeof box> => box !== null);
+    assert.ok(present.length > 0);
+    const left = Math.min(...present.map((box) => box.x));
+    const top = Math.min(...present.map((box) => box.y));
+    const right = Math.max(...present.map((box) => box.x + box.width));
+    const bottom = Math.max(...present.map((box) => box.y + box.height));
+    return { x: left, y: top, width: right - left, height: bottom - top };
+  };
+  const assertNestedScreenFit = (portal: Awaited<ReturnType<typeof sourceProjectionScreenBounds>>, child: Awaited<ReturnType<typeof sourceProjectionScreenBounds>>, label: string) => {
+    const portalCenter = { x: portal.x + portal.width / 2, y: portal.y + portal.height / 2 };
+    const childCenter = { x: child.x + child.width / 2, y: child.y + child.height / 2 };
+    assert.ok(Math.abs(portalCenter.x - childCenter.x) <= 3, `${label}: horizontal centers drifted; portal=${JSON.stringify(portal)} child=${JSON.stringify(child)}`);
+    assert.ok(Math.abs(portalCenter.y - childCenter.y) <= 3, `${label}: vertical centers drifted; portal=${JSON.stringify(portal)} child=${JSON.stringify(child)}`);
+    assert.ok(child.width <= portal.width + 3 && child.height <= portal.height + 3, `${label}: child no longer fits its portal`);
+    assert.ok(Math.min(Math.abs(portal.width - child.width), Math.abs(portal.height - child.height)) <= 3, `${label}: neither fitted dimension stayed continuous`);
+  };
   const zoomOutOneLevel = async (depth: string) => {
     const box = await canvas.boundingBox();
     assert.ok(box);
+    let projectionBeforeExit = await sourceProjectionScreenBounds();
     await page.mouse.move(box.x + box.width * .72, box.y + box.height * .42);
     for (let attempt = 0; attempt < 16 && await canvas.getAttribute("data-semantic-depth") !== depth; attempt += 1) {
+      projectionBeforeExit = await sourceProjectionScreenBounds();
       await page.mouse.wheel(0, 620);
       await page.waitForTimeout(80);
     }
     assert.equal(await canvas.getAttribute("data-semantic-depth"), depth);
+    return projectionBeforeExit;
   };
-  await zoomOutOneLevel("1");
+
+  const movedInvocationId = await invocations.first().getAttribute("data-source-entity-id");
+  assert.ok(movedInvocationId);
+  await invocations.first().click();
+  await canvas.getByRole("button", { name: "Move out one level" }).click();
+  await page.waitForFunction(() => document.querySelectorAll("[data-source-entity-kind='invocation']").length === 2);
+  const updatedChildBounds = await zoomOutOneLevel("1");
+  const updatedHullBounds = await hull.boundingBox();
+  assert.ok(updatedHullBounds);
+  assertNestedScreenFit(updatedHullBounds, updatedChildBounds, "semantic exit uses the latest child and portal geometry");
   assert.equal(await canvas.locator("[data-source-entity-kind='invocation']").count(), 4);
+  await sourceEntity(canvas, movedInvocationId).click();
+  const moveBack = canvas.getByRole("button", { name: "Move back" });
+  await moveBack.click();
+  await moveBack.waitFor({ state: "detached" });
+  await page.waitForFunction(() => document.querySelectorAll("[data-source-entity-kind='invocation']").length === 4);
   await page.getByRole("button", { name: "Fit Workflow" }).click();
   await page.waitForTimeout(350);
   await hull.getByRole("button", { name: /^Collapse / }).click();
@@ -403,6 +460,18 @@ test("production Nextflow workflow uses one continuous semantic-zoom canvas", { 
   await macro.getByRole("button", { name: /Expand .* inline/ }).click();
   await page.getByRole("button", { name: "Fit Workflow" }).click();
   await page.waitForTimeout(350);
+  await hull.getByRole("button", { name: /^Ungroup / }).click();
+  await hull.waitFor({ state: "detached" });
+  const dissolvedChildBounds = await zoomOutOneLevel("0");
+  const sourcePortalBounds = await sourceNode.boundingBox();
+  assert.ok(sourcePortalBounds);
+  assertNestedScreenFit(sourcePortalBounds, dissolvedChildBounds, "dissolving inside an active frame updates the root inverse camera");
+  await sourceNode.hover();
+  for (let attempt = 0; attempt < 12 && await canvas.getAttribute("data-semantic-depth") !== "1"; attempt += 1) {
+    await page.mouse.wheel(0, -620);
+    await page.waitForTimeout(80);
+  }
+  assert.equal(await canvas.getAttribute("data-semantic-depth"), "1", "dissolving a group cannot leave semantic zoom stuck");
   const firstSourceCallId = await canvas.locator(".source-outline-node").first().getAttribute("data-source-entity-id");
   assert.ok(firstSourceCallId);
   const firstSourceCall = sourceEntity(canvas, firstSourceCallId);
@@ -412,6 +481,7 @@ test("production Nextflow workflow uses one continuous semantic-zoom canvas", { 
   await replacementPicker.getByRole("button", { name: /^Import file files\.import / }).click();
   await firstSourceCall.getByRole("button", { name: "Make editable" }).click();
   await page.getByText("Native variant", { exact: true }).waitFor();
+  await canvas.locator(".react-flow__node").first().waitFor();
   assert.equal(await canvas.locator(".react-flow__node").count(), 1);
 
   await page.getByRole("button", { name: "Review source calls" }).click();
@@ -676,6 +746,75 @@ test("production controls complete validation, run, and bundle download journeys
   assert.ok(downloadPath);
   assert.ok((await stat(downloadPath)).size > 4);
   await page.locator(".status-copy").getByText(/Exported .*\.somite-run\.zip/).waitFor();
+  assertNoPageErrors();
+});
+
+test("public-source validation explains exactly what representative data did not exercise", { timeout: 90_000 }, async (context) => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "somite-browser-public-validation-"));
+  context.after(() => rm(projectRoot, { recursive: true, force: true }));
+  const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+  const download = catalog.get("ensembl.fasta")!;
+  const decompress = catalog.get("archive.gunzip_fasta")!;
+  const index = catalog.get("align.star_index")!;
+  const graph: SomiteGraph = {
+    schema_version: 3,
+    name: "Representative public reference",
+    nodes: [
+      { id: "download", operator: download.id, operator_revision: download.revision, ports: operatorPorts(download), params: { url: "https://example.invalid/reference.fa.gz" }, layout: { x: 0, y: 0 } },
+      { id: "decompress", operator: decompress.id, operator_revision: decompress.revision, ports: operatorPorts(decompress), params: {}, layout: { x: 240, y: 0 } },
+      { id: "index", operator: index.id, operator_revision: index.revision, ports: operatorPorts(index), params: { threads: 1 }, layout: { x: 480, y: 0 } },
+    ],
+    edges: [
+      { id: "download-decompress", from_node: "download", from_port: "fasta", to_node: "decompress", to_port: "compressed" },
+      { id: "decompress-index", from_node: "decompress", from_port: "fasta", to_node: "index", to_port: "ref" },
+    ],
+  };
+  await writeFile(join(projectRoot, "workflow.somite.json"), `${JSON.stringify(graph, null, 2)}\n`);
+  const app = await startProductionApp({ projectRoot, graph: "workflow.somite.json" });
+  context.after(app.stop);
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+  context.after(() => page.close());
+  const assertNoPageErrors = watchPage(page);
+  await emptyCatalogs(page, app);
+  let submitted: unknown;
+  await page.route(`${app.runnerUrl}/api/validations`, async (route) => {
+    if (route.request().method() === "OPTIONS") return fulfillJson(route, app, {}, 204);
+    submitted = route.request().postDataJSON();
+    return fulfillJson(route, app, { run_id: "public-validation", phase: "preparing", replayed: false }, 202);
+  });
+  await page.route(`${app.runnerUrl}/api/runs/public-validation*`, (route) => fulfillJson(route, app, {
+    run_id: "public-validation",
+    phase: "completed",
+    states: { download: "skipped", decompress: "skipped", index: "done", "decompress-fixture": "done" },
+    progress: { completed: 4, total: 4, unit: "nodes", message: "Completed" },
+    exit_code: 0,
+    evidence_receipt: {
+      receipt_digest: "blake3:public-browser-receipt",
+      recorded_at_unix_ms: 1,
+      subject_digest: "blake3:public-browser-subject",
+      kind: "configuration_validation",
+      scope: "graph_e2e_public_retrieval_not_exercised_fixture_parameters_adjusted",
+      configuration_digest: "blake3:public-browser-configuration",
+      fixture_digests: ["blake3:public-browser-reference"],
+      verifier: "somite-browser-test",
+      result: "passed",
+      node_results: { download: "inconclusive", decompress: "inconclusive", index: "passed" },
+      edge_results: { "download-decompress": "inconclusive", "decompress-index": "inconclusive" },
+      artifact_digests: [],
+      log_digests: [],
+    },
+  }));
+
+  await page.goto(app.webUrl);
+  await page.locator(".react-flow__node").nth(2).waitFor();
+  const validate = page.getByRole("button", { name: "Validate", exact: true });
+  assert.match(await validate.getAttribute("title") ?? "", /public retrieval is not exercised/);
+  await validate.click();
+  await page.locator(".status-copy").getByText(/Representative check passed · 1 workflow node passed · 2 public retrieval steps not exercised · tiny-data parameters disclosed/).waitFor();
+  const submittedGraph = (submitted as { graph?: typeof graph })?.graph;
+  assert.deepEqual(submittedGraph?.nodes.map((node) => node.operator), ["ensembl.fasta", "archive.gunzip_fasta", "align.star_index"]);
+  assert.equal(submittedGraph?.nodes.find((node) => node.id === "index")?.params?.genome_sa_index_nbases, undefined,
+    "fixture-only STAR sizing belongs to runner binding, not the saved canvas submission");
   assertNoPageErrors();
 });
 

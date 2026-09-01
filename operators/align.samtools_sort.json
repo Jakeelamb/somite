@@ -11,7 +11,7 @@
   },
   "ports": {
     "in": [{ "name": "bam", "type": "Bam" }],
-    "out": [{ "name": "bam", "type": "Bam" }]
+    "out": [{ "name": "bam", "type": "Bam", "resource_profile": "coordinate-sorted-bam" }]
   },
   "argv": [
     "samtools", "sort", "-@", "{param.threads}", "-o", "{work}/out/sorted.bam", "{input.bam}"

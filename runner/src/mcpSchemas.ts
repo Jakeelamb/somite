@@ -23,7 +23,10 @@ function object(
 
 /** Nested domain records may grow without replicating their complete model in every tool. */
 function openObject(properties: Record<string, unknown>, required: readonly string[]): JsonSchema {
-  return object(properties, required, true);
+  // JSON Schema permits additional properties by default. Omitting the explicit
+  // `true` keeps the advertised contract identical while avoiding the same
+  // redundant keyword in every nested response record.
+  return { type: "object", properties, required };
 }
 
 function record(values: JsonSchema): JsonSchema {
@@ -34,7 +37,7 @@ const portType = {
   type: "string",
   enum: [
     "Sra", "Fastq", "FastqGz", "Fasta", "FastaGz", "Gtf", "GtfGz", "Gff3",
-    "Sam", "Bam", "Bai", "Vcf", "VcfGz", "Bed", "Agp", "Chain", "Table",
+    "Sam", "Bam", "ReadGroupedBam", "GatkReadyBam", "Bai", "Fai", "Dict", "Vcf", "VcfGz", "Bed", "Agp", "Chain", "Table",
     "Json", "Html", "Image", "Zip", "Directory", "Text", "Preview",
   ],
 } as const;
@@ -50,7 +53,7 @@ const sourceWorkflow = openObject({
   schema_version: { const: 1 },
   workflow_revision: string,
   source: openObject({
-    provider: { enum: ["nf_core", "local"] },
+    provider: { enum: ["nf_core", "github", "local"] },
     repository: string,
     requested_revision: string,
     resolved_revision: string,
@@ -229,6 +232,7 @@ export const MCP_OUTPUT_SCHEMAS = Object.freeze({
     cached: boolean,
   })),
   "somite.source_workflow.resolve_nfcore": result(transaction),
+  "somite.source_workflow.resolve_github": result(transaction),
   "somite.source_workflow.edit": result(transaction),
   "somite.source_workflow.promote": result(transaction),
   "somite.source.search": result(object({
@@ -247,6 +251,7 @@ export const MCP_OUTPUT_SCHEMAS = Object.freeze({
         result: string,
         action: string,
         operator_ids: array(string),
+        read_layout: { enum: ["single", "paired"] },
       }, ["kind", "value", "provider", "result", "action", "operator_ids"]),
     }, ["key", "title", "accession", "provider", "data_kind", "request"])),
   })),

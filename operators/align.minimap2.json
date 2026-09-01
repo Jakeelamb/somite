@@ -18,9 +18,9 @@
   "ports": {
     "in": [
       { "name": "reads", "type": "Fastq", "union": ["Fastq", "FastqGz", "Fasta", "FastaGz"] },
-      { "name": "ref", "type": "Fasta", "union": ["Fasta", "FastaGz", "Directory"], "optional": true }
+      { "name": "ref", "type": "Fasta", "union": ["Fasta", "FastaGz"] }
     ],
-    "out": [{ "name": "bam", "type": "Bam" }]
+    "out": [{ "name": "sam", "type": "Sam" }]
   },
   "argv": [
     "minimap2",
@@ -31,6 +31,6 @@
     "-o", "{work}/out/aln.sam"
   ],
   "outputs": {
-    "bam": { "glob": "{work}/out/aln.sam", "type": "Bam", "optional": true }
+    "sam": { "glob": "{work}/out/aln.sam", "type": "Sam" }
   }
 }

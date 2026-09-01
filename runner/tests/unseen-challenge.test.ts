@@ -70,14 +70,101 @@ test("paper challenge reports exact provenance and reconstruction gaps", async (
   assert.deepEqual(report.reconstruction.operators, []);
   assert.deepEqual(report.reconstruction.unsupported, ["artic", "freyja"]);
   assert.deepEqual(report.reconstruction.mentions, [
-    { name: "artic", support: "unsupported" },
-    { name: "freyja", support: "unsupported" },
+    { name: "artic", support: "unsupported", executable: true },
+    { name: "freyja", support: "unsupported", executable: true },
   ]);
   assert.equal(report.source.id, "PMC12716492");
   assert.equal(report.retrieved_at, retrievedAt);
 });
 
-test("paper challenge names missing adapters instead of reporting an opaque evidence fragment", async () => {
+test("paper challenge keeps executable method evidence visible in a partial draft", async () => {
+  const content = new TextEncoder().encode([
+    "Methods",
+    "Paired-end sequencing reads were assessed with FastQC and trimmed using Trim Galore.",
+    "The ARTIC pipeline was used to generate the final consensus genome.",
+  ].join("\n"));
+  const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+  const review = reconstructPaper(catalog, new TextDecoder().decode(content), "jats");
+  const report = createPaperChallengeReport({
+    source: { provider: "europe_pmc", id: "PMC4", title: "Partial draft", url: "https://europepmc.org/articles/PMC4" },
+    content,
+    retrieved_at: retrievedAt,
+    review,
+  });
+
+  assert.equal(report.reconstruction.status, "candidate_built");
+  assert.deepEqual(report.reconstruction.gaps, []);
+  assert.deepEqual(report.reconstruction.evidence_only_methods, ["trimgalore", "artic"]);
+  assert.deepEqual(report.reconstruction.omitted_methods, []);
+  assert.equal(report.quality.result, "attention");
+  assert.deepEqual(report.quality.issues, ["The visual draft retains 2 executable paper methods as untyped evidence: trimgalore, artic."]);
+});
+
+test("paper challenge compares canonical method identities when labels contain punctuation", async () => {
+  const content = new TextEncoder().encode([
+    "Methods",
+    "Paired-end sequencing reads were assessed with FastQC.",
+    "A custom Python script was used to summarize the resulting reports.",
+  ].join("\n"));
+  const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+  const review = reconstructPaper(catalog, new TextDecoder().decode(content), "jats");
+  const report = createPaperChallengeReport({
+    source: { provider: "europe_pmc", id: "PMC-CANONICAL", title: "Punctuated method", url: "https://example.invalid/canonical" },
+    content,
+    retrieved_at: retrievedAt,
+    review,
+  });
+
+  assert.ok(review.mentions.some((mention) => mention.normalized_name === "custom-script"));
+  assert.deepEqual(report.reconstruction.evidence_only_methods, ["custom-script"]);
+  assert.deepEqual(report.reconstruction.omitted_methods, []);
+});
+
+test("paper challenge distinguishes an exact cited workflow from a failed no-method extraction", async () => {
+  const content = new TextEncoder().encode([
+    "Methods",
+    "The analysis workflow source code is available at https://github.com/example/reconstructable-pipeline.",
+  ].join("\n"));
+  const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+  const review = reconstructPaper(catalog, new TextDecoder().decode(content), "jats");
+  const report = createPaperChallengeReport({
+    source: { provider: "europe_pmc", id: "PMC-SOURCE", title: "Cited source", url: "https://example.invalid/source" },
+    content,
+    retrieved_at: retrievedAt,
+    review,
+  });
+
+  assert.equal(report.reconstruction.status, "source_workflow_found");
+  assert.equal(report.quality.result, "attention");
+  assert.equal(report.reconstruction.workflow_sources[0]?.repository, "https://github.com/example/reconstructable-pipeline");
+});
+
+test("paper challenge matches a long tool label to its canonical acronym evidence", async () => {
+  const content = new TextEncoder().encode([
+    "Methods",
+    "PacBio HiFi reads were assembled with hifiasm.",
+    "Another Gtf/Gff Analysis Toolkit (AGAT) was used to retain the longest transcript isoform.",
+  ].join("\n"));
+  const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+  const review = reconstructPaper(catalog, new TextDecoder().decode(content), "jats");
+  const report = createPaperChallengeReport({
+    source: { provider: "europe_pmc", id: "PMC-ACRONYM", title: "Acronym method evidence", url: "https://example.invalid/acronym" },
+    content,
+    retrieved_at: retrievedAt,
+    review,
+  });
+
+  const candidate = review.candidates.find((item) => item.assay === "assembly");
+  assert.ok(candidate?.graph.nodes.some((node) => node.operator === "asm.hifiasm"));
+  const evidence = candidate?.graph.nodes.find((node) => node.operator === "gap.missing" && node.params?.tool === "AGAT");
+  assert.ok(evidence);
+  assert.deepEqual(evidence.ports, []);
+  assert.equal(candidate?.graph.edges.some((edge) => edge.from_node === evidence.id || edge.to_node === evidence.id), false);
+  assert.deepEqual(report.reconstruction.evidence_only_methods, ["agat"]);
+  assert.deepEqual(report.reconstruction.omitted_methods, []);
+});
+
+test("paper challenge uses the reviewed Picard action while retaining typed local inputs", async () => {
   const content = new TextEncoder().encode([
     "Methods",
     "RNA-seq reads were aligned with STAR, duplicates were marked with Picard MarkDuplicates, and counts were generated with featureCounts.",
@@ -91,7 +178,12 @@ test("paper challenge names missing adapters instead of reporting an opaque evid
     review,
   });
 
-  assert.deepEqual(report.reconstruction.gaps, ["Picard"]);
+  assert.deepEqual(report.reconstruction.gaps, []);
+  assert.equal(report.reconstruction.required_actions, 3);
+  assert.ok(report.reconstruction.operators.includes("align.picard_mark_duplicates"));
+  assert.ok(report.reconstruction.operators.includes("files.import_gtf"));
+  assert.deepEqual(report.reconstruction.unresolved_method_inputs, []);
+  assert.deepEqual(report.quality.issues, []);
 });
 
 test("workflow challenge reports the frozen source identity and exact blockers", () => {
@@ -126,6 +218,9 @@ test("workflow challenge reports the frozen source identity and exact blockers",
   assert.equal(report.content_digest, digest("c"));
   assert.equal(report.source.resolved_revision, "b".repeat(40));
   assert.equal(report.index.scopes, 1);
+  assert.equal(report.semantic_projection.result, "failed");
+  assert.equal(report.semantic_projection.indexed_invocations, 0);
+  assert.equal(report.semantic_projection.projected_entities, 0);
   assert.equal(report.status, "inspectable_only");
   assert.equal(report.quality.result, "failed");
   assert.equal(report.capabilities.exact_execution, false);
@@ -186,8 +281,17 @@ test("workflow challenge discovery imports until it finds a new frozen source di
       file_count: 2,
       source_bytes: 200,
     },
-    scopes: [],
-    invocations: [],
+    scopes: [
+      { id: "root", title: "Root", kind: "entry_workflow", span: { path: "main.nf", start_line: 1, end_line: 4 } },
+      { id: "task", title: "Task", kind: "process", span: { path: "modules/task.nf", start_line: 1, end_line: 3 } },
+    ],
+    invocations: [{
+      id: "call-task",
+      caller: "root",
+      name: "TASK",
+      callee: "task",
+      span: { path: "main.nf", start_line: 3, end_line: 3 },
+    }],
     capabilities: {
       exact_execution: false,
       parameter_edits: true,
@@ -218,9 +322,27 @@ test("workflow challenge discovery imports until it finds a new frozen source di
     content_digest: old.source.source_digest,
     tested_at: retrievedAt,
   }] });
+  const ticks = [0, 0, 10, 10, 25, 25, 27, 27, 47, 47, 50];
 
-  const report = await runUnseenWorkflowChallenge({ gateway, ledger, retrieved_at: retrievedAt });
+  const report = await runUnseenWorkflowChallenge({
+    gateway,
+    ledger,
+    retrieved_at: retrievedAt,
+    clock: () => ticks.shift() ?? 50,
+  });
 
   assert.equal(report.source.repository, "https://github.com/nf-core/fresh");
   assert.deepEqual(imported, ["nf-core/old", "nf-core/fresh"]);
+  assert.deepEqual(report.semantic_projection, {
+    result: "passed",
+    indexed_invocations: 1,
+    projected_entities: 1,
+    projected_relations: 0,
+  });
+  assert.deepEqual(report.timings_ms, {
+    catalog_discovery: 10,
+    source_import: 35,
+    semantic_projection: 5,
+    total: 50,
+  });
 });

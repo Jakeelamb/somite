@@ -24,7 +24,7 @@ import type {
 import { validateGraph } from "./workflow.ts";
 
 const PORT_TYPES = new Set<PortType>([
-  "Sra", "Fastq", "FastqGz", "Fasta", "FastaGz", "Gtf", "GtfGz", "Gff3", "Sam", "Bam", "Bai",
+  "Sra", "Fastq", "FastqGz", "Fasta", "FastaGz", "Gtf", "GtfGz", "Gff3", "Sam", "Bam", "ReadGroupedBam", "GatkReadyBam", "Bai", "Fai", "Dict",
   "Vcf", "VcfGz", "Bed", "Agp", "Chain", "Table", "Json", "Html", "Image", "Zip", "Directory", "Text", "Preview",
 ]);
 const COLORS = new Set<CanvasColor>(["yellow", "orange", "rose", "violet", "blue", "teal", "green", "gray"]);
@@ -171,7 +171,7 @@ function sourcePin(value: unknown, path: string): WorkflowSourcePin {
   const raw = object(value, path);
   knownFields(raw, path, ["provider", "repository", "requested_revision", "resolved_revision", "source_digest", "entrypoint", "file_count", "source_bytes"]);
   return {
-    provider: oneOf(raw.provider, `${path}.provider`, new Set(["nf_core", "local"] as const)),
+    provider: oneOf(raw.provider, `${path}.provider`, new Set(["nf_core", "github", "local"] as const)),
     repository: string(raw.repository, `${path}.repository`),
     requested_revision: string(raw.requested_revision, `${path}.requested_revision`),
     resolved_revision: string(raw.resolved_revision, `${path}.resolved_revision`),

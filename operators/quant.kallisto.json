@@ -1,0 +1,58 @@
+{
+  "id": "quant.kallisto",
+  "title": "Kallisto",
+  "palette": ["RNA"],
+  "paper": {
+    "aliases": ["Kallisto"],
+    "operation_class": "transcript_quantification",
+    "assays": ["rna-seq"]
+  },
+  "kind": "external",
+  "cost": "high",
+  "bin": "kallisto",
+  "pixi": ["bioconda::kallisto=0.52.0"],
+  "params": {
+    "threads": { "type": "int", "label": "Threads", "page": "Kallisto", "default": 4, "min": 1, "max": 64 }
+  },
+  "ports": {
+    "in": [
+      { "name": "r1", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
+      { "name": "r2", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
+      {
+        "name": "index",
+        "type": "Directory",
+        "stage_as": "kallisto_index",
+        "resource": {
+          "profile": "kallisto-transcriptome-index",
+          "title": "Kallisto transcriptome index",
+          "detail": "Connect a Kallisto index built from the exact transcript sequences being quantified.",
+          "resolutions": [
+            {
+              "id": "build-from-transcript-fasta",
+              "label": "Build from transcript FASTA",
+              "detail": "Add Build Kallisto transcriptome index and connect a transcript FASTA, not a genomic assembly FASTA.",
+              "kind": "build",
+              "recommended": true,
+              "source_url": "https://pachterlab.github.io/kallisto/manual"
+            }
+          ]
+        }
+      }
+    ],
+    "out": [
+      { "name": "abundance", "type": "Table" },
+      { "name": "run_info", "type": "Json" }
+    ]
+  },
+  "argv": [
+    "kallisto", "quant",
+    "--index", "{input.index}/transcripts.idx",
+    "--output-dir", "{work}/out",
+    "--threads", "{param.threads}",
+    "{input.r1}", "{input.r2}"
+  ],
+  "outputs": {
+    "abundance": { "glob": "{work}/out/abundance.tsv", "type": "Table" },
+    "run_info": { "glob": "{work}/out/run_info.json", "type": "Json" }
+  }
+}

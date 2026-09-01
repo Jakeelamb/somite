@@ -25,10 +25,12 @@ import {
   validateGraph,
   validateSourceWorkflow,
 } from "./workflow.ts";
+import { planTaskEnvironments } from "./taskEnvironment.ts";
+import { planSourceTaskExecution } from "./sourceTaskExecution.ts";
 
 // Bump whenever immutable source-derived fields or capabilities change. This is
 // part of every cached source request identity, not a presentation version.
-export const SOURCE_INDEXER_REVISION = "source-indexer-ts-v2";
+export const SOURCE_INDEXER_REVISION = "source-indexer-ts-v9";
 const encoder = new TextEncoder();
 const MAX_SCHEMA_BYTES = 8 * 1024 * 1024;
 const MAX_SCHEMA_NODES = 100_000;
@@ -38,7 +40,7 @@ const MAX_SCHEMA_PARAMETERS = 10_000;
 const MAX_SCHEMA_STRING_BYTES = 16 * 1024;
 const MAX_SCHEMA_TOTAL_STRING_BYTES = 16 * 1024 * 1024;
 const MAX_SCHEMA_NUMBER_BYTES = 16 * 1024;
-const PROPERTY_KEYS = new Set(["type", "enum", "minimum", "maximum", "pattern", "format", "default"]);
+const PROPERTY_KEYS = new Set(["type", "enum", "minimum", "maximum", "pattern", "format", "default", "exists"]);
 const PROPERTY_ANNOTATIONS = new Set(["title", "description", "help_text", "help", "hidden", "fa_icon", "mimetype", "errorMessage", "examples", "$comment", "readOnly", "writeOnly"]);
 const CONTAINER_ANNOTATIONS = new Set(["title", "description", "help_text", "help", "hidden", "fa_icon", "default", "examples", "$comment", "readOnly", "writeOnly"]);
 const ROOT_KEYS = new Set(["type", "properties", "required", "allOf", "$defs", "definitions", "$id", "$schema"]);
@@ -46,6 +48,7 @@ const GROUP_KEYS = new Set(["type", "properties", "required"]);
 const STRING_ANNOTATIONS = new Set(["title", "description", "help_text", "help", "fa_icon", "$comment"]);
 const BOOLEAN_ANNOTATIONS = new Set(["hidden", "readOnly", "writeOnly"]);
 const PATH_FORMATS = new Set(["file-path", "directory-path", "path"]);
+const MAX_SCHEMA_PATTERN_REPETITION = 10_000;
 
 type JsonObject = Record<string, unknown>;
 type JsonPath = readonly (string | number)[];
@@ -344,7 +347,7 @@ function safePattern(pattern: string): string | undefined {
     if (character === "\\") {
       const escaped = pattern[++index];
       if (!escaped) return "pattern ends with an incomplete escape";
-      const allowed = inClass ? "dDsSwW]\\^-" : "dDsSwWbB.^$*+?()[]|\\";
+      const allowed = inClass ? "dDsSwW].\\^-" : "dDsSwWbB.^$*+?()[]|\\";
       if (!allowed.includes(escaped)) return `escape \\${escaped} is outside the supported subset`;
     } else if (character === "[") {
       if (inClass) return "nested character classes are not supported";
@@ -354,7 +357,19 @@ function safePattern(pattern: string): string | undefined {
       inClass = false;
     } else if (character === "(" && !inClass && pattern[index + 1] === "?" && pattern[index + 2] !== ":") {
       return "lookarounds, inline modes, and special groups are not supported";
-    } else if (character === "{" || character === "}") return "counted quantifiers are not supported";
+    } else if (character === "{" && !inClass) {
+      const close = pattern.indexOf("}", index + 1);
+      if (close < 0) return "counted quantifier is missing its closing brace";
+      const repetition = /^(\d{1,5})(?:,(\d{0,5}))?$/.exec(pattern.slice(index + 1, close));
+      if (!repetition) return "counted quantifier is outside the supported {n}, {n,}, or {n,m} forms";
+      const minimum = Number(repetition[1]);
+      const maximum = repetition[2] ? Number(repetition[2]) : repetition[2] === undefined ? minimum : undefined;
+      if (minimum > MAX_SCHEMA_PATTERN_REPETITION || maximum !== undefined && maximum > MAX_SCHEMA_PATTERN_REPETITION) {
+        return `counted quantifier exceeds ${MAX_SCHEMA_PATTERN_REPETITION} repetitions`;
+      }
+      if (maximum !== undefined && maximum < minimum) return "counted quantifier maximum is less than its minimum";
+      index = close;
+    } else if (character === "}" && !inClass) return "unmatched counted-quantifier close is not supported";
   }
   try {
     new RegExp(pattern);
@@ -362,6 +377,19 @@ function safePattern(pattern: string): string | undefined {
     return error instanceof Error ? error.message : String(error);
   }
   return undefined;
+}
+
+function retainedRemotePathDefault(value: string) {
+  if (![...value].every((character) => {
+    const code = character.codePointAt(0) ?? 0;
+    return code >= 33 && code <= 126;
+  })) return false;
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol !== "file:" && Boolean(parsed.hostname) && !parsed.username && !parsed.password;
+  } catch {
+    return false;
+  }
 }
 
 function valueValid(field: Pick<WorkflowParameterField, "type" | "minimum" | "maximum" | "choices" | "pattern">, value: ParamValue) {
@@ -461,6 +489,15 @@ function parseProperty(
   if (schema.format !== undefined && (!format || !PATH_FORMATS.has(format) || type !== "string")) {
     return unsupportedProperty(name, group, schema, required, "JSON Schema format is not a supported path format on a string property");
   }
+  if (schema.exists !== undefined && (schema.exists !== true || type !== "string" || !format)) {
+    return unsupportedProperty(
+      name,
+      group,
+      schema,
+      required,
+      "nf-core exists is only proven for a true constraint on a typed project path",
+    );
+  }
 
   if ((schema.minimum !== undefined || schema.maximum !== undefined) && type !== "integer" && type !== "number") {
     return unsupportedProperty(name, group, schema, required, "numeric bounds on a non-numeric property are outside Somite's proven editable contract");
@@ -522,6 +559,17 @@ function parseProperty(
   const defaultValue = parameterValue(schema.default);
   if (schema.default !== undefined && schema.default !== null && (defaultValue === undefined || !valueValid(field, defaultValue)
     || (format && (typeof defaultValue !== "string" || !safeSourcePath(defaultValue))))) {
+    if (!required && format && typeof defaultValue === "string" && valueValid(field, defaultValue)
+      && retainedRemotePathDefault(defaultValue)) {
+      return {
+        field,
+        diagnostic: {
+          code: "source_parameter_default_retained",
+          message: `Parameter ${name} is editable through an explicit project-path binding; its remote URI default remains owned by the pinned source and is not rewritten as a local path.`,
+          span: schemaSpan(),
+        },
+      };
+    }
     return unsupportedProperty(
       name,
       group,
@@ -844,39 +892,32 @@ function rootPixiDependencies(text: string) {
   return dependencies;
 }
 
-function externalEnvironmentDirective(files: readonly FrozenSourceFile[]) {
-  const sourceFiles = files.filter((file) => file.path.endsWith(".nf") || file.path.endsWith(".config"));
-  for (const file of sourceFiles) {
-    const text = sourceText(file);
-    if (text === undefined) continue;
-    const lines = text.split("\n");
-    for (let index = 0; index < lines.length; index += 1) {
-      const line = lines[index]!.replace(/\/\/.*$/, "");
-      if (/\b(?:container|conda|spack|module)\s+(?:['"]|[A-Za-z_$])/.test(line)
-        || /\b(?:container|conda|spack|module)\s*=/.test(line)
-        || /\b(?:docker|podman|singularity|apptainer|wave|fusion)\.enabled\s*=\s*true\b/.test(line)) {
-        return { path: file.path, line: index + 1 };
-      }
-    }
-  }
-  return undefined;
-}
-
-function sourceExecutionCapability(files: readonly FrozenSourceFile[]) {
+function sourceExecutionCapability(files: readonly FrozenSourceFile[], entrypoint: string) {
   const diagnostics: SourceDiagnostic[] = [];
   const manifestFile = files.find((file) => file.path === "pixi.toml");
   const lockFile = files.find((file) => file.path === "pixi.lock");
+  const environments = planTaskEnvironments(files, entrypoint);
+  const sourcePath = files.find((file) => file.path.endsWith(".nf"))?.path ?? "main.nf";
+  const processDeclarations = environments.declarations.filter((entry) => entry.origin === "process");
+  const condaDeclarations = processDeclarations.filter((entry) => entry.kind === "conda");
+  const containerDeclarations = processDeclarations.filter((entry) => entry.kind === "container");
+  const environmentSummary = [
+    `${environments.conda_environments.length} referenced Conda environment file${environments.conda_environments.length === 1 ? "" : "s"}`,
+    `${environments.covered_processes}/${environments.processes.length} processes covered`,
+    `${containerDeclarations.length} container declaration${containerDeclarations.length === 1 ? "" : "s"}`,
+  ].join(", ");
   const diagnostic = (code: string, message: string, path: string, line = 1) => diagnostics.push({
     code,
     message,
     span: { path, start_line: line, end_line: line },
   });
   if (!manifestFile && !lockFile) {
-    diagnostic(
-      "source_pixi_environment_missing",
-      "Exact execution remains disabled because the source has no root pixi.toml and pixi.lock task environment.",
-      "main.nf",
-    );
+    const decision = planSourceTaskExecution(files, entrypoint);
+    if (decision.status === "candidate") return { exact: true, diagnostics };
+    for (const blocker of decision.blockers.slice(0, 64)) {
+      const span = blocker.spans[0];
+      diagnostic(blocker.code, blocker.message, span?.path ?? sourcePath, span?.start_line ?? 1);
+    }
     return { exact: false, diagnostics };
   }
   if (!manifestFile || !lockFile) {
@@ -899,13 +940,23 @@ function sourceExecutionCapability(files: readonly FrozenSourceFile[]) {
     );
     return { exact: false, diagnostics };
   }
-  const external = externalEnvironmentDirective(files);
-  if (external) {
+  if (environments.configuration_issues.length) {
+    for (const problem of environments.configuration_issues.slice(0, 64)) {
+      diagnostics.push({
+        code: problem.code,
+        message: problem.message,
+        span: problem.spans[0] ?? { path: sourcePath, start_line: 1, end_line: 1 },
+      });
+    }
+    return { exact: false, diagnostics };
+  }
+  if (environments.declarations.length) {
+    const first = environments.declarations[0]!;
     diagnostic(
       "source_external_task_environment",
-      "Exact execution remains disabled because this workflow delegates a process environment to a container, Conda, module, or external runtime instead of the locked root Pixi environment.",
-      external.path,
-      external.line,
+      `Exact execution remains disabled because ${condaDeclarations.length} Conda and ${containerDeclarations.length} container process declarations plus any config overrides are not proven by the locked root Pixi environment (${environmentSummary}).`,
+      first.span.path,
+      first.span.start_line,
     );
     return { exact: false, diagnostics };
   }
@@ -917,7 +968,7 @@ export function deriveSourceWorkflow(files: readonly FrozenSourceFile[], source:
   const projectionBudget = new DerivedProjectionBudget();
   const outline = indexNextflowSource(files, source.entrypoint, manifest.source_digest, projectionBudget);
   const schema = parseNextflowParameterSchema(files, projectionBudget);
-  const execution = sourceExecutionCapability(files);
+  const execution = sourceExecutionCapability(files, source.entrypoint);
   const diagnostics = [...outline.diagnostics, ...schema.diagnostics, ...execution.diagnostics].sort((left, right) =>
     (left.span?.path ?? "").localeCompare(right.span?.path ?? "")
     || (left.span?.start_line ?? 0) - (right.span?.start_line ?? 0)

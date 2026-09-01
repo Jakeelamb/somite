@@ -15,7 +15,7 @@ import { graphStateRevision, topologicalOrder, validateGraph } from "../workflow
 const SEED = 0x50_4f_4d_49;
 const VALID_CASES = 64;
 const PORT_TYPES: readonly PortType[] = [
-  "Sra", "Fastq", "FastqGz", "Fasta", "FastaGz", "Gtf", "GtfGz", "Gff3", "Sam", "Bam", "Bai",
+  "Sra", "Fastq", "FastqGz", "Fasta", "FastaGz", "Gtf", "GtfGz", "Gff3", "Sam", "Bam", "ReadGroupedBam", "GatkReadyBam", "Bai", "Fai", "Dict",
   "Vcf", "VcfGz", "Bed", "Agp", "Chain", "Table", "Json", "Html", "Image", "Zip", "Directory", "Text", "Preview",
 ];
 const COLORS: readonly CanvasColor[] = ["yellow", "orange", "rose", "violet", "blue", "teal", "green", "gray"];

@@ -247,6 +247,61 @@ test("paper decoding rejects response-only enum drift", async () => {
   );
 });
 
+test("paper decoding retains cited GitHub workflow sources", async () => {
+  const client = createSomiteClient("http://runner.test", (async () => json({
+    extracted_via: "jats",
+    outcome: "no_reconstructable_methods",
+    warnings: [],
+    mentions: [],
+    resources: [],
+    workflow_sources: [{
+      provider: "github",
+      repository: "https://github.com/MedvedevaLab/NEXT-scASV",
+      context: "The Nextflow pipeline is available from this repository.",
+    }],
+    candidates: [],
+  })) as typeof fetch);
+
+  const review = await client.reconstructPaperPath("paper.xml", new AbortController().signal);
+  assert.equal(review.workflow_sources?.[0]?.repository, "https://github.com/MedvedevaLab/NEXT-scASV");
+});
+
+test("paper decoding rejects non-GitHub workflow citation links", async () => {
+  const payload = {
+    extracted_via: "jats",
+    outcome: "no_reconstructable_methods",
+    warnings: [],
+    mentions: [],
+    resources: [],
+    workflow_sources: [{
+      provider: "github",
+      repository: "javascript:alert(1)",
+      context: "malicious cached value",
+    }],
+    candidates: [],
+  };
+  const client = createSomiteClient("http://runner.test", (async () => json(payload)) as typeof fetch);
+  await assert.rejects(
+    client.reconstructPaperPath("paper.xml", new AbortController().signal),
+    (error: unknown) => error instanceof ResponseContractError && /workflow_sources/.test(error.message),
+  );
+});
+
+test("GitHub workflow resolution preserves its narrow transport contract", async () => {
+  let requestUrl = "";
+  let requestBody: unknown;
+  const client = createSomiteClient("http://runner.test", (async (input, init) => {
+    requestUrl = String(input);
+    requestBody = JSON.parse(String(init?.body));
+    return json({ engine: "nextflow", workflow: "MedvedevaLab/NEXT-scASV", revision: "default branch", graph, cached: false });
+  }) as typeof fetch);
+
+  const result = await client.resolveGithubWorkflow("https://github.com/MedvedevaLab/NEXT-scASV");
+  assert.equal(requestUrl, "http://runner.test/api/source-workflows/github/resolve");
+  assert.deepEqual(requestBody, { repository: "https://github.com/MedvedevaLab/NEXT-scASV", revision: "" });
+  assert.equal(result.engine, "nextflow");
+});
+
 test("paper intake status validates required job identity", async () => {
   const client = createSomiteClient("http://runner.test", (async () => json({
     phase: "queued",

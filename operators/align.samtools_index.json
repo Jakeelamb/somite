@@ -1,0 +1,23 @@
+{
+  "id": "align.samtools_index",
+  "title": "Index coordinate-sorted BAM",
+  "palette": ["Alignment preparation"],
+  "kind": "external",
+  "cost": "low",
+  "bin": "samtools",
+  "pixi": ["bioconda::samtools"],
+  "params": {
+    "threads": { "type": "int", "label": "Threads", "page": "Index", "default": 4, "min": 1, "max": 64 }
+  },
+  "ports": {
+    "in": [{ "name": "bam", "type": "GatkReadyBam", "stage_as": "sample.bam" }],
+    "out": [{ "name": "bai", "type": "Bai" }]
+  },
+  "argv": [
+    "samtools", "index", "-@", "{param.threads}",
+    "-o", "{work}/out/sample.bam.bai", "{input.bam}"
+  ],
+  "outputs": {
+    "bai": { "glob": "{work}/out/sample.bam.bai", "type": "Bai" }
+  }
+}

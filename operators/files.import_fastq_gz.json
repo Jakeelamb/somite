@@ -1,0 +1,16 @@
+{
+  "id": "files.import_fastq_gz",
+  "title": "Local compressed reads",
+  "palette": ["Files"],
+  "kind": "inprocess",
+  "cost": "low",
+  "params": {
+    "path": { "type": "string", "label": "Compressed FASTQ path", "page": "Reads", "required": true }
+  },
+  "ports": {
+    "in": [],
+    "out": [{ "name": "reads", "type": "FastqGz", "import_param": "path" }]
+  },
+  "argv": [],
+  "outputs": {}
+}

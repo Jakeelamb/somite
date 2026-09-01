@@ -119,8 +119,8 @@ test("starter preview is removed and the real canvas is wired", async () => {
   assert.match(app, /setCatalogExpansion\(\{ operatorId: operator\.id, title: operator\.title, phase: "resolving" \}\)/);
   assert.match(app, /This pinned workflow uses the whole canvas\. Start it in a new or empty project\./);
   assert.match(panels, /Search by organism, name, or accession/);
-  assert.match(panels, /!isSource\(operator\) \|\| visibleSpecializedInput\(operator\)/);
-  assert.match(panels, /operator\.kind !== "source"/);
+  assert.match(panels, /operators\.filter\(\(operator\) => libraryOperatorIsAvailable\(operator, continuation\)\)\.filter/);
+  assert.match(panels, /operators\.filter\(libraryOperatorIsVisible\)\.length/);
   assert.doesNotMatch(panels, /Library Modes|Quick Add|Workflow Engines|Open a local Snakemake project/);
   assert.match(app, /className="canvas-toolbar"/);
   assert.match(app, /agent-edge-launcher/);

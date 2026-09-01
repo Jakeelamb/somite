@@ -1,0 +1,34 @@
+{
+  "id": "ncbi.datasets_extract_assembly",
+  "title": "Extract NCBI assembly package",
+  "palette": ["NCBI", "Datasets"],
+  "kind": "external",
+  "cost": "low",
+  "bin": "unzip",
+  "pixi": ["conda-forge::unzip"],
+  "params": {},
+  "ports": {
+    "in": [{ "name": "package", "type": "Zip" }],
+    "out": [
+      { "name": "genome", "type": "Fasta" },
+      { "name": "gff3", "type": "Gff3", "optional": true },
+      { "name": "gtf", "type": "Gtf", "optional": true },
+      { "name": "catalog", "type": "Json" },
+      { "name": "sequence_report", "type": "Text", "optional": true }
+    ]
+  },
+  "argv": [
+    "unzip",
+    "-q",
+    "{input.package}",
+    "-d",
+    "{work}/out/package"
+  ],
+  "outputs": {
+    "genome": { "glob": "{work}/out/package/ncbi_dataset/data/*/*_genomic.fna", "type": "Fasta" },
+    "gff3": { "glob": "{work}/out/package/ncbi_dataset/data/*/genomic.gff", "type": "Gff3", "optional": true },
+    "gtf": { "glob": "{work}/out/package/ncbi_dataset/data/*/genomic.gtf", "type": "Gtf", "optional": true },
+    "catalog": { "glob": "{work}/out/package/ncbi_dataset/dataset_catalog.json", "type": "Json" },
+    "sequence_report": { "glob": "{work}/out/package/ncbi_dataset/data/*/sequence_report.jsonl", "type": "Text", "optional": true }
+  }
+}

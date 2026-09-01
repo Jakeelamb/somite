@@ -42,6 +42,8 @@ export type PortSpec = {
   resource?: ResourceSpec;
   stage_as?: string;
   import_param?: string;
+  /** The executable discovers this staged input by its conventional basename instead of an argv flag. */
+  implicit_sidecar?: boolean;
 };
 
 export type OutputSpec = {
@@ -155,6 +157,164 @@ export function operatorPorts(operator: Operator): SomitePort[] {
       ...(port.optional ? { optional: true } : {}),
     })),
   ];
+}
+
+export type OperatorImportPath = Readonly<{
+  port: string;
+  parameter: string;
+  kind: "file" | "directory";
+}>;
+
+/** The exact local path parameters consumed directly by one in-process import operator. */
+export function operatorImportPaths(operator: Operator): readonly OperatorImportPath[] {
+  return operator.ports.out
+    .filter((port) => port.import_param !== undefined)
+    .map((port) => ({
+      port: port.name,
+      parameter: port.import_param!,
+      kind: port.type === "Directory" ? "directory" as const : "file" as const,
+    }));
+}
+
+export type OperatorContractIssueCode =
+  | "missing_binary"
+  | "missing_argv"
+  | "unknown_input_reference"
+  | "unknown_input_condition"
+  | "unconsumed_input"
+  | "unguarded_optional_input"
+  | "unknown_parameter_reference"
+  | "missing_output_rule"
+  | "extra_output_rule"
+  | "output_type_mismatch"
+  | "output_optionality_mismatch"
+  | "unsupported_output_exclude"
+  | "unsupported_output_placeholder"
+  | "unknown_stdout_output"
+  | "invalid_import_parameter"
+  | "unsupported_inprocess";
+
+export type OperatorContractIssue = Readonly<{
+  code: OperatorContractIssueCode;
+  message: string;
+}>;
+
+function contractIssue(code: OperatorContractIssueCode, message: string): OperatorContractIssue {
+  return { code, message };
+}
+
+/**
+ * Cross-field invariants for one reviewed execution contract.
+ *
+ * The JSON codec validates shape. This validates that ports, argv, output
+ * collection, and in-process lowering describe the same executable behavior.
+ */
+export function operatorContractIssues(operator: Operator): readonly OperatorContractIssue[] {
+  const issues: OperatorContractIssue[] = [];
+  if (operator.kind === "external") {
+    if (!operator.bin?.trim()) issues.push(contractIssue("missing_binary", `${operator.id}: external operator has no executable binary`));
+    if ((operator.argv ?? []).length === 0) issues.push(contractIssue("missing_argv", `${operator.id}: external operator argv is empty`));
+
+    const inputs = new Map(operator.ports.in.map((port) => [port.name, port]));
+    const references = new Map<string, Array<{ condition?: string }>>();
+    for (const configured of operator.argv ?? []) {
+      const conditional = /^(\?!|\?)([^:]+):/.exec(configured);
+      const condition = conditional?.[2];
+      if (condition !== undefined && !inputs.has(condition)) {
+        issues.push(contractIssue("unknown_input_condition", `${operator.id}: argv conditions on unknown input ${condition}`));
+      }
+      for (const match of configured.matchAll(/\{input\.([^}]+)\}/g)) {
+        const name = match[1]!;
+        if (!inputs.has(name)) {
+          issues.push(contractIssue("unknown_input_reference", `${operator.id}: argv references unknown input ${name}`));
+          continue;
+        }
+        const uses = references.get(name) ?? [];
+        uses.push({ ...(condition === undefined ? {} : { condition }) });
+        references.set(name, uses);
+      }
+      for (const match of configured.matchAll(/\{(?:param|flag)\.([^}]+)\}/g)) {
+        const name = match[1]!;
+        if (!Object.hasOwn(operator.params, name)) {
+          issues.push(contractIssue("unknown_parameter_reference", `${operator.id}: argv references unknown parameter ${name}`));
+        }
+      }
+    }
+    for (const input of operator.ports.in) {
+      const uses = references.get(input.name) ?? [];
+      if (uses.length === 0 && !input.implicit_sidecar) {
+        issues.push(contractIssue("unconsumed_input", `${operator.id}.${input.name}: declared input is never consumed`));
+      }
+      if (input.optional && uses.some((reference) => reference.condition !== input.name)) {
+        issues.push(contractIssue(
+          "unguarded_optional_input",
+          `${operator.id}.${input.name}: optional input is referenced outside its own conditional argv token`,
+        ));
+      }
+    }
+
+    const outputs = new Map(operator.ports.out.map((port) => [port.name, port]));
+    for (const port of operator.ports.out) {
+      const spec = operator.outputs?.[port.name];
+      if (!spec) {
+        issues.push(contractIssue("missing_output_rule", `${operator.id}.${port.name}: output port has no collection rule`));
+        continue;
+      }
+      if (spec.type !== port.type) {
+        issues.push(contractIssue(
+          "output_type_mismatch",
+          `${operator.id}.${port.name}: output port declares ${port.type}, collection rule declares ${spec.type}`,
+        ));
+      }
+      if (Boolean(spec.optional) !== Boolean(port.optional)) {
+        issues.push(contractIssue(
+          "output_optionality_mismatch",
+          `${operator.id}.${port.name}: output optionality differs between port and collection rule`,
+        ));
+      }
+      if ((spec.exclude ?? []).length > 0) {
+        issues.push(contractIssue(
+          "unsupported_output_exclude",
+          `${operator.id}.${port.name}: output exclusions are not supported by the Nextflow compiler`,
+        ));
+      }
+      const controlledPattern = spec.glob
+        .replaceAll("{work}/out", "somite_out")
+        .replaceAll("{work}/tmp", "somite_tmp")
+        .replaceAll("{work}", ".");
+      if (controlledPattern.includes("{")) {
+        issues.push(contractIssue(
+          "unsupported_output_placeholder",
+          `${operator.id}.${port.name}: output collection contains an unsupported placeholder`,
+        ));
+      }
+    }
+    for (const output of Object.keys(operator.outputs ?? {})) {
+      if (!outputs.has(output)) {
+        issues.push(contractIssue("extra_output_rule", `${operator.id}.${output}: collection rule has no output port`));
+      }
+    }
+    if (operator.stdout !== undefined && !outputs.has(operator.stdout)) {
+      issues.push(contractIssue("unknown_stdout_output", `${operator.id}: stdout names unknown output ${operator.stdout}`));
+    }
+  } else if (operator.kind === "inprocess") {
+    const paths = operatorImportPaths(operator);
+    for (const path of paths) {
+      if (!Object.hasOwn(operator.params, path.parameter)) {
+        issues.push(contractIssue(
+          "invalid_import_parameter",
+          `${operator.id}.${path.port}: import parameter ${path.parameter} is not declared`,
+        ));
+      }
+    }
+    if (paths.length === 0 && !operator.resolution) {
+      issues.push(contractIssue(
+        "unsupported_inprocess",
+        `${operator.id}: in-process operator has neither path-import lowering nor an explicit unresolved contract`,
+      ));
+    }
+  }
+  return issues;
 }
 
 function stringParam(node: SomiteGraphNode, name: string) {

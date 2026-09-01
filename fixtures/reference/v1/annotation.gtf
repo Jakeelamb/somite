@@ -1,0 +1,3 @@
+somite_representative_reference	Somite	gene	1	128	.	+	.	gene_id "somite_gene_1"; gene_name "representative_gene";
+somite_representative_reference	Somite	exon	1	64	.	+	.	gene_id "somite_gene_1"; transcript_id "somite_transcript_1";
+somite_representative_reference	Somite	exon	65	128	.	+	.	gene_id "somite_gene_1"; transcript_id "somite_transcript_1";

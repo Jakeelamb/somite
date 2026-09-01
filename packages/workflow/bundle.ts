@@ -247,16 +247,20 @@ export function createFrozenPackageFiles(
 }
 
 /** Deterministic, stored ZIP for download or runner transfer. */
-export function archiveFrozenPackage(packageFiles: ReadonlyMap<string, Uint8Array>) {
+export function archiveFrozenPackage(
+  packageFiles: ReadonlyMap<string, Uint8Array>,
+  modes: ReadonlyMap<string, 0o644 | 0o755> = new Map(),
+) {
   const archive: Zippable = {};
   for (const [path, bytes] of [...packageFiles].sort(([left], [right]) => compareText(left, right))) {
-    archive[path] = bytes;
+    archive[path] = [bytes, {
+      mtime: new Date(1980, 0, 1),
+      os: 3,
+      attrs: (modes.get(path) ?? 0o644) << 16,
+    }];
   }
   return zipSync(archive, {
     level: 0,
-    mtime: new Date(1980, 0, 1),
-    os: 3,
-    attrs: 0o644 << 16,
   });
 }
 

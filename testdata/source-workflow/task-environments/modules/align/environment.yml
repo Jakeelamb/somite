@@ -1,0 +1,8 @@
+name: align
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - bioconda::bowtie2=2.5.4
+  - conda-forge::coreutils=9.5
+  - conda-forge::r-base>=4.0

@@ -13,8 +13,8 @@
   "pixi": ["bioconda::yahs"],
   "ports": {
     "in": [
-      { "name": "contigs", "type": "Fasta", "union": ["Fasta", "FastaGz", "Directory"] },
-      { "name": "hic", "type": "Fastq", "union": ["Fastq", "FastqGz", "Bam"], "optional": true }
+      { "name": "contigs", "type": "Fasta", "union": ["Fasta", "FastaGz"] },
+      { "name": "hic", "type": "Bam" }
     ],
     "out": [{ "name": "scaffolds", "type": "Fasta" }]
   },
@@ -25,6 +25,6 @@
     "-o", "{work}/out/yahs"
   ],
   "outputs": {
-    "scaffolds": { "glob": "{work}/out/*.fa", "type": "Fasta", "optional": true }
+    "scaffolds": { "glob": "{work}/out/*.fa", "type": "Fasta" }
   }
 }

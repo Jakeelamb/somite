@@ -1,0 +1,33 @@
+{
+  "id": "align.gatk_add_read_groups",
+  "title": "Add sample read group",
+  "palette": ["Alignment preparation"],
+  "kind": "external",
+  "cost": "low",
+  "bin": "gatk",
+  "pixi": ["bioconda::gatk4"],
+  "params": {
+    "read_group_id": { "type": "string", "label": "Read-group ID", "page": "Sample identity", "required": true },
+    "library": { "type": "string", "label": "Library", "page": "Sample identity", "required": true },
+    "platform": { "type": "string", "label": "Platform", "page": "Sample identity", "required": true },
+    "platform_unit": { "type": "string", "label": "Platform unit", "page": "Sample identity", "required": true },
+    "sample": { "type": "string", "label": "Sample", "page": "Sample identity", "required": true }
+  },
+  "ports": {
+    "in": [{ "name": "bam", "type": "Bam" }],
+    "out": [{ "name": "bam", "type": "ReadGroupedBam" }]
+  },
+  "argv": [
+    "gatk", "AddOrReplaceReadGroups",
+    "-I", "{input.bam}",
+    "-O", "{work}/out/read-grouped.bam",
+    "--RGID", "{param.read_group_id}",
+    "--RGLB", "{param.library}",
+    "--RGPL", "{param.platform}",
+    "--RGPU", "{param.platform_unit}",
+    "--RGSM", "{param.sample}"
+  ],
+  "outputs": {
+    "bam": { "glob": "{work}/out/read-grouped.bam", "type": "ReadGroupedBam" }
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "id": "files.import_fasta_gz",
+  "title": "Local compressed FASTA",
+  "palette": ["Files"],
+  "kind": "inprocess",
+  "cost": "low",
+  "params": {
+    "path": { "type": "string", "label": "Compressed FASTA path", "page": "Input", "required": true }
+  },
+  "ports": {
+    "in": [],
+    "out": [{ "name": "assembly", "type": "FastaGz", "import_param": "path" }]
+  },
+  "argv": [],
+  "outputs": {}
+}

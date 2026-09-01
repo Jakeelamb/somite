@@ -111,9 +111,12 @@ network, or AI work.
 
 Readiness and evidence remain different claims. A structurally complete graph
 may be ready to run without having a passing validation receipt.
-Representative validation is capability-gated separately: the current fixture
-adapter supports local single and paired FASTQ roots. Other roots use their real
-inputs for Run and never enter a synthetic validation attempt.
+Representative validation is capability-gated separately. Reviewed local
+FASTQ, FASTA, GTF, and GFF3 roots bind content-addressed fixtures. Exact SRA,
+NCBI assembly, and Ensembl source shapes may bind the same typed data without a
+network transfer, but every bypassed retrieval Node stays skipped and
+inconclusive. Unknown shapes use their real inputs for Run and never enter a
+synthetic validation attempt.
 
 ### Compilation and freezing
 
@@ -132,41 +135,99 @@ pixi run --frozen --manifest-path <package>/pixi.toml run
 
 The freezer is shared by browser export, Run, Validate, and Agent compilation.
 
-A whole-source Nextflow workflow follows a separate conservative path. Its
-frozen source tree must contain a root `pixi.toml` and `pixi.lock` that include
-Nextflow and OpenJDK, and its tracked Nextflow/config files must not delegate
-task environments to containers, Conda, Spack, or system modules. Somite adopts
-those exact bytes without solving a replacement environment. Validate invokes
-Nextflow preview mode and records source-preview evidence; Run invokes the same
-entrypoint in the adopted frozen environment. Missing parameter editing support
-is an inspector limitation, not an execution blocker unless a required
-parameter is actually unresolved.
+A whole-source Nextflow workflow has two mutually exclusive freezing modes. If
+the source tree contains either root Pixi file, it uses the conservative
+root-lock mode: both `pixi.toml` and `pixi.lock` must exist, lock Nextflow and
+OpenJDK, and cover source with no delegated container, Conda, Spack, system
+module, or config-level task environment. Somite adopts those exact bytes and
+does not solve a replacement environment or fall back from an incomplete pair.
+
+With no root Pixi files, the per-task planner closes over invocations reachable
+from the indexed entry workflow and accepts each process only when it maps
+unambiguously to one static, quoted Conda literal. That literal may name a
+source-relative environment file or a bounded direct MatchSpec list whose every
+package explicitly names its channel. One named Pixi environment is rendered
+per unique environment-file content or direct-expression digest, while a
+pinned default environment supplies Nextflow, OpenJDK, and micromamba. Exact
+dependency constraints, builds, explicit channels, and channel spelling and
+order are preserved. A shared environment-file order may cover direct package
+channels; without one, direct declarations must use a single shared channel
+because Somite does not invent priority between multiple channels. Different
+package versions in different named environments are valid; conflicts within
+one environment and different channel orders across reachable environments are
+blockers. The plan also fails closed for unresolved reachable invocations,
+missing or ambiguous process mappings, dynamic, missing, unsupported, or
+unqualified environment expressions, config environment overrides, and
+dynamic, external, missing, or overriding `includeConfig` sources. Static
+includes are traversed before admission; plugins and `withName` or `withLabel`
+selectors fail closed because their runtime effects cannot be reduced to the
+discovered process contracts. Unreachable process declarations do not enlarge
+the software closure.
+
+Pixi solves one lock containing the default and every planned named
+environment. Run realizes and verifies every prefix, then byte-guards the
+original Conda expressions while rewriting a host-only staged source copy to
+those canonical prefixes. Compile, Agent compilation, and Export do not install
+the workspace and instead rewrite their staged source to portable
+`${projectDir}/.pixi/envs/<content-addressed-name>` literals. Both forms retain
+the original source digest, plan digest, rewrite ranges, and executed-source
+digest; the frozen imported object is never mutated. Generated runs enable
+Nextflow's micromamba-backed Conda adapter against the existing Pixi prefixes.
+
+Source execution never inherits the user's Nextflow configuration search path.
+The runner passes only the reviewed source config files plus a generated Somite
+policy through `nextflow -C`, appends the Somite profile last, uses a private
+offline `NXF_HOME`, forces the local executor, and disables container, Wave,
+and Fusion engines. Compile and Export add a mode-preserving `somite-run`
+launcher that installs every locked Pixi environment and repeats this exact
+configuration. Input bindings stay project-relative rather than embedding the
+authoring machine's absolute paths.
+
+Validate invokes Nextflow preview mode for either whole-source mode and records
+source-preview evidence only after Nextflow emits one bounded regular DAG
+artifact whose digest enters the receipt. It proves compilation and DAG
+construction but does not execute scientific tasks or provide
+representative-data validation.
+Missing parameter editing support is an inspector limitation, not an execution
+blocker unless a required parameter is actually unresolved.
 
 ### Jobs and evidence
 
 A job moves through preparing, queued, running, cancelling, and terminal phases.
-Status includes bounded progress and Node states. Cancellation terminates the
-complete child process tree. Starts are idempotent, so retrying a lost response
-cannot create duplicate compute.
+Status includes bounded progress and Node states. Cancellation is checked again
+at the process-spawn boundary, terminates the complete child process tree, and
+clears process ownership on every exit. Starts are idempotent, so retrying a
+lost response cannot create duplicate compute.
 
-Validation binds supported root sources to small content-addressed FASTQ
-fixtures and enters the same compiler and runner. A passing run creates an
-append-only Evidence receipt keyed to both semantic Graph and fixture
+Validation binds supported root sources to small content-addressed typed
+fixtures and enters the same compiler and runner. Fixture-only parameter
+changes needed by tiny data are disclosed and enter configuration identity.
+The Evidence scope names when public retrieval was not exercised, and those
+Nodes remain inconclusive even when downstream work passes. A passing scoped
+run creates an append-only receipt keyed to both semantic Graph and fixture
 configuration. Layout-only edits keep the receipt current; semantic edits do
 not.
 
 ## Workflow imports
 
-### nf-core
+### Nextflow repositories
 
-Somite resolves an exact release to an immutable Git commit and verified source
-tree. One outer source-backed Node shows a live miniature of every indexed
-invocation call and known relationship. Cursor-centered zoom crosses into that
-outline within the same persistent React Flow host; the canvas grid, controls,
-Agent, and tools remain unchanged. Zooming outward applies the exact inverse
-camera transform. Workflow, subworkflow, and process scopes remain quiet
-provenance and may drive grouping suggestions, but only an explicit user action
-creates a Source group.
+nf-core imports resolve an exact release to an immutable Git commit and verified
+source tree. A cited public GitHub workflow uses the same pinned-source model:
+Somite accepts only a canonical repository URL, resolves its default branch or
+requested revision to one full commit ID, bounds and extracts that exact source
+archive, and requires an unambiguous Nextflow entrypoint. Repository, requested
+revision, resolved commit, source digest, and indexer revision enter cache and
+trust identity. The paper-derived candidate and cited source remain distinct;
+using a citation never treats prose extraction as source conversion.
+
+One outer source-backed Node shows a live miniature of every indexed invocation
+call and known relationship. Cursor-centered zoom crosses into that outline
+within the same persistent React Flow host; the canvas grid, controls, Agent,
+and tools remain unchanged. Zooming outward applies the exact inverse camera
+transform. Workflow, subworkflow, and process scopes remain quiet provenance
+and may drive grouping suggestions, but only an explicit user action creates a
+Source group.
 
 The workflow Module stores group membership as a presentation forest separate
 from source entities and executable Graph topology. The React adapter renders
@@ -281,6 +342,16 @@ mutation, conflicting identities, shell actions, and other tools remain
 user-approved. Redacted transcripts persist under
 `.somite/agent-transcripts/`.
 
+Pixi and Nextflow share one initially empty session tool root. Agent compilation
+retains the canonical frozen package under `.somite/compiled/`, verifies its
+content-addressed path, complete Run-closure schema, and compiler-trusted file
+manifest, then leases an isolated copy of that exact package into the tool
+root. Both MCP servers receive the same workspace-relative path. Lease paths
+are unique and remain stable so later compilation cannot invalidate an active
+tool call; every lease is generation-bound and the complete private root is
+removed before disconnect finishes. Unrelated project files remain outside the
+tool filesystem boundary.
+
 Missing tool contracts cross one explicit workshop rather than growing an
 unreviewed global catalog. Agent may draft a `project.*` external Operator from
 authoritative evidence and prove it through the ordinary frozen RunManager in
@@ -322,6 +393,30 @@ cache so deeply nested projects do not exceed package relocation placeholders
 and identical frozen environments are reused across projects. The cache root is
 configurable with the absolute `SOMITE_PIXI_CACHE_DIR` path; temporary storage
 is not a durable environment adapter.
+
+Cache schema v3 binds each in-progress entry to a unique builder identity. A
+live builder is never reaped solely because its wall-clock age crosses a limit;
+on Linux the marker also binds the PID's kernel start identity. Stale cleanup
+first atomically quarantines the candidate and verifies its directory and
+builder identities before deletion, so a delayed builder or cleaner cannot
+delete a replacement entry it no longer owns.
+
+Before publication, the cache creates a bounded entrypoint receipt over every
+direct regular file and in-prefix symbolic-link target under `bin` (or
+`Scripts` and `Library/bin` for a Windows-targeted prefix). The receipt records
+path, type, mode, size, target, and BLAKE3 content digest. Reuse reads and hashes
+only that bounded recorded list; missing, retargeted, mode-changed, resized, or
+content-modified entrypoints fail closed, and cap overflow never produces a
+partial receipt. This deliberately avoids an unbounded recursive scan on every
+run. It is not full-prefix attestation: libraries, language site packages, and
+other non-entrypoint payloads remain outside this Somite digest receipt.
+
+Compiled workflow reuse is stricter than environment-prefix reuse. A trusted
+manifest inventories every expected package file and directory with its mode,
+size, and BLAKE3 digest. Reuse rescans that bounded inventory, rejects links,
+special or extra entries, and verifies the Run closure still names the same
+graph and closure. Failed verification preserves the suspect artifact for
+inspection.
 
 Managed resources live outside the project in a separate private cache rooted
 at `SOMITE_RESOURCE_CACHE_DIR` or the platform user-cache directory. Their

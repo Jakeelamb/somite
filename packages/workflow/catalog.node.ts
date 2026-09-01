@@ -1,6 +1,6 @@
 import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
-import { OperatorCatalog, type PinnedOperator } from "./catalog.ts";
+import { OperatorCatalog, operatorContractIssues, type PinnedOperator } from "./catalog.ts";
 import { catalogRevision, operatorRevision, parseOperator } from "./catalogCodec.ts";
 
 export type LoadedOperatorCatalog = Readonly<{
@@ -49,6 +49,8 @@ async function loadOperatorDirectory(directory: string): Promise<PinnedOperator[
       throw new Error(`json ${path}: ${error instanceof Error ? error.message : String(error)}`);
     }
     const operator = parseOperator(value, path);
+    const issue = operatorContractIssues(operator)[0];
+    if (issue) throw new Error(`operator contract ${path}: ${issue.message}`);
     operators.push({ ...operator, revision: operatorRevision(operator) });
   }
   return operators;

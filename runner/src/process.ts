@@ -7,6 +7,15 @@ export type CapturedCommand = Readonly<{
   stderr: string;
 }>;
 
+export type ProcessCompletion = Readonly<{
+  code: number | null;
+  signal: NodeJS.Signals | null;
+}>;
+
+export type ChildProcessOwner = {
+  child?: ChildProcess;
+};
+
 const MAX_CAPTURE_BYTES = 512 * 1024;
 const terminationTimers = new WeakMap<ChildProcess, ReturnType<typeof setTimeout>>();
 
@@ -42,6 +51,29 @@ export function terminateProcessTree(child: ChildProcess) {
       terminationTimers.delete(child);
     });
     timer.unref();
+  }
+}
+
+export async function runAbortableProcess(
+  signal: AbortSignal,
+  spawnProcess: () => ChildProcess,
+  owner: ChildProcessOwner,
+): Promise<ProcessCompletion> {
+  if (signal.aborted) throw new Error("operation cancelled");
+  const child = spawnProcess();
+  owner.child = child;
+  const completed = new Promise<ProcessCompletion>((resolvePromise, rejectPromise) => {
+    child.once("error", rejectPromise);
+    child.once("close", (code, closeSignal) => resolvePromise({ code, signal: closeSignal }));
+  });
+  const cancel = () => terminateProcessTree(child);
+  signal.addEventListener("abort", cancel, { once: true });
+  if (signal.aborted) cancel();
+  try {
+    return await completed;
+  } finally {
+    signal.removeEventListener("abort", cancel);
+    if (owner.child === child) owner.child = undefined;
   }
 }
 

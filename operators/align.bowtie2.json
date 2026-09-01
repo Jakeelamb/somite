@@ -1,6 +1,11 @@
 {
   "id": "align.bowtie2",
   "title": "Bowtie2",
+  "paper": {
+    "aliases": ["Bowtie2", "Bowtie 2"],
+    "operation_class": "read_alignment",
+    "assays": ["assembly", "rna-seq", "variants", "metagenome"]
+  },
   "palette": ["Alignment"],
   "kind": "external",
   "cost": "high",
@@ -13,7 +18,25 @@
     "in": [
       { "name": "r1", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
       { "name": "r2", "type": "Fastq", "union": ["Fastq", "FastqGz"], "optional": true },
-      { "name": "index", "type": "Directory" }
+      {
+        "name": "index",
+        "type": "Directory",
+        "stage_as": "bowtie2_index",
+        "resource": {
+          "profile": "bowtie2-index",
+          "title": "Bowtie2 index",
+          "detail": "Connect an index built from the same reference assembly you want to align against.",
+          "resolutions": [
+            {
+              "id": "build-from-fasta",
+              "label": "Build from FASTA",
+              "detail": "Add Build Bowtie2 index and connect a reference FASTA.",
+              "kind": "build",
+              "recommended": true
+            }
+          ]
+        }
+      }
     ],
     "out": [{ "name": "sam", "type": "Sam" }]
   },

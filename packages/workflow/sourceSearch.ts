@@ -1,13 +1,14 @@
 import { boundedResponseBytes } from "./boundedResponse.ts";
 
 export type SourceSearchRequest = Readonly<{
-  kind: string;
+  kind: "sra" | "assembly" | "ensembl-gene" | "ensembl-transcript" | "ensembl-protein";
   value: string;
   provider: string;
   result: string;
   action: string;
   operator_ids: readonly string[];
-  sequence_type?: string;
+  sequence_type?: "genomic" | "cdna" | "protein";
+  read_layout?: "single" | "paired";
 }>;
 
 export type SourceSearchResult = Readonly<{
@@ -99,6 +100,8 @@ export function sraResults(value: unknown): SourceSearchResult[] {
   const organism = attributeAfter(experiment, "<Organism", "ScientificName") ?? "Unknown organism";
   const strategy = between(experiment, "<LIBRARY_STRATEGY>", "</LIBRARY_STRATEGY>") ?? "Sequencing";
   const paired = experiment.includes("<PAIRED");
+  const single = experiment.includes("<SINGLE");
+  if (paired === single) return [];
   return runAccessions(runs).map((accession) => ({
     key: `ncbi-sra-${accession}`,
     title,
@@ -111,9 +114,10 @@ export function sraResults(value: unknown): SourceSearchResult[] {
       kind: "sra",
       value: accession,
       provider: "NCBI SRA",
-      result: "SRA download → separate R1 / R2 FASTQ streams",
+      result: paired ? "SRA download → separate R1 / R2 FASTQ streams" : "SRA download → one FASTQ stream",
       action: "Add Reads",
-      operator_ids: ["sra.prefetch", "sra.fasterq_dump"],
+      operator_ids: ["sra.prefetch", paired ? "sra.fasterq_dump" : "sra.fasterq_dump_single"],
+      read_layout: paired ? "paired" : "single",
     },
   }));
 }
@@ -123,15 +127,21 @@ function assemblyRequest(accession: string, provider: string): SourceSearchReque
     kind: "assembly",
     value: accession,
     provider,
-    result: "Genome, annotations, proteins & metadata package",
+    result: "Typed genome FASTA, GFF3 / GTF annotations & metadata",
     action: "Add Assembly",
-    operator_ids: ["ncbi.datasets_assembly", "archive.unzip"],
+    operator_ids: ["ncbi.datasets_assembly", "ncbi.datasets_extract_assembly"],
   };
 }
 
-export function assemblyResult(value: unknown): SourceSearchResult | undefined {
-  const accession = field(value, "assemblyaccession");
-  if (!accession) return undefined;
+export function assemblyResult(value: unknown, requestedAccession?: string): SourceSearchResult | undefined {
+  const summary = record(value);
+  const reported = text(summary?.assemblyaccession);
+  if (!reported) return undefined;
+  const synonym = record(summary?.synonym);
+  const accessions = [reported, text(synonym?.genbank), text(synonym?.refseq)].filter((item): item is string => Boolean(item));
+  const requested = requestedAccession?.trim().toUpperCase();
+  if (requested && !accessions.some((item) => item.toUpperCase() === requested)) return undefined;
+  const accession = requested ?? reported;
   const assembly = field(value, "assemblyname") ?? accession;
   const organism = field(value, "organism") ?? "Genome assembly";
   const level = field(value, "assemblystatus") ?? "Assembly";
@@ -173,10 +183,10 @@ export function ensemblFeatureResult(value: unknown): SourceSearchResult | undef
   const description = field(value, "description") ?? `Ensembl ${objectType}`;
   const lower = objectType.toLowerCase();
   const [kind, sequenceType, dataKind] = lower.includes("transcript")
-    ? ["ensembl-transcript", "cdna", "Transcript"]
+    ? ["ensembl-transcript", "cdna", "Transcript"] as const
     : lower.includes("translation") || lower.includes("protein")
-      ? ["ensembl-protein", "protein", "Protein"]
-      : ["ensembl-gene", "genomic", "Gene"];
+      ? ["ensembl-protein", "protein", "Protein"] as const
+      : ["ensembl-gene", "genomic", "Gene"] as const;
   return {
     key: `ensembl-feature-${accession}`,
     title,
@@ -231,6 +241,18 @@ function geneQuery(query: string): readonly [string, string] | undefined {
   return [parts.length === 1 ? "human" : parts.slice(0, -1).join("_"), symbol.toUpperCase()];
 }
 
+function ensemblStableId(query: string) {
+  return query.trim().toUpperCase().match(/^(ENS[A-Z]{0,16}[GTP]\d{6,18})(?:\.\d{1,6})?$/)?.[1];
+}
+
+function exactAssemblyAccession(query: string) {
+  return query.trim().toUpperCase().match(/^(?:GCA_|GCF_)\d{1,18}(?:\.\d{1,6})?$/)?.[0];
+}
+
+function exactSraRunAccession(query: string) {
+  return query.trim().toUpperCase().match(/^(?:SRR|ERR|DRR)\d{6,18}$/)?.[0];
+}
+
 async function fetchJson(fetcher: typeof fetch, url: URL, signal?: AbortSignal) {
   const response = await fetcher(url, {
     headers: { accept: "application/json" },
@@ -266,7 +288,8 @@ async function esummary(fetcher: typeof fetch, database: string, ids: readonly s
 
 async function searchSra(fetcher: typeof fetch, query: string, signal?: AbortSignal) {
   const collection = collectionQuery(query);
-  const ids = await esearch(fetcher, "sra", ncbiTerm(query), collection ? 16 : 4, signal);
+  const run = exactSraRunAccession(query);
+  const ids = await esearch(fetcher, "sra", run ? `${run}[Accession]` : ncbiTerm(query), collection ? 16 : 4, signal);
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 360));
   const summary = await esummary(fetcher, "sra", ids, signal);
   const results = ids.flatMap((id) => sraResults(summary[id]));
@@ -275,11 +298,14 @@ async function searchSra(fetcher: typeof fetch, query: string, signal?: AbortSig
 }
 
 async function searchAssemblies(fetcher: typeof fetch, query: string, signal?: AbortSignal) {
-  const term = `${ncbiTerm(assemblySubject(query))} AND "reference genome"[RefSeq Category]`;
+  const accession = exactAssemblyAccession(query);
+  const term = accession
+    ? `${accession}[Assembly Accession]`
+    : `${ncbiTerm(assemblySubject(query))} AND "reference genome"[RefSeq Category]`;
   const ids = await esearch(fetcher, "assembly", term, 3, signal);
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 360));
   const summary = await esummary(fetcher, "assembly", ids, signal);
-  return ids.map((id) => assemblyResult(summary[id])).filter((result): result is SourceSearchResult => result !== undefined);
+  return ids.map((id) => assemblyResult(summary[id], accession)).filter((result): result is SourceSearchResult => result !== undefined);
 }
 
 export async function searchNcbi(query: string, fetcher: typeof fetch = fetch, signal?: AbortSignal) {
@@ -292,9 +318,12 @@ export async function searchNcbi(query: string, fetcher: typeof fetch = fetch, s
 }
 
 export async function searchEnsembl(query: string, fetcher: typeof fetch = fetch, signal?: AbortSignal) {
-  const gene = geneQuery(query);
-  if (gene) {
-    const url = new URL(`${ENSEMBL}/lookup/symbol/${encodeURIComponent(gene[0])}/${encodeURIComponent(gene[1])}`);
+  const stableId = ensemblStableId(query);
+  const gene = stableId ? undefined : geneQuery(query);
+  if (stableId || gene) {
+    const url = stableId
+      ? new URL(`${ENSEMBL}/lookup/id/${encodeURIComponent(stableId)}`)
+      : new URL(`${ENSEMBL}/lookup/symbol/${encodeURIComponent(gene![0])}/${encodeURIComponent(gene![1])}`);
     url.searchParams.set("content-type", "application/json");
     try {
       const result = ensemblFeatureResult(await fetchJson(fetcher, url, signal));

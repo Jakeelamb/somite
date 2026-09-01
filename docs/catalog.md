@@ -10,7 +10,9 @@ See [the operator contract](operator-contract.md) for the executable boundary.
 
 The source launcher searches NCBI SRA, NCBI assemblies, and Ensembl, and also
 accepts exact accessions or local paths. A suggestion identifies its provider
-and artifact role before it creates a visible source Node.
+and artifact role before it creates a visible source Node. Exact SRA runs wait
+for NCBI's declared single- or paired-end layout; Somite never infers layout
+from the accession string.
 
 Examples:
 
@@ -18,13 +20,23 @@ Examples:
 |---|---|
 | `files.import` | local file to one typed artifact |
 | `files.import_paired` | separate local R1 and R2 artifacts |
+| `files.import_fastq_gz` | one local gzip-compressed FASTQ retained as `FastqGz` |
+| `files.import_paired_gz` | separate gzip-compressed R1 and R2 artifacts retained as `FastqGz` |
+| `files.import_bam` | one local BAM retained as a typed `Bam` artifact |
+| `files.import_multiqc_reports` | one existing report directory explicitly typed for MultiQC scanning |
 | `sra.prefetch` | SRA accession to an SRA artifact |
-| `sra.fasterq_dump` | SRA artifact to R1, optional R2, and optional unpaired reads |
+| `sra.fasterq_dump` | paired-end SRA artifact to required R1 and R2 FASTQ streams |
+| `sra.fasterq_dump_single` | single-end SRA artifact to one FASTQ stream |
 | `ncbi.datasets_assembly` | GCA or GCF accession to an assembly package |
+| `ncbi.datasets_extract_assembly` | NCBI package to typed genome FASTA, optional GFF3/GTF, and metadata |
 | `ensembl.sequence` | stable Ensembl ID to FASTA |
 
 Provider discovery and data transfer remain separate. Search metadata never
 pretends that a remote dataset has already been downloaded or validated.
+Local compressed reads stay compressed on import so gzip-aware tools can use
+them directly. Starting a connection from a `FastqGz` port offers the visible
+decompression adapter when a downstream tool, such as STAR, requires plain
+FASTQ; Somite does not disguise decompression inside that tool.
 
 ## Typed Tools
 
@@ -35,13 +47,47 @@ not a promise that Somite manually maintains every bioinformatics package.
 |---|---|
 | `qc.fastp` | R1 plus optional R2 to trimmed R1 plus optional R2 |
 | `qc.fastqc` | FASTQ to HTML plus optional preview |
+| `archive.gunzip_fastq` | gzip-compressed FASTQ to plain FASTQ |
 | `align.star` | reads plus reference to BAM |
 | `align.bwa` | reads plus reference to BAM |
 | `align.bowtie2_build` | reference FASTA to a reusable Bowtie2 index directory |
 | `align.bowtie2` | reads plus Bowtie2 index to SAM |
+| `ref.samtools_faidx` | reference FASTA to its typed FAI sidecar |
+| `ref.gatk_sequence_dictionary` | reference FASTA to its typed sequence dictionary |
+| `align.gatk_add_read_groups` | BAM plus explicit sample/library identity to read-grouped BAM |
+| `align.samtools_sort_gatk` | read-grouped BAM to coordinate-sorted GATK-ready BAM |
+| `align.samtools_index` | GATK-ready BAM to BAI |
+| `align.picard_mark_duplicates` | coordinate-sorted BAM to duplicate-marked BAM plus Picard metrics |
+| `var.haplotypecaller` | GATK-ready BAM, BAI, reference FASTA, FAI, and dictionary to VCF |
+| `qc.multiqc` | one reviewed analysis-report directory to HTML report plus parsed-data directory |
+| `quant.kallisto_index` | transcript FASTA to a reusable Kallisto transcriptome index directory |
+| `quant.kallisto` | paired reads plus Kallisto index to abundance table and run metadata |
+| `quant.kallisto_single` | single-end reads plus fragment distribution and Kallisto index to abundance table and run metadata |
 | `quant.salmon` | reads plus index to abundance table |
-| `samtools.index` | BAM to BAI |
 | `class.kraken2` | reads plus a required local Kraken2 database directory to a classification table |
+
+`Bam`, `ReadGroupedBam`, and `GatkReadyBam` are distinct channel types.
+A generic or merely sorted BAM cannot satisfy HaplotypeCaller: the visible
+read-group, coordinate-sort, and index nodes must produce the exact artifacts,
+and paper drafts leave sample identity values unresolved rather than inventing
+them. The bundled read-group operator is deliberately single-sample because
+Picard replaces existing read groups wholesale; multiplexed BAMs need a more
+specific preparation contract. Picard MarkDuplicates also requires the
+`coordinate-sorted-bam` profile: STAR's sorted output provides it directly,
+while a generic or imported BAM must pass through the visible SAMtools sort
+node first.
+
+MultiQC scans a directory, not one arbitrary HTML file. Its profiled input
+therefore accepts the reviewed existing-report-directory source and cannot be
+silently wired to an unrelated tool index directory. Somite's current scalar
+graph can aggregate one directory tree; gathering independent report channels
+from many upstream Nodes remains an explicit collection-contract gap.
+
+Kallisto indexing is separate from quantification because the index is a real
+reusable artifact built from transcript sequences, not a genomic assembly.
+Paired-end quantification lets Kallisto estimate fragment length from the read
+pair. The single-end Operator separately requires the measured mean and
+standard deviation instead of inventing them.
 
 The scalable catalog path is the Project tools Operator Workshop:
 
@@ -51,10 +97,13 @@ The scalable catalog path is the Project tools Operator Workshop:
 4. inspect artifacts and record the evidence receipt; and
 5. let the user accept the proven candidate into `.somite/operators/`.
 
-The first automated fixture pack covers local single- and paired-end FASTQ
-graphs. It is deliberately not a universal biological test corpus: unsupported
-source kinds remain unvalidated until a representative pack and binding policy
-are added.
+The automated fixture packs cover reviewed local FASTQ, FASTA, BAM, GTF, and GFF3
+roots plus exact SRA, NCBI assembly, and Ensembl retrieval shapes. Public
+retrieval is bypassed and remains inconclusive while downstream tools run on
+typed local fixtures. Fixture-only parameter changes are part of the evidence
+configuration and shown to the user. This is deliberately not a universal
+biological test corpus: unknown source shapes fail closed until a reviewed
+binding policy is added.
 
 Agents can perform steps 1 through 4 through the bounded Somite, Pixi, and
 Nextflow MCP surfaces. Acceptance is human-only. A package name, inferred argv,

@@ -6,9 +6,10 @@ export type SourceRequest = {
   provider: string;
   result: string;
   action: string;
-  operator_ids?: string[];
+  operator_ids?: readonly string[];
   sequenceType?: "genomic" | "cdna" | "protein";
   sequence_type?: "genomic" | "cdna" | "protein";
+  read_layout?: "single" | "paired";
 };
 
 export type SourceSearchResult = {
@@ -34,25 +35,22 @@ const ENSEMBL_PATTERN = /^(ENS[A-Z]*)([GTP])(\d{6,})(?:\.\d+)?$/;
 
 function candidate(value: string): SourceRequest | null {
   if (SRA_PATTERN.test(value)) {
-    return {
-      kind: "sra",
-      value,
-      provider: "NCBI SRA",
-      result: "SRA download → separate R1 / R2 FASTQ streams",
-      action: "Add Reads",
-    };
+    // SRA layout is provider metadata, not an accession-string property. Wait
+    // for the live result so the canvas never invents paired outputs.
+    return null;
   }
   if (ASSEMBLY_PATTERN.test(value)) {
     return {
       kind: "assembly",
       value,
       provider: "NCBI Datasets",
-      result: "Genome, annotations, proteins & metadata package",
+      result: "Typed genome FASTA, GFF3 / GTF annotations & metadata",
       action: "Add Assembly",
     };
   }
   const ensembl = value.match(ENSEMBL_PATTERN);
   if (!ensembl) return null;
+  if (value.includes(".")) return null;
   if (ensembl[2] === "G") {
     return {
       kind: "ensembl-gene",

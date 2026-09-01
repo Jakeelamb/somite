@@ -8,7 +8,11 @@ import { fileURLToPath } from "node:url";
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
 import { operatorPorts } from "@somite/workflow/catalog";
 import type { SomiteGraph } from "@somite/workflow/model";
-import { materializeProductionGraph, ProductionInputError } from "../src/productionGraph.ts";
+import {
+  materializePortableProductionGraph,
+  materializeProductionGraph,
+  ProductionInputError,
+} from "../src/productionGraph.ts";
 
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 
@@ -101,6 +105,35 @@ test("production inputs preserve remote identities and validate local type and c
         (error: unknown) => error instanceof ProductionInputError && error.code === "input_path_unsafe",
       );
     }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("portable production inputs are verified but never embed host-absolute paths", async () => {
+  const { root, catalog, graph } = await fixture();
+  const outside = await mkdtemp(join(tmpdir(), "somite-portable-inputs-outside-"));
+  try {
+    await mkdir(join(root, "data"), { recursive: true });
+    await writeFile(join(root, "data", "reads.fastq"), "project\n");
+    const relativeInput = await materializePortableProductionGraph(graph, catalog, root);
+    assert.equal(relativeInput.nodes[0]?.params?.path, "data/reads.fastq");
+
+    graph.nodes[0]!.params!.path = join(root, "data", "reads.fastq");
+    const absoluteInsideProject = await materializePortableProductionGraph(graph, catalog, root);
+    assert.equal(absoluteInsideProject.nodes[0]?.params?.path, "data/reads.fastq");
+
+    await mkdir(join(outside, "data"));
+    await writeFile(join(outside, "data", "reads.fastq"), "outside\n");
+    graph.nodes[0]!.params!.path = "data/reads.fastq";
+    await assert.rejects(
+      materializePortableProductionGraph(graph, catalog, root, {
+        graphBase: outside,
+        relativeInputOrder: "graph_first",
+      }),
+      (error: unknown) => error instanceof ProductionInputError && error.code === "input_path_not_portable",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });

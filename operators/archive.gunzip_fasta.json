@@ -1,0 +1,19 @@
+{
+  "id": "archive.gunzip_fasta",
+  "title": "Decompress FASTA",
+  "palette": ["Files", "Archives"],
+  "kind": "external",
+  "cost": "low",
+  "bin": "gzip",
+  "pixi": ["conda-forge::gzip"],
+  "params": {},
+  "ports": {
+    "in": [{ "name": "compressed", "type": "FastaGz" }],
+    "out": [{ "name": "fasta", "type": "Fasta" }]
+  },
+  "argv": ["gzip", "-cd", "{input.compressed}"],
+  "outputs": {
+    "fasta": { "glob": "{work}/out/reference.fa", "type": "Fasta" }
+  },
+  "stdout": "fasta"
+}

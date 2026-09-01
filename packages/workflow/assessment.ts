@@ -175,6 +175,18 @@ function gapTitle(node: SomiteGraphNode, operator: Operator) {
 function assessNode(node: SomiteGraphNode, operator: Operator, resolutionUnresolved: boolean): NodeAssessment {
   const recipes = (operator.resolution?.recipes ?? []).map(recipe);
   const title = gapTitle(node, operator);
+  if (operator.id === "gap.missing" && node.ports.length === 0) {
+    return {
+      node_id: node.id,
+      operator_id: node.operator,
+      title,
+      kind: "adapter",
+      label: "Evidence retained",
+      detail: "The paper names this executable method, but Somite did not infer ports, arguments, outputs, or a workflow position.",
+      requires_action: false,
+      recipes,
+    };
+  }
   const workflow = node.source_workflow;
   if (workflow) {
     const missingParameter = (workflow.parameters ?? []).some((parameter) => parameter.required
@@ -468,6 +480,8 @@ export function assessWorkflow(graph: SomiteGraph, catalog: OperatorCatalog, con
       }
       continue;
     }
+
+    if (operator.id === "gap.missing" && node.ports.length === 0) continue;
 
     const resolution = operator.resolution;
     if (resolution && resolutionUnresolved) {

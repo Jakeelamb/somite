@@ -1,0 +1,23 @@
+{
+  "id": "files.import_multiqc_reports",
+  "title": "Existing MultiQC input directory",
+  "palette": ["Files", "QC"],
+  "kind": "inprocess",
+  "cost": "low",
+  "params": {
+    "path": { "type": "string", "label": "Analysis reports directory", "page": "MultiQC", "required": true }
+  },
+  "ports": {
+    "in": [],
+    "out": [
+      {
+        "name": "reports",
+        "type": "Directory",
+        "import_param": "path",
+        "resource_profile": "multiqc-scan-directory"
+      }
+    ]
+  },
+  "argv": [],
+  "outputs": {}
+}

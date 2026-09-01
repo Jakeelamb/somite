@@ -1,10 +1,9 @@
 import { join } from "node:path";
-import { gunzip } from "node:zlib";
 
 import type { OperatorCatalog } from "@somite/workflow/catalog";
 import { boundedResponseBytes } from "@somite/workflow/boundedResponse";
 import { byteDigest } from "@somite/workflow/contentIdentity";
-import type { SomiteGraph, SourceWorkflowInstance } from "@somite/workflow/model";
+import { parseGraph } from "@somite/workflow/graphCodec";
 import {
   NFCORE_CATALOG_URL,
   nfcoreCatalogResponse,
@@ -12,118 +11,30 @@ import {
   searchNfcoreCatalog,
   type NfcorePipeline,
 } from "@somite/workflow/nfcore";
-import {
-  safeSourcePath,
-  type FrozenSourceFile,
-} from "@somite/workflow/nextflowSource";
 import { deriveSourceWorkflow, SOURCE_INDEXER_REVISION, sourceWorkflowRevision } from "@somite/workflow/sourceWorkflow";
-import { validateGraph } from "@somite/workflow/workflow";
 import { atomicWrite, ensurePrivateDirectory, pathExists, regularFile } from "./files.ts";
+import { extractGithubTarGz } from "./githubArchive.ts";
 import { persistSourceObject } from "./sourceWorkflowStore.ts";
 import { verifyGraphSourceWorkflowTrust } from "./sourceWorkflowTrust.ts";
 
 export { readSourceObject } from "./sourceWorkflowStore.ts";
+export { extractGithubTarGz } from "./githubArchive.ts";
 
 const MAX_CATALOG_BYTES = 64 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES = 128 * 1024 * 1024;
-const MAX_UNPACKED_BYTES = 640 * 1024 * 1024;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
 type CatalogSnapshot = Readonly<{ pipelines: readonly NfcorePipeline[]; cached: boolean }>;
 
+function object(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} returned invalid JSON`);
+  return value as Record<string, unknown>;
+}
+
 async function boundedResponse(response: Response, maximumBytes: number, label: string) {
   if (!response.ok) throw new Error(`${label} returned ${response.status} ${response.statusText}`);
   return boundedResponseBytes(response, maximumBytes, label);
-}
-
-function unzip(bytes: Uint8Array) {
-  return new Promise<Uint8Array>((resolvePromise, rejectPromise) => {
-    gunzip(bytes, { maxOutputLength: MAX_UNPACKED_BYTES }, (error, result) => {
-      if (error) rejectPromise(error);
-      else resolvePromise(result);
-    });
-  });
-}
-
-function tarText(block: Uint8Array, start: number, length: number) {
-  const field = block.subarray(start, start + length);
-  const end = field.indexOf(0);
-  return decoder.decode(end < 0 ? field : field.subarray(0, end)).trim();
-}
-
-function tarOctal(block: Uint8Array, start: number, length: number, label: string) {
-  const value = tarText(block, start, length).replace(/^0+/, "") || "0";
-  if (!/^[0-7]+$/.test(value)) throw new Error(`tar ${label} is not octal`);
-  const parsed = Number.parseInt(value, 8);
-  if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`tar ${label} is outside the safe integer domain`);
-  return parsed;
-}
-
-function verifyTarHeader(block: Uint8Array) {
-  const expected = tarOctal(block, 148, 8, "checksum");
-  let actual = 0;
-  for (let index = 0; index < 512; index += 1) actual += index >= 148 && index < 156 ? 32 : block[index]!;
-  if (actual !== expected) throw new Error("tar header checksum is invalid");
-}
-
-function parsePax(bytes: Uint8Array) {
-  const values = new Map<string, string>();
-  let offset = 0;
-  while (offset < bytes.length) {
-    const space = bytes.indexOf(32, offset);
-    if (space < 0) throw new Error("PAX record has no length separator");
-    const length = Number.parseInt(decoder.decode(bytes.subarray(offset, space)), 10);
-    if (!Number.isSafeInteger(length) || length <= 0 || offset + length > bytes.length || bytes[offset + length - 1] !== 10) throw new Error("PAX record length is invalid");
-    const record = decoder.decode(bytes.subarray(space + 1, offset + length - 1));
-    const equals = record.indexOf("=");
-    if (equals > 0) values.set(record.slice(0, equals), record.slice(equals + 1));
-    offset += length;
-  }
-  return values;
-}
-
-export async function extractGithubTarGz(compressed: Uint8Array): Promise<FrozenSourceFile[]> {
-  const archive = await unzip(compressed);
-  const raw: Array<{ path: string; mode: number; bytes: Uint8Array }> = [];
-  let offset = 0;
-  let pax = new Map<string, string>();
-  let longName: string | undefined;
-  while (offset + 512 <= archive.length) {
-    const header = archive.subarray(offset, offset + 512);
-    if (header.every((byte) => byte === 0)) break;
-    verifyTarHeader(header);
-    const size = tarOctal(header, 124, 12, "size");
-    const mode = tarOctal(header, 100, 8, "mode");
-    const type = String.fromCharCode(header[156] ?? 0);
-    const prefix = tarText(header, 345, 155);
-    const headerName = `${prefix ? `${prefix}/` : ""}${tarText(header, 0, 100)}`;
-    const bodyStart = offset + 512;
-    const bodyEnd = bodyStart + size;
-    if (bodyEnd > archive.length) throw new Error("tar entry exceeds the archive");
-    const body = archive.slice(bodyStart, bodyEnd);
-    if (type === "x") pax = parsePax(body);
-    else if (type === "L") longName = tarText(body, 0, body.length);
-    else if (type === "0" || type === "\0") {
-      const path = pax.get("path") ?? longName ?? headerName;
-      raw.push({ path, mode, bytes: body });
-      pax = new Map();
-      longName = undefined;
-    } else if (type === "1" || type === "2") {
-      throw new Error(`source archive contains unsupported linked entry ${headerName}`);
-    } else if (type !== "5" && type !== "g") {
-      throw new Error(`source archive contains unsupported tar entry type ${JSON.stringify(type)}`);
-    }
-    offset = bodyStart + Math.ceil(size / 512) * 512;
-  }
-  if (!raw.length) throw new Error("source archive contains no regular files");
-  const roots = new Set(raw.map((file) => file.path.split("/")[0]));
-  if (roots.size !== 1) throw new Error("source archive does not have one repository root");
-  return raw.map((file): FrozenSourceFile => {
-    const path = file.path.split("/").slice(1).join("/");
-    if (!safeSourcePath(path)) throw new Error(`source archive contains unsafe path ${file.path}`);
-    return { path, mode: file.mode & 0o111 ? 0o100755 : 0o100644, bytes: file.bytes };
-  });
 }
 
 function requestKey(workflow: string, revision: string) {
@@ -165,16 +76,23 @@ export class NfcoreGateway {
     const requests = await ensurePrivateDirectory(this.#root, ".somite/source-workflows/requests-ts");
     const requestPath = join(requests, `${requestKey(workflow, revision)}.json`);
     if (await pathExists(requestPath)) {
-      const cached = JSON.parse(decoder.decode(await regularFile(requestPath, 32 * 1024 * 1024, "nf-core source request"))) as {
-        schema_version?: unknown;
-        indexer_revision?: unknown;
-        workflow: SourceWorkflowInstance;
-      };
-      if (cached.schema_version !== 1 || cached.indexer_revision !== SOURCE_INDEXER_REVISION
-        || sourceWorkflowRevision(cached.workflow) !== cached.workflow.workflow_revision
-        || cached.workflow.source.requested_revision !== revision
-        || cached.workflow.source.resolved_revision !== pipeline.resolvedRevision) throw new Error("cached nf-core source request has an invalid identity");
-      return this.#response(workflow, revision, cached.workflow, true);
+      const cached = object(
+        JSON.parse(decoder.decode(await regularFile(requestPath, 32 * 1024 * 1024, "nf-core source request"))),
+        "cached nf-core source request",
+      );
+      if (cached.schema_version !== 1 || cached.indexer_revision !== SOURCE_INDEXER_REVISION) {
+        throw new Error("cached nf-core source request has an invalid identity");
+      }
+      const response = await this.#response(workflow, revision, cached.workflow, true);
+      const sourceWorkflow = response.graph.nodes[0]?.source_workflow;
+      if (!sourceWorkflow || sourceWorkflowRevision(sourceWorkflow) !== sourceWorkflow.workflow_revision
+        || sourceWorkflow.source.provider !== "nf_core"
+        || sourceWorkflow.source.repository !== `https://github.com/${workflow}`
+        || sourceWorkflow.source.requested_revision !== revision
+        || sourceWorkflow.source.resolved_revision !== pipeline.resolvedRevision) {
+        throw new Error("cached nf-core source request has an invalid identity");
+      }
+      return response;
     }
 
     const controller = new AbortController();
@@ -205,10 +123,10 @@ export class NfcoreGateway {
     return response;
   }
 
-  async #response(workflow: string, revision: string, sourceWorkflow: SourceWorkflowInstance, cached: boolean) {
+  async #response(workflow: string, revision: string, sourceWorkflowValue: unknown, cached: boolean) {
     const sourceOperator = this.#catalog.get("workflow.source");
     if (!sourceOperator) throw new Error("workflow.source operator is missing");
-    const graph: SomiteGraph = {
+    const graph = parseGraph({
       schema_version: 3,
       name: workflow,
       nodes: [{
@@ -217,15 +135,15 @@ export class NfcoreGateway {
         operator_revision: sourceOperator.revision,
         ports: [],
         params: {},
-        source_workflow: sourceWorkflow,
+        source_workflow: sourceWorkflowValue,
         layout: { x: 0, y: 0 },
-        note: `Pinned from ${workflow}@${revision} (${sourceWorkflow.source.resolved_revision.slice(0, 12)})`,
+        note: `Pinned from ${workflow}@${revision}`,
       }],
       edges: [],
       annotations: [],
-    };
-    const valid = validateGraph(graph);
-    if (!valid.ok) throw new Error(valid.issue.message);
+    }, cached ? "cached nf-core source request.workflow" : "nf-core source workflow");
+    const sourceWorkflow = graph.nodes[0]!.source_workflow!;
+    graph.nodes[0]!.note = `Pinned from ${workflow}@${revision} (${sourceWorkflow.source.resolved_revision.slice(0, 12)})`;
     const verified = this.#catalog.verifyGraph(graph);
     if (!verified.ok) throw new Error(verified.issue.message);
     await verifyGraphSourceWorkflowTrust(this.#root, this.#catalog, graph);

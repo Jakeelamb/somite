@@ -7,12 +7,14 @@ import {
   paperCandidateCanApply,
   paperIntakeIsBusy,
   paperIntakePresentation,
+  paperRetainedUnsupportedMentions,
   paperUnsupportedMentions,
   PaperIntakeFailureError,
   type PaperIntakeTransport,
   type PaperReconstructionSource,
 } from "../app/paperIntake.ts";
 import { createPaperIntakeHttpTransport, type PaperIntakeClient } from "../app/paperIntakeApi.ts";
+import { paperSupportedCount } from "../app/paperResolution.ts";
 import type { PaperReview } from "../app/types.ts";
 
 function deferred<T>() {
@@ -170,6 +172,40 @@ test("unsupported mentions stay visible without blocking a supported draft", () 
 
   assert.deepEqual(paperUnsupportedMentions(mixed).map((mention) => mention.display_name), ["NovelPostprocess"]);
   assert.equal(paperCandidateCanApply(mixed, mixed.candidates[0], false), true, "omitted methods warn without blocking the supported draft");
+});
+
+test("unsupported evidence is not called omitted after its adapter node is visible", () => {
+  const represented = readyReview("Visible adapter evidence");
+  represented.mentions = [{
+    display_name: "NovelPostprocess",
+    normalized_name: "novelpostprocess",
+    operation_class: "postprocessing",
+    evidence: "NovelPostprocess generated the final calls.",
+    support: "unsupported",
+    executable: true,
+  }];
+  represented.candidates[0]!.graph.nodes.push({
+    id: "novel-postprocess",
+    operator: "gap.missing",
+    operator_revision: "gap-revision",
+    ports: [],
+    params: { tool: "Novel Postprocess", quote: "NovelPostprocess generated the final calls." },
+    layout: { x: 0, y: 0 },
+  });
+  represented.candidates[0]!.assessment.nodes.push({
+    node_id: "novel-postprocess",
+    operator_id: "gap.missing",
+    title: "Novel Postprocess",
+    kind: "adapter",
+    label: "Evidence retained",
+    detail: "No typed contract was inferred.",
+    requires_action: false,
+    recipes: [],
+  });
+
+  assert.deepEqual(paperUnsupportedMentions(represented), []);
+  assert.deepEqual(paperRetainedUnsupportedMentions(represented).map((mention) => mention.normalized_name), ["novelpostprocess"]);
+  assert.equal(paperSupportedCount(represented.candidates[0]), 0, "retained evidence is not counted as supported execution");
 });
 
 test("cancel is immediately visible but terminal only after transport acknowledgement", async () => {

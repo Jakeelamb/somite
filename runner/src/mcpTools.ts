@@ -5,6 +5,7 @@ export const SOMITE_MCP_TOOL = Object.freeze({
   catalogSearch: "somite.catalog.search",
   sourceWorkflowSearchNfcore: "somite.source_workflow.search_nfcore",
   sourceWorkflowResolveNfcore: "somite.source_workflow.resolve_nfcore",
+  sourceWorkflowResolveGithub: "somite.source_workflow.resolve_github",
   sourceWorkflowEdit: "somite.source_workflow.edit",
   sourceWorkflowPromote: "somite.source_workflow.promote",
   sourceSearch: "somite.source.search",

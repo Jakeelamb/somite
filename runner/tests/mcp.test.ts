@@ -23,6 +23,7 @@ const REQUIRED_SUCCESS_FIELDS = {
   "somite.catalog.search": ["query", "catalog_revision", "total_matches", "matches"],
   "somite.source_workflow.search_nfcore": ["query", "provenance", "total_matches", "entries"],
   "somite.source_workflow.resolve_nfcore": ["transaction_id", "previous_state_revision", "state_revision", "graph_revision", "graph", "replayed"],
+  "somite.source_workflow.resolve_github": ["transaction_id", "previous_state_revision", "state_revision", "graph_revision", "graph", "replayed"],
   "somite.source_workflow.edit": ["transaction_id", "previous_state_revision", "state_revision", "graph_revision", "graph", "replayed"],
   "somite.source_workflow.promote": ["transaction_id", "previous_state_revision", "state_revision", "graph_revision", "graph", "replayed"],
   "somite.source.search": ["query", "provider", "results"],

@@ -9,7 +9,7 @@
   },
   "ports": {
     "in": [],
-    "out": [{ "name": "file", "type": "Fastq" }]
+    "out": [{ "name": "file", "type": "Fastq", "import_param": "path" }]
   },
   "argv": [],
   "outputs": {}

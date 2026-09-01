@@ -9,6 +9,7 @@ import { operatorImportPaths } from "@somite/workflow/nextflow";
 export type ProductionInputErrorCode =
   | "input_path_invalid"
   | "input_path_missing"
+  | "input_path_not_portable"
   | "input_path_unsafe"
   | "input_path_type";
 
@@ -131,28 +132,45 @@ async function materializeBinding(
   graphBase: string,
   relativeInputOrder: GraphInputLocation["relativeInputOrder"],
   label: string,
+  portable: boolean,
 ): Promise<WorkflowBinding> {
   if (binding.kind === "literal") return binding;
+  const resolved = await resolveInputPath(
+    binding.path,
+    binding.kind === "project_directory" ? "directory" : "file",
+    projectRoot,
+    graphBase,
+    relativeInputOrder,
+    label,
+  );
   return {
     ...binding,
-    path: await resolveInputPath(
-      binding.path,
-      binding.kind === "project_directory" ? "directory" : "file",
-      projectRoot,
-      graphBase,
-      relativeInputOrder,
-      label,
-    ),
+    path: portable ? portableInputPath(resolved, projectRoot, label) : resolved,
   };
 }
 
-/** Resolve executable local inputs on a clone while leaving the saved canvas portable. */
-export async function materializeProductionGraph(
+function portableInputPath(resolved: string, projectRoot: string, label: string) {
+  if (remoteIdentity(resolved)) return resolved;
+  if (!inside(projectRoot, resolved)) {
+    throw new ProductionInputError(
+      "input_path_not_portable",
+      `${label} resolves outside the project; move it into the project before compiling or exporting a shared workflow`,
+    );
+  }
+  const projectRelative = relative(projectRoot, resolved);
+  if (!projectRelative) {
+    throw new ProductionInputError("input_path_not_portable", `${label} cannot bind the project root as a portable input`);
+  }
+  return projectRelative.split(sep).join("/");
+}
+
+async function materializeGraph(
   graph: SomiteGraph,
   catalog: OperatorCatalog,
   projectRootValue: string,
-  graphLocation: string | GraphInputLocation = projectRootValue,
-  managedResourceResolver?: ManagedResourceResolver,
+  graphLocation: string | GraphInputLocation,
+  managedResourceResolver: ManagedResourceResolver | undefined,
+  portable: boolean,
 ) {
   const graphBaseValue = typeof graphLocation === "string" ? graphLocation : graphLocation.graphBase;
   const relativeInputOrder = typeof graphLocation === "string" ? "project_first" : graphLocation.relativeInputOrder;
@@ -168,7 +186,7 @@ export async function materializeProductionGraph(
       const value = node.params?.[contract.parameter];
       if (typeof value !== "string") continue;
       node.params ??= {};
-      node.params[contract.parameter] = await resolveInputPath(
+      const resolved = await resolveInputPath(
         value,
         contract.kind,
         projectRoot,
@@ -177,13 +195,45 @@ export async function materializeProductionGraph(
         `${operator.title} ${contract.parameter}`,
         managedResourceResolver,
       );
+      node.params[contract.parameter] = portable
+        ? portableInputPath(resolved, projectRoot, `${operator.title} ${contract.parameter}`)
+        : resolved;
     }
     if (!node.source_workflow?.bindings) continue;
     const bindings: Record<string, WorkflowBinding> = {};
     for (const [name, binding] of Object.entries(node.source_workflow.bindings)) {
-      bindings[name] = await materializeBinding(binding, projectRoot, graphBase, relativeInputOrder, `${operator.title} ${name}`);
+      bindings[name] = await materializeBinding(
+        binding,
+        projectRoot,
+        graphBase,
+        relativeInputOrder,
+        `${operator.title} ${name}`,
+        portable,
+      );
     }
     node.source_workflow.bindings = bindings;
   }
   return materialized;
+}
+
+/** Resolve executable local inputs on a clone while leaving the saved canvas portable. */
+export async function materializeProductionGraph(
+  graph: SomiteGraph,
+  catalog: OperatorCatalog,
+  projectRootValue: string,
+  graphLocation: string | GraphInputLocation = projectRootValue,
+  managedResourceResolver?: ManagedResourceResolver,
+) {
+  return materializeGraph(graph, catalog, projectRootValue, graphLocation, managedResourceResolver, false);
+}
+
+/** Verify local inputs while retaining only project-relative paths for sharing. */
+export async function materializePortableProductionGraph(
+  graph: SomiteGraph,
+  catalog: OperatorCatalog,
+  projectRootValue: string,
+  graphLocation: string | GraphInputLocation = projectRootValue,
+  managedResourceResolver?: ManagedResourceResolver,
+) {
+  return materializeGraph(graph, catalog, projectRootValue, graphLocation, managedResourceResolver, true);
 }

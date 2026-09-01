@@ -28,6 +28,6 @@
     "{param.max_size}"
   ],
   "outputs": {
-    "sra": { "glob": "{work}/out/{param.accession}/{param.accession}.sra", "type": "Sra" }
+    "sra": { "glob": "{work}/out/*/*.sra", "type": "Sra" }
   }
 }

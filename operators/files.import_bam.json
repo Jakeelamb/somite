@@ -1,0 +1,16 @@
+{
+  "id": "files.import_bam",
+  "title": "Local BAM",
+  "palette": ["Files"],
+  "kind": "inprocess",
+  "cost": "low",
+  "params": {
+    "path": { "type": "string", "label": "BAM path", "page": "Input", "required": true }
+  },
+  "ports": {
+    "in": [],
+    "out": [{ "name": "bam", "type": "Bam", "import_param": "path" }]
+  },
+  "argv": [],
+  "outputs": {}
+}

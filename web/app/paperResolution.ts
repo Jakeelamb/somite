@@ -6,7 +6,7 @@ export function paperAttentionItems(candidate: PaperCandidate | null | undefined
 }
 
 export function paperSupportedCount(candidate: PaperCandidate | null | undefined) {
-  return candidate?.assessment.nodes.filter((node) => !node.requires_action).length ?? 0;
+  return candidate?.assessment.nodes.filter((node) => node.operator_id !== "gap.missing" && !node.requires_action).length ?? 0;
 }
 
 export function paperParameterValue(candidate: PaperCandidate, nodeId: string, field: string) {
@@ -14,12 +14,64 @@ export function paperParameterValue(candidate: PaperCandidate, nodeId: string, f
   return typeof value === "string" ? value : value == null ? "" : String(value);
 }
 
-export function nextPaperReadSlot(candidate: PaperCandidate | null | undefined) {
+type PaperReadRole = "r1" | "r2";
+
+type PaperReadSlotPlan = {
+  outputPorts: Map<string, string>;
+  additions: { outputPort: PaperReadRole; toNode: string; toPort: PaperReadRole }[];
+};
+
+function acceptsFastqRole(node: SomiteGraphNode | undefined, role: PaperReadRole) {
+  const port = node?.ports.find((candidate) => candidate.dir === "in" && candidate.name === role);
+  return Boolean(port && (port.ty === "Fastq" || port.union?.includes("Fastq")));
+}
+
+function paperReadSlotPlan(
+  graph: SomiteGraph,
+  slot: SomiteGraphNode,
+  requestedLayout?: "single" | "paired",
+): PaperReadSlotPlan | null {
+  const layout = requestedLayout ?? (slot.operator === "files.import_paired" ? "paired" : "single");
+  const outgoing = graph.edges.filter((edge) => edge.from_node === slot.id);
+  if (slot.operator === "files.import_paired") {
+    if (layout !== "paired" || outgoing.some((edge) => edge.from_port !== "r1" && edge.from_port !== "r2")) return null;
+    return { outputPorts: new Map(outgoing.map((edge) => [edge.id, edge.from_port])), additions: [] };
+  }
+  if (slot.operator !== "files.import") return null;
+  if (outgoing.some((edge) => edge.from_port !== "file")) return null;
+  if (layout === "single") {
+    if (outgoing.length > 1) return null;
+    return { outputPorts: new Map(outgoing.map((edge) => [edge.id, "reads"])), additions: [] };
+  }
+  if (outgoing.length < 1 || outgoing.length > 2) return null;
+  const target = outgoing[0]?.to_node;
+  const targetNode = graph.nodes.find((node) => node.id === target);
+  const roles = new Set(outgoing.map((edge) => edge.to_port));
+  if (!target || outgoing.some((edge) => edge.to_node !== target)
+    || roles.size !== outgoing.length
+    || [...roles].some((role) => role !== "r1" && role !== "r2")
+    || graph.edges.some((edge) => edge.from_node !== slot.id && edge.to_node === target && (edge.to_port === "r1" || edge.to_port === "r2"))
+    || !acceptsFastqRole(targetNode, "r1")
+    || !acceptsFastqRole(targetNode, "r2")) return null;
+  const additions = (["r1", "r2"] as const)
+    .filter((role) => !roles.has(role))
+    .map((role) => ({ outputPort: role, toNode: target, toPort: role }));
+  return {
+    outputPorts: new Map(outgoing.map((edge) => [edge.id, edge.to_port])),
+    additions,
+  };
+}
+
+export function nextPaperReadSlot(candidate: PaperCandidate | null | undefined, readLayout?: "single" | "paired") {
   return candidate?.graph.nodes.find((node) => {
     if (node.operator === "files.import_paired") {
-      return !String(node.params?.r1 ?? "").trim() && !String(node.params?.r2 ?? "").trim();
+      return !String(node.params?.r1 ?? "").trim()
+        && !String(node.params?.r2 ?? "").trim()
+        && paperReadSlotPlan(candidate.graph, node, readLayout) !== null;
     }
-    return node.operator === "files.import" && !String(node.params?.path ?? "").trim();
+    return node.operator === "files.import"
+      && !String(node.params?.path ?? "").trim()
+      && paperReadSlotPlan(candidate.graph, node, readLayout) !== null;
   }) ?? null;
 }
 
@@ -118,19 +170,29 @@ export function replacePaperReadSlot(
 ) {
   const slot = graph.nodes.find((node) => node.id === slotId);
   if (!slot || !["files.import", "files.import_paired"].includes(slot.operator)) return graph;
+  const single = fasterq.operator === "sra.fasterq_dump_single";
+  const plan = paperReadSlotPlan(graph, slot, single ? "single" : "paired");
+  if (!plan) return graph;
   const rewired = graph.edges
     .filter((edge) => edge.to_node !== slotId)
     .map((edge) => edge.from_node !== slotId ? edge : {
       ...edge,
-      id: `e-${fasterq.id}-${slot.operator === "files.import" ? "r1" : edge.from_port}-${edge.to_node}-${edge.to_port}`,
+      id: `e-${fasterq.id}-${plan.outputPorts.get(edge.id)}-${edge.to_node}-${edge.to_port}`,
       from_node: fasterq.id,
-      from_port: slot.operator === "files.import" ? "r1" : edge.from_port,
+      from_port: plan.outputPorts.get(edge.id)!,
     });
   return {
     ...graph,
     nodes: [...graph.nodes.filter((node) => node.id !== slotId), prefetch, fasterq],
     edges: [
       ...rewired,
+      ...plan.additions.map((addition) => ({
+        id: `e-${fasterq.id}-${addition.outputPort}-${addition.toNode}-${addition.toPort}`,
+        from_node: fasterq.id,
+        from_port: addition.outputPort,
+        to_node: addition.toNode,
+        to_port: addition.toPort,
+      })),
       {
         id: `e-${prefetch.id}-sra-${fasterq.id}-sra`,
         from_node: prefetch.id,

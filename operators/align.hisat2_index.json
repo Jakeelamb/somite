@@ -1,0 +1,25 @@
+{
+  "id": "align.hisat2_index",
+  "title": "Build HISAT2 index",
+  "palette": ["Alignment"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "hisat2-build",
+  "pixi": ["bioconda::hisat2"],
+  "params": {
+    "threads": { "type": "int", "label": "Threads", "page": "HISAT2 index", "default": 8, "min": 1, "max": 64 }
+  },
+  "ports": {
+    "in": [{ "name": "ref", "type": "Fasta" }],
+    "out": [{ "name": "index", "type": "Directory", "resource_profile": "hisat2-index" }]
+  },
+  "argv": [
+    "hisat2-build",
+    "-p", "{param.threads}",
+    "{input.ref}",
+    "{work}/out/index"
+  ],
+  "outputs": {
+    "index": { "glob": "{work}/out", "type": "Directory" }
+  }
+}

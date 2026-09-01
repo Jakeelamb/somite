@@ -24,8 +24,8 @@ the ACP session:
 
 ```bash
 node --experimental-strip-types runner/src/mcp.ts --server-url http://127.0.0.1:7310
-node --experimental-strip-types mcp/pixi/src/server.ts --workspace-root /path/to/project
-node --experimental-strip-types mcp/nextflow/src/server.ts --workspace-root /path/to/project
+node --experimental-strip-types mcp/pixi/src/server.ts --workspace-root /tmp/somite-workflow-agent-.../tools
+node --experimental-strip-types mcp/nextflow/src/server.ts --workspace-root /tmp/somite-workflow-agent-.../tools
 ```
 
 This command is illustrative; a capability supplied only by the parent process
@@ -39,6 +39,22 @@ transaction, compile, and evidence routes reject requests without it even when
 the caller omits the MCP activity header. Human-facing run routes remain part
 of the loopback web application; this capability is not a sandbox for arbitrary
 local processes running as the same user.
+
+The shared Pixi/Nextflow root begins empty. After `somite.workflow.compile`,
+Somite verifies the canonical content-addressed project path, the complete
+Run-closure schema, and every file path, mode, size, and BLAKE3 digest against
+the compiler's in-memory trusted manifest. Symbolic links, hard links, special
+files, unlisted files, and changed bytes fail before publication. The verified
+copy uses filesystem copy-on-write when available and is independent of the
+canonical project artifact.
+
+Each successful attachment receives a unique digest-bearing `output_path`
+relative to the shared root. Earlier paths remain stable for in-flight Pixi and
+Nextflow calls; a later compile never renames or removes a package that a tool
+may still reference. Attachments remain bound to the ACP session generation
+that requested them and have explicit session count and byte ceilings.
+Disconnect waits for pending attachment work and removal of the complete
+private workspace; a cleanup failure is reported explicitly.
 
 The Pixi and Nextflow servers use the official MCP TypeScript SDK v2. Each
 exposes the complete documentation catalog from the authoritative upstream tag
@@ -118,6 +134,7 @@ insufficient.
 | `somite.catalog.search` | Search exact operator contracts, ports, parameters, Pixi packages, and revisions with deterministic ranking and opaque pagination. |
 | `somite.source_workflow.search_nfcore` | Search the official nf-core catalog for exact repository and release pairs. |
 | `somite.source_workflow.resolve_nfcore` | Resolve one exact nf-core release onto an unchanged empty canvas as a pinned source workflow. |
+| `somite.source_workflow.resolve_github` | Resolve a public GitHub Nextflow repository to an immutable commit and place that pinned source on an unchanged empty canvas. |
 | `somite.source_workflow.edit` | Apply typed parameter or invocation-replacement edits to a pinned source workflow. |
 | `somite.source_workflow.promote` | Promote one or more selected source invocation replacements into ordinary editable typed nodes in one native variant. |
 | `somite.source.search` | Search current NCBI or Ensembl reads, reference assemblies, organisms, accessions, and genes with structured provenance and ordered native source-recipe operators. |
@@ -126,7 +143,7 @@ insufficient.
 | `somite.operator_proof.status` | Read the candidate proof through terminal run evidence. |
 | `somite.resource` | Install, inspect, or cancel one reviewed managed scientific resource after explicit size and scientific-effect consent. |
 | `somite.graph.apply_transaction` | Apply up to 64 graph operations as one validated compare-and-swap transaction. |
-| `somite.workflow.compile` | Freeze the current graph through the production Pixi/Nextflow compiler into a content-addressed package. |
+| `somite.workflow.compile` | Freeze the current graph through the production compiler and attach one verified, generation-bound lease to Pixi and Nextflow; `output_path` is relative to their shared confined root and remains stable for the session. |
 | `somite.run.start` | Start the production runner with configured inputs. |
 | `somite.validation.start` | Start the production runner with a supported representative fixture binding. |
 | `somite.run.status` | Read lifecycle, graph-node state, closure identity, and evidence. |

@@ -436,18 +436,18 @@ test("unsupported representative validation returns a typed capability before wr
     const session = await fetch(`${running.url}/api/session`).then((response) => response.json()) as {
       operators: Operator[];
     };
-    const input = session.operators.find((operator) => operator.id === "files.import_fasta");
+    const input = session.operators.find((operator) => operator.id === "files.import_directory");
     assert.ok(input?.revision);
-    await writeFile(join(root, "reference.fasta"), ">reference\nACGT\n");
+    await mkdir(join(root, "resource-directory"));
     const graph = {
       schema_version: 3,
-      name: "FASTA-rooted workflow",
+      name: "Directory-rooted workflow",
       nodes: [{
         id: "reference",
         operator: input.id,
         operator_revision: input.revision,
         ports: operatorPorts(input),
-        params: { path: "reference.fasta" },
+        params: { path: "resource-directory" },
         layout: { x: 0, y: 0 },
       }],
       edges: [],
@@ -465,7 +465,7 @@ test("unsupported representative validation returns a typed capability before wr
         supported: false,
         code: "representative_fixture_unsupported",
         reason: body.error,
-        unsupported_roots: ["files.import_fasta"],
+        unsupported_roots: ["files.import_directory"],
       });
     }
     await assert.rejects(access(join(root, ".somite", "fixtures")), { code: "ENOENT" });
@@ -727,6 +727,68 @@ test("recovered graphs fail closed until their local input location is explicitl
     await running?.close().catch(() => undefined);
     await rm(root, { recursive: true, force: true });
     await rm(external, { recursive: true, force: true });
+  }
+});
+
+test("browser GitHub source resolution rejects non-string request fields before import", async () => {
+  const root = await mkdtemp(join(tmpdir(), "somite-runner-github-request-"));
+  const running = await startServer({ projectRoot: root, port: await unusedPort() });
+  const headers = { "content-type": "application/json", origin: "http://localhost:3000" };
+  try {
+    const invalidRevision = await fetch(`${running.url}/api/source-workflows/github/resolve`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ repository: "https://example.com/not-github", revision: false }),
+    });
+    assert.equal(invalidRevision.status, 400, await invalidRevision.clone().text());
+    assert.match(await invalidRevision.text(), /revision must be a string/);
+
+    const invalidRepository = await fetch(`${running.url}/api/source-workflows/github/resolve`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ repository: 42 }),
+    });
+    assert.equal(invalidRepository.status, 400, await invalidRepository.clone().text());
+    assert.match(await invalidRepository.text(), /repository must be a non-empty string/);
+  } finally {
+    await running.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Agent GitHub source resolution rejects non-string request fields before import", async () => {
+  const root = await mkdtemp(join(tmpdir(), "somite-runner-agent-github-request-"));
+  const agentCapability = "a".repeat(64);
+  const running = await startServer({ projectRoot: root, port: await unusedPort(), agentCapability });
+  const headers = {
+    "content-type": "application/json",
+    "x-somite-mcp-capability": agentCapability,
+  };
+  try {
+    const session = await fetch(`${running.url}/api/session`).then((response) => response.json()) as { state_revision: string };
+    const base = {
+      base_state_revision: session.state_revision,
+      idempotency_key: "github-request-test",
+      summary: "Import cited GitHub workflow",
+    };
+    const invalidRevision = await fetch(`${running.url}/api/agent/source-workflows/github/resolve`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ...base, repository: "https://example.com/not-github", revision: [] }),
+    });
+    assert.equal(invalidRevision.status, 400, await invalidRevision.clone().text());
+    assert.match(await invalidRevision.text(), /revision must be a string/);
+
+    const invalidRepository = await fetch(`${running.url}/api/agent/source-workflows/github/resolve`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ...base, repository: { owner: "somite" } }),
+    });
+    assert.equal(invalidRepository.status, 400, await invalidRepository.clone().text());
+    assert.match(await invalidRepository.text(), /repository must be a non-empty string/);
+  } finally {
+    await running.close();
+    await rm(root, { recursive: true, force: true });
   }
 });
 

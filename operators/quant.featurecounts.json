@@ -17,7 +17,7 @@
   "ports": {
     "in": [
       { "name": "bam", "type": "Bam" },
-      { "name": "gtf", "type": "Gtf", "union": ["Gtf", "GtfGz"], "optional": true }
+      { "name": "gtf", "type": "Gtf", "union": ["Gtf", "GtfGz"] }
     ],
     "out": [{ "name": "counts", "type": "Table" }]
   },
@@ -29,6 +29,6 @@
     "{input.bam}"
   ],
   "outputs": {
-    "counts": { "glob": "{work}/out/counts.txt", "type": "Table", "optional": true }
+    "counts": { "glob": "{work}/out/counts.txt", "type": "Table" }
   }
 }

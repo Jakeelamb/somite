@@ -87,7 +87,8 @@ test("a cited run replaces the next local read placeholder without disturbing it
     ],
   };
   const candidateWithSlot = { ...candidate, graph };
-  assert.equal(nextPaperReadSlot(candidateWithSlot)?.id, "reads");
+  assert.equal(nextPaperReadSlot(candidateWithSlot, "paired")?.id, "reads");
+  assert.equal(nextPaperReadSlot(candidateWithSlot, "single"), null);
   const prefetch = { id: "reads-fetch", operator: "sra.prefetch", operator_revision: "r3", ports: [{ name: "sra", dir: "out" as const, ty: "Sra" as const }], params: { accession: "SRR123456" }, layout: { x: 20, y: 40 } };
   const fasterq = { id: "reads-fastq", operator: "sra.fasterq_dump", operator_revision: "r4", ports: [{ name: "sra", dir: "in" as const, ty: "Sra" as const }, { name: "r1", dir: "out" as const, ty: "Fastq" as const }, { name: "r2", dir: "out" as const, ty: "Fastq" as const }], params: {}, layout: { x: 240, y: 40 } };
   const replaced = replacePaperReadSlot(graph, "reads", prefetch, fasterq);
@@ -131,4 +132,103 @@ test("a cited run replaces the next local read placeholder without disturbing it
   };
   assert.equal(paperCanvasOwnsCandidate(graph, sourceCanvas), false);
   assert.equal(paperCanvasUpdate(0, 0, graph, replaced, sourceCanvas), null, "a stale paper action cannot mix native nodes into a source-owned canvas");
+});
+
+test("a cited single-end run replaces only a single-read placeholder", () => {
+  const graph: SomiteGraph = {
+    schema_version: 3,
+    nodes: [
+      { id: "reads", operator: "files.import", operator_revision: "r1", ports: [{ name: "file", dir: "out", ty: "Fastq" }], params: {}, layout: { x: 20, y: 40 } },
+      { id: "fastqc", operator: "qc.fastqc", operator_revision: "r2", ports: [], params: {}, layout: { x: 300, y: 40 } },
+    ],
+    edges: [{ id: "old-reads", from_node: "reads", from_port: "file", to_node: "fastqc", to_port: "reads" }],
+  };
+  const candidateWithSlot = { ...candidate, graph };
+  assert.equal(nextPaperReadSlot(candidateWithSlot, "single")?.id, "reads");
+  const prefetch = { id: "reads-fetch", operator: "sra.prefetch", operator_revision: "r3", ports: [{ name: "sra", dir: "out" as const, ty: "Sra" as const }], params: { accession: "SRR123456" }, layout: { x: 20, y: 40 } };
+  const fasterq = { id: "reads-fastq", operator: "sra.fasterq_dump_single", operator_revision: "r4", ports: [{ name: "sra", dir: "in" as const, ty: "Sra" as const }, { name: "reads", dir: "out" as const, ty: "Fastq" as const }], params: {}, layout: { x: 240, y: 40 } };
+  const replaced = replacePaperReadSlot(graph, "reads", prefetch, fasterq);
+  assert.deepEqual(replaced.edges.map((edge) => [edge.from_node, edge.from_port, edge.to_node, edge.to_port]), [
+    ["reads-fastq", "reads", "fastqc", "reads"],
+    ["reads-fetch", "sra", "reads-fastq", "sra"],
+  ]);
+});
+
+test("a paired cited run fills both exact downstream roles from an unresolved-layout placeholder", () => {
+  const graph: SomiteGraph = {
+    schema_version: 3,
+    nodes: [
+      { id: "reads", operator: "files.import", operator_revision: "r1", ports: [{ name: "file", dir: "out", ty: "Fastq" }], params: {}, layout: { x: 20, y: 40 } },
+      { id: "fastp", operator: "qc.fastp", operator_revision: "r2", ports: [{ name: "r1", dir: "in", ty: "Fastq", union: ["Fastq", "FastqGz"] }, { name: "r2", dir: "in", ty: "Fastq", union: ["Fastq", "FastqGz"], optional: true }], params: {}, layout: { x: 300, y: 40 } },
+    ],
+    edges: [{ id: "old-reads", from_node: "reads", from_port: "file", to_node: "fastp", to_port: "r1" }],
+  };
+  const candidateWithSlot = { ...candidate, graph };
+  assert.equal(nextPaperReadSlot(candidateWithSlot, "paired")?.id, "reads");
+  const prefetch = { id: "reads-fetch", operator: "sra.prefetch", operator_revision: "r3", ports: [{ name: "sra", dir: "out" as const, ty: "Sra" as const }], params: { accession: "SRR123456" }, layout: { x: 20, y: 40 } };
+  const fasterq = { id: "reads-fastq", operator: "sra.fasterq_dump", operator_revision: "r4", ports: [{ name: "sra", dir: "in" as const, ty: "Sra" as const }, { name: "r1", dir: "out" as const, ty: "Fastq" as const }, { name: "r2", dir: "out" as const, ty: "Fastq" as const }], params: {}, layout: { x: 240, y: 40 } };
+  const replaced = replacePaperReadSlot(graph, "reads", prefetch, fasterq);
+  assert.deepEqual(replaced.edges.map((edge) => [edge.from_node, edge.from_port, edge.to_node, edge.to_port]), [
+    ["reads-fastq", "r1", "fastp", "r1"],
+    ["reads-fastq", "r2", "fastp", "r2"],
+    ["reads-fetch", "sra", "reads-fastq", "sra"],
+  ]);
+});
+
+test("a paired cited run cannot replace an unresolved placeholder feeding a generic one-port consumer", () => {
+  const graph: SomiteGraph = {
+    schema_version: 3,
+    nodes: [
+      { id: "reads", operator: "files.import", operator_revision: "r1", ports: [{ name: "file", dir: "out", ty: "Fastq" }], params: {}, layout: { x: 20, y: 40 } },
+      { id: "fastqc", operator: "qc.fastqc", operator_revision: "r2", ports: [{ name: "reads", dir: "in", ty: "Fastq" }], params: {}, layout: { x: 300, y: 40 } },
+    ],
+    edges: [{ id: "old-reads", from_node: "reads", from_port: "file", to_node: "fastqc", to_port: "reads" }],
+  };
+  assert.equal(nextPaperReadSlot({ ...candidate, graph }, "paired"), null);
+  const prefetch = { id: "reads-fetch", operator: "sra.prefetch", operator_revision: "r3", ports: [{ name: "sra", dir: "out" as const, ty: "Sra" as const }], params: { accession: "SRR123456" }, layout: { x: 20, y: 40 } };
+  const fasterq = { id: "reads-fastq", operator: "sra.fasterq_dump", operator_revision: "r4", ports: [{ name: "sra", dir: "in" as const, ty: "Sra" as const }, { name: "r1", dir: "out" as const, ty: "Fastq" as const }, { name: "r2", dir: "out" as const, ty: "Fastq" as const }], params: {}, layout: { x: 240, y: 40 } };
+  assert.equal(replacePaperReadSlot(graph, "reads", prefetch, fasterq), graph);
+});
+
+test("a paired cited run cannot replace a placeholder when another source already owns a mate role", () => {
+  const graph: SomiteGraph = {
+    schema_version: 3,
+    nodes: [
+      { id: "reads", operator: "files.import", operator_revision: "r1", ports: [{ name: "file", dir: "out", ty: "Fastq" }], params: {}, layout: { x: 20, y: 40 } },
+      { id: "other-reads", operator: "files.import", operator_revision: "r1", ports: [{ name: "file", dir: "out", ty: "Fastq" }], params: { path: "mate.fastq" }, layout: { x: 20, y: 160 } },
+      { id: "fastp", operator: "qc.fastp", operator_revision: "r2", ports: [{ name: "r1", dir: "in", ty: "Fastq" }, { name: "r2", dir: "in", ty: "Fastq", optional: true }], params: {}, layout: { x: 300, y: 40 } },
+    ],
+    edges: [
+      { id: "old-r1", from_node: "reads", from_port: "file", to_node: "fastp", to_port: "r1" },
+      { id: "other-r2", from_node: "other-reads", from_port: "file", to_node: "fastp", to_port: "r2" },
+    ],
+  };
+  assert.equal(nextPaperReadSlot({ ...candidate, graph }, "paired"), null);
+  const prefetch = { id: "reads-fetch", operator: "sra.prefetch", operator_revision: "r3", ports: [{ name: "sra", dir: "out" as const, ty: "Sra" as const }], params: { accession: "SRR123456" }, layout: { x: 20, y: 40 } };
+  const fasterq = { id: "reads-fastq", operator: "sra.fasterq_dump", operator_revision: "r4", ports: [{ name: "sra", dir: "in" as const, ty: "Sra" as const }, { name: "r1", dir: "out" as const, ty: "Fastq" as const }, { name: "r2", dir: "out" as const, ty: "Fastq" as const }], params: {}, layout: { x: 240, y: 40 } };
+  assert.equal(replacePaperReadSlot(graph, "reads", prefetch, fasterq), graph);
+});
+
+test("a paired cited run preserves explicit r1 and r2 downstream roles", () => {
+  const graph: SomiteGraph = {
+    schema_version: 3,
+    nodes: [
+      { id: "reads", operator: "files.import", operator_revision: "r1", ports: [{ name: "file", dir: "out", ty: "Fastq" }], params: {}, layout: { x: 20, y: 40 } },
+      { id: "fastp", operator: "qc.fastp", operator_revision: "r2", ports: [{ name: "r1", dir: "in", ty: "Fastq" }, { name: "r2", dir: "in", ty: "Fastq", optional: true }], params: {}, layout: { x: 300, y: 40 } },
+    ],
+    edges: [
+      { id: "old-r1", from_node: "reads", from_port: "file", to_node: "fastp", to_port: "r1" },
+      { id: "old-r2", from_node: "reads", from_port: "file", to_node: "fastp", to_port: "r2" },
+    ],
+  };
+  const candidateWithSlot = { ...candidate, graph };
+  assert.equal(nextPaperReadSlot(candidateWithSlot, "paired")?.id, "reads");
+  const prefetch = { id: "reads-fetch", operator: "sra.prefetch", operator_revision: "r3", ports: [{ name: "sra", dir: "out" as const, ty: "Sra" as const }], params: { accession: "SRR123456" }, layout: { x: 20, y: 40 } };
+  const fasterq = { id: "reads-fastq", operator: "sra.fasterq_dump", operator_revision: "r4", ports: [{ name: "sra", dir: "in" as const, ty: "Sra" as const }, { name: "r1", dir: "out" as const, ty: "Fastq" as const }, { name: "r2", dir: "out" as const, ty: "Fastq" as const }], params: {}, layout: { x: 240, y: 40 } };
+  const replaced = replacePaperReadSlot(graph, "reads", prefetch, fasterq);
+  assert.deepEqual(replaced.edges.map((edge) => [edge.from_node, edge.from_port, edge.to_node, edge.to_port]), [
+    ["reads-fastq", "r1", "fastp", "r1"],
+    ["reads-fastq", "r2", "fastp", "r2"],
+    ["reads-fetch", "sra", "reads-fastq", "sra"],
+  ]);
 });

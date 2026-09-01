@@ -1,5 +1,6 @@
 import {
   chmod,
+  lstat,
   mkdir,
   open,
   readFile,
@@ -8,9 +9,10 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
-import { dirname, join, relative } from "node:path";
+import { dirname, join, posix, relative } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { gzipSync } from "node:zlib";
 
 import {
   archiveFrozenPackage,
@@ -23,11 +25,13 @@ import { OperatorCatalog } from "@somite/workflow/catalog";
 import type { WorkflowAssessmentContext } from "@somite/workflow/assessment";
 import { byteDigest, canonicalJsonDigest } from "@somite/workflow/contentIdentity";
 import {
-  bindRepresentativeFastq,
+  bindRepresentativeInputs,
+  REPRESENTATIVE_SOURCE_PACK,
   representativeValidationCapability,
   SOURCE_PREVIEW_PACK,
   type FixtureBinding,
-  type MaterializedFastqFixture,
+  type MaterializedFixture,
+  type RepresentativeFixtureSet,
   RepresentativeValidationError,
 } from "@somite/workflow/fixtures";
 import {
@@ -50,16 +54,39 @@ import { EvidenceStore } from "./evidenceStore.ts";
 import { atomicWrite, containedPath, pathExists } from "./files.ts";
 import { PixiCache, type LockedManifest } from "./pixiCache.ts";
 import { readSourceObject } from "./sourceWorkflowStore.ts";
-import { terminateProcessTree } from "./process.ts";
-import { materializeProductionGraph, type GraphInputLocation, type ManagedResourceResolver } from "./productionGraph.ts";
+import { runAbortableProcess, terminateProcessTree } from "./process.ts";
+import {
+  materializePortableProductionGraph,
+  materializeProductionGraph,
+  type GraphInputLocation,
+  type ManagedResourceResolver,
+} from "./productionGraph.ts";
 import { RunStorage } from "./runStorage.ts";
 import { requireReadyWorkflow } from "./workflowAdmission.ts";
 import { executablePath, pixiPlatform } from "./system.ts";
+import {
+  createCompiledArtifactManifest,
+  verifyCompiledArtifactDirectory,
+  type CompiledArtifactManifest,
+  type CompiledArtifactSourceFile,
+} from "./compiledArtifact.ts";
+import {
+  freezeSourceExecution,
+  packagePortableSourceExecution,
+  realizeSourceExecution,
+  SOURCE_EXECUTION_CONFIG,
+  SOURCE_EXECUTION_PACKAGE_REVISION,
+  SOURCE_EXECUTION_PROFILE,
+} from "./sourceExecution.ts";
 
 export type RunPhase = "preparing" | "running" | "finalizing" | "completed" | "failed" | "cancelling" | "cancelled";
 export type RunNodeState = "queued" | "running" | "cached" | "done" | "failed" | "skipped" | "cancelled";
 
 const MAX_FAILURE_LOG_TAIL_BYTES = 64 * 1024;
+const MAX_SOURCE_PREVIEW_DAG_BYTES = 8 * 1024 * 1024;
+const SOURCE_PREVIEW_DAG_PATH = ".somite/run/source-preview-dag.html";
+const SOURCE_LAUNCHER_PATH = "somite-run";
+const SOURCE_LAUNCHER_README_PATH = ".somite/run/README.md";
 
 export type RunStatus = {
   run_id: string;
@@ -75,7 +102,7 @@ export type RunStatus = {
 export type RunStart = Readonly<{ run_id: string; phase: RunPhase; replayed: boolean }>;
 
 type RepresentativeValidationContext = Readonly<{
-  kind: "representative_fastq";
+  kind: "representative_inputs";
   subjectDigest: string;
   binding: FixtureBinding;
   originalGraph: SomiteGraph;
@@ -174,11 +201,15 @@ function terminal(phase: RunPhase) {
   return phase === "completed" || phase === "failed" || phase === "cancelled";
 }
 
-async function writePackageFiles(directory: string, packageFiles: ReadonlyMap<string, Uint8Array>) {
+async function writePackageFiles(
+  directory: string,
+  packageFiles: ReadonlyMap<string, Uint8Array>,
+  executablePaths: ReadonlySet<string> = new Set(),
+) {
   for (const [relativePath, bytes] of packageFiles) {
     const destination = join(directory, relativePath);
     await mkdir(dirname(destination), { recursive: true });
-    await writeFile(destination, bytes);
+    await writeFile(destination, bytes, { mode: executablePaths.has(relativePath) ? 0o755 : 0o644 });
   }
 }
 
@@ -186,7 +217,13 @@ type PreparedSourcePackage = Readonly<{
   closureDigest: string;
   graphRevision: string;
   locked: LockedManifest;
+  environmentManifest?: string;
+  executionMode: "root_lock" | "generated_task_environments";
+  nextflowConfigurationPaths: readonly string[];
+  nextflowProfiles: readonly string[];
   files: ReadonlyMap<string, Uint8Array>;
+  archiveModes: ReadonlyMap<string, 0o644 | 0o755>;
+  artifactManifest: CompiledArtifactManifest;
   workflow: NonNullable<SomiteGraph["nodes"][number]["source_workflow"]>;
 }>;
 
@@ -202,36 +239,170 @@ function sourceParameters(workflow: PreparedSourcePackage["workflow"]) {
     .map(([name, binding]) => [name, binding.kind === "literal" ? binding.value : binding.path]));
 }
 
+function shellQuote(value: string) {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function sourceLauncher(
+  entrypoint: string,
+  configurationPaths: readonly string[],
+  profiles: readonly string[],
+  generatedTaskEnvironments: boolean,
+) {
+  const nextflow = [
+    "nextflow",
+    "-log",
+    ".somite/run/nextflow.log",
+    "-C",
+    configurationPaths.join(","),
+    "run",
+    entrypoint,
+    "-params-file",
+    ".somite/run/params.json",
+    "-profile",
+    profiles.join(","),
+    ...(generatedTaskEnvironments ? ["-with-conda"] : []),
+    "-resume",
+    '"$@"',
+  ].map((value) => value === '"$@"' ? value : shellQuote(value)).join(" ");
+  return [
+    "#!/bin/sh",
+    "set -eu",
+    'root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)',
+    'cd "$root"',
+    "if ! command -v pixi >/dev/null 2>&1; then",
+    "  echo 'Somite source packages require Pixi on PATH: https://pixi.prefix.dev/' >&2",
+    "  exit 127",
+    "fi",
+    'mkdir -p .somite/run/nextflow-home',
+    'export NXF_HOME="$root/.somite/run/nextflow-home"',
+    "export NXF_OFFLINE=true",
+    "export NXF_DISABLE_CHECK_LATEST=true",
+    "pixi install --all --frozen --manifest-path pixi.toml",
+    `exec pixi run --frozen --manifest-path pixi.toml -- ${nextflow}`,
+    "",
+  ].join("\n");
+}
+
+function sourceLauncherReadme() {
+  return [
+    "# Run this frozen Somite source workflow",
+    "",
+    "Install Pixi, place any project-relative inputs named in `.somite/run/params.json`, then run:",
+    "",
+    "```bash",
+    "./somite-run",
+    "```",
+    "",
+    "The launcher installs every locked Pixi environment before starting the pinned local Nextflow workflow.",
+    "Validation receipts describe preview/structure evidence separately from a scientific task run.",
+    "",
+  ].join("\n");
+}
+
+function reservedSourcePath(path: string) {
+  return path === SOURCE_LAUNCHER_PATH
+    || path === ".somite"
+    || path === ".somite/run"
+    || path.startsWith(".somite/run/")
+    || path === ".nextflow"
+    || path.startsWith(".nextflow/")
+    || path === "evidence"
+    || path === "evidence/index.json";
+}
+
+function sourceJobLogPaths(packagePath: string) {
+  return {
+    stdout: join(packagePath, ".somite", "run", "stdout.log"),
+    stderr: join(packagePath, ".somite", "run", "stderr.log"),
+    nextflow: join(packagePath, ".somite", "run", "nextflow.log"),
+  };
+}
+
+async function requireSourcePreviewDag(packagePath: string) {
+  const path = join(packagePath, SOURCE_PREVIEW_DAG_PATH);
+  let metadata;
+  try {
+    metadata = await lstat(path);
+  } catch (cause) {
+    throw new Error("Nextflow preview completed without producing the requested DAG artifact", { cause });
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1
+    || metadata.size < 1 || metadata.size > MAX_SOURCE_PREVIEW_DAG_BYTES) {
+    throw new Error(`Nextflow preview DAG is not one regular file between 1 and ${MAX_SOURCE_PREVIEW_DAG_BYTES} bytes`);
+  }
+  return path;
+}
+
 async function prepareSourcePackage(
   graph: SomiteGraph,
   directory: string,
   projectRoot: string,
   cache: PixiCache,
+  platform: string,
+  realizeEnvironment: boolean,
+  signal?: AbortSignal,
 ) : Promise<PreparedSourcePackage> {
   const node = exactSourceNode(graph);
   if (!node?.source_workflow) throw new Error("source workflow does not have a frozen Pixi execution contract");
   const workflow = node.source_workflow;
   const source = await readSourceObject(projectRoot, workflow.source.source_digest);
-  const manifest = source.files.find((file) => file.path === "pixi.toml");
-  const lock = source.files.find((file) => file.path === "pixi.lock");
-  if (!manifest || !lock) throw new Error("source workflow is missing its trusted Pixi manifest or lock");
-  if (source.files.some((file) => file.path.startsWith(".somite/run/"))) {
-    throw new Error("source workflow reserves the .somite/run path required for execution metadata");
+  const sourceBytes = source.files.reduce((total, file) => total + file.bytes.byteLength, 0);
+  enforceFrozenArchiveSize(sourceBytes);
+  if (source.files.some((file) => reservedSourcePath(file.path))) {
+    throw new Error("source workflow uses a path reserved for Somite execution metadata");
   }
-  const locked = await cache.adoptLock(manifest.bytes, lock.bytes);
+  const frozenExecution = await freezeSourceExecution(source.files, workflow.source.entrypoint, platform, cache, signal);
+  const portableExecution = packagePortableSourceExecution(frozenExecution);
+  const realizedExecution = realizeEnvironment
+    ? await realizeSourceExecution(frozenExecution, platform, cache, signal)
+    : undefined;
+  const execution = realizedExecution ?? portableExecution;
+  const locked = execution.locked;
   const graphRevision = semanticGraphRevision(graph);
   const params = sourceParameters(workflow);
+  const sourcePaths = new Set(execution.source_files.map((file) => file.path));
+  const projectConfig = posix.join(posix.dirname(workflow.source.entrypoint), "nextflow.config");
+  const nextflowConfigurationPaths = [...new Set([projectConfig, "nextflow.config"])]
+    .filter((path) => sourcePaths.has(path));
+  nextflowConfigurationPaths.push(SOURCE_EXECUTION_CONFIG);
+  const nextflowProfiles = [...new Set([...(workflow.profiles ?? []), SOURCE_EXECUTION_PROFILE])];
+  const launcherBytes = encoder.encode(sourceLauncher(
+    workflow.source.entrypoint,
+    nextflowConfigurationPaths,
+    nextflowProfiles,
+    execution.mode === "generated_task_environments",
+  ));
+  const policyBytes = portableExecution.generated_files.get(SOURCE_EXECUTION_CONFIG);
+  if (!policyBytes) throw new Error("source workflow package is missing its frozen Nextflow execution policy");
+  const portableSourceDigest = portableExecution.staged?.executed_source_digest ?? workflow.source.source_digest;
+  const portableEnvironmentIdentity = {
+    mode: execution.environment_identity.mode,
+    manifest_digest: execution.environment_identity.manifest_digest,
+    lock_digest: execution.environment_identity.lock_digest,
+    ...(execution.environment_identity.source_plan_digest
+      ? { source_plan_digest: execution.environment_identity.source_plan_digest }
+      : {}),
+  };
   const closureDigest = canonicalJsonDigest({
     schema_version: 1,
     kind: "source_workflow",
     graph_revision: graphRevision,
     workflow_revision: workflow.workflow_revision,
     source_digest: workflow.source.source_digest,
-    environment_manifest_digest: locked.manifest_digest,
-    environment_lock_digest: locked.lock_digest,
+    environment: portableEnvironmentIdentity,
     parameters: params,
+    packaging: {
+      revision: SOURCE_EXECUTION_PACKAGE_REVISION,
+      execution_policy_digest: byteDigest(policyBytes),
+      launcher_digest: byteDigest(launcherBytes),
+      portable_source_digest: portableSourceDigest,
+    },
   });
   const generated = new Map<string, Uint8Array>([
+    ...execution.generated_files,
+    [SOURCE_LAUNCHER_PATH, launcherBytes],
+    [SOURCE_LAUNCHER_README_PATH, encoder.encode(sourceLauncherReadme())],
     ["evidence/index.json", encoder.encode(`${JSON.stringify(emptyEvidenceIndex(), null, 2)}\n`)],
     [".somite/run/params.json", encoder.encode(`${JSON.stringify(params, null, 2)}\n`)],
     [".somite/run/workflow.somite.json", encoder.encode(`${JSON.stringify(graph, null, 2)}\n`)],
@@ -246,26 +417,68 @@ async function prepareSourcePackage(
       graph_revision: graphRevision,
       workflow_revision: workflow.workflow_revision,
       source_digest: workflow.source.source_digest,
-      environment: { manifest_digest: locked.manifest_digest, lock_digest: locked.lock_digest },
+      environment: {
+        ...portableEnvironmentIdentity,
+        ...(execution.environment_identity.executed_source_digest
+          ? { executed_source_digest: execution.environment_identity.executed_source_digest }
+          : {}),
+      },
+      packaging: {
+        revision: SOURCE_EXECUTION_PACKAGE_REVISION,
+        execution_policy_digest: byteDigest(policyBytes),
+        launcher_digest: byteDigest(launcherBytes),
+        portable_source_digest: portableSourceDigest,
+      },
     }, null, 2)}\n`)],
   ]);
   const graphBytes = generated.get(".somite/run/workflow.somite.json")!.byteLength;
   if (graphBytes > MAX_WORKFLOW_DOCUMENT_BYTES) {
     throw new FrozenPackageSizeError("workflow_document", graphBytes, MAX_WORKFLOW_DOCUMENT_BYTES);
   }
-  const files = new Map<string, Uint8Array>(source.files.map((file) => [file.path, file.bytes]));
+  const files = new Map<string, Uint8Array>(execution.source_files.map((file) => [file.path, file.bytes]));
   for (const [path, bytes] of generated) files.set(path, bytes);
   const totalBytes = [...files.values()].reduce((total, bytes) => total + bytes.byteLength, 0);
   enforceFrozenArchiveSize(totalBytes);
   await mkdir(directory, { recursive: false });
-  for (const file of source.files) {
+  for (const file of execution.source_files) {
     const destination = containedPath(directory, file.path);
     await mkdir(dirname(destination), { recursive: true });
     await writeFile(destination, file.bytes, { flag: "wx", mode: file.mode === 0o100755 ? 0o755 : 0o644 });
     if (file.mode === 0o100755) await chmod(destination, 0o755);
   }
-  await writePackageFiles(directory, generated);
-  return { closureDigest, graphRevision, locked, files, workflow };
+  await writePackageFiles(directory, generated, new Set([SOURCE_LAUNCHER_PATH]));
+  const sourceArtifactFiles: CompiledArtifactSourceFile[] = execution.source_files.map((file) => ({
+    path: file.path,
+    bytes: file.bytes,
+    mode: file.mode === 0o100755 ? 0o755 : 0o644,
+  }));
+  const generatedArtifactFiles: CompiledArtifactSourceFile[] = [...generated].map(([path, bytes]) => ({
+    path,
+    bytes,
+    mode: path === SOURCE_LAUNCHER_PATH ? 0o755 : 0o644,
+  }));
+  const artifactManifest = createCompiledArtifactManifest(
+    closureDigest,
+    graphRevision,
+    [...sourceArtifactFiles, ...generatedArtifactFiles],
+  );
+  const archiveModes = new Map<string, 0o644 | 0o755>([
+    ...sourceArtifactFiles.map((file) => [file.path, file.mode] as const),
+    ...generatedArtifactFiles.map((file) => [file.path, file.mode] as const),
+  ]);
+  return {
+    closureDigest,
+    graphRevision,
+    locked,
+    ...(realizedExecution ? { environmentManifest: realizedExecution.environment_manifest } : {}),
+    executionMode: execution.mode,
+    nextflowConfigurationPaths,
+    nextflowProfiles,
+    files,
+    archiveModes,
+    artifactManifest,
+    workflow,
+  };
 }
 
 async function prepareFrozenPackage(
@@ -349,7 +562,7 @@ function copyStatus(status: RunStatus): RunStatus {
       completed,
       total: Object.keys(states).length,
       unit: "nodes",
-      message: statusMessage(status.phase),
+      message: status.phase === "preparing" ? status.progress.message : statusMessage(status.phase),
     },
   };
 }
@@ -378,10 +591,43 @@ async function digestsForPaths(paths: readonly string[]) {
   return Promise.all([...paths].sort().map(fileDigest));
 }
 
-async function materializeFixtureObject(projectRoot: string, sourcePath: string): Promise<MaterializedFastqFixture> {
-  const bytes = await readFile(sourcePath);
+async function materializeFixtureObject(
+  projectRoot: string,
+  sourcePath: string,
+  payloadName = "payload.fastq",
+): Promise<MaterializedFixture> {
+  return materializeFixtureBytes(projectRoot, await readFile(sourcePath), payloadName);
+}
+
+async function materializeCompressedFixtureObject(
+  projectRoot: string,
+  sourcePath: string,
+  payloadName: string,
+): Promise<MaterializedFixture> {
+  const compressed = gzipSync(await readFile(sourcePath), { level: 9 });
+  return materializeFixtureBytes(projectRoot, compressed, payloadName);
+}
+
+async function materializeBase64FixtureObject(
+  projectRoot: string,
+  sourcePath: string,
+  payloadName: string,
+): Promise<MaterializedFixture> {
+  const encoded = (await readFile(sourcePath, "utf8")).trim();
+  const canonicalBase64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+  if (!encoded || !canonicalBase64.test(encoded)) throw new Error(`fixture source ${sourcePath} is not canonical base64`);
+  const bytes = Buffer.from(encoded, "base64");
+  if (bytes.toString("base64") !== encoded) throw new Error(`fixture source ${sourcePath} is not canonical base64`);
+  return materializeFixtureBytes(projectRoot, bytes, payloadName);
+}
+
+async function materializeFixtureBytes(
+  projectRoot: string,
+  bytes: Uint8Array,
+  payloadName: string,
+): Promise<MaterializedFixture> {
   const digest = byteDigest(bytes);
-  const payload = join(projectRoot, ".somite", "fixtures", "objects", digest.slice("blake3:".length), "payload.fastq");
+  const payload = join(projectRoot, ".somite", "fixtures", "objects", digest.slice("blake3:".length), payloadName);
   try {
     const existing = await readFile(payload);
     if (byteDigest(existing) !== digest) throw new Error(`fixture object ${digest} does not match its content address`);
@@ -465,7 +711,7 @@ export class RunManager {
     requireReadyWorkflow(graph, this.#catalog, intent === "validation" ? "validate" : "run", await this.#assessmentContext());
     const validation = intent === "validation" ? await this.#validationContext(graph) : undefined;
     const runnable = await materializeProductionGraph(
-      validation?.kind === "representative_fastq" ? validation.binding.graph : graph,
+      validation?.kind === "representative_inputs" ? validation.binding.graph : graph,
       this.#catalog,
       this.#projectRoot,
       graphLocation,
@@ -482,7 +728,12 @@ export class RunManager {
       status: {
         run_id: id,
         phase: "preparing",
-        states: Object.fromEntries(runnable.nodes.map((node) => [node.id, "queued" as const])),
+        states: Object.fromEntries([
+          ...runnable.nodes.map((node) => [node.id, "queued" as const] as const),
+          ...(validation?.kind === "representative_inputs"
+            ? (validation.binding.unexercised_nodes ?? []).map((nodeId) => [nodeId, "skipped" as const] as const)
+            : []),
+        ]),
         progress: { completed: 0, total: runnable.nodes.length, unit: "nodes", message: "Preparing workflow" },
       },
       revision: 0,
@@ -543,11 +794,11 @@ export class RunManager {
   async validationStatus(graph: SomiteGraph) {
     const validation = await this.#validationContext(graph);
     const receipt = [...await this.#evidence.forSubject(validation.subjectDigest)].reverse().find((candidate) => candidate.subject_digest === validation.subjectDigest
-      && candidate.configuration_digest === (validation.kind === "representative_fastq" ? validation.binding.configuration_digest : validation.configurationDigest));
+      && candidate.configuration_digest === (validation.kind === "representative_inputs" ? validation.binding.configuration_digest : validation.configurationDigest));
     return {
       subject_digest: validation.subjectDigest,
-      configuration_digest: validation.kind === "representative_fastq" ? validation.binding.configuration_digest : validation.configurationDigest,
-      fixture_pack: validation.kind === "representative_fastq" ? validation.binding.fixture_pack : validation.fixturePack,
+      configuration_digest: validation.kind === "representative_inputs" ? validation.binding.configuration_digest : validation.configurationDigest,
+      fixture_pack: validation.kind === "representative_inputs" ? validation.binding.fixture_pack : validation.fixturePack,
       ...(receipt ? { receipt } : {}),
     };
   }
@@ -558,24 +809,22 @@ export class RunManager {
     const temporary = join(parent, `.compile-${randomUUID()}.partial`);
     await mkdir(parent, { recursive: true });
     try {
-      const runnable = await materializeProductionGraph(graph, this.#catalog, this.#projectRoot, graphLocation, this.#managedResourceResolver);
+      const runnable = await materializePortableProductionGraph(graph, this.#catalog, this.#projectRoot, graphLocation, this.#managedResourceResolver);
       if (exactSourceNode(runnable)) {
-        const prepared = await prepareSourcePackage(runnable, temporary, this.#projectRoot, this.#pixi);
+        const prepared = await prepareSourcePackage(runnable, temporary, this.#projectRoot, this.#pixi, target.platform, false);
         const destination = join(parent, prepared.closureDigest.replace(/^blake3:/, ""));
         let reused = false;
-        try {
-          await readFile(join(destination, ".somite", "run", "run-closure.json"));
+        let artifactManifest = prepared.artifactManifest;
+        if (await pathExists(destination)) {
+          artifactManifest = await verifyCompiledArtifactDirectory(destination, artifactManifest);
           reused = true;
-        } catch {
+        } else {
           try {
             await rename(temporary, destination);
           } catch (moveError) {
-            try {
-              await readFile(join(destination, ".somite", "run", "run-closure.json"));
-              reused = true;
-            } catch {
-              throw moveError;
-            }
+            if (!await pathExists(destination)) throw moveError;
+            artifactManifest = await verifyCompiledArtifactDirectory(destination, artifactManifest);
+            reused = true;
           }
         }
         if (reused) await rm(temporary, { recursive: true, force: true });
@@ -586,24 +835,28 @@ export class RunManager {
           compiled_graph_revision: prepared.graphRevision,
           output_path: displayed && !displayed.startsWith("..") ? displayed : destination,
           reused,
+          artifact_manifest: artifactManifest,
         };
       }
       const { frozen } = await prepareFrozenPackage(runnable, this.#catalog, target, temporary, this.#projectRoot, this.#pixi);
+      const artifactManifest = createCompiledArtifactManifest(
+        frozen.closure.closure_digest,
+        frozen.closure.graph_revision,
+        [...frozen.files].map(([path, bytes]) => ({ path, bytes, mode: 0o644 })),
+      );
       const destination = join(parent, frozen.closure.closure_digest.replace(/^blake3:/, ""));
       let reused = false;
-      try {
-        await readFile(join(destination, "run-closure.json"));
+      let verifiedArtifactManifest = artifactManifest;
+      if (await pathExists(destination)) {
+        verifiedArtifactManifest = await verifyCompiledArtifactDirectory(destination, artifactManifest);
         reused = true;
-      } catch {
+      } else {
         try {
           await rename(temporary, destination);
         } catch (moveError) {
-          try {
-            await readFile(join(destination, "run-closure.json"));
-            reused = true;
-          } catch {
-            throw moveError;
-          }
+          if (!await pathExists(destination)) throw moveError;
+          verifiedArtifactManifest = await verifyCompiledArtifactDirectory(destination, artifactManifest);
+          reused = true;
         }
       }
       if (reused) await rm(temporary, { recursive: true, force: true });
@@ -614,6 +867,7 @@ export class RunManager {
         compiled_graph_revision: frozen.closure.graph_revision,
         output_path: displayed && !displayed.startsWith("..") ? displayed : destination,
         reused,
+        artifact_manifest: verifiedArtifactManifest,
       };
     } catch (error) {
       await rm(temporary, { recursive: true, force: true });
@@ -638,10 +892,10 @@ export class RunManager {
     const directory = join(this.#projectRoot, ".somite", "exports", `export-${randomUUID()}`);
     await mkdir(join(directory, ".."), { recursive: true });
     try {
-      const runnable = await materializeProductionGraph(graph, this.#catalog, this.#projectRoot, graphLocation, this.#managedResourceResolver);
+      const runnable = await materializePortableProductionGraph(graph, this.#catalog, this.#projectRoot, graphLocation, this.#managedResourceResolver);
       if (exactSourceNode(runnable)) {
-        const prepared = await prepareSourcePackage(runnable, directory, this.#projectRoot, this.#pixi);
-        const bytes = archiveFrozenPackage(prepared.files);
+        const prepared = await prepareSourcePackage(runnable, directory, this.#projectRoot, this.#pixi, target.platform, false);
+        const bytes = archiveFrozenPackage(prepared.files, prepared.archiveModes);
         enforceFrozenArchiveSize(bytes.byteLength);
         return { filename: `${safeArchiveName(target.archiveName)}.somite-source.zip`, bytes };
       }
@@ -673,10 +927,23 @@ export class RunManager {
       materializeFixtureObject(this.#projectRoot, join(this.#repositoryRoot, "fixtures", "fastq", "v1", "reads_R1.fastq")),
       materializeFixtureObject(this.#projectRoot, join(this.#repositoryRoot, "fixtures", "fastq", "v1", "reads_R2.fastq")),
     ]);
+    let fixtures: RepresentativeFixtureSet = { readOne, readTwo };
+    if (capability.fixture_pack === REPRESENTATIVE_SOURCE_PACK) {
+      const [readOneGz, readTwoGz, reference, referenceGz, gtf, gff3, bam] = await Promise.all([
+        materializeCompressedFixtureObject(this.#projectRoot, join(this.#repositoryRoot, "fixtures", "fastq", "v1", "reads_R1.fastq"), "payload.fastq.gz"),
+        materializeCompressedFixtureObject(this.#projectRoot, join(this.#repositoryRoot, "fixtures", "fastq", "v1", "reads_R2.fastq"), "payload.fastq.gz"),
+        materializeFixtureObject(this.#projectRoot, join(this.#repositoryRoot, "fixtures", "reference", "v1", "reference.fa"), "payload.fa"),
+        materializeCompressedFixtureObject(this.#projectRoot, join(this.#repositoryRoot, "fixtures", "reference", "v1", "reference.fa"), "payload.fa.gz"),
+        materializeFixtureObject(this.#projectRoot, join(this.#repositoryRoot, "fixtures", "reference", "v1", "annotation.gtf"), "payload.gtf"),
+        materializeFixtureObject(this.#projectRoot, join(this.#repositoryRoot, "fixtures", "reference", "v1", "annotation.gff3"), "payload.gff3"),
+        materializeBase64FixtureObject(this.#projectRoot, join(this.#repositoryRoot, "fixtures", "bam", "v1", "sample.bam.b64"), "payload.bam"),
+      ]);
+      fixtures = { ...fixtures, readOneGz, readTwoGz, reference, referenceGz, gtf, gff3, bam };
+    }
     return {
-      kind: "representative_fastq",
+      kind: "representative_inputs",
       subjectDigest: semanticGraphRevision(graph),
-      binding: bindRepresentativeFastq(graph, { readOne, readTwo }),
+      binding: bindRepresentativeInputs(graph, this.#catalog, fixtures),
       originalGraph: graph,
     };
   }
@@ -696,6 +963,7 @@ export class RunManager {
     try {
       await mkdir(join(job.packagePath, ".."), { recursive: true });
       if (exactSourceNode(job.graph)) return await this.#executeSource(job);
+      this.#update(job, { progress: { ...job.status.progress, message: "Freezing workflow tools with Pixi" } });
       const target = { archiveName: job.graph.name ?? "somite-workflow", platform: pixiPlatform() };
       const { frozen, locked } = await prepareFrozenPackage(
         job.graph,
@@ -707,32 +975,31 @@ export class RunManager {
         job.abort.signal,
       );
       if (job.abort.signal.aborted) return this.#finishCancelled(job);
+      this.#update(job, { progress: { ...job.status.progress, message: "Installing the frozen workflow environment" } });
       const environmentManifest = await this.#pixi.environment(locked, target.platform, job.abort.signal);
       if (job.abort.signal.aborted) return this.#finishCancelled(job);
       this.#update(job, { closure_digest: frozen.closure.closure_digest, phase: "running" });
+      const nextflowHome = join(job.packagePath, ".somite", "run", "nextflow-home");
+      await mkdir(nextflowHome, { recursive: true });
       const stdout = await open(join(job.packagePath, "run.stdout.log"), "w");
       const stderr = await open(join(job.packagePath, "run.stderr.log"), "w");
       try {
-        const child = spawn(
+        const result = await runAbortableProcess(job.abort.signal, () => spawn(
           locked.pixi,
           ["run", "--frozen", "--manifest-path", environmentManifest, "--", "nextflow", "run", "main.nf", "-params-file", "params.json", "-resume"],
           {
             cwd: job.packagePath,
             detached: process.platform !== "win32",
-            env: { ...process.env, NXF_DISABLE_CHECK_LATEST: "true" },
+            env: {
+              ...process.env,
+              NXF_DISABLE_CHECK_LATEST: "true",
+              NXF_HOME: nextflowHome,
+              NXF_OFFLINE: "true",
+            },
             windowsHide: true,
             stdio: ["ignore", stdout.fd, stderr.fd],
           },
-        );
-        job.child = child;
-        const cancel = () => terminateProcessTree(child);
-        job.abort.signal.addEventListener("abort", cancel, { once: true });
-        const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolvePromise, rejectPromise) => {
-          child.once("error", rejectPromise);
-          child.once("close", (code, closeSignal) => resolvePromise({ code, signal: closeSignal }));
-        });
-        job.abort.signal.removeEventListener("abort", cancel);
-        job.child = undefined;
+        ), job);
         if (job.abort.signal.aborted) return this.#finishCancelled(job);
         await this.#refreshStates(job);
         if (result.code === 0) {
@@ -764,46 +1031,67 @@ export class RunManager {
 
   async #executeSource(job: RunJob) {
     const target = { platform: pixiPlatform() };
-    const prepared = await prepareSourcePackage(job.graph, job.packagePath, this.#projectRoot, this.#pixi);
-    if (job.abort.signal.aborted) return this.#finishCancelled(job);
-    const environmentManifest = await this.#pixi.environment(prepared.locked, target.platform, job.abort.signal);
+    this.#update(job, { progress: { ...job.status.progress, message: "Verifying and installing the source workflow environment" } });
+    const prepared = await prepareSourcePackage(
+      job.graph,
+      job.packagePath,
+      this.#projectRoot,
+      this.#pixi,
+      target.platform,
+      true,
+      job.abort.signal,
+    );
     if (job.abort.signal.aborted) return this.#finishCancelled(job);
     const nodeId = job.graph.nodes[0]!.id;
     job.status.states[nodeId] = "running";
     this.#update(job, { closure_digest: prepared.closureDigest, phase: "running" });
-    const stdout = await open(join(job.packagePath, "run.stdout.log"), "w");
-    const stderr = await open(join(job.packagePath, "run.stderr.log"), "w");
+    const sourceLogs = sourceJobLogPaths(job.packagePath);
+    const stdout = await open(sourceLogs.stdout, "w");
+    const stderr = await open(sourceLogs.stderr, "w");
     try {
+      const generatedTaskEnvironments = prepared.executionMode === "generated_task_environments";
+      const mambaRoot = join(job.packagePath, ".somite", "run", "mamba-root");
+      const nextflowHome = join(job.packagePath, ".somite", "run", "nextflow-home");
+      await mkdir(nextflowHome, { recursive: true });
+      if (generatedTaskEnvironments) await mkdir(mambaRoot, { recursive: true });
       const nextflowArgs = [
+        "-log",
+        ".somite/run/nextflow.log",
+        "-C",
+        prepared.nextflowConfigurationPaths.join(","),
         "run",
         prepared.workflow.source.entrypoint,
         "-params-file",
         ".somite/run/params.json",
-        ...(prepared.workflow.profiles?.length ? ["-profile", prepared.workflow.profiles.join(",")] : []),
-        ...(job.intent === "validation" ? ["-preview"] : ["-resume"]),
+        "-profile",
+        prepared.nextflowProfiles.join(","),
+        ...(generatedTaskEnvironments ? ["-with-conda"] : []),
+        ...(job.intent === "validation"
+          ? ["-preview", "-with-dag", SOURCE_PREVIEW_DAG_PATH]
+          : ["-resume"]),
       ];
-      const child = spawn(
+      const environmentManifest = prepared.environmentManifest;
+      if (!environmentManifest) throw new Error("source workflow execution environment was not realized");
+      const result = await runAbortableProcess(job.abort.signal, () => spawn(
         prepared.locked.pixi,
         ["run", "--frozen", "--manifest-path", environmentManifest, "--", "nextflow", ...nextflowArgs],
         {
           cwd: job.packagePath,
           detached: process.platform !== "win32",
-          env: { ...process.env, NXF_DISABLE_CHECK_LATEST: "true" },
+          env: {
+            ...process.env,
+            NXF_DISABLE_CHECK_LATEST: "true",
+            NXF_HOME: nextflowHome,
+            NXF_OFFLINE: "true",
+            ...(generatedTaskEnvironments ? { MAMBA_ROOT_PREFIX: mambaRoot } : {}),
+          },
           windowsHide: true,
           stdio: ["ignore", stdout.fd, stderr.fd],
         },
-      );
-      job.child = child;
-      const cancel = () => terminateProcessTree(child);
-      job.abort.signal.addEventListener("abort", cancel, { once: true });
-      const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolvePromise, rejectPromise) => {
-        child.once("error", rejectPromise);
-        child.once("close", (code, closeSignal) => resolvePromise({ code, signal: closeSignal }));
-      });
-      job.abort.signal.removeEventListener("abort", cancel);
-      job.child = undefined;
+      ), job);
       if (job.abort.signal.aborted) return this.#finishCancelled(job);
       if (result.code === 0) {
+        if (job.validation?.kind === "source_preview") await requireSourcePreviewDag(job.packagePath);
         job.status.states[nodeId] = "done";
         if (job.validation) {
           this.#update(job, { phase: "finalizing", exit_code: result.code });
@@ -890,7 +1178,11 @@ export class RunManager {
   async #recordEvidence(job: RunJob, closureDigest: string, terminalPhase: "completed" | "failed") {
     const validation = job.validation!;
     await this.#refreshStates(job);
-    const nodeResults = Object.fromEntries(Object.entries(job.status.states).map(([node, state]) => [node, evidenceNodeResult(state)]));
+    const unexercised = new Set(validation.kind === "representative_inputs" ? validation.binding.unexercised_nodes ?? [] : []);
+    const nodeResults = Object.fromEntries(validation.originalGraph.nodes.map((node) => [
+      node.id,
+      unexercised.has(node.id) ? "inconclusive" as const : evidenceNodeResult(job.status.states[node.id]),
+    ]));
     const edgeResults = Object.fromEntries(validation.originalGraph.edges.map((edge) => {
       const source = nodeResults[edge.from_node];
       const target = nodeResults[edge.to_node];
@@ -899,11 +1191,15 @@ export class RunManager {
       return [edge.id, result];
     }));
     const artifactFiles = await collectFiles(join(job.packagePath, "results"));
-    const candidateLogFiles = [
-      join(job.packagePath, "run.stdout.log"),
-      join(job.packagePath, "run.stderr.log"),
-      join(job.packagePath, ".nextflow.log"),
-    ];
+    if (validation.kind === "source_preview") artifactFiles.push(await requireSourcePreviewDag(job.packagePath));
+    const sourceLogs = sourceJobLogPaths(job.packagePath);
+    const candidateLogFiles = validation.kind === "source_preview"
+      ? [sourceLogs.stdout, sourceLogs.stderr, sourceLogs.nextflow]
+      : [
+          join(job.packagePath, "run.stdout.log"),
+          join(job.packagePath, "run.stderr.log"),
+          join(job.packagePath, ".nextflow.log"),
+        ];
     const logFiles = (await Promise.all(candidateLogFiles.map(async (path) => ({ path, exists: await pathExists(path) }))))
       .filter((candidate) => candidate.exists)
       .map((candidate) => candidate.path);
@@ -912,7 +1208,12 @@ export class RunManager {
       subject_digest: validation.subjectDigest,
       observed_closure_digest: closureDigest,
       kind: validation.kind === "source_preview" ? "source_preview_validation" : "configuration_validation",
-      scope: validation.kind === "source_preview" ? "nextflow_source_compile_and_dag" : "graph_e2e",
+      scope: validation.kind === "source_preview" ? "nextflow_source_compile_and_dag"
+        : validation.binding.unexercised_nodes?.length && validation.binding.parameter_overrides
+          ? "graph_e2e_public_retrieval_not_exercised_fixture_parameters_adjusted"
+          : validation.binding.unexercised_nodes?.length ? "graph_e2e_public_retrieval_not_exercised"
+            : validation.binding.parameter_overrides ? "graph_e2e_fixture_parameters_adjusted"
+              : "graph_e2e",
       configuration_digest: validation.kind === "source_preview" ? validation.configurationDigest : validation.binding.configuration_digest,
       fixture_digests: validation.kind === "source_preview" ? validation.fixtureDigests : validation.binding.fixture_digests,
       verifier: SOMITE_TYPESCRIPT_RUNNER_IDENTITY,
@@ -957,10 +1258,11 @@ export class RunManager {
   }
 
   async #executionFailure(job: RunJob, result: { code: number | null; signal: NodeJS.Signals | null }) {
+    const sourceLogs = exactSourceNode(job.graph) ? sourceJobLogPaths(job.packagePath) : undefined;
     const evidence = await Promise.all([
-      ["stderr", join(job.packagePath, "run.stderr.log")],
-      ["stdout", join(job.packagePath, "run.stdout.log")],
-      [".nextflow.log", join(job.packagePath, ".nextflow.log")],
+      ["stderr", sourceLogs?.stderr ?? join(job.packagePath, "run.stderr.log")],
+      ["stdout", sourceLogs?.stdout ?? join(job.packagePath, "run.stdout.log")],
+      [".nextflow.log", sourceLogs?.nextflow ?? join(job.packagePath, ".nextflow.log")],
     ].map(async ([label, path]) => ({ label, tail: await this.#logTail(path) })));
     const shown = evidence.filter((entry) => entry.tail).map((entry) => `${entry.label}:\n${entry.tail}`);
     return shown.length

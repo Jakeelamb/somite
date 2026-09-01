@@ -15,6 +15,7 @@ import {
   FileSearch,
   FileInput,
   FolderOpen,
+  GitBranch,
   LoaderCircle,
   MoreHorizontal,
   MessageSquare,
@@ -59,12 +60,13 @@ import { OperatorGlyph, portColor } from "./visual";
 import type { SomiteClient } from "./api";
 import { formatResourceBytes } from "./readinessState";
 import { nextPaperReadSlot, paperAttentionItems, paperParameterValue, paperResourceApplied, paperSupportedCount } from "./paperResolution";
-import { formatPaperElapsed, paperCandidateCanApply, paperIntakeIsBusy, paperIntakePresentation, paperUnsupportedMentions, type PaperIntakeState } from "./paperIntake";
+import { formatPaperElapsed, paperCandidateCanApply, paperIntakeIsBusy, paperIntakePresentation, paperRetainedUnsupportedMentions, paperUnsupportedMentions, type PaperIntakeState } from "./paperIntake";
 import { paperReadingPresentation } from "./paperReading";
 import { publicSourceOutcome, type PublicSourceFailures } from "./publicSourceSearch";
 import { catalogExpansionPresentation, type CatalogExpansionActivity } from "./catalogExpansion";
+import { libraryOperatorIsAvailable, libraryOperatorIsSource, libraryOperatorIsVisible } from "./libraryVisibility";
 import type { WorkflowCatalogLoadState } from "./backgroundRequests";
-import { SOURCE_PREVIEW_PACK, type RepresentativeValidationCapability } from "@somite/workflow/fixtures";
+import { REPRESENTATIVE_SOURCE_PACK, SOURCE_PREVIEW_PACK, type RepresentativeValidationCapability } from "@somite/workflow/fixtures";
 import {
   groupedWorkflowParameters,
   hiddenRequiredWorkflowParameters,
@@ -337,11 +339,14 @@ export function ReadinessPanel({ snapshot, evidence, validationCapability, manag
     .map((resolution) => ({ item, resolution })));
   const receipt = evidence?.receipt;
   const sourcePreview = validationCapability.supported && validationCapability.fixture_pack === SOURCE_PREVIEW_PACK;
+  const representativeSources = validationCapability.supported && validationCapability.fixture_pack === REPRESENTATIVE_SOURCE_PACK;
   const evidenceLabel = !validationCapability.supported
     ? "Unavailable"
     : sourcePreview
       ? receipt?.result === "passed" ? "Source checked" : receipt?.result === "failed" ? "Source check failed" : receipt ? "Source check inconclusive" : "Not checked"
-      : receipt?.result === "passed" ? "Validated" : receipt?.result === "failed" ? "Failed" : receipt ? "Inconclusive" : "Not validated";
+      : representativeSources
+        ? receipt?.result === "passed" ? "Representative check passed" : receipt?.result === "failed" ? "Representative check failed" : receipt ? "Representative check inconclusive" : "Not checked"
+        : receipt?.result === "passed" ? "Validated" : receipt?.result === "failed" ? "Failed" : receipt ? "Inconclusive" : "Not validated";
   const sourceBlocker = current?.operator_id === "workflow.source" && current.fields.length === 0;
   const currentResourceJob = current?.resource_profile === managedResourceJob?.profile ? managedResourceJob : null;
   return (
@@ -414,6 +419,8 @@ export function ReadinessPanel({ snapshot, evidence, validationCapability, manag
               ? validationCapability.reason
               : sourcePreview
                 ? receipt ? "Nextflow preview compiled this frozen source without running its tasks." : "Check the frozen source in Nextflow preview mode when readiness is clear."
+                : representativeSources
+                  ? `${receipt ? `${receipt.scope} · ` : ""}Tiny typed local fixtures stand in for reads, reference, or annotation.${validationCapability.unexercised_nodes.length ? ` Public retrieval is not exercised for ${validationCapability.unexercised_nodes.length} node${validationCapability.unexercised_nodes.length === 1 ? "" : "s"}.` : ""}${validationCapability.parameter_overrides ? ` ${Object.keys(validationCapability.parameter_overrides).length} fixture-only parameter${Object.keys(validationCapability.parameter_overrides).length === 1 ? " is" : "s are"} disclosed in this check.` : ""}`
                 : receipt ? `${receipt.scope} · ${receipt.fixture_digests.length} fixture${receipt.fixture_digests.length === 1 ? "" : "s"}` : "Validate with representative fixtures when readiness is clear."}</small></span>
           </div>
         </section>
@@ -424,18 +431,8 @@ export function ReadinessPanel({ snapshot, evidence, validationCapability, manag
 
 type LibrarySection = { title: string; operators: Operator[]; open: boolean };
 
-function isSource(operator: Operator) {
-  return ["files.", "sheet.", "archive.", "sra.", "ncbi.", "ensembl."].some((prefix) =>
-    operator.id.startsWith(prefix),
-  );
-}
-
-function visibleSpecializedInput(operator: Operator) {
-  return operator.id === "files.import_kraken2_database";
-}
-
 function sectionTitle(operator: Operator) {
-  if (isSource(operator)) return "Data & Inputs";
+  if (libraryOperatorIsSource(operator)) return "Data & Inputs";
   if (operator.id.startsWith("nf.")) return "Nextflow Workflows";
   if (operator.id.startsWith("smk.")) return "Snakemake Workflows";
   if (operator.id.startsWith("workflow.")) return "Workflow Templates";
@@ -460,7 +457,7 @@ function buildSections(
   continuation?: PendingConnection | null,
 ): LibrarySection[] {
   const normalized = query.trim().toLowerCase();
-  const matches = operators.filter((operator) => !isSource(operator) || visibleSpecializedInput(operator)).filter((operator) => operator.kind !== "source" && !opaqueNfcoreFallback(operator)).filter((operator) => {
+  const matches = operators.filter((operator) => libraryOperatorIsAvailable(operator, continuation)).filter((operator) => {
     if (continuation && !operatorContinues(operator, continuation)) return false;
     if (normalized) {
       return `${operator.title} ${operator.id} ${operator.palette.join(" ")} ${operator.description ?? ""} ${(operator.topics ?? []).join(" ")}`
@@ -544,7 +541,7 @@ export function LibraryPanel({
   onDismissCatalogExpansion: () => void;
 }) {
   const request = classifySource(query);
-  const libraryOperatorCount = operators.filter((operator) => operator.kind !== "source" && !opaqueNfcoreFallback(operator)).length;
+  const libraryOperatorCount = operators.filter(libraryOperatorIsVisible).length;
   const nextflowCount = operators.filter((operator) => operator.id.startsWith("nf.") && !opaqueNfcoreFallback(operator)).length;
   const [sourceResults, setSourceResults] = useState<SourceSearchResult[]>([]);
   const [sourceSearching, setSourceSearching] = useState(false);
@@ -949,7 +946,7 @@ function PaperElapsed({ startedAtMs }: { startedAtMs: number }) {
   return <small className="paper-job-elapsed">Elapsed {formatPaperElapsed(startedAtMs, nowMs)}</small>;
 }
 
-export function PaperPanel({ client, intake, active, applied, preparingField, onFile, onRetry, onCancel, onExample, onReconstruct, onSelect, onApply, onUseResource, onAttachInput, onSetInput, onEscalate, onEvidence, onClose }: {
+export function PaperPanel({ client, intake, active, applied, preparingField, onFile, onRetry, onCancel, onExample, onReconstruct, onSelect, onApply, onUseResource, onUseWorkflowSource, onAttachInput, onSetInput, onEscalate, onEvidence, onClose }: {
   client: SomiteClient;
   intake: PaperIntakeState;
   active: number;
@@ -963,6 +960,7 @@ export function PaperPanel({ client, intake, active, applied, preparingField, on
   onSelect: (index: number) => void;
   onApply: (index: number) => void;
   onUseResource: (index: number, result: SourceSearchResult) => Promise<void>;
+  onUseWorkflowSource: (source: NonNullable<PaperReview["workflow_sources"]>[number]) => Promise<void>;
   onAttachInput: (index: number, item: ReadinessItem, field: string, file: File) => Promise<void>;
   onSetInput: (index: number, item: ReadinessItem, field: string, value: string) => Promise<void>;
   onEscalate: (candidate: PaperReview["candidates"][number], item: ReadinessItem) => void;
@@ -981,6 +979,7 @@ export function PaperPanel({ client, intake, active, applied, preparingField, on
   const [attentionStep, setAttentionStep] = useState(0);
   const [resourceLookup, setResourceLookup] = useState<{ key: string; resolution: PaperResourceResolution | null; error: string }>({ key: "", resolution: null, error: "" });
   const [addingResource, setAddingResource] = useState<string | null>(null);
+  const [addingWorkflowSource, setAddingWorkflowSource] = useState<string | null>(null);
   const dragDepth = useRef(0);
   const review = intake.current?.review ?? null;
   const runningActivity = intake.activity.status === "running" ? intake.activity : null;
@@ -994,7 +993,7 @@ export function PaperPanel({ client, intake, active, applied, preparingField, on
     ? candidate?.assay
     : review?.outcome === "recognized_unsupported"
       ? "Methods retained"
-      : review ? "No workflow identified" : "";
+      : review?.workflow_sources?.length ? "Cited workflow found" : review ? "No workflow identified" : "";
   const resourceKey = (review?.resources ?? []).map((resource) => `${resource.accession}:${resource.role}`).join("|");
   const resourceResolution = resourceLookup.key === resourceKey ? resourceLookup.resolution : null;
   const resourceError = resourceLookup.key === resourceKey ? resourceLookup.error : "";
@@ -1005,6 +1004,7 @@ export function PaperPanel({ client, intake, active, applied, preparingField, on
   const currentAttention = attentionItems[currentAttentionStep] ?? null;
   const supportedCount = paperSupportedCount(candidate);
   const unsupportedMentions = paperUnsupportedMentions(review);
+  const retainedUnsupportedMentions = paperRetainedUnsupportedMentions(review);
   const canApplyCandidate = paperCandidateCanApply(review, candidate, intakeBusy);
   const resolutionCounts = candidate?.assessment.nodes.reduce<Record<string, number>>((counts, node) => node.requires_action ? ({ ...counts, [node.kind]: (counts[node.kind] ?? 0) + 1 }) : counts, {}) ?? {};
   const activityRequestId = intake.activity.status === "idle" ? 0 : intake.activity.requestId;
@@ -1182,12 +1182,26 @@ export function PaperPanel({ client, intake, active, applied, preparingField, on
           {review.candidates.map((item, index) => <button key={`${item.name}-${index}`} type="button" className={active === index ? "active" : ""} onClick={() => { setAttentionStep(0); onSelect(index); }}><strong>{item.name}</strong><span>{item.role} · {item.graph.nodes.length} nodes{applied === index ? " · on canvas" : ""}</span></button>)}
         </nav>}
         {review.outcome !== "drafts_ready" && <section className={`paper-outcome outcome-${review.outcome}`}>
-          <header><CircleAlert size={16} /><span><strong>{review.outcome === "recognized_unsupported" ? "What Somite found" : "No workflow was claimed"}</strong><small>{review.outcome === "recognized_unsupported" ? "Recognized methods are retained without guessed tools or wiring." : "The paper was readable, but it did not yield a reconstructable computational track."}</small></span></header>
+          <header><CircleAlert size={16} /><span><strong>{review.outcome === "recognized_unsupported" ? "What Somite found" : review.workflow_sources?.length ? "Cited source repository found" : "No workflow was claimed"}</strong><small>{review.outcome === "recognized_unsupported" ? "Recognized methods are retained without guessed tools or wiring." : review.workflow_sources?.length ? "Inspect the paper's pinned source below; Somite will verify that it contains a Nextflow workflow." : "The paper was readable, but it did not yield a reconstructable computational track."}</small></span></header>
           {review.mentions.length > 0 ? <div className="paper-method-mentions">{review.mentions.map((mention, index) => <details key={`${mention.normalized_name}-${mention.source_location ?? index}`}>
-            <summary><span><strong>{mention.display_name}</strong><small>{mention.operation_class ?? mention.support}</small></span><em>{mention.source_location ?? "method evidence"}</em><ChevronDown size={11} /></summary>
+            <summary><span><strong>{mention.display_name}</strong><small>{mention.operation_class ?? mention.support}{mention.version ? ` · v${mention.version}` : ""}</small></span><em>{mention.source_location ?? "method evidence"}</em><ChevronDown size={11} /></summary>
             <p>{mention.evidence}</p>
           </details>)}</div> : <p>Somite found no method evidence strong enough to turn into an executable draft.</p>}
           {review.warnings.length > 0 && <details className="paper-outcome-notes"><summary>Why no draft was built <ChevronDown size={11} /></summary>{review.warnings.map((warning) => <p key={warning}>{warning}</p>)}</details>}
+        </section>}
+        {(review.workflow_sources ?? []).length > 0 && <section className="paper-workflow-sources" aria-label="Cited workflows">
+          <header><GitBranch size={16} aria-hidden="true" /><span><strong>Cited source repository</strong><small>Somite resolves the exact commit and verifies a Nextflow entrypoint before adding it.</small></span></header>
+          {(review.workflow_sources ?? []).map((source) => {
+            const name = source.repository.split("/").slice(-2).join("/");
+            const loading = addingWorkflowSource === source.repository;
+            return <article key={source.repository}>
+              <span><strong>{name}</strong><small>{source.source_location ?? "GitHub repository"}</small><p>{source.context}</p></span>
+              <div><a href={source.repository} target="_blank" rel="noreferrer" aria-label={`Open ${name} on GitHub`}><ExternalLink size={12} /></a><button type="button" disabled={intakeBusy || addingWorkflowSource !== null} onClick={() => {
+                setAddingWorkflowSource(source.repository);
+                void onUseWorkflowSource(source).finally(() => setAddingWorkflowSource(null));
+              }}>{loading ? "Inspecting…" : "Inspect source"}</button></div>
+            </article>;
+          })}
         </section>}
         {review.resources.length > 0 && <section className="paper-resources" aria-label="Cited data">
           <header><span><Database size={16} aria-hidden="true" /><span><strong>Cited data</strong><small>{resourcesLoading ? "Checking NCBI and Ensembl…" : `${review.resources.length} accession${review.resources.length === 1 ? "" : "s"} found in the paper`}</small></span></span>{resourceResolution && <em>{resourceResolution.groups.reduce((count, group) => count + group.results.length, 0)} available item{resourceResolution.groups.reduce((count, group) => count + group.results.length, 0) === 1 ? "" : "s"}</em>}</header>
@@ -1203,13 +1217,13 @@ export function PaperPanel({ client, intake, active, applied, preparingField, on
               {group.results.map((result) => {
                 const used = paperResourceApplied(candidate, result.request.value);
                 const canUseReads = result.request.kind === "sra";
-                const noSlot = canUseReads && !nextPaperReadSlot(candidate);
+                const noSlot = canUseReads && !nextPaperReadSlot(candidate, result.request.read_layout);
                 return <article className="paper-resource-result" key={result.key}>
                   <span><strong>{result.accession}</strong><small>{result.title}</small><em>{result.tags.join(" · ")}</em></span>
                   {canUseReads ? <button type="button" disabled={intakeBusy || used || noSlot || addingResource !== null} onClick={() => {
                     setAddingResource(result.key);
                     void onUseResource(active, result).finally(() => setAddingResource(null));
-                  }}>{addingResource === result.key ? "Adding…" : used ? "Used in draft" : !candidate ? "No workflow draft" : noSlot ? "Read inputs filled" : "Use these reads"}</button> : <small className="paper-resource-found">Located in {result.provider}</small>}
+                  }}>{addingResource === result.key ? "Adding…" : used ? "Used in draft" : !candidate ? "No workflow draft" : noSlot ? "No matching read input" : "Use these reads"}</button> : <small className="paper-resource-found">Located in {result.provider}</small>}
                 </article>;
               })}
               {!available && <div className="paper-resource-empty">Somite kept this citation and its paper context, but no compatible downloadable record was returned.</div>}
@@ -1220,6 +1234,7 @@ export function PaperPanel({ client, intake, active, applied, preparingField, on
           <button type="button" className="paper-apply" disabled={applied === active || !canApplyCandidate} onClick={() => onApply(active)}>{intakeBusy ? "Waiting for current paper intake" : applied === active ? "Workflow is on the canvas" : attentionItems.length ? "Add draft to canvas" : "Use ready workflow on the canvas"}</button>
           {applied !== active && <p className="paper-draft-note">Prepare the known inputs here, then add the reviewed draft when you are ready.</p>}
           {unsupportedMentions.length > 0 && <div className="paper-draft-omissions" role="status"><CircleAlert size={15} /><span><strong>{unsupportedMentions.length} paper method{unsupportedMentions.length === 1 ? " is" : "s are"} not represented in this draft</strong><small>The supported draft remains available. Review the omitted evidence under provenance.</small></span></div>}
+          {retainedUnsupportedMentions.length > 0 && <div className="paper-retained-methods" role="status"><CheckCircle2 size={15} /><span><strong>{retainedUnsupportedMentions.length} additional paper method{retainedUnsupportedMentions.length === 1 ? " is" : "s are"} retained as evidence</strong><small>They appear as unconnected evidence cards, not missing runtime inputs, and do not block the supported draft.</small></span></div>}
 
           <section className={`paper-guided-setup ${attentionItems.length ? "needs-attention" : "ready"}`}>
             {!currentAttention ? <div className="paper-guided-ready"><CheckCircle2 size={18} /><span><strong>Setup complete</strong><small>Every deterministic requirement is satisfied. Preparation can begin after you add the workflow.</small></span></div> : <>
@@ -1261,7 +1276,14 @@ export function PaperPanel({ client, intake, active, applied, preparingField, on
             {unsupportedMentions.length > 0 && <details className="paper-omitted-methods">
               <summary><span><strong>Methods not represented in this draft</strong><small>{unsupportedMentions.length} retained paper mention{unsupportedMentions.length === 1 ? "" : "s"}</small></span><ChevronDown size={12} /></summary>
               <div>{unsupportedMentions.map((mention, index) => <article key={`${mention.normalized_name}-${mention.source_location ?? index}`}>
-                <header><strong>{mention.display_name}</strong><span>{mention.operation_class ?? "unclassified method"}</span><em>{mention.source_location ?? "paper evidence"}</em></header>
+                <header><strong>{mention.display_name}</strong><span>{mention.operation_class ?? "unclassified method"}{mention.version ? ` · v${mention.version}` : ""}</span><em>{mention.source_location ?? "paper evidence"}</em></header>
+                <p>{mention.evidence}</p>
+              </article>)}</div>
+            </details>}
+            {retainedUnsupportedMentions.length > 0 && <details className="paper-omitted-methods retained">
+              <summary><span><strong>Retained unsupported evidence</strong><small>{retainedUnsupportedMentions.length} visible paper method{retainedUnsupportedMentions.length === 1 ? "" : "s"}</small></span><ChevronDown size={12} /></summary>
+              <div>{retainedUnsupportedMentions.map((mention, index) => <article key={`${mention.normalized_name}-${mention.source_location ?? index}`}>
+                <header><strong>{mention.display_name}</strong><span>{mention.operation_class ?? "unclassified method"}{mention.version ? ` · v${mention.version}` : ""}</span><em>{mention.source_location ?? "paper evidence"}</em></header>
                 <p>{mention.evidence}</p>
               </article>)}</div>
             </details>}

@@ -73,9 +73,9 @@
     "--output", "{work}/out/class.tsv",
     "?r2:--paired",
     "{input.r1}",
-    "{input.r2}"
+    "?r2:{input.r2}"
   ],
   "outputs": {
-    "report": { "glob": "{work}/out/report.txt", "type": "Table", "optional": true }
+    "report": { "glob": "{work}/out/report.txt", "type": "Table" }
   }
 }

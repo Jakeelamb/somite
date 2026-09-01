@@ -37,6 +37,13 @@ Collections, scatter/gather, tuple metadata, and streaming channels are not in
 the current Graph schema. An Operator that requires them is an adapter gap, not
 a reason to hide semantics in a shell command.
 
+Artifact preparation states that change downstream correctness remain typed.
+For example, `Bam`, `ReadGroupedBam`, and `GatkReadyBam` are not interchangeable,
+and `Fai`, `Dict`, and `Bai` sidecars are explicit ports. An
+`implicit_sidecar` is still a visible incoming Edge; it only tells the
+executable that the staged basename, rather than an argv flag, is how the tool
+discovers that file.
+
 ## JSON shape
 
 ```json

@@ -11,7 +11,11 @@ export type PortType =
   | "Gff3"
   | "Sam"
   | "Bam"
+  | "ReadGroupedBam"
+  | "GatkReadyBam"
   | "Bai"
+  | "Fai"
+  | "Dict"
   | "Vcf"
   | "VcfGz"
   | "Bed"
@@ -44,7 +48,7 @@ export type SomitePort = {
   optional?: boolean;
 };
 
-export type SourceProvider = "nf_core" | "local";
+export type SourceProvider = "nf_core" | "github" | "local";
 
 export type WorkflowSourcePin = {
   provider: SourceProvider;

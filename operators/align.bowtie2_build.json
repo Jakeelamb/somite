@@ -10,8 +10,8 @@
     "threads": { "type": "int", "label": "Threads", "page": "Bowtie2 index", "default": 8, "min": 1, "max": 64 }
   },
   "ports": {
-    "in": [{ "name": "ref", "type": "Fasta", "union": ["Fasta", "FastaGz"] }],
-    "out": [{ "name": "index", "type": "Directory" }]
+    "in": [{ "name": "ref", "type": "Fasta" }],
+    "out": [{ "name": "index", "type": "Directory", "resource_profile": "bowtie2-index" }]
   },
   "argv": [
     "bowtie2-build",

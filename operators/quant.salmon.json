@@ -18,7 +18,25 @@
     "in": [
       { "name": "r1", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
       { "name": "r2", "type": "Fastq", "union": ["Fastq", "FastqGz"], "optional": true },
-      { "name": "index", "type": "Directory", "union": ["Directory", "Fasta", "FastaGz"], "optional": true }
+      {
+        "name": "index",
+        "type": "Directory",
+        "stage_as": "salmon_index",
+        "resource": {
+          "profile": "salmon-index",
+          "title": "Salmon transcriptome index",
+          "detail": "Connect a Salmon index built from the transcript sequences you want to quantify.",
+          "resolutions": [
+            {
+              "id": "build-from-transcript-fasta",
+              "label": "Build from transcript FASTA",
+              "detail": "Add Build Salmon transcriptome index and connect a transcript FASTA, not a genomic assembly FASTA.",
+              "kind": "build",
+              "recommended": true
+            }
+          ]
+        }
+      }
     ],
     "out": [{ "name": "quant", "type": "Table" }]
   },
@@ -32,6 +50,6 @@
     "-o", "{work}/out"
   ],
   "outputs": {
-    "quant": { "glob": "{work}/out/quant.sf", "type": "Table", "optional": true }
+    "quant": { "glob": "{work}/out/quant.sf", "type": "Table" }
   }
 }

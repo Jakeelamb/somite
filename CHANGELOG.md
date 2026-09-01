@@ -14,10 +14,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   graph, environment, and run-closure identities.
 - Representative-data validation with content-addressed fixtures and
   configuration-scoped evidence receipts.
+- Offline representative validation for exact SRA, NCBI assembly, and Ensembl
+  source shapes using typed FASTQ, FASTA, BAM, GTF, and GFF3 fixtures, with public
+  retrieval retained as inconclusive and tiny-data parameter changes disclosed.
 - Native NCBI, Ensembl, nf-core, local-file, and Snakemake discovery or import
   paths without hiding source operations from the graph.
 - Evidence-bound paper reconstruction with reviewable candidates and explicit
   unsupported-method, input, resource, and manual-checkpoint boundaries.
+- Paper reconstruction retains explicitly cited public GitHub workflow
+  repositories with page evidence. One action resolves the repository to an
+  immutable commit and opens its pinned Nextflow source on an unchanged empty
+  canvas, independently of the prose-derived draft.
+- Public GitHub Nextflow import resolves a canonical repository and optional
+  revision to one full commit, bounds and verifies the exact source archive,
+  runtime-decodes cached workflow metadata, and requires an unambiguous
+  comment-aware entrypoint before inserting the source graph.
+- Reviewed, version-pinned paper adapters for MultiQC report aggregation,
+  Picard MarkDuplicates with coordinate-sort provenance, and separate Kallisto
+  transcriptome indexing, paired-end quantification, and single-end
+  quantification with explicit fragment-distribution inputs.
 - Bring-your-own ACP agents backed by revision-safe MCP tools and normal,
   undoable canvas transactions.
 - A content-addressed, observable paper-intake pipeline using native PDF.js
@@ -43,6 +58,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Full browser directory import for local Nextflow trees, plus exact validation,
   execution, compilation, and export when the source carries one complete root
   Pixi lock without delegated task environments.
+- Exact per-task execution for source Nextflow projects without root Pixi files
+  when every reachable process has one static environment-file or fully
+  channel-qualified direct Conda literal. Somite preserves a source-proven
+  shared channel order and dependency conflicts, isolates unique file and
+  expression environments in one frozen Pixi lock, uses verified host-prefix
+  rewrites only for Run, and emits portable
+  `${projectDir}/.pixi/envs/...` rewrites for compilation and export. Dynamic,
+  missing, ambiguous, unqualified, config-overridden, and unsupported task
+  environments remain explicit blockers.
 - A daily unseen-source challenge that advances a content-addressed novelty
   ledger across recent Europe PMC methods papers and current nf-core releases
   and retains structured diagnostic reports without expanding the fixed corpus.
@@ -101,6 +125,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Nextflow source indexing and parameter-schema projection now carry aggregate
   cardinality, depth, precision, string, and derived-memory limits across the
   complete pinned workflow.
+- Source parameter projection now accepts nf-core path-existence constraints
+  only where project-file trust can enforce them, validates common bounded
+  anchored patterns, and retains remote URI defaults in pinned source. Unseen
+  workflow reports also time discovery, import, and the same semantic canvas
+  projection used by the UI, with exact invocation coverage.
 - Release verification separates read-only tagged-source execution from the
   minimal publish authority and crosses Linux and macOS on x64 and arm64.
 - Replaced the abbreviated license notice with the complete Apache License 2.0
@@ -108,11 +137,51 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Local gzip-compressed FASTQ inputs now retain exact `FastqGz` types and paired
+  read roles. Mixed-compression pairs fail before upload, and STAR accepts them
+  only through a visible typed decompression step while gzip-aware tools can
+  consume the compressed source directly.
+- GATK HaplotypeCaller no longer appears runnable from an arbitrary BAM and
+  FASTA. Its visible typed path now requires reviewed read-group metadata,
+  coordinate sorting, BAM indexing, FASTA indexing, and a sequence dictionary;
+  the Linux Pixi/Nextflow smoke verifies the resulting VCF artifact.
+- Source-backed calls and relationships can no longer disappear through canvas
+  deletion, and semantic zoom now exits with current group geometry after
+  moving, re-nesting, or dissolving presentation groups.
+- Agent-compiled Pixi/Nextflow packages now verify a compiler-trusted manifest
+  and canonical Run closure before entering the shared tool root. Stable,
+  generation-bound lease paths no longer invalidate active tool calls, and
+  disconnect waits for complete private-workspace cleanup.
+- Native and source compilation caches now require an exact bounded inventory,
+  file modes, BLAKE3 digests, and matching Run-closure identity before reuse;
+  corrupt or extra entries fail closed and remain available for inspection.
+- Source execution now ignores ambient Nextflow configuration through an
+  explicit `-C` set, private offline `NXF_HOME`, local-only Somite profile, and
+  container-engine shutdown. Plugins and process selectors block admission,
+  validation requires a real bounded DAG artifact, and exported ZIPs preserve
+  an executable `somite-run` launcher with portable task-environment paths.
+- Run cancellation now rechecks the abort signal at process creation and always
+  releases child ownership, closing the cancel-before-spawn race.
+- Source-index cache identity now advances whenever immutable indexing or
+  execution-capability derivation changes, so an older source graph is rebuilt
+  instead of failing later trust verification against newer semantics.
+- Pixi cache schema v3 no longer reaps a live builder because of elapsed time or
+  lets stale cleanup delete a replacement entry. Published prefixes carry a
+  bounded, reverified digest receipt for executable-directory entrypoints;
+  deleted or modified entrypoints now fail closed without claiming integrity
+  for libraries, language site packages, or the complete environment tree.
 - Paper reconstruction now keeps recognized unsupported methods and explains
   that workflow support is unavailable instead of blaming the uploaded paper.
+- Supported paper drafts now retain executable but untyped methods as
+  unconnected evidence nodes instead of silently omitting them or presenting
+  them as missing runtime inputs. Command-specific SAMtools nodes are selected
+  only from explicit action evidence, while unresolved suite work stays visible.
 - nf-core imports now retry older pinned pipelines with process-scoped legacy
   parser compatibility and show expansion progress or actionable failures in
   the catalog instead of relying on the footer status line.
+- Frozen Nextflow imports now resolve repository-root `projectDir` module
+  paths and keep imported helper and plugin functions out of the visual
+  process/subworkflow outline.
 - Imported workflow references now retain their generated dependency ports
   through autosave and readiness checks without becoming executable contracts.
 - The Agent window is clamped into the current viewport when it opens or the

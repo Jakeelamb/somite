@@ -18,16 +18,34 @@
     "in": [
       { "name": "r1", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
       { "name": "r2", "type": "Fastq", "union": ["Fastq", "FastqGz"], "optional": true },
-      { "name": "ref", "type": "Fasta", "union": ["Fasta", "FastaGz"] }
+      {
+        "name": "index",
+        "type": "Directory",
+        "stage_as": "bwa_index",
+        "resource": {
+          "profile": "bwa-index",
+          "title": "BWA index",
+          "detail": "Connect an index built from the same reference assembly you want to align against.",
+          "resolutions": [
+            {
+              "id": "build-from-fasta",
+              "label": "Build from FASTA",
+              "detail": "Add Build BWA index and connect a reference FASTA.",
+              "kind": "build",
+              "recommended": true
+            }
+          ]
+        }
+      }
     ],
     "out": [{ "name": "sam", "type": "Sam" }]
   },
   "argv": [
     "bwa", "mem",
     "-t", "{param.threads}",
-    "{input.ref}",
+    "{input.index}/index",
     "{input.r1}",
-    "{input.r2}"
+    "?r2:{input.r2}"
   ],
   "outputs": {
     "sam": { "glob": "{work}/out/aligned.sam", "type": "Sam" }

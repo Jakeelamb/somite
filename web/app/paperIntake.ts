@@ -156,8 +156,30 @@ export function paperIntakeIsBusy(activity: PaperIntakeActivity) {
   return activity.status === "running" || activity.status === "cancelling";
 }
 
+function representedUnsupportedMethods(review: PaperReview) {
+  const normalized = (value: string) => value.replace(/[^A-Za-z0-9]/g, "").toLocaleLowerCase("en-US");
+  const gaps = review.candidates.flatMap((candidate) => candidate.graph.nodes
+    .filter((node) => node.operator === "gap.missing" && typeof node.params?.tool === "string"));
+  return {
+    all: new Set(gaps.map((node) => normalized(String(node.params!.tool)))),
+    evidenceOnly: new Set(gaps.filter((node) => node.ports.length === 0).map((node) => normalized(String(node.params!.tool)))),
+  };
+}
+
 export function paperUnsupportedMentions(review: PaperReview | null | undefined) {
-  return review?.mentions.filter((mention) => mention.support === "unsupported") ?? [];
+  if (!review) return [];
+  const represented = representedUnsupportedMethods(review).all;
+  return review.mentions.filter((mention) => mention.support === "unsupported"
+    && mention.executable !== false
+    && !represented.has(mention.normalized_name));
+}
+
+export function paperRetainedUnsupportedMentions(review: PaperReview | null | undefined) {
+  if (!review) return [];
+  const represented = representedUnsupportedMethods(review).evidenceOnly;
+  return review.mentions.filter((mention) => mention.support === "unsupported"
+    && mention.executable !== false
+    && represented.has(mention.normalized_name));
 }
 
 export type PaperIntakePresentation = {

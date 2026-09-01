@@ -51,7 +51,9 @@ export function sourceWorkflowTitle(workflow: SourceWorkflowInstance) {
 }
 
 export function sourceWorkflowProvider(workflow: SourceWorkflowInstance) {
-  return workflow.source.provider === "nf_core" ? "nf-core" : "Local source";
+  if (workflow.source.provider === "nf_core") return "nf-core";
+  if (workflow.source.provider === "github") return "GitHub source";
+  return "Local source";
 }
 
 export function sourceWorkflowRevision(workflow: SourceWorkflowInstance) {

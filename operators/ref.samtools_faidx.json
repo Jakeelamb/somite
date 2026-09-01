@@ -1,0 +1,22 @@
+{
+  "id": "ref.samtools_faidx",
+  "title": "Index reference FASTA",
+  "palette": ["Reference preparation"],
+  "kind": "external",
+  "cost": "low",
+  "bin": "samtools",
+  "pixi": ["bioconda::samtools"],
+  "params": {},
+  "ports": {
+    "in": [{ "name": "ref", "type": "Fasta", "stage_as": "reference.fa" }],
+    "out": [{ "name": "fai", "type": "Fai" }]
+  },
+  "argv": [
+    "samtools", "faidx",
+    "--fai-idx", "{work}/out/reference.fa.fai",
+    "{input.ref}"
+  ],
+  "outputs": {
+    "fai": { "glob": "{work}/out/reference.fa.fai", "type": "Fai" }
+  }
+}

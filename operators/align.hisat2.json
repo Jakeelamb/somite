@@ -18,20 +18,38 @@
     "in": [
       { "name": "r1", "type": "Fastq", "union": ["Fastq", "FastqGz"] },
       { "name": "r2", "type": "Fastq", "union": ["Fastq", "FastqGz"], "optional": true },
-      { "name": "index", "type": "Directory", "union": ["Directory", "Fasta", "FastaGz"], "optional": true }
+      {
+        "name": "index",
+        "type": "Directory",
+        "stage_as": "hisat2_index",
+        "resource": {
+          "profile": "hisat2-index",
+          "title": "HISAT2 index",
+          "detail": "Connect a HISAT2 index built from the reference genome used for this analysis.",
+          "resolutions": [
+            {
+              "id": "build-from-fasta",
+              "label": "Build from FASTA",
+              "detail": "Add Build HISAT2 index and connect a reference FASTA.",
+              "kind": "build",
+              "recommended": true
+            }
+          ]
+        }
+      }
     ],
-    "out": [{ "name": "bam", "type": "Bam" }]
+    "out": [{ "name": "sam", "type": "Sam" }]
   },
   "argv": [
     "hisat2",
     "-p", "{param.threads}",
-    "-x", "{input.index}",
+    "-x", "{input.index}/index",
     "?r2:-1", "?r2:{input.r1}",
     "?r2:-2", "?r2:{input.r2}",
     "?!r2:-U", "?!r2:{input.r1}",
     "-S", "{work}/out/aln.sam"
   ],
   "outputs": {
-    "bam": { "glob": "{work}/out/aln.sam", "type": "Bam", "optional": true }
+    "sam": { "glob": "{work}/out/aln.sam", "type": "Sam" }
   }
 }

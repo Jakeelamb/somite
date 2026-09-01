@@ -1,0 +1,22 @@
+{
+  "id": "ref.gatk_sequence_dictionary",
+  "title": "Create reference sequence dictionary",
+  "palette": ["Reference preparation"],
+  "kind": "external",
+  "cost": "low",
+  "bin": "gatk",
+  "pixi": ["bioconda::gatk4"],
+  "params": {},
+  "ports": {
+    "in": [{ "name": "ref", "type": "Fasta", "stage_as": "reference.fa" }],
+    "out": [{ "name": "dict", "type": "Dict" }]
+  },
+  "argv": [
+    "gatk", "CreateSequenceDictionary",
+    "-R", "{input.ref}",
+    "-O", "{work}/out/reference.dict"
+  ],
+  "outputs": {
+    "dict": { "glob": "{work}/out/reference.dict", "type": "Dict" }
+  }
+}

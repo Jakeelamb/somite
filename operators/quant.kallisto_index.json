@@ -1,0 +1,25 @@
+{
+  "id": "quant.kallisto_index",
+  "title": "Build Kallisto transcriptome index",
+  "palette": ["RNA"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "kallisto",
+  "pixi": ["bioconda::kallisto=0.52.0"],
+  "params": {
+    "threads": { "type": "int", "label": "Threads", "page": "Kallisto index", "default": 4, "min": 1, "max": 64 }
+  },
+  "ports": {
+    "in": [{ "name": "transcripts", "type": "Fasta", "union": ["Fasta", "FastaGz"] }],
+    "out": [{ "name": "index", "type": "Directory", "resource_profile": "kallisto-transcriptome-index" }]
+  },
+  "argv": [
+    "kallisto", "index",
+    "--index", "{work}/out/transcripts.idx",
+    "--threads", "{param.threads}",
+    "{input.transcripts}"
+  ],
+  "outputs": {
+    "index": { "glob": "{work}/out", "type": "Directory" }
+  }
+}

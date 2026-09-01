@@ -56,7 +56,12 @@ test("content-addressed paper intake is replayable, cached, and reconstructs typ
     const status = await completed(manager, started.job_id);
     assert.equal(status.phase, "completed");
     assert.equal(status.result?.outcome, "drafts_ready");
-    assert.ok(status.result?.candidates[0]?.graph.nodes.some((node) => node.operator === "sra.prefetch"));
+    assert.equal(status.result?.candidates[0]?.graph.nodes.some((node) => node.operator === "sra.prefetch"), false);
+    assert.ok(status.result?.resources.some((resource) => resource.accession === "SRR12345678" && resource.role === "reads"));
+    const readPlaceholder = status.result?.candidates[0]?.graph.nodes.find((node) => node.operator === "files.import_paired");
+    assert.match(readPlaceholder?.note ?? "", /SRR12345678/);
+    assert.match(readPlaceholder?.note ?? "", /layout/i);
+    assert.notEqual(status.result?.candidates[0]?.assessment.state, "ready");
     assert.equal(status.cache.extraction, false);
 
     const second = await manager.start(artifact.digest, "paper-test-two");

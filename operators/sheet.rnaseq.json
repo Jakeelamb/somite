@@ -14,5 +14,25 @@
       { "name": "r2", "type": "Fastq", "union": ["Fastq", "FastqGz"], "optional": true }
     ],
     "out": [{ "name": "sheet", "type": "Table" }]
+  },
+  "resolution": {
+    "kind": "adapter",
+    "title": "Add a reviewed samplesheet adapter",
+    "detail": "Somite can visualize this samplesheet step, but it does not yet have a reviewed transform that writes the exact nf-core RNA-seq schema from the connected reads.",
+    "action_label": "Ask Agent to add it",
+    "recipes": [
+      {
+        "id": "rnaseq-samplesheet-adapter-v1",
+        "title": "Build a tested RNA-seq samplesheet transform",
+        "summary": "Define the exact row schema, optional paired-read behavior, and emitted file before making this node executable.",
+        "version": "1",
+        "kind": "adapter_contract",
+        "steps": [
+          "Pin the target nf-core/rnaseq samplesheet schema.",
+          "Map connected single-end or paired-end reads into one deterministic row.",
+          "Prove the emitted CSV with a representative fixture before accepting the adapter."
+        ]
+      }
+    ]
   }
 }

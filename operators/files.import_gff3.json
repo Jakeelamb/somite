@@ -1,0 +1,16 @@
+{
+  "id": "files.import_gff3",
+  "title": "Local GFF3 annotation",
+  "palette": ["Files"],
+  "kind": "inprocess",
+  "cost": "low",
+  "params": {
+    "path": { "type": "string", "label": "GFF3 path", "page": "Input", "required": true }
+  },
+  "ports": {
+    "in": [],
+    "out": [{ "name": "gff3", "type": "Gff3", "import_param": "path" }]
+  },
+  "argv": [],
+  "outputs": {}
+}

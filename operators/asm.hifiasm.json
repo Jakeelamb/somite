@@ -16,13 +16,12 @@
   },
   "ports": {
     "in": [
-      { "name": "reads", "type": "Fastq", "union": ["Fastq", "FastqGz", "Fasta", "FastaGz"] },
-      { "name": "hic", "type": "Fastq", "union": ["Fastq", "FastqGz"], "optional": true }
+      { "name": "reads", "type": "Fastq", "union": ["Fastq", "FastqGz", "Fasta", "FastaGz"] }
     ],
     "out": [{ "name": "asm", "type": "Directory" }]
   },
   "argv": ["hifiasm", "-t", "{param.threads}", "-o", "{work}/out/asm", "{input.reads}"],
   "outputs": {
-    "asm": { "glob": "{work}/out", "type": "Directory", "optional": true }
+    "asm": { "glob": "{work}/out", "type": "Directory" }
   }
 }

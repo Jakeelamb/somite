@@ -1,0 +1,32 @@
+{
+  "id": "sra.fasterq_dump_single",
+  "title": "fasterq-dump single-end",
+  "palette": ["NCBI", "SRA"],
+  "kind": "external",
+  "cost": "high",
+  "bin": "fasterq-dump",
+  "pixi": ["bioconda::sra-tools"],
+  "params": {
+    "threads": { "type": "int", "label": "Threads", "page": "SRA", "default": 8, "min": 1, "max": 64 }
+  },
+  "ports": {
+    "in": [{ "name": "sra", "type": "Sra" }],
+    "out": [{ "name": "reads", "type": "Fastq" }]
+  },
+  "argv": [
+    "fasterq-dump",
+    "{input.sra}",
+    "-O",
+    "{work}/out",
+    "-t",
+    "{work}/tmp",
+    "-e",
+    "{param.threads}"
+  ],
+  "outputs": {
+    "reads": {
+      "glob": "{work}/out/*.fastq",
+      "type": "Fastq"
+    }
+  }
+}

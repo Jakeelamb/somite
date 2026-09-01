@@ -6,6 +6,7 @@ import {
   type FrozenSourceFile,
 } from "@somite/workflow/nextflowSource";
 import {
+  applySourceWorkflowEdits,
   deriveSourceWorkflow,
   parseNextflowParameterSchema,
 } from "@somite/workflow/sourceWorkflow";
@@ -92,6 +93,93 @@ test("unsupported property constraints remain source-only without hiding proven 
   assert.ok(constraints.length >= 5);
   assert.ok(constraints.every((diagnostic) => diagnostic.message.includes("source-only")
     && diagnostic.message.includes("independently proven parameters remain editable")));
+});
+
+test("common nf-core path and pattern keywords project only where Somite can enforce them", () => {
+  const workflow = deriveSchema(`{
+    "type": "object",
+    "required": ["reads", "sample_sheet"],
+    "properties": {
+      "reads": {
+        "type": "string",
+        "format": "file-path",
+        "exists": true,
+        "pattern": "^\\\\S+\\\\.fastq$"
+      },
+      "index": {
+        "type": "string",
+        "format": "directory-path",
+        "exists": true
+      },
+      "email": {
+        "type": "string",
+        "pattern": "^([a-zA-Z0-9_\\\\-\\\\.]+)@([a-zA-Z0-9_\\\\-\\\\.]+)\\\\.([a-zA-Z]{2,5})$"
+      },
+      "igenomes_base": {
+        "type": "string",
+        "format": "directory-path",
+        "default": "s3://ngi-igenomes/igenomes/"
+      },
+      "sample_sheet": {
+        "type": "string",
+        "format": "file-path",
+        "exists": true,
+        "schema": "assets/schema_input.json"
+      },
+      "untyped_exists": {
+        "type": "string",
+        "exists": true
+      },
+      "malformed_exists": {
+        "type": "string",
+        "format": "file-path",
+        "exists": "yes"
+      }
+    }
+  }`);
+
+  assert.deepEqual(workflow.parameters?.map((parameter) => parameter.name), [
+    "reads",
+    "index",
+    "email",
+    "igenomes_base",
+  ]);
+  assert.equal(workflow.parameters?.find((parameter) => parameter.name === "reads")?.required, true);
+  assert.equal(workflow.parameters?.find((parameter) => parameter.name === "igenomes_base")?.default, undefined);
+  assert.deepEqual(workflow.unsupported_required_parameters?.map((parameter) => parameter.name), ["sample_sheet"]);
+  assert.ok(workflow.diagnostics?.some((diagnostic) => diagnostic.code === "source_parameter_default_retained"
+    && diagnostic.message.includes("igenomes_base")));
+  assert.ok(workflow.diagnostics?.some((diagnostic) => diagnostic.code === "unsupported_parameter_constraint"
+    && diagnostic.message.includes("sample_sheet")
+    && diagnostic.message.includes("schema")));
+  assert.ok(workflow.diagnostics?.some((diagnostic) => diagnostic.code === "unsupported_parameter_constraint"
+    && diagnostic.message.includes("untyped_exists")));
+  assert.ok(workflow.diagnostics?.some((diagnostic) => diagnostic.code === "unsupported_parameter_constraint"
+    && diagnostic.message.includes("malformed_exists")));
+
+  const email = workflow.parameters?.find((parameter) => parameter.name === "email");
+  assert.ok(email);
+  const valid = applySourceWorkflowEdits(workflow, workflow.workflow_revision, [{
+    kind: "set_parameter",
+    name: "email",
+    binding: { kind: "literal", value: "person@example.org" },
+  }]);
+  assert.equal(valid.bindings?.email?.kind, "literal");
+  assert.throws(() => applySourceWorkflowEdits(workflow, workflow.workflow_revision, [{
+    kind: "set_parameter",
+    name: "email",
+    binding: { kind: "literal", value: "not-an-email" },
+  }]), /violates its contract/);
+
+  const unsafeRepetitions = parseSchema(`{
+    "type": "object",
+    "properties": {
+      "too_wide": {"type": "string", "pattern": "^a{10001}$"},
+      "backwards": {"type": "string", "pattern": "^a{5,2}$"}
+    }
+  }`);
+  assert.deepEqual(unsafeRepetitions.parameters, []);
+  assert.equal(unsafeRepetitions.diagnostics.filter((diagnostic) => diagnostic.code === "unsupported_parameter_pattern").length, 2);
 });
 
 test("numeric lexemes are compared before JavaScript can round them", () => {

@@ -11,8 +11,8 @@
   "ports": {
     "in": [],
     "out": [
-      { "name": "r1", "type": "Fastq" },
-      { "name": "r2", "type": "Fastq" }
+      { "name": "r1", "type": "Fastq", "import_param": "r1" },
+      { "name": "r2", "type": "Fastq", "import_param": "r2" }
     ]
   },
   "argv": [],

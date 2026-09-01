@@ -18,7 +18,7 @@
   "ports": {
     "in": [
       { "name": "map", "type": "Bed", "stage_as": "evidence.bed" },
-      { "name": "weights", "type": "Text", "stage_as": "weights.txt" },
+      { "name": "weights", "type": "Text", "stage_as": "weights.txt", "implicit_sidecar": true },
       { "name": "assembly", "type": "Fasta", "union": ["Fasta", "FastaGz"], "stage_as": "assembly.fasta" }
     ],
     "out": [

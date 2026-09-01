@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { chmod, link, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { byteDigest, canonicalJsonDigest } from "@somite/workflow/contentIdentity";
+import { MAX_FROZEN_PACKAGE_BYTES } from "@somite/workflow/limits";
 import { SOMITE_VERSION } from "@somite/workflow/version";
 import type { AgentTransactionResult } from "@somite/workflow/agentTransaction";
 import {
@@ -17,6 +20,69 @@ import {
   trustedSomiteMcpPermissionTool,
 } from "../src/agentManager.ts";
 import { SOMITE_MCP_TOOL_NAMES } from "../src/mcpTools.ts";
+
+const TEST_DIGEST_ONE = `blake3:${"1".repeat(64)}`;
+const TEST_DIGEST_TWO = `blake3:${"2".repeat(64)}`;
+
+type TestArtifactFile = Readonly<{ path: string; contents: string; mode?: 0o644 | 0o755 }>;
+
+function testRunClosure(closureDigest: string, graphRevision: string) {
+  return `${JSON.stringify({
+    schema_version: 1,
+    closure_digest: closureDigest,
+    graph_revision: graphRevision,
+    target_platform: "linux-64",
+    operators: [],
+    environment: { manifest_digest: TEST_DIGEST_ONE, lock_digest: TEST_DIGEST_TWO },
+    compiler_identity: "somite-nextflow-ts-test",
+    nextflow_identity: "nextflow@26.04.6",
+    openjdk_identity: "openjdk@21",
+  })}\n`;
+}
+
+function testArtifactManifest(closureDigest: string, graphRevision: string, files: readonly TestArtifactFile[]) {
+  const base = {
+    schema_version: 1 as const,
+    closure_digest: closureDigest,
+    compiled_graph_revision: graphRevision,
+    files: files.map((file) => ({
+      path: file.path,
+      bytes: Buffer.byteLength(file.contents),
+      digest: byteDigest(Buffer.from(file.contents)),
+      mode: file.mode ?? 0o644,
+    })).sort((left, right) => left.path.localeCompare(right.path)),
+  };
+  return { ...base, manifest_digest: canonicalJsonDigest(base) };
+}
+
+async function testCompiledArtifact(root: string, letter: string, files: readonly TestArtifactFile[]) {
+  const digestHex = letter.repeat(64);
+  const closureDigest = `blake3:${digestHex}`;
+  const graphRevision = `blake3:${letter.charCodeAt(0).toString(16).padStart(2, "0").repeat(32)}`;
+  const source = join(root, ".somite", "compiled", digestHex);
+  const completeFiles = [
+    { path: "run-closure.json", contents: testRunClosure(closureDigest, graphRevision) },
+    ...files,
+  ];
+  await mkdir(source, { recursive: true });
+  for (const file of completeFiles) {
+    const destination = join(source, file.path);
+    await mkdir(dirname(destination), { recursive: true });
+    await writeFile(destination, file.contents, { mode: file.mode ?? 0o644 });
+  }
+  return {
+    source,
+    files: completeFiles,
+    artifact: {
+      source_graph_revision: `blake3:source-${letter}`,
+      closure_digest: closureDigest,
+      compiled_graph_revision: graphRevision,
+      output_path: `.somite/compiled/${digestHex}`,
+      reused: false,
+      artifact_manifest: testArtifactManifest(closureDigest, graphRevision, completeFiles),
+    },
+  };
+}
 
 async function until(predicate: () => boolean | Promise<boolean>, timeoutMs = 5_000) {
   const started = Date.now();
@@ -196,8 +262,226 @@ test("ACP manager streams events, configures the session, and auto-approves only
   await until(() => !manager.snapshot().connected && !manager.snapshot().connecting);
 });
 
-test("ACP manager contains Pixi and Nextflow tools in the disposable Agent workspace", async (context) => {
+test("ACP manager leases the exact compiled closure to confined Pixi and Nextflow tools", async (context) => {
   const root = await mkdtemp(join(tmpdir(), "somite-agent-contained-tools-"));
+  const fixture = fileURLToPath(new URL("./fixtures/fake-acp-agent.ts", import.meta.url));
+  const manager = new AgentManager("http://127.0.0.1:9", "test-capability", fixture, root);
+  context.after(async () => {
+    await manager.disconnect().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  });
+  const command = `${JSON.stringify(process.execPath)} --experimental-strip-types ${JSON.stringify(fixture)}`;
+  await manager.connect(command);
+  await until(() => manager.snapshot().connected);
+  const first = await testCompiledArtifact(root, "a", [
+    { path: "main.nf", contents: "workflow { }\n" },
+    { path: "pixi.toml", contents: "[workspace]\n" },
+  ]);
+  await writeFile(join(root, "unrelated-project-secret.txt"), "must stay outside the Agent tools\n");
+  const leased = await manager.attachCompiledArtifact(first.artifact);
+  const cursor = manager.snapshot().cursor;
+  await manager.prompt("[test:mcp-workspace-roots]");
+  await until(() => !manager.snapshot().busy);
+  const detail = manager.snapshot(cursor).events.find((event) => event.kind === "message" && event.detail?.startsWith("{"))?.detail;
+  assert.ok(detail);
+  const attached = JSON.parse(detail) as { cwd: string; servers: Array<{ name: string; args: string[] }> };
+  assert.notEqual(attached.cwd, root);
+  let toolRoot: string | undefined;
+  for (const name of ["Pixi", "Nextflow"]) {
+    const server = attached.servers.find((candidate) => candidate.name === name);
+    assert.ok(server);
+    const serverRoot = server.args[server.args.indexOf("--workspace-root") + 1];
+    toolRoot ??= serverRoot;
+    assert.equal(serverRoot, toolRoot);
+  }
+  assert.ok(toolRoot);
+  assert.match(leased.output_path, new RegExp(`^compiled/${"a".repeat(64)}-[a-f0-9-]{36}$`));
+  assert.equal(leased.closure_digest, first.artifact.closure_digest);
+  assert.deepEqual(await readdir(toolRoot), ["compiled"]);
+  assert.deepEqual(await readdir(join(toolRoot, "compiled")), [basename(leased.output_path)]);
+  assert.equal(await readFile(join(toolRoot, leased.output_path, "run-closure.json"), "utf8"), first.files[0]?.contents);
+  assert.equal(await readFile(join(toolRoot, leased.output_path, "main.nf"), "utf8"), "workflow { }\n");
+  await writeFile(join(first.source, "main.nf"), "workflow { changed_after_lease() }\n");
+  assert.equal(await readFile(join(toolRoot, leased.output_path, "main.nf"), "utf8"), "workflow { }\n");
+  await writeFile(join(toolRoot, leased.output_path, "main.nf"), "workflow { agent_experiment() }\n");
+  assert.equal(await readFile(join(first.source, "main.nf"), "utf8"), "workflow { changed_after_lease() }\n");
+  await assert.rejects(readFile(join(toolRoot, "unrelated-project-secret.txt"), "utf8"), { code: "ENOENT" });
+
+  const second = await testCompiledArtifact(root, "b", [
+    { path: "main.nf", contents: "workflow { second() }\n" },
+    { path: "pixi.toml", contents: "[workspace]\n" },
+  ]);
+  const secondLease = await manager.attachCompiledArtifact(second.artifact);
+  assert.notEqual(secondLease.output_path, leased.output_path);
+  assert.equal(await readFile(join(toolRoot, leased.output_path, "main.nf"), "utf8"), "workflow { agent_experiment() }\n");
+  assert.equal(await readFile(join(toolRoot, secondLease.output_path, "main.nf"), "utf8"), "workflow { second() }\n");
+  assert.deepEqual((await readdir(join(toolRoot, "compiled"))).sort(), [basename(leased.output_path), basename(secondLease.output_path)].sort());
+});
+
+test("ACP manager rejects closure-schema, package-byte, link, and manifest forgery before publication", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "somite-agent-artifact-trust-"));
+  const fixture = fileURLToPath(new URL("./fixtures/fake-acp-agent.ts", import.meta.url));
+  const manager = new AgentManager("http://127.0.0.1:9", "test-capability", fixture, root);
+  context.after(async () => {
+    await manager.disconnect().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  });
+  const command = `${JSON.stringify(process.execPath)} --experimental-strip-types ${JSON.stringify(fixture)}`;
+  await manager.connect(command);
+  await until(() => manager.snapshot().connected);
+
+  const tampered = await testCompiledArtifact(root, "c", [
+    { path: "main.nf", contents: "workflow { trusted() }\n" },
+    { path: "pixi.toml", contents: "[workspace]\n" },
+  ]);
+  await writeFile(join(tampered.source, "main.nf"), "workflow { altered() }\n");
+  await assert.rejects(manager.attachCompiledArtifact(tampered.artifact), (cause: unknown) => (
+    cause instanceof AgentManagerError && cause.code === "artifact_invalid"
+  ));
+
+  const malformedClosure = await testCompiledArtifact(root, "d", [
+    { path: "main.nf", contents: "workflow { malformed() }\n" },
+    { path: "pixi.toml", contents: "[workspace]\n" },
+  ]);
+  const malformedBytes = `${JSON.stringify({ schema_version: 1, closure_digest: malformedClosure.artifact.closure_digest })}\n`;
+  await writeFile(join(malformedClosure.source, "run-closure.json"), malformedBytes);
+  const malformedFiles = malformedClosure.files.map((file) => file.path === "run-closure.json" ? { ...file, contents: malformedBytes } : file);
+  const malformedArtifact = {
+    ...malformedClosure.artifact,
+    artifact_manifest: testArtifactManifest(
+      malformedClosure.artifact.closure_digest,
+      malformedClosure.artifact.compiled_graph_revision,
+      malformedFiles,
+    ),
+  };
+  await assert.rejects(manager.attachCompiledArtifact(malformedArtifact), (cause: unknown) => (
+    cause instanceof AgentManagerError && cause.code === "artifact_invalid"
+  ));
+
+  const linked = await testCompiledArtifact(root, "e", [
+    { path: "pixi.toml", contents: "[workspace]\n" },
+  ]);
+  const outside = join(root, "outside-closure.txt");
+  await writeFile(outside, "outside closure\n");
+  await link(outside, join(linked.source, "main.nf"));
+  const linkedFiles = [...linked.files, { path: "main.nf", contents: "outside closure\n" }];
+  const linkedArtifact = {
+    ...linked.artifact,
+    artifact_manifest: testArtifactManifest(linked.artifact.closure_digest, linked.artifact.compiled_graph_revision, linkedFiles),
+  };
+  await assert.rejects(manager.attachCompiledArtifact(linkedArtifact), (cause: unknown) => (
+    cause instanceof AgentManagerError && cause.code === "artifact_invalid"
+  ));
+
+  const symlinked = await testCompiledArtifact(root, "6", [
+    { path: "pixi.toml", contents: "[workspace]\n" },
+  ]);
+  await symlink(outside, join(symlinked.source, "main.nf"));
+  const symlinkedFiles = [...symlinked.files, { path: "main.nf", contents: "outside closure\n" }];
+  const symlinkedArtifact = {
+    ...symlinked.artifact,
+    artifact_manifest: testArtifactManifest(
+      symlinked.artifact.closure_digest,
+      symlinked.artifact.compiled_graph_revision,
+      symlinkedFiles,
+    ),
+  };
+  await assert.rejects(manager.attachCompiledArtifact(symlinkedArtifact), (cause: unknown) => (
+    cause instanceof AgentManagerError && cause.code === "artifact_invalid"
+  ));
+
+  const unlisted = await testCompiledArtifact(root, "0", [
+    { path: "main.nf", contents: "workflow { listed_files_only() }\n" },
+    { path: "pixi.toml", contents: "[workspace]\n" },
+  ]);
+  await writeFile(join(unlisted.source, "not-in-manifest.txt"), "untrusted\n");
+  await assert.rejects(manager.attachCompiledArtifact(unlisted.artifact), (cause: unknown) => (
+    cause instanceof AgentManagerError && cause.code === "artifact_invalid"
+  ));
+
+  if (process.platform !== "win32") {
+    const special = await testCompiledArtifact(root, "3", [
+      { path: "main.nf", contents: "workflow { regular_files_only() }\n" },
+      { path: "pixi.toml", contents: "[workspace]\n" },
+    ]);
+    const specialPath = join(special.source, "special.fifo");
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      execFile("mkfifo", [specialPath], (cause) => cause ? rejectPromise(cause) : resolvePromise());
+    });
+    const base = {
+      schema_version: 1 as const,
+      closure_digest: special.artifact.closure_digest,
+      compiled_graph_revision: special.artifact.compiled_graph_revision,
+      files: [...special.artifact.artifact_manifest.files, {
+        path: "special.fifo",
+        bytes: 0,
+        digest: byteDigest(new Uint8Array()),
+        mode: 0o644 as const,
+      }].sort((left, right) => left.path.localeCompare(right.path)),
+    };
+    await assert.rejects(manager.attachCompiledArtifact({
+      ...special.artifact,
+      artifact_manifest: { ...base, manifest_digest: canonicalJsonDigest(base) },
+    }), (cause: unknown) => cause instanceof AgentManagerError && cause.code === "artifact_invalid");
+  }
+
+  const oversized = await testCompiledArtifact(root, "4", [
+    { path: "main.nf", contents: "workflow { bounded_package() }\n" },
+    { path: "pixi.toml", contents: "[workspace]\n" },
+  ]);
+  const oversizedBase = {
+    schema_version: 1 as const,
+    closure_digest: oversized.artifact.closure_digest,
+    compiled_graph_revision: oversized.artifact.compiled_graph_revision,
+    files: oversized.artifact.artifact_manifest.files.map((file, index) => (
+      index === 0 ? { ...file, bytes: MAX_FROZEN_PACKAGE_BYTES + 1 } : file
+    )),
+  };
+  await assert.rejects(manager.attachCompiledArtifact({
+    ...oversized.artifact,
+    artifact_manifest: { ...oversizedBase, manifest_digest: canonicalJsonDigest(oversizedBase) },
+  }), (cause: unknown) => cause instanceof AgentManagerError && cause.code === "artifact_invalid");
+
+  const forged = await testCompiledArtifact(root, "f", [
+    { path: "main.nf", contents: "workflow { forged() }\n" },
+    { path: "pixi.toml", contents: "[workspace]\n" },
+  ]);
+  const forgedArtifact = {
+    ...forged.artifact,
+    artifact_manifest: { ...forged.artifact.artifact_manifest, manifest_digest: TEST_DIGEST_ONE },
+  };
+  await assert.rejects(manager.attachCompiledArtifact(forgedArtifact), (cause: unknown) => (
+    cause instanceof AgentManagerError && cause.code === "artifact_invalid"
+  ));
+
+  const cursor = manager.snapshot().cursor;
+  await manager.prompt("[test:mcp-workspace-roots]");
+  await until(() => !manager.snapshot().busy);
+  const detail = manager.snapshot(cursor).events.find((event) => event.kind === "message" && event.detail?.startsWith("{"))?.detail;
+  assert.ok(detail);
+  const attached = JSON.parse(detail) as { servers: Array<{ name: string; args: string[] }> };
+  const pixi = attached.servers.find((candidate) => candidate.name === "Pixi");
+  assert.ok(pixi);
+  const toolRoot = pixi.args[pixi.args.indexOf("--workspace-root") + 1];
+  assert.ok(toolRoot);
+  assert.deepEqual(await readdir(join(toolRoot, "compiled")), []);
+
+  const publishTrap = join(root, "outside-agent-tool-root");
+  await mkdir(publishTrap);
+  await rm(join(toolRoot, "compiled"), { recursive: true });
+  await symlink(publishTrap, join(toolRoot, "compiled"), "dir");
+  const redirected = await testCompiledArtifact(root, "9", [
+    { path: "main.nf", contents: "workflow { must_remain_confined() }\n" },
+    { path: "pixi.toml", contents: "[workspace]\n" },
+  ]);
+  await assert.rejects(manager.attachCompiledArtifact(redirected.artifact), (cause: unknown) => (
+    cause instanceof AgentManagerError && cause.code === "artifact_invalid"
+  ));
+  assert.deepEqual(await readdir(publishTrap), []);
+});
+
+test("ACP disconnect awaits complete private-workspace cleanup", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "somite-agent-cleanup-"));
   const fixture = fileURLToPath(new URL("./fixtures/fake-acp-agent.ts", import.meta.url));
   const manager = new AgentManager("http://127.0.0.1:9", "test-capability", fixture, root);
   context.after(async () => {
@@ -212,13 +496,90 @@ test("ACP manager contains Pixi and Nextflow tools in the disposable Agent works
   await until(() => !manager.snapshot().busy);
   const detail = manager.snapshot(cursor).events.find((event) => event.kind === "message" && event.detail?.startsWith("{"))?.detail;
   assert.ok(detail);
-  const attached = JSON.parse(detail) as { cwd: string; servers: Array<{ name: string; args: string[] }> };
-  assert.notEqual(attached.cwd, root);
-  for (const name of ["Pixi", "Nextflow"]) {
-    const server = attached.servers.find((candidate) => candidate.name === name);
-    assert.ok(server);
-    assert.equal(server.args[server.args.indexOf("--workspace-root") + 1], attached.cwd);
+  const workspace = (JSON.parse(detail) as { cwd: string }).cwd;
+  const blocked = join(workspace, "undeletable-before-disconnect");
+  await mkdir(blocked);
+  await writeFile(join(blocked, "held"), "x");
+  await chmod(blocked, 0);
+
+  await manager.disconnect();
+  await assert.rejects(lstat(workspace), { code: "ENOENT" });
+});
+
+test("queued artifact attachments remain bound to their originating Agent generation", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "somite-agent-generation-"));
+  const fixture = fileURLToPath(new URL("./fixtures/fake-acp-agent.ts", import.meta.url));
+  const manager = new AgentManager("http://127.0.0.1:9", "test-capability", fixture, root);
+  context.after(async () => {
+    await manager.disconnect().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  });
+  const command = `${JSON.stringify(process.execPath)} --experimental-strip-types ${JSON.stringify(fixture)}`;
+  await manager.connect(command);
+  await until(() => manager.snapshot().connected);
+  const compiled = await testCompiledArtifact(root, "7", [
+    { path: "main.nf", contents: "workflow { stale_session() }\n" },
+    { path: "pixi.toml", contents: "[workspace]\n" },
+  ]);
+
+  const attachment = manager.attachCompiledArtifact(compiled.artifact);
+  const disconnected = manager.disconnect();
+  await assert.rejects(attachment, (cause: unknown) => (
+    cause instanceof AgentManagerError && cause.code === "not_connected"
+  ));
+  await disconnected;
+
+  await manager.connect(command);
+  await until(() => manager.snapshot().connected);
+  const cursor = manager.snapshot().cursor;
+  await manager.prompt("[test:mcp-workspace-roots]");
+  await until(() => !manager.snapshot().busy);
+  const detail = manager.snapshot(cursor).events.find((event) => event.kind === "message" && event.detail?.startsWith("{"))?.detail;
+  assert.ok(detail);
+  const attached = JSON.parse(detail) as { servers: Array<{ name: string; args: string[] }> };
+  const pixi = attached.servers.find((candidate) => candidate.name === "Pixi");
+  assert.ok(pixi);
+  const toolRoot = pixi.args[pixi.args.indexOf("--workspace-root") + 1];
+  assert.ok(toolRoot);
+  assert.deepEqual(await readdir(join(toolRoot, "compiled")), []);
+});
+
+test("Agent artifact leases are bounded without removing earlier paths", async (context) => {
+  const root = await mkdtemp(join(tmpdir(), "somite-agent-lease-bound-"));
+  const fixture = fileURLToPath(new URL("./fixtures/fake-acp-agent.ts", import.meta.url));
+  const manager = new AgentManager("http://127.0.0.1:9", "test-capability", fixture, root);
+  context.after(async () => {
+    await manager.disconnect().catch(() => undefined);
+    await rm(root, { recursive: true, force: true });
+  });
+  const command = `${JSON.stringify(process.execPath)} --experimental-strip-types ${JSON.stringify(fixture)}`;
+  await manager.connect(command);
+  await until(() => manager.snapshot().connected);
+  const compiled = await testCompiledArtifact(root, "8", [
+    { path: "main.nf", contents: "workflow { bounded() }\n" },
+    { path: "pixi.toml", contents: "[workspace]\n" },
+  ]);
+
+  const paths = [];
+  for (let index = 0; index < 16; index += 1) {
+    paths.push((await manager.attachCompiledArtifact(compiled.artifact)).output_path);
   }
+  assert.equal(new Set(paths).size, 16);
+  await assert.rejects(manager.attachCompiledArtifact(compiled.artifact), (cause: unknown) => (
+    cause instanceof AgentManagerError && cause.code === "artifact_limit"
+  ));
+
+  const cursor = manager.snapshot().cursor;
+  await manager.prompt("[test:mcp-workspace-roots]");
+  await until(() => !manager.snapshot().busy);
+  const detail = manager.snapshot(cursor).events.find((event) => event.kind === "message" && event.detail?.startsWith("{"))?.detail;
+  assert.ok(detail);
+  const attached = JSON.parse(detail) as { servers: Array<{ name: string; args: string[] }> };
+  const pixi = attached.servers.find((candidate) => candidate.name === "Pixi");
+  assert.ok(pixi);
+  const toolRoot = pixi.args[pixi.args.indexOf("--workspace-root") + 1];
+  assert.ok(toolRoot);
+  for (const path of paths) assert.equal(await readFile(join(toolRoot, path, "main.nf"), "utf8"), "workflow { bounded() }\n");
 });
 
 test("ACP manager never auto-approves unknown Somite labels or shell actions", async (context) => {

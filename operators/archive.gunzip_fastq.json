@@ -1,0 +1,19 @@
+{
+  "id": "archive.gunzip_fastq",
+  "title": "Decompress FASTQ",
+  "palette": ["Files", "Archives"],
+  "kind": "external",
+  "cost": "low",
+  "bin": "gzip",
+  "pixi": ["conda-forge::gzip"],
+  "params": {},
+  "ports": {
+    "in": [{ "name": "compressed", "type": "FastqGz" }],
+    "out": [{ "name": "fastq", "type": "Fastq" }]
+  },
+  "argv": ["gzip", "-cd", "{input.compressed}"],
+  "outputs": {
+    "fastq": { "glob": "{work}/out/reads.fastq", "type": "Fastq" }
+  },
+  "stdout": "fastq"
+}

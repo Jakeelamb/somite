@@ -210,6 +210,47 @@ function text(bytes: Uint8Array, token: Token) {
   return decoder.decode(bytes.subarray(token.start, token.end));
 }
 
+function slashyLiteralCanStart(bytes: Uint8Array, offset: number) {
+  let previous = offset - 1;
+  while (previous >= 0 && (bytes[previous] === 32 || bytes[previous] === 9 || bytes[previous] === 13 || bytes[previous] === 12 || bytes[previous] === 11)) previous -= 1;
+  if (previous < 0 || bytes[previous] === 10) return true;
+  if (asciiAlpha(bytes[previous]!) || bytes[previous] === 95) {
+    let start = previous;
+    while (start > 0 && (asciiAlpha(bytes[start - 1]!) || asciiNumeric(bytes[start - 1]!) || bytes[start - 1] === 95)) start -= 1;
+    const keyword = decoder.decode(bytes.subarray(start, previous + 1));
+    return keyword === "assert" || keyword === "case" || keyword === "return" || keyword === "throw" || keyword === "yield";
+  }
+  switch (bytes[previous]) {
+    case 33: case 37: case 38: case 40: case 42: case 43: case 44: case 45:
+    case 58: case 59: case 60: case 61: case 62: case 63: case 91: case 94:
+    case 123: case 124: case 126:
+      return true;
+    default:
+      return false;
+  }
+}
+
+function skipSlashyLiteral(bytes: Uint8Array, offset: number, line: number) {
+  let index = offset + 1;
+  while (index < bytes.length) {
+    if (bytes[index] === 10) line += 1;
+    if (bytes[index] === 92 && index + 1 < bytes.length) index += 2;
+    else if (bytes[index] === 47) return { index: index + 1, line };
+    else index += 1;
+  }
+  return { index, line };
+}
+
+function skipDollarSlashyLiteral(bytes: Uint8Array, offset: number, line: number) {
+  let index = offset + 2;
+  while (index < bytes.length) {
+    if (bytes[index] === 10) line += 1;
+    if (bytes[index] === 47 && bytes[index + 1] === 36) return { index: index + 2, line };
+    index += 1;
+  }
+  return { index, line };
+}
+
 function tokenizeNextflowWithBudget(bytes: Uint8Array, budget: SourceIndexBudget): Token[] {
   const tokens: Token[] = [];
   let index = 0;
@@ -225,6 +266,8 @@ function tokenizeNextflowWithBudget(bytes: Uint8Array, budget: SourceIndexBudget
       index += 1;
     } else if (byte === 32 || byte === 9 || byte === 13 || byte === 12 || byte === 11) {
       index += 1;
+    } else if (byte === 36 && bytes[index + 1] === 47) {
+      ({ index, line } = skipDollarSlashyLiteral(bytes, index, line));
     } else if (byte === 47 && bytes[index + 1] === 47) {
       index += 2;
       while (index < bytes.length && bytes[index] !== 10) index += 1;
@@ -238,6 +281,8 @@ function tokenizeNextflowWithBudget(bytes: Uint8Array, budget: SourceIndexBudget
         }
         index += 1;
       }
+    } else if (byte === 47 && slashyLiteralCanStart(bytes, index)) {
+      ({ index, line } = skipSlashyLiteral(bytes, index, line));
     } else if (byte === 39 || byte === 34) {
       const start = index;
       const startLine = line;
@@ -307,21 +352,40 @@ function stableId(namespace: string, parts: readonly string[]) {
   return `${namespace}:${bytesToHex(hasher.digest())}`;
 }
 
-type IndexedScope = Readonly<{ value: SourceScope; open: number; close: number }>;
-type Include = Readonly<{ alias: string; symbol: string; target?: string }>;
+type IndexedScope = Readonly<{ value: SourceScope; declaration: number; open: number; close: number }>;
+type Include = Readonly<{ alias: string; symbol: string; target?: string; pluginFunction?: true }>;
 type IndexedFile = Readonly<{
   path: string;
   bytes: Uint8Array;
   tokens: readonly Token[];
   scopes: readonly IndexedScope[];
   includes: readonly Include[];
+  functions: readonly string[];
   parens: ReadonlyMap<number, number>;
 }>;
 
+function legacyProcessChannels(file: IndexedFile) {
+  for (const scope of file.scopes) {
+    if (scope.value.kind !== "process") continue;
+    for (let index = scope.open + 1; index < scope.close; index += 1) {
+      const token = file.tokens[index]!;
+      if (token.kind !== "ident") continue;
+      const keyword = text(file.bytes, token);
+      if (keyword === "from" || keyword === "into") return true;
+    }
+  }
+  return false;
+}
+
 function resolveInclude(current: string, requested: string, paths: ReadonlySet<string>) {
-  if (!requested.startsWith("./") && !requested.startsWith("../")) return undefined;
-  const parts = current.split("/").slice(0, -1);
-  for (const part of requested.split("/")) {
+  const projectRelative = requested.startsWith("${projectDir}/")
+    ? requested.slice("${projectDir}/".length)
+    : requested.startsWith("$projectDir/")
+      ? requested.slice("$projectDir/".length)
+      : undefined;
+  if (projectRelative === undefined && !requested.startsWith("./") && !requested.startsWith("../")) return undefined;
+  const parts = projectRelative === undefined ? current.split("/").slice(0, -1) : [];
+  for (const part of (projectRelative ?? requested).split("/")) {
     if (!part || part === ".") continue;
     if (part === "..") {
       if (!parts.pop()) return undefined;
@@ -369,7 +433,7 @@ function indexFile(
       kind,
       span: { path: file.path, start_line: token.line, end_line: tokens[close]!.endLine },
     };
-    const indexedScope = { value, open, close } as const;
+    const indexedScope = { value, declaration: index, open, close } as const;
     budget.claim("scopes", projectedJsonBytes(indexedScope));
     scopes.push(indexedScope);
   });
@@ -382,6 +446,7 @@ function indexFile(
     if (close === undefined || tokens[close + 1]?.kind !== "ident" || text(file.bytes, tokens[close + 1]!) !== "from" || tokens[close + 2]?.kind !== "string") return;
     const requested = text(file.bytes, tokens[close + 2]!);
     const target = resolveInclude(file.path, requested, paths);
+    const pluginFunction = requested.startsWith("plugin/");
     let cursor = open + 1;
     while (cursor < close) {
       if (tokens[cursor]?.kind !== "ident") {
@@ -398,14 +463,27 @@ function indexFile(
         alias = text(file.bytes, tokens[cursor + 2]!);
         cursor += 2;
       }
-      const include = { alias, symbol, ...(target ? { target } : {}) };
+      const include = { alias, symbol, ...(target ? { target } : {}), ...(pluginFunction ? { pluginFunction: true as const } : {}) };
       budget.claim("include_bindings", projectedJsonBytes(include));
       includes.push(include);
       cursor += 1;
     }
   });
+  const functions: string[] = [];
+  const active: number[] = [];
+  let nextScope = 0;
+  for (let index = 0; index < tokens.length; index += 1) {
+    while (active.length && scopes[active.at(-1)!]!.close <= index) active.pop();
+    while (scopes[nextScope] && scopes[nextScope]!.open < index) active.push(nextScope++);
+    if (active.length) continue;
+    const token = tokens[index]!;
+    if (token.kind !== "ident" || text(file.bytes, token) !== "def"
+      || tokens[index + 1]?.kind !== "ident" || tokens[index + 2]?.kind !== "left_paren") continue;
+    functions.push(text(file.bytes, tokens[index + 1]!));
+  }
+  budget.reserveProjection(projectedJsonBytes(functions), "function declarations");
   budget.reserveProjection(projectedJsonBytes({ path: file.path }), "indexed files");
-  return { path: file.path, bytes: file.bytes, tokens, scopes, includes, parens };
+  return { path: file.path, bytes: file.bytes, tokens, scopes, includes, functions, parens };
 }
 
 export function indexNextflowSource(
@@ -434,6 +512,7 @@ export function indexNextflowSource(
     }
   }
   const scopeLookup = new Map<string, Map<string, string[]>>();
+  const functionLookup = new Map<string, ReadonlySet<string>>();
   for (const file of indexed) {
     const symbols = scopeLookup.get(file.path) ?? new Map<string, string[]>();
     for (const scope of file.scopes) {
@@ -441,6 +520,7 @@ export function indexNextflowSource(
       symbols.set(scope.value.symbol, [...(symbols.get(scope.value.symbol) ?? []), scope.value.id]);
     }
     scopeLookup.set(file.path, symbols);
+    functionLookup.set(file.path, new Set(file.functions));
   }
 
   const invocations: SourceInvocation[] = [];
@@ -459,6 +539,7 @@ export function indexNextflowSource(
       const alias = aliases.get(name);
       const local = scopeLookup.get(file.path)?.get(name);
       if (!alias && !local) continue;
+      if (alias?.pluginFunction || (alias?.target && functionLookup.get(alias.target)?.has(alias.symbol))) continue;
       const candidates = alias?.target ? scopeLookup.get(alias.target)?.get(alias.symbol) : local;
       const callee = candidates?.length === 1 ? candidates[0] : undefined;
       const close = file.parens.get(tokenIndex + 1) ?? tokenIndex + 1;
@@ -475,6 +556,35 @@ export function indexNextflowSource(
     }
   }
   const scopes = indexed.flatMap((file) => file.scopes.map((scope) => scope.value));
+  const entryFile = indexed.find((file) => file.path === entrypoint);
+  const explicitEntry = entryFile?.scopes.some((scope) => scope.value.kind === "entry_workflow") ?? false;
+  if (entryFile && !explicitEntry && legacyProcessChannels(entryFile)) {
+    const entry: SourceScope = {
+      id: stableId("scope", [sourceDigest, entrypoint, "entry_workflow", "<implicit-dsl1>", "0"]),
+      title: "Entry workflow",
+      kind: "entry_workflow",
+      span: {
+        path: entrypoint,
+        start_line: 1,
+        end_line: entryFile.tokens.at(-1)?.endLine ?? 1,
+      },
+    };
+    budget.claim("scopes", projectedJsonBytes(entry));
+    scopes.push(entry);
+    for (const scope of entryFile.scopes) {
+      if (scope.value.kind !== "process" || !scope.value.symbol) continue;
+      const declaration = entryFile.tokens[scope.declaration]!;
+      const invocation: SourceInvocation = {
+        id: stableId("invocation", [sourceDigest, entry.id, scope.value.symbol, String(declaration.offset)]),
+        caller: entry.id,
+        name: scope.value.symbol,
+        callee: scope.value.id,
+        span: scope.value.span,
+      };
+      budget.claim("invocations", projectedJsonBytes(invocation));
+      invocations.push(invocation);
+    }
+  }
   scopes.sort((left, right) => less(left.span.path, right.span.path) || left.span.start_line - right.span.start_line || less(left.id, right.id));
   invocations.sort((left, right) => less(left.span.path, right.span.path) || left.span.start_line - right.span.start_line || less(left.id, right.id));
   if (!scopes.length) pushDiagnostic({ code: "source_outline_empty", message: "No Nextflow workflow or process declarations were indexed." });

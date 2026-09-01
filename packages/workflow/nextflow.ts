@@ -1,5 +1,6 @@
 import type { Operator, OutputSpec, ParamSpec, PinnedOperator } from "./catalog.ts";
-import { OperatorCatalog, operatorPorts } from "./catalog.ts";
+import { OperatorCatalog, operatorImportPaths, operatorPorts } from "./catalog.ts";
+export { operatorImportPaths, type OperatorImportPath } from "./catalog.ts";
 import type {
   ParamValue,
   PortType,
@@ -284,35 +285,6 @@ function compileImport(
   });
 }
 
-export type OperatorImportPath = Readonly<{
-  port: string;
-  parameter: string;
-  kind: "file" | "directory";
-}>;
-
-/** The exact local path parameters consumed directly by one in-process import operator. */
-export function operatorImportPaths(operator: PinnedOperator): readonly OperatorImportPath[] {
-  const declared = operator.ports.out
-    .filter((port) => port.import_param !== undefined)
-    .map((port) => ({
-      port: port.name,
-      parameter: port.import_param!,
-      kind: port.type === "Directory" ? "directory" as const : "file" as const,
-    }));
-  if (declared.length) return declared;
-  if (operator.id === "files.import_paired") {
-    return [
-      { port: "r1", parameter: "r1", kind: "file" },
-      { port: "r2", parameter: "r2", kind: "file" },
-    ];
-  }
-  if (Object.hasOwn(operator.params, "path") && operator.ports.out.length === 1) {
-    const port = operator.ports.out[0]!;
-    return [{ port: port.name, parameter: "path", kind: port.type === "Directory" ? "directory" : "file" }];
-  }
-  return [];
-}
-
 function promotedSourceEntry(graph: SomiteGraph, node: SomiteGraphNode): PromotedSourceMapEntry | undefined {
   const origin = graph.variant_origin;
   if (!origin) return undefined;
@@ -538,11 +510,17 @@ function renderOutputs(operator: PinnedOperator) {
         `operator ${operator.id} output ${port.name}: declares ${spec.type} but the output port declares ${port.type}`,
       );
     }
+    if (Boolean(spec.optional) !== Boolean(port.optional)) {
+      fail(
+        "invalid_output",
+        `operator ${operator.id} output ${port.name}: optionality differs between port and collection rule`,
+      );
+    }
     if ((spec.exclude ?? []).length > 0) {
       fail("invalid_output", `operator ${operator.id} output ${port.name}: exclude rules are not supported by the Nextflow compiler`);
     }
     const pattern = controlledOutputPattern(operator, port.name, spec);
-    const optional = spec.optional || port.optional ? ", optional: true" : "";
+    const optional = port.optional ? ", optional: true" : "";
     return `    path '${bashSingle(pattern)}', emit: out_${lowerIdent(port.name)}${optional}`;
   });
 }
@@ -561,6 +539,7 @@ function renderOutputValidators(operator: PinnedOperator) {
     validators.push(`      ${count}=$(( ${count} + 1 ))\n`);
     if (port.type === "Directory") {
       validators.push("      if [[ ! -d \"$somite_artifact\" ]]; then echo \"Somite: expected directory $somite_artifact\" >&2; exit 74; fi\n");
+      validators.push("      if [[ -z \"$(find \"$somite_artifact\" -mindepth 1 -print -quit)\" ]]; then echo \"Somite: empty output directory $somite_artifact\" >&2; exit 74; fi\n");
     } else {
       validators.push("      if [[ ! -s \"$somite_artifact\" ]]; then echo \"Somite: empty output $somite_artifact\" >&2; exit 74; fi\n");
       if (["FastqGz", "FastaGz", "GtfGz", "VcfGz"].includes(port.type)) {
@@ -568,7 +547,7 @@ function renderOutputValidators(operator: PinnedOperator) {
       }
     }
     validators.push(`    done < <(compgen -G '${bashSingle(pattern)}' || true)\n`);
-    if (!(spec.optional || port.optional)) {
+    if (!port.optional) {
       validators.push(
         `    if (( ${count} == 0 )); then echo 'Somite: required output ${bashSingle(port.name)} was not created' >&2; exit 74; fi\n`,
       );
@@ -760,7 +739,11 @@ function extension(type: PortType) {
     Gff3: ".gff3",
     Sam: ".sam",
     Bam: ".bam",
+    ReadGroupedBam: ".bam",
+    GatkReadyBam: ".bam",
     Bai: ".bai",
+    Fai: ".fai",
+    Dict: ".dict",
     Vcf: ".vcf",
     VcfGz: ".vcf.gz",
     Bed: ".bed",

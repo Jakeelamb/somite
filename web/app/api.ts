@@ -9,7 +9,7 @@ import {
   MAX_PAPER_STATUS_BYTES,
   MAX_WORKFLOW_DOCUMENT_BYTES,
 } from "@somite/workflow/limits";
-import type { PaperCandidate, PaperEvidence, PaperMethodMention, PaperResourceCitation, PaperReview } from "@somite/workflow/paper";
+import type { PaperCandidate, PaperEvidence, PaperMethodMention, PaperResourceCitation, PaperReview, PaperWorkflowCitation } from "@somite/workflow/paper";
 import type { SomiteGraph } from "@somite/workflow/model";
 
 import type { GraphWritePath } from "./graphPersistence";
@@ -334,6 +334,21 @@ function paperCitation(value: unknown, path: string): PaperResourceCitation {
   return value as PaperResourceCitation;
 }
 
+function paperWorkflowCitation(value: unknown, path: string): PaperWorkflowCitation {
+  const raw = record(value, path);
+  oneOf(raw.provider, `${path}.provider`, ["github"] as const);
+  const repository = httpUrl(raw.repository, `${path}.repository`);
+  const parsed = new URL(repository);
+  if (parsed.protocol !== "https:" || parsed.hostname.toLocaleLowerCase("en-US") !== "github.com"
+    || parsed.username || parsed.password || parsed.search || parsed.hash
+    || !/^\/[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9_.-]{1,100}$/.test(parsed.pathname.replace(/\.git\/?$/i, ""))) {
+    throw new Error(`${path}.repository must be a canonical public GitHub repository URL`);
+  }
+  text(raw.context, `${path}.context`);
+  optionalText(raw.source_location, `${path}.source_location`);
+  return value as PaperWorkflowCitation;
+}
+
 function paperEvidence(value: unknown, path: string): PaperEvidence {
   const raw = record(value, path);
   oneOf(raw.target_kind, `${path}.target_kind`, ["node", "edge"] as const);
@@ -353,8 +368,10 @@ function paperMention(value: unknown, path: string): PaperMethodMention {
   text(raw.display_name, `${path}.display_name`);
   text(raw.normalized_name, `${path}.normalized_name`);
   optionalText(raw.operation_class, `${path}.operation_class`);
+  optionalText(raw.version, `${path}.version`);
   text(raw.evidence, `${path}.evidence`);
   oneOf(raw.support, `${path}.support`, ["operator", "unsupported"] as const);
+  if (raw.executable !== undefined) bool(raw.executable, `${path}.executable`);
   optionalText(raw.operator_id, `${path}.operator_id`);
   optionalText(raw.source_location, `${path}.source_location`);
   return value as PaperMethodMention;
@@ -382,6 +399,9 @@ function paperReview(value: unknown, path: string): PaperReview {
     warnings: texts(raw.warnings, `${path}.warnings`),
     mentions: list(raw.mentions, `${path}.mentions`, paperMention),
     resources: list(raw.resources, `${path}.resources`, paperCitation),
+    workflow_sources: raw.workflow_sources === undefined
+      ? []
+      : list(raw.workflow_sources, `${path}.workflow_sources`, paperWorkflowCitation),
     candidates: list(raw.candidates, `${path}.candidates`, paperCandidate),
   };
 }
@@ -393,6 +413,7 @@ function sourceRequest(value: unknown, path: string): SourceRequest {
   if (raw.operator_ids !== undefined) texts(raw.operator_ids, `${path}.operator_ids`);
   if (raw.sequence_type !== undefined) oneOf(raw.sequence_type, `${path}.sequence_type`, ["genomic", "cdna", "protein"] as const);
   if (raw.sequenceType !== undefined) oneOf(raw.sequenceType, `${path}.sequenceType`, ["genomic", "cdna", "protein"] as const);
+  if (raw.read_layout !== undefined) oneOf(raw.read_layout, `${path}.read_layout`, ["single", "paired"] as const);
   return value as SourceRequest;
 }
 
@@ -1047,6 +1068,9 @@ export class SomiteClient {
   }
   expandWorkflow(engine: "nfcore" | "snakemake", workflow: string, revision: string) {
     return this.#json(engine === "nfcore" ? "/api/catalog/nfcore/expand" : "/api/catalog/snakemake/expand", workflowGraph, jsonInit("POST", { workflow, revision }), MAX_DOCUMENT_RESPONSE_BYTES);
+  }
+  resolveGithubWorkflow(repository: string, revision = "") {
+    return this.#json("/api/source-workflows/github/resolve", workflowGraph, jsonInit("POST", { repository, revision }), MAX_DOCUMENT_RESPONSE_BYTES);
   }
   uploadFile(file: File, signal?: AbortSignal) {
     const body = new FormData();

@@ -72,6 +72,7 @@ import React, {
 import { CanvasAnnotations } from "./CanvasAnnotations";
 import { OperatorWorkshopPanel } from "./OperatorWorkshopPanel";
 import type { SourceRequest, SourceSearchResult } from "./sourceBuilder";
+import { buildPublicSourceGraph } from "./publicSourceGraph";
 import { preventBrowserZoomOutsideCanvas } from "./canvasGestures";
 import { nextPaperReadSlot, paperCandidateDocument, paperCanvasUpdate, paperResolutionAgentPrompt, replacePaperReadSlot } from "./paperResolution";
 import {
@@ -104,6 +105,7 @@ import type {
   PaperCandidate,
   PaperEvidence,
   PaperSearchResult,
+  PaperWorkflowCitation,
   ExportPlan,
   ProjectSession,
   ReadinessItem,
@@ -141,12 +143,12 @@ import {
   type WorkflowDocumentHistory,
 } from "./projectDocument";
 import { validationEvidenceRequestPath, workflowCatalogRequestPaths, type WorkflowCatalogLoadState } from "./backgroundRequests";
-import { planLocalInputs } from "./localInputPlanning";
+import { localInputOperatorId, localInputOperatorIds, planLocalInputs } from "./localInputPlanning";
 import { droppedProjectDirectory, type DroppedProjectFile } from "./projectImport";
 import { assessWorkflow } from "@somite/workflow/assessment";
 import { OperatorCatalog } from "@somite/workflow/catalog";
-import { SOURCE_PREVIEW_PACK, representativeValidationCapability } from "@somite/workflow/fixtures";
-import { projectSourceCanvas } from "@somite/workflow/sourceCanvas";
+import { REPRESENTATIVE_SOURCE_PACK, SOURCE_PREVIEW_PACK, representativeValidationCapability } from "@somite/workflow/fixtures";
+import { projectSourceCanvas, type SourceCanvasProjection } from "@somite/workflow/sourceCanvas";
 
 const workspacePanels = () => import("./WorkspacePanels");
 const AgentPanel = lazy(async () => ({ default: (await workspacePanels()).AgentPanel }));
@@ -187,6 +189,44 @@ type SemanticFrame = Readonly<{
 
 function pointInside(bounds: CanvasBounds, point: { x: number; y: number }) {
   return point.x >= bounds.x && point.x <= bounds.x + bounds.width && point.y >= bounds.y && point.y <= bounds.y + bounds.height;
+}
+
+function reconcileSemanticFrames(
+  currentFrames: readonly SemanticFrame[],
+  workflow: NonNullable<SomiteGraphNode["source_workflow"]>,
+  view: SourceCanvasView | undefined,
+  activeProjection: SourceCanvasProjection,
+) {
+  const rootFrame = currentFrames[0];
+  if (!rootFrame) return [];
+  const focusGroupId = activeProjection.focus_group_id;
+  const parentById = new Map((view?.groups ?? []).map((group) => [group.id, group.parent_group_id]));
+  const path: string[] = [];
+  const visited = new Set<string>();
+  for (let id: string | null | undefined = focusGroupId; id; id = parentById.get(id)) {
+    if (visited.has(id) || !parentById.has(id)) return [rootFrame];
+    visited.add(id);
+    path.push(id);
+  }
+  path.reverse();
+
+  const reusable = new Map(currentFrames.slice(1).map((frame) => [frame.focusGroupId, frame]));
+  const frames: SemanticFrame[] = [rootFrame];
+  for (const groupId of path) {
+    frames.push(reusable.get(groupId) ?? { ...rootFrame, focusGroupId: groupId });
+  }
+  const childBounds = sourceProjectionBounds(activeProjection);
+  if (!childBounds) return frames;
+  if (!focusGroupId) return [{ ...rootFrame, focusGroupId: null, childBounds }];
+
+  const parentFocus = parentById.get(focusGroupId) ?? null;
+  const parentProjection = projectSourceCanvas(workflow, view, parentFocus);
+  if (!parentProjection.ok) return frames;
+  const portalBounds = parentProjection.projection.groups.find((group) => group.id === focusGroupId)?.bounds
+    ?? parentProjection.projection.portals.find((portal) => portal.kind === "collapsed_group" && portal.group_id === focusGroupId)?.bounds;
+  if (!portalBounds) return frames;
+  frames[frames.length - 1] = { sourceNodeId: rootFrame.sourceNodeId, focusGroupId, portalBounds, childBounds };
+  return frames;
 }
 type SourceWorkflowSemanticEdit =
   | { kind: "set_parameter"; name: string; binding: WorkflowBinding }
@@ -269,8 +309,8 @@ function NodeViewer({ node, title }: { node: SomiteGraphNode; title: string }) {
     const engine = operator.startsWith("nf.") ? "nf-core" : "Snakemake";
     return <div className="viewer-pipeline"><span>{engine}</span><strong>{operator.split(".").slice(1).join("/")}</strong><small>{stringParam(node, "revision") || stringParam(node, "profile") || "workflow"}</small><div aria-hidden="true"><i /><b /><i /><b /><i /></div></div>;
   }
-  if (operator === "sra.fasterq_dump") {
-    return <div className="viewer-accession"><span>SRA conversion</span><strong>FASTQ</strong><small>separate R1 / R2</small></div>;
+  if (operator === "sra.fasterq_dump" || operator === "sra.fasterq_dump_single") {
+    return <div className="viewer-accession"><span>SRA conversion</span><strong>FASTQ</strong><small>{operator.endsWith("_single") ? "single read stream" : "separate R1 / R2"}</small></div>;
   }
   if (operator.startsWith("sra.") || operator.startsWith("ncbi.")) {
     const accession = stringParam(node, "accession") || stringParam(node, "taxon") || operator.split(".").at(-1);
@@ -1860,36 +1900,11 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       return;
     }
     const center = canvasCenter();
-    const requireOperator = (id: string) => {
-      const operator = operatorMap.get(id);
-      if (!operator) throw new Error(`${id} operator is missing`);
-      return operator;
-    };
     try {
       remember();
-      const created: SomiteGraphNode[] = [];
-      const createdEdges: SomiteEdge[] = [];
-      if (request.kind === "sra") {
-        const prefetch = requireOperator("sra.prefetch");
-        const fasterq = requireOperator("sra.fasterq_dump");
-        const prefetchId = nextNodeId(prefetch, [...nodes, ...created.map((node) => flowNode(node, operatorMap))]);
-        created.push(makeGraphNode(prefetch, prefetchId, center, { accession: request.value }));
-        const fasterqId = nextNodeId(fasterq, [...nodes, ...created.map((node) => flowNode(node, operatorMap))]);
-        created.push(makeGraphNode(fasterq, fasterqId, { x: center.x + 240, y: center.y }));
-        createdEdges.push({ id: `e-${prefetchId}-sra-${fasterqId}-sra`, from_node: prefetchId, from_port: "sra", to_node: fasterqId, to_port: "sra" });
-      } else if (request.kind === "assembly") {
-        const download = requireOperator("ncbi.datasets_assembly");
-        const unzip = requireOperator("archive.unzip");
-        const downloadId = nextNodeId(download, [...nodes, ...created.map((node) => flowNode(node, operatorMap))]);
-        created.push(makeGraphNode(download, downloadId, center, { accession: request.value }));
-        const unzipId = nextNodeId(unzip, [...nodes, ...created.map((node) => flowNode(node, operatorMap))]);
-        created.push(makeGraphNode(unzip, unzipId, { x: center.x + 240, y: center.y }));
-        createdEdges.push({ id: `e-${downloadId}-package-${unzipId}-archive`, from_node: downloadId, from_port: "package", to_node: unzipId, to_port: "archive" });
-      } else {
-        const operator = requireOperator("ensembl.sequence");
-        const id = nextNodeId(operator, nodes);
-        created.push(makeGraphNode(operator, id, center, { accession: request.value, sequence_type: request.sequenceType ?? request.sequence_type ?? "genomic" }));
-      }
+      const slice = buildPublicSourceGraph(request, operatorMap, nodes.map((node) => node.data.graphNode), center);
+      const created = [...slice.nodes];
+      const createdEdges = [...slice.edges];
       const graphNodes = [...nodes.map((node) => node.data.graphNode), ...created];
       setNodes((current) => [...current.map((node) => ({ ...node, selected: false })), ...created.map((node) => ({ ...flowNode(node, operatorMap), selected: true }))]);
       setEdges((current) => [...current, ...createdEdges.map((edge) => flowEdge(edge, graphNodes))]);
@@ -2199,13 +2214,18 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
   const usePaperResource = useCallback(async (index: number, result: SourceSearchResult) => {
     const candidate = paperReview?.candidates[index];
     if (!candidate || result.request.kind !== "sra") return;
-    const slot = nextPaperReadSlot(candidate);
+    const readLayout = result.request.read_layout;
+    if (readLayout !== "single" && readLayout !== "paired") {
+      setStatus(`Could not use ${result.request.value} — NCBI did not report its library layout`);
+      return;
+    }
+    const slot = nextPaperReadSlot(candidate, readLayout);
     if (!slot) {
-      setStatus("Every read input in this draft already has a source");
+      setStatus(`No unfilled ${readLayout}-end read input is available in this draft`);
       return;
     }
     const prefetchOperator = operatorMap.get("sra.prefetch");
-    const fasterqOperator = operatorMap.get("sra.fasterq_dump");
+    const fasterqOperator = operatorMap.get(readLayout === "paired" ? "sra.fasterq_dump" : "sra.fasterq_dump_single");
     if (!prefetchOperator || !fasterqOperator) {
       setStatus("Could not use cited reads — the native SRA recipe is unavailable");
       return;
@@ -2232,6 +2252,22 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       throw error;
     }
   }, [operatorMap, paperReview, updatePaperCandidateGraph]);
+
+  const usePaperWorkflowSource = useCallback(async (source: PaperWorkflowCitation) => {
+    const target = canvasCenter();
+    const name = source.repository.split("/").slice(-2).join("/");
+    if (!sourceWorkflowCanvasIsEmpty(graphSnapshotRef.current)) {
+      setStatus(`Cited workflow ${name} needs an empty canvas so its pinned source remains intact`);
+      return;
+    }
+    setStatus(`Resolving and pinning cited workflow ${name}…`);
+    try {
+      const imported = await client.resolveGithubWorkflow(source.repository);
+      insertImportedGraph(imported, target, `Added cited workflow ${name}`);
+    } catch (error) {
+      setStatus(`Could not use cited workflow ${name} — ${errorMessage(error)}`);
+    }
+  }, [canvasCenter, client, insertImportedGraph]);
 
   const attachPaperInput = useCallback(async (index: number, item: ReadinessItem, field: string, file: File) => {
     const key = `${item.id}:${field}`;
@@ -2355,9 +2391,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     setStatus(`Importing ${files.length === 1 ? files[0].name : `${files.length} files`}…`);
     try {
       const plan = planLocalInputs(files);
-      const requiredOperatorIds = new Set<string>(plan.map((entry) => entry.kind === "paired_fastq"
-        ? "files.import_paired"
-        : entry.kind === "fasta" ? "files.import_fasta" : "files.import"));
+      const requiredOperatorIds = new Set<string>(plan.flatMap(localInputOperatorIds));
       for (const operatorId of requiredOperatorIds) {
         if (!operatorMap.has(operatorId)) throw new Error(`${operatorId} operator is unavailable; no files were imported`);
       }
@@ -2380,24 +2414,42 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       }
       const currentFlowNodes = currentGraph.nodes.map((node) => flowNode(node, operatorMap));
       const created: SomiteGraphNode[] = [];
+      const createdEdges: SomiteEdge[] = [];
       for (const [index, entry] of plan.entries()) {
-        const operatorId = entry.kind === "paired_fastq"
-          ? "files.import_paired"
-          : entry.kind === "fasta" ? "files.import_fasta" : "files.import";
+        const operatorId = localInputOperatorId(entry);
         const operator = operatorMap.get(operatorId)!;
         const occupied = [...currentFlowNodes, ...created.map((node) => flowNode(node, operatorMap))];
         const id = nextNodeId(operator, occupied);
-        const layout = { x: position.x + (index % 3) * 240, y: position.y + Math.floor(index / 3) * 170 };
-        const params: Record<string, ParamValue> = entry.kind === "paired_fastq"
+        const layout = { x: position.x + (index % 2) * 500, y: position.y + Math.floor(index / 2) * 180 };
+        const params: Record<string, ParamValue> = entry.kind === "paired_fastq" || entry.kind === "paired_fastq_gz"
           ? { r1: uploaded[entry.r1]!.path, r2: uploaded[entry.r2]!.path }
           : { path: uploaded[entry.file]!.path };
-        created.push(makeGraphNode(operator, id, layout, params));
+        const source = makeGraphNode(operator, id, layout, params);
+        created.push(source);
+        if (entry.kind === "fasta_gz") {
+          const decompressOperator = operatorMap.get("archive.gunzip_fasta")!;
+          const decompressId = nextNodeId(decompressOperator, [...currentFlowNodes, ...created.map((node) => flowNode(node, operatorMap))]);
+          const decompress = {
+            ...makeGraphNode(decompressOperator, decompressId, { x: layout.x + 240, y: layout.y }),
+            note: "Automatically added because this local FASTA is gzip-compressed.",
+          };
+          created.push(decompress);
+          createdEdges.push({
+            id: `e-${id}-assembly-${decompressId}-compressed`,
+            from_node: id,
+            from_port: "assembly",
+            to_node: decompressId,
+            to_port: "compressed",
+          });
+        }
       }
       remember(currentGraph);
+      const graphNodes = [...currentGraph.nodes, ...created];
       setNodes((current) => [
         ...current.map((node) => ({ ...node, selected: false })),
         ...created.map((node) => ({ ...flowNode(node, operatorMap), selected: true })),
       ]);
+      setEdges((current) => [...current, ...createdEdges.map((edge) => flowEdge(edge, graphNodes))]);
       setSelectedIds(created.map((node) => node.id));
       setRecent((current) => [
         ...requiredOperatorIds,
@@ -2407,12 +2459,15 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
       setPendingConnection(null);
       setLibraryVisible(false);
       setDirty(true);
-      const pairedCount = plan.filter((entry) => entry.kind === "paired_fastq").length;
-      setStatus(`Added ${created.length} input node${created.length === 1 ? "" : "s"} from all ${files.length} file${files.length === 1 ? "" : "s"}${pairedCount ? ` · ${pairedCount} verified R1/R2 pair${pairedCount === 1 ? "" : "s"}` : ""}`);
+      const pairedCount = plan.filter((entry) => entry.kind === "paired_fastq" || entry.kind === "paired_fastq_gz").length;
+      const compressedFastaCount = plan.filter((entry) => entry.kind === "fasta_gz").length;
+      const compressedReadCount = plan.reduce((count, entry) => count
+        + (entry.kind === "paired_fastq_gz" ? 2 : entry.kind === "fastq_gz" ? 1 : 0), 0);
+      setStatus(`Added ${created.length} canvas node${created.length === 1 ? "" : "s"} from all ${files.length} file${files.length === 1 ? "" : "s"}${pairedCount ? ` · ${pairedCount} verified R1/R2 pair${pairedCount === 1 ? "" : "s"}` : ""}${compressedFastaCount ? ` · ${compressedFastaCount} compressed FASTA${compressedFastaCount === 1 ? "" : "s"} made runnable` : ""}${compressedReadCount ? ` · ${compressedReadCount} compressed read${compressedReadCount === 1 ? "" : "s"} kept compressed for gzip-aware tools` : ""}`);
     } catch (error) {
       setStatus(`Could not import files — ${errorMessage(error)}`);
     }
-  }, [editSourceWorkflowBinding, operatorMap, remember, setNodes, upload]);
+  }, [editSourceWorkflowBinding, operatorMap, remember, setEdges, setNodes, upload]);
 
   const onDrop = useCallback((event: React.DragEvent) => {
     event.preventDefault();
@@ -2593,6 +2648,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     const graph = snapshot();
     const validationCapability = intent === "validation" ? representativeValidationCapability(graph) : undefined;
     const sourcePreview = validationCapability?.supported && validationCapability.fixture_pack === SOURCE_PREVIEW_PACK;
+    const representativeSources = validationCapability?.supported && validationCapability.fixture_pack === REPRESENTATIVE_SOURCE_PACK;
     if (intent === "validation") {
       if (!validationCapability?.supported) {
         setStatus(validationCapability?.reason ?? "This workflow cannot be validated yet");
@@ -2621,7 +2677,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     }
     setActiveIntent(intent);
     setStatus(intent === "validation"
-      ? sourcePreview ? "Checking the frozen Nextflow source…" : "Binding representative FASTQ fixtures…"
+      ? sourcePreview ? "Checking the frozen Nextflow source…" : representativeSources ? "Binding tiny typed reads, reference, and annotation fixtures…" : "Binding representative FASTQ fixtures…"
       : "Freezing the exact Pixi environment…");
     setNodes((current) => current.map((node) => ({ ...node, data: { ...node.data, runState: "queued" } })));
     setEdges((current) => current.map((edge) => ({ ...edge, animated: true, data: intent === "validation" && edge.data ? { ...edge.data, validationState: "queued" } : edge.data })));
@@ -2645,15 +2701,20 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
         if (report.phase === "preparing") setStatus(intent === "validation"
           ? sourcePreview ? "Restoring the immutable source and Pixi lock…" : "Freezing the fixture-bound validation closure…"
           : "Freezing the exact Pixi environment…");
-        else if (report.phase === "running") setStatus(`${intent === "validation" ? sourcePreview ? "Checking source in Nextflow preview mode" : "Validating" : "Nextflow running"} · ${counts.done ?? 0} done · ${counts.running ?? 0} active · ${counts.queued ?? 0} queued`);
+        else if (report.phase === "running") setStatus(`${intent === "validation" ? sourcePreview ? "Checking source in Nextflow preview mode" : representativeSources ? "Checking the workflow with typed local fixtures" : "Validating" : "Nextflow running"} · ${counts.done ?? 0} done · ${counts.running ?? 0} active · ${counts.queued ?? 0} queued`);
         else if (report.phase === "finalizing") setStatus("Recording scoped evidence receipt…");
         else if (report.phase === "cancelling") setStatus("Stopping Nextflow…");
       } while (!(["completed", "failed", "cancelled"] as const).includes(report.phase as "completed" | "failed" | "cancelled"));
 
       const counts = Object.values(report.states).reduce<Record<string, number>>((result, state) => ({ ...result, [state]: (result[state] ?? 0) + 1 }), {});
-      if (report.phase === "completed" && intent === "validation") setStatus(sourcePreview
-        ? "Source preview validated · Nextflow compiled the workflow without running tasks"
-        : `Validated with ${report.evidence_receipt?.fixture_digests.length ?? 0} fixture${report.evidence_receipt?.fixture_digests.length === 1 ? "" : "s"} · ${counts.done ?? 0} nodes passed`);
+      if (report.phase === "completed" && intent === "validation") {
+        const passedNodes = Object.values(report.evidence_receipt?.node_results ?? {}).filter((result) => result === "passed").length;
+        setStatus(sourcePreview
+          ? "Source preview validated · Nextflow compiled the workflow without running tasks"
+          : representativeSources
+            ? `Representative check passed · ${passedNodes} workflow node${passedNodes === 1 ? "" : "s"} passed${validationCapability.unexercised_nodes.length ? ` · ${validationCapability.unexercised_nodes.length} public retrieval step${validationCapability.unexercised_nodes.length === 1 ? "" : "s"} not exercised` : ""}${validationCapability.parameter_overrides ? " · tiny-data parameters disclosed" : ""}`
+            : `Validated with ${report.evidence_receipt?.fixture_digests.length ?? 0} fixture${report.evidence_receipt?.fixture_digests.length === 1 ? "" : "s"} · ${counts.done ?? 0} nodes passed`);
+      }
       else if (report.phase === "completed") setStatus(`Run complete · ${counts.done ?? 0} done · ${counts.cached ?? 0} cached`);
       else if (report.phase === "cancelled") setStatus(`${intent === "validation" ? "Validation" : "Run"} cancelled`);
       else setStatus(`${intent === "validation" ? "Validation" : "Run"} failed — ${report.error?.split("\n").at(-1) ?? `exit ${report.exit_code ?? "unknown"}`}`);
@@ -3028,6 +3089,12 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     onPromote: promoteOpenSourceInvocation,
     onReset: resetOpenSourceInvocation,
   });
+  useEffect(() => {
+    const rootFrame = semanticFramesRef.current[0];
+    const workflow = nestedSourceNode?.data.graphNode.source_workflow;
+    if (!sourceCanvasOpen || !rootFrame || !workflow || !sourceScene.projection) return;
+    semanticFramesRef.current = reconcileSemanticFrames(semanticFramesRef.current, workflow, sourceScene.view, sourceScene.projection);
+  }, [nestedSourceNode, sourceCanvasOpen, sourceScene.projection, sourceScene.view]);
   const canvasNodes: WorkspaceFlowNode[] = sourceCanvasOpen ? sourceScene.nodes : nodes;
   const canvasEdges: WorkspaceFlowEdge[] = sourceCanvasOpen ? sourceScene.edges : edges;
 
@@ -3179,7 +3246,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
             <button type="button" className="studio-button theme-toggle" aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`} title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`} onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}>{theme === "dark" ? <Sun size={14} aria-hidden="true" /> : <Moon size={14} aria-hidden="true" />}</button>
             <button type="button" className="studio-button" onClick={() => void save()} disabled={saving || !dirty || inputOriginRecoveryRequired} title={inputOriginBlockedReason ?? "Save workflow"}>{saving ? <span className="spin"><LoaderCircle size={14} /></span> : inputOriginRecoveryRequired ? <CircleAlert size={14} /> : dirty ? <Save size={14} /> : <Check size={14} />}<span>{saving ? "Saving…" : inputOriginRecoveryRequired ? "Paused" : dirty ? "Save" : "Saved"}</span></button>
             <button type="button" className={`studio-button ${toolchainVisible ? "active" : ""}`} onClick={() => void toggleToolchain()} disabled={inputOriginRecoveryRequired} title={inputOriginBlockedReason ?? "Environment and Export"}><PackageOpen size={14} aria-hidden="true" /><span>Export</span></button>
-            <button type="button" className="studio-button validation-button" disabled={inputOriginRecoveryRequired || running || !validationCapability.supported} onClick={() => void validateGraphWithFixtures()} title={inputOriginBlockedReason ?? (validationCapability.supported ? validationCapability.fixture_pack === SOURCE_PREVIEW_PACK ? "Check this frozen source workflow in Nextflow preview mode" : "Validate with small representative FASTQ fixtures" : validationCapability.reason)}>{activeIntent === "validation" ? <span className="spin"><LoaderCircle size={14} /></span> : <ShieldCheck size={14} />}<span>{activeIntent === "validation" ? "Validating…" : "Validate"}</span></button>
+            <button type="button" className="studio-button validation-button" disabled={inputOriginRecoveryRequired || running || !validationCapability.supported} onClick={() => void validateGraphWithFixtures()} title={inputOriginBlockedReason ?? (validationCapability.supported ? validationCapability.fixture_pack === SOURCE_PREVIEW_PACK ? "Check this frozen source workflow in Nextflow preview mode" : validationCapability.fixture_pack === REPRESENTATIVE_SOURCE_PACK ? "Check downstream tools with tiny typed local fixtures; public retrieval is not exercised" : "Validate with small representative FASTQ fixtures" : validationCapability.reason)}>{activeIntent === "validation" ? <span className="spin"><LoaderCircle size={14} /></span> : <ShieldCheck size={14} />}<span>{activeIntent === "validation" ? "Validating…" : "Validate"}</span></button>
             <button type="button" className={`run-button ${running ? "is-running" : ""}`} disabled={(!running && inputOriginRecoveryRequired) || (running && !activeRunId)} onClick={() => void (running ? cancelRun() : runGraph())} title={inputOriginBlockedReason ?? (running ? "Cancel active Nextflow run" : "Run workflow (F5 or Ctrl/Cmd Enter)")}>{running ? activeRunId ? <><Square size={12} fill="currentColor" />Cancel</> : <><span className="spin"><LoaderCircle size={14} /></span>Preparing…</> : <><Play size={14} />Run</>}</button>
           </div>
         </header>
@@ -3351,7 +3418,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
 
         {toolchainVisible && <div className="toolchain-layer" onPointerDown={(event) => event.stopPropagation()}><ToolchainPanel plan={exportPlan} pixiReady={system?.tools.pixi} loading={exportLoading} downloading={exportDownloading} onDownload={downloadBundle} onClose={() => setToolchainVisible(false)} /></div>}
 
-        {paperVisible && <div className="paper-layer" onPointerDown={(event) => event.stopPropagation()}><PaperPanel client={client} intake={paperIntake} active={activePaperCandidate} applied={appliedPaperCandidate} preparingField={paperPreparingField} onFile={rebuildPaper} onRetry={retryPaper} onCancel={cancelPaper} onExample={openExamplePaper} onReconstruct={rebuildBiorxivPaper} onSelect={setActivePaperCandidate} onApply={(index) => { const candidate = paperReview?.candidates[index]; if (candidate) installPaperCandidate(candidate, index); }} onUseResource={usePaperResource} onAttachInput={attachPaperInput} onSetInput={setPaperInput} onEscalate={askAgentAboutPaperItem} onEvidence={focusPaperEvidence} onClose={() => setPaperVisible(false)} /></div>}
+        {paperVisible && <div className="paper-layer" onPointerDown={(event) => event.stopPropagation()}><PaperPanel client={client} intake={paperIntake} active={activePaperCandidate} applied={appliedPaperCandidate} preparingField={paperPreparingField} onFile={rebuildPaper} onRetry={retryPaper} onCancel={cancelPaper} onExample={openExamplePaper} onReconstruct={rebuildBiorxivPaper} onSelect={setActivePaperCandidate} onApply={(index) => { const candidate = paperReview?.candidates[index]; if (candidate) installPaperCandidate(candidate, index); }} onUseResource={usePaperResource} onUseWorkflowSource={usePaperWorkflowSource} onAttachInput={attachPaperInput} onSetInput={setPaperInput} onEscalate={askAgentAboutPaperItem} onEvidence={focusPaperEvidence} onClose={() => setPaperVisible(false)} /></div>}
 
         {readinessVisible && readiness && <div className={`readiness-layer ${agentVisible ? "with-agent" : ""}`} onPointerDown={(event) => event.stopPropagation()}><ReadinessPanel snapshot={readiness} evidence={validationEvidence} validationCapability={validationCapability} managedResourceJob={managedResourceJob} onResolve={resolveRequirement} onCancelManagedResource={cancelManagedResource} onFocus={focusRequirement} onAttachFile={attachRequirementFile} onAskAssistant={askAssistantAboutRequirement} onClose={() => setReadinessVisible(false)} /></div>}
 

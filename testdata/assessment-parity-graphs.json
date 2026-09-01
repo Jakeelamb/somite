@@ -10,7 +10,7 @@
       "nodes": [{
         "id": "input1",
         "operator": "files.import",
-        "operator_revision": "blake3:4919927a3059aa4543d45380fd700993964e3e239ceb9e3fda73b5956b89bc4a",
+        "operator_revision": "blake3:7941f364ee2ab61ac7257b0c9874a0c2ba45352f74fe63c50d282469e7ed3883",
         "ports": [{ "name": "file", "dir": "out", "ty": "Fastq" }],
         "layout": { "x": 0, "y": 0 }
       }],
@@ -42,7 +42,7 @@
       "nodes": [{
         "id": "kraken1",
         "operator": "class.kraken2",
-        "operator_revision": "blake3:a41eda6b13cc31f2b5a90b36b600e5efa75c86d228eabb379efdd11507469113",
+        "operator_revision": "blake3:3f30099d18012a8868f70ec231bcf9f09485210da8c0832c40a7f4cc9d2b25e0",
         "ports": [
           { "name": "r1", "dir": "in", "ty": "Fastq", "union": ["Fastq", "FastqGz"] },
           { "name": "r2", "dir": "in", "ty": "Fastq", "union": ["Fastq", "FastqGz"], "optional": true },
@@ -62,7 +62,7 @@
         {
           "id": "input1",
           "operator": "files.import",
-          "operator_revision": "blake3:4919927a3059aa4543d45380fd700993964e3e239ceb9e3fda73b5956b89bc4a",
+          "operator_revision": "blake3:7941f364ee2ab61ac7257b0c9874a0c2ba45352f74fe63c50d282469e7ed3883",
           "ports": [{ "name": "file", "dir": "out", "ty": "Fastq" }],
           "params": { "path": "data/reads.fastq" },
           "layout": { "x": 0, "y": 0 }
@@ -113,7 +113,7 @@
       "nodes": [{
         "id": "joinmap1",
         "operator": "manual.joinmap",
-        "operator_revision": "blake3:e8076ca74c5bff7ebe0dd9f1de048d39a2f047dc10075d84a9f3327c0ef13601",
+        "operator_revision": "blake3:b4fcba1e27425f5c6592b42ed7c2db20ce0d7e3d6750b570e73adb2edfd92cd1",
         "ports": [
           { "name": "variants", "dir": "in", "ty": "Vcf", "union": ["Vcf", "VcfGz"], "optional": true },
           { "name": "map", "dir": "out", "ty": "Table" }
@@ -130,7 +130,7 @@
       "nodes": [{
         "id": "joinmap1",
         "operator": "manual.joinmap",
-        "operator_revision": "blake3:e8076ca74c5bff7ebe0dd9f1de048d39a2f047dc10075d84a9f3327c0ef13601",
+        "operator_revision": "blake3:b4fcba1e27425f5c6592b42ed7c2db20ce0d7e3d6750b570e73adb2edfd92cd1",
         "ports": [
           { "name": "variants", "dir": "in", "ty": "Vcf", "union": ["Vcf", "VcfGz"], "optional": true },
           { "name": "map", "dir": "out", "ty": "Table" }
