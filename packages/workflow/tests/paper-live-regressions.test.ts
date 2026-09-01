@@ -68,6 +68,32 @@ test("executable nodes cite the executable method occurrence, not an earlier com
   assert.doesNotMatch(mention?.evidence ?? "", /compared STAR/i);
 });
 
+test("cached method recognition resets occurrence state while preserving case and token boundaries", async () => {
+  const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+  const executable = reconstructPaper(catalog, [
+    "Methods",
+    "Previous evaluations compared STAR with other aligners.",
+    "Paired-end RNA-seq reads were then aligned using STAR v2.7.11 and quantified with featureCounts.",
+  ].join("\n"), "jats");
+  const rejected = reconstructPaper(catalog, [
+    "Methods",
+    "Paired-end RNA-seq reads were aligned with HISAT2, selected over STAR, and quantified with featureCounts.",
+  ].join("\n"), "jats");
+  const falseBoundaries = reconstructPaper(catalog, [
+    "Methods",
+    "The lowercase label star, STAR_index, and STAR+suffix were metadata fields rather than executable tools.",
+    "Paired-end RNA-seq reads were aligned with HISAT2 and quantified with featureCounts.",
+  ].join("\n"), "jats");
+
+  const executableStar = executable.mentions.find((mention) => mention.operator_id === "align.star");
+  const rejectedStar = rejected.mentions.find((mention) => mention.operator_id === "align.star");
+  assert.equal(executableStar?.executable, true);
+  assert.match(executableStar?.evidence ?? "", /aligned using STAR/i);
+  assert.equal(rejectedStar?.executable, false, "a prior cached scan leaked executable state into the next paper");
+  assert.equal(falseBoundaries.mentions.some((mention) => mention.operator_id === "align.star"), false,
+    "case-sensitive acronym or protected token boundaries changed while reusing the recognition plan");
+});
+
 test("negated synthetic assembly support methods remain evidence without becoming nodes", async () => {
   const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
   const review = reconstructPaper(catalog, [
@@ -92,9 +118,23 @@ test("retains a versioned executable method even when the paper has no repositor
   assert.equal(mention?.support, "unsupported");
   assert.equal(mention?.operation_class, "assemble");
   assert.equal(mention?.version, "1.4.2");
+  assert.equal(mention?.core, true, "an unsupported primary assembler must remain core evidence");
   assert.ok(review.candidates.some((candidate) => candidate.assay === "assembly"));
   assert.ok(review.candidates.flatMap((candidate) => candidate.graph.nodes)
     .some((node) => node.operator === "gap.missing" && node.params?.tool === "OrbitAssembler"));
+});
+
+test("assembly prose cannot promote a non-assembly method to core", async () => {
+  const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+  const review = reconstructPaper(catalog, [
+    "Methods",
+    "Sequencing reads were assembled with STAR v2.7.11 and the resulting files were quantified with featureCounts.",
+  ].join("\n"), "jats");
+
+  const star = review.mentions.find((mention) => mention.operator_id === "align.star");
+  assert.ok(star);
+  assert.equal(star.operation_class, "read_alignment");
+  assert.notEqual(star.core, true, "primary-assembler detection ran for a non-assembly method");
 });
 
 test("does not invent versioned document labels as executable software", async () => {
@@ -604,4 +644,91 @@ test("does not label generic project homepages or implementation repositories as
   ].join("\n"), "jats");
 
   assert.deepEqual(citations, []);
+});
+
+test("keeps the longest branded executable name and places it only in its evidenced assay", async () => {
+  const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+  const review = reconstructPaper(catalog, [
+    "Methods",
+    "Genome assembly",
+    "PacBio reads were processed into HiFi reads with SMRT Link v13.1 and genome size was estimated with GenomeScope v2.0.",
+    "The HiFi reads were assembled with hifiasm.",
+    "RNA sequencing",
+    "RNA-seq reads were aligned with STAR and quantified with featureCounts.",
+  ].join("\n"), "jats");
+
+  const mentions = new Map(review.mentions.map((mention) => [mention.normalized_name, mention]));
+  assert.equal(mentions.get("smrtlink")?.display_name, "SMRT Link");
+  assert.equal(mentions.has("link"), false, "a suffix of the branded executable became a method");
+  const assembly = review.candidates.find((candidate) => candidate.assay === "assembly");
+  const rna = review.candidates.find((candidate) => candidate.assay === "rna_seq");
+  assert.ok(assembly && rna);
+  const tools = (candidate: typeof assembly) => new Set(candidate.graph.nodes
+    .filter((node) => node.operator === "gap.missing")
+    .map((node) => String(node.params?.tool).replaceAll(/[^A-Za-z0-9]/g, "").toLocaleLowerCase("en-US")));
+  assert.ok(tools(assembly).has("smrtlink"));
+  assert.ok(tools(assembly).has("genomescope"));
+  assert.equal(tools(rna).has("smrtlink"), false);
+  assert.equal(tools(rna).has("genomescope"), false, "method placement fell back to another assay");
+});
+
+test("classifies viewers, comparators, and internal components before graph projection", async () => {
+  const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+  const review = reconstructPaper(catalog, [
+    "Methods",
+    "Long reads were assembled with Canu v2.2 and annotated with BRAKER3 v3.0.8, which used AUGUSTUS as an internal component.",
+    "FigTree v1.4.4 was used only to view the resulting phylogeny.",
+    "RNA-MosaicHunter identified RNA mosaic variants; MuTect v1.1.7 was evaluated only as a comparator and was not part of the workflow.",
+  ].join("\n"), "jats");
+
+  const mentions = new Map(review.mentions.map((mention) => [mention.normalized_name, mention]));
+  assert.equal(mentions.get("figtree")?.executable, false);
+  assert.equal(mentions.get("augustus")?.executable, false);
+  assert.equal(mentions.get("mutect")?.executable, false);
+  assert.equal(mentions.has("mutect2"), false, "MuTect comparator evidence was rewritten as Mutect2");
+  const projected = review.candidates.flatMap((candidate) => candidate.graph.nodes);
+  for (const forbidden of ["FigTree", "AUGUSTUS", "MuTect", "Mutect2"]) {
+    assert.equal(projected.some((node) => node.operator === "gap.missing" && node.params?.tool === forbidden), false, forbidden);
+  }
+});
+
+test("a named core workflow cannot disappear behind supporting-tool nodes", async () => {
+  const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+  const review = reconstructPaper(catalog, [
+    "Methods",
+    "RNA-MosaicHunter was the core workflow used to identify RNA mosaic variants.",
+    "The RNA-MosaicHunter source code is available at https://github.com/example/RNA-MosaicHunter.",
+    "STAR aligned the RNA-seq reads before the workflow was run.",
+  ].join("\n"), "jats");
+
+  const core = review.mentions.find((mention) => mention.normalized_name === "rnamosaichunter");
+  assert.ok(core, "the named core workflow was not retained as method evidence");
+  const represented = review.candidates.some((candidate) => candidate.graph.nodes.some((node) => (
+    node.operator === core.operator_id
+    || (node.operator === "gap.missing"
+      && String(node.params?.tool).replaceAll(/[^A-Za-z0-9]/g, "").toLocaleLowerCase("en-US") === "rnamosaichunter")
+  )));
+  assert.ok(
+    represented || (review.outcome === "recognized_unsupported" && review.candidates.length === 0),
+    "supporting STAR nodes produced a misleading draft after the core workflow disappeared",
+  );
+});
+
+test("Picard SamToFastq remains action-specific unsupported evidence", async () => {
+  const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+  const review = reconstructPaper(catalog, [
+    "Methods",
+    "Picard SamToFastq v3.1.1 converted aligned BAM files into paired FASTQ reads.",
+    "STAR then aligned those RNA-seq reads to the reference genome.",
+  ].join("\n"), "jats");
+
+  const picard = review.mentions.find((mention) => /Picard/i.test(mention.display_name));
+  assert.ok(picard);
+  assert.match(picard.evidence, /SamToFastq/i);
+  assert.equal(picard.operator_id, undefined);
+  const nodes = review.candidates.flatMap((candidate) => candidate.graph.nodes);
+  assert.equal(nodes.some((node) => node.operator === "align.picard_mark_duplicates"), false);
+  const retained = nodes.find((node) => node.operator === "gap.missing" && /Picard/i.test(String(node.params?.tool)));
+  assert.ok(retained, "the unsupported action evidence disappeared");
+  assert.equal(retained.ports.length, 0, "an unknown action acquired a generic Bam-to-Bam contract");
 });

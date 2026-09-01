@@ -102,21 +102,33 @@ fall through to another strategy.
 
 When neither root Pixi file exists, Somite can freeze reachable processes whose
 source contains exactly one static Conda literal. It may be a source-relative
-environment file or a direct MatchSpec list in which every package names its
-channel. Byte-identical files and identical direct expressions share their own
-content-addressed named Pixi environments; different contents stay isolated,
-so conflicting tool versions across tasks remain valid. Dependency versions,
-builds, explicit channels, and case-sensitive channel order are retained. A
-file environment may prove the shared order for direct package channels;
-without one, multiple direct channels fail closed rather than receiving an
-invented priority. Conflicts inside one environment or different channel
-orders across reachable environments also fail closed. So do unresolved
-reachable calls, ambiguous process mappings, dynamic or missing environment
-files, unqualified or unsupported task-environment forms, config-level
-environment overrides, and dynamic, external, or missing `includeConfig`
-targets. Static configuration includes are inspected before execution; plugins
-and `withName` or `withLabel` selectors remain blockers because they can change
-the runtime closure after process discovery.
+environment file or a bounded direct MatchSpec list. Byte-identical files and
+identical direct expressions share their own content-addressed named Pixi
+environments; different contents stay isolated, so conflicting tool versions
+across tasks remain valid. Each environment retains its own dependency versions,
+builds, explicit channels, and case-sensitive channel priority. Different named
+environments may use different channel orders because their solves remain
+isolated. Direct expressions use their explicit channels or one exact
+`conda.channels` order from frozen source configuration; Somite never sorts or
+invents priority between multiple channels.
+
+Rendering preserves every source-owned requirement, channel order, and digest.
+Task features contain exactly the frozen scientific dependencies: Somite does
+not inject launcher packages or an extra support channel into their solves. A
+separate default runtime pins Nextflow, OpenJDK, micromamba, Bash, coreutils,
+gawk, grep, sed, and procps-ng on Linux. Somite launches Nextflow without an
+ambient `CONDA_PREFIX`, so that runtime remains the fallback after Nextflow
+activates an existing task prefix without contaminating the task solve.
+
+The static planner evaluates only a bounded, side-effect-free subset of
+Nextflow configuration needed to resolve source-local `includeConfig` paths from
+exact scalar bindings and the fixed offline environment. It is not a Groovy
+interpreter. Dynamic, external, or missing configs; configuration precedence
+that cannot be reduced statically; unresolved reachable calls; ambiguous
+process mappings; and dynamic or missing task environments fail closed. Exact
+`id@version` Nextflow plugins are installed with the locked runtime into a
+content-addressed, fully inventoried store. Dynamic, unpinned, conflicting, or
+corrupt plugins remain blockers.
 
 Run installs the one frozen workspace and rewrites only a staged execution copy
 to verified host prefixes. Compile and Export never embed those machine paths;
@@ -129,14 +141,27 @@ path remain inspectable with explicit blockers. Promoting reviewed invocations
 creates an editable native partial variant; it does not claim to convert an
 entire imported pipeline.
 
-Every admitted source run starts Nextflow with an explicit `-C` configuration
-set and a final Somite profile that uses the local executor and disables
-container, Wave, and Fusion engines. It also receives a package-private
-`NXF_HOME` in offline mode, so user-global Nextflow configuration cannot alter
-the frozen execution. Exported source packages retain project-relative input
-bindings and include an executable `./somite-run` launcher; after the named
-inputs are placed beside the extracted project, the launcher installs the
-exact lock with Pixi and runs that same policy.
+Every admitted source run starts Nextflow with one generated effective `-C`
+wrapper. It binds the selected scalar parameters around the exact source configs
+and applies the final Somite profile last. For generated task environments, its
+catch-all process selector forces the local executor, disables scratch staging,
+uses the locked Pixi Bash for task scripts, and disables trace, timeline, report,
+container, Wave, and Fusion engines. A frozen source `conda` profile is activated
+only when the frozen channel order originates in that profile. Nextflow also receives a package-private
+offline `NXF_HOME` and only the frozen plugin store, so user-global configuration
+and plugins cannot alter execution. Nextflow's outer local wrapper currently
+requires host `/bin/bash`; Somite checks that prerequisite before a source Run
+instead of failing later with an opaque task error.
+
+Before preview or Run, the locked Nextflow runtime must resolve that exact
+configuration and emit a bounded process inspection offline. Somite uses the
+default parser first and retries parser v1 only for the exact known legacy
+configuration diagnostic; every attempt is retained in the proof receipt. This
+proves configuration and structure, not task execution or scientific
+equivalence. Exported source packages retain project-relative input bindings
+and include an executable `./somite-run` launcher; after the named inputs are
+placed beside the extracted project, the launcher installs the exact Pixi lock
+and repeats the same frozen policy.
 
 The canvas supports cursor-centered semantic zoom, magnetic alignment,
 undo/redo, multi-selection,
@@ -446,6 +471,15 @@ from the content-addressed novelty ledger, runs reconstruction and source
 indexing without turning either source into a fixture, and writes a dated report
 under `output/challenges/`. Scheduled CI advances the ledger daily so the same
 small corpus cannot hide regressions.
+
+Use `npm run challenge:live -- --dry-run` for an isolated live check. It reads
+the existing novelty ledger but advances novelty only in memory, never persists
+the ledger, and writes its report to a new private temporary directory printed
+in the command result. `--state-dir PATH` and `--report-dir PATH` accept either
+absolute paths or paths relative to the repository, so a reproducible external
+run can keep both state and reports outside the checkout. Omitting these options
+without `--dry-run` preserves the scheduled `.somite/challenges/ledger.json` and
+`output/challenges/` behavior.
 
 Weekly benchmark CI retains deterministic and production-host JSON snapshots
 separately from that live challenge. Hosted runners are different performance

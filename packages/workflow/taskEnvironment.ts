@@ -1,5 +1,10 @@
 import { byteDigest } from "./contentIdentity.ts";
 import {
+  extractNextflowConfigScalarDefaults,
+  resolveNextflowConfigExpression,
+  type NextflowConfigScalar,
+} from "./nextflowConfigExpression.ts";
+import {
   safeSourcePath,
   tokenizeNextflow,
   type FrozenSourceFile,
@@ -13,7 +18,9 @@ const MAX_TASK_ENVIRONMENT_DECLARATIONS = 25_000;
 const MAX_TASK_ENVIRONMENT_DEPENDENCIES = 100_000;
 const MAX_TASK_ENVIRONMENT_EXPRESSION_BYTES = 16 * 1024;
 const MAX_TASK_ENVIRONMENT_CONFIGURATION_ISSUES = 25_000;
-const MAX_TASK_ENVIRONMENT_PLUGIN_DETAILS = 16;
+const MAX_TASK_ENVIRONMENT_PLUGIN_DECLARATIONS = 1_024;
+export const MAX_NEXTFLOW_PLUGIN_REQUIREMENTS = 64;
+export const MAX_NEXTFLOW_CONDA_CHANNELS = 64;
 
 export type TaskEnvironmentProcess = Readonly<{
   id: string;
@@ -68,6 +75,54 @@ export type TaskEnvironmentIssue = Readonly<{
   spans: readonly SourceSpan[];
 }>;
 
+export type NextflowPluginRequirement = Readonly<{
+  name: string;
+  version: string;
+  requirement: string;
+  spans: readonly SourceSpan[];
+}>;
+
+export type NextflowConfigIncludeResolution = Readonly<{
+  expression: string;
+  span: SourceSpan;
+  status: "source" | "ignored" | "unresolved" | "missing" | "external";
+  resolved_path?: string;
+  reason?: string;
+  parameters: readonly Readonly<{ name: string; value: NextflowConfigScalar }>[];
+  environment: readonly Readonly<{ name: string; value?: string }>[];
+}>;
+
+export type NextflowCondaChannelOrder = Readonly<{
+  channels: readonly string[];
+  origin: "top_level" | "profile";
+  profile?: "conda";
+  span: SourceSpan;
+  expression_provenance: Readonly<{
+    start_byte: number;
+    end_byte: number;
+    digest: string;
+  }>;
+}>;
+
+export type NextflowCondaProfileProvenance = Readonly<{
+  name: "conda";
+  blocks: readonly Readonly<{
+    span: SourceSpan;
+    digest: string;
+  }>[];
+}>;
+
+export type NextflowConfigClosure = Readonly<{
+  paths: readonly string[];
+  includes: readonly NextflowConfigIncludeResolution[];
+  conda_channel_order?: NextflowCondaChannelOrder;
+  conda_profile?: NextflowCondaProfileProvenance;
+}>;
+
+export type TaskEnvironmentPlanningOptions = Readonly<{
+  parameters?: Readonly<Record<string, NextflowConfigScalar>>;
+}>;
+
 export type PixiClosureDependency = Readonly<{
   name: string;
   match_spec: string;
@@ -83,6 +138,8 @@ export type TaskEnvironmentPlan = Readonly<{
   covered_processes: number;
   declarations: readonly TaskEnvironmentDeclaration[];
   configuration_issues: readonly TaskEnvironmentIssue[];
+  config_closure: NextflowConfigClosure;
+  nextflow_plugins: readonly NextflowPluginRequirement[];
   conda_environments: readonly CondaEnvironment[];
   pixi_closure: Readonly<{
     status: "candidate" | "blocked";
@@ -519,6 +576,225 @@ type ConfigInclude = Readonly<{
   resolved_path?: string;
 }>;
 
+type ConfigPluginDeclaration = Readonly<{
+  directive: string;
+  expression: string;
+  literal: boolean;
+  span: SourceSpan;
+}>;
+
+type ConfigCondaChannelDeclaration = Readonly<{
+  origin: "top_level" | "profile";
+  resolution: "static" | "dynamic";
+  channels?: readonly string[];
+  span: SourceSpan;
+  expression_provenance?: Readonly<{
+    start_byte: number;
+    end_byte: number;
+    digest: string;
+  }>;
+  reason?: string;
+}>;
+
+type ConfigCondaProfileBlock = Readonly<{
+  span: SourceSpan;
+  digest: string;
+}>;
+
+type ConfigBlock = Readonly<{
+  role: "profiles" | "conda_profile" | "other";
+}>;
+
+function skipConfigTrivia(bytes: Uint8Array, start: number, limit: number) {
+  let cursor = start;
+  while (cursor < limit) {
+    const byte = bytes[cursor]!;
+    if (byte === 32 || byte === 9 || byte === 10 || byte === 13 || byte === 12 || byte === 11) {
+      cursor += 1;
+      continue;
+    }
+    if (byte === 47 && bytes[cursor + 1] === 47) {
+      cursor += 2;
+      while (cursor < limit && bytes[cursor] !== 10) cursor += 1;
+      continue;
+    }
+    if (byte === 47 && bytes[cursor + 1] === 42) {
+      const commentStart = cursor;
+      cursor += 2;
+      while (cursor + 1 < limit && !(bytes[cursor] === 42 && bytes[cursor + 1] === 47)) cursor += 1;
+      if (cursor + 1 >= limit) return { cursor: commentStart, complete: false };
+      cursor += 2;
+      continue;
+    }
+    break;
+  }
+  return { cursor, complete: true };
+}
+
+function configExpressionEndLine(bytes: Uint8Array, start: number, end: number, startLine: number) {
+  let line = startLine;
+  for (let cursor = start; cursor < end; cursor += 1) if (bytes[cursor] === 10) line += 1;
+  return line;
+}
+
+function staticChannelValue(value: string) {
+  if (!value || new TextEncoder().encode(value).byteLength > 2_048) return false;
+  for (const character of value) {
+    const point = character.codePointAt(0) ?? 0;
+    if (point <= 32 || point === 127 || character === "$" || character === "\\") return false;
+  }
+  return true;
+}
+
+function parseStaticCondaChannelList(
+  file: FrozenSourceFile,
+  channelToken: NextflowToken,
+): Omit<ConfigCondaChannelDeclaration, "origin"> {
+  const bytes = file.bytes;
+  const limit = Math.min(bytes.byteLength, channelToken.end + MAX_TASK_ENVIRONMENT_EXPRESSION_BYTES);
+  let skipped = skipConfigTrivia(bytes, channelToken.end, limit);
+  let cursor = skipped.cursor;
+  const dynamic = (reason: string): Omit<ConfigCondaChannelDeclaration, "origin"> => ({
+    resolution: "dynamic",
+    span: { path: file.path, start_line: channelToken.line, end_line: channelToken.endLine },
+    reason,
+  });
+  if (!skipped.complete) return dynamic("the assignment contains an unclosed comment");
+  if (bytes[cursor] !== 61) return dynamic("the declaration is not one direct assignment");
+  cursor += 1;
+  skipped = skipConfigTrivia(bytes, cursor, limit);
+  cursor = skipped.cursor;
+  if (!skipped.complete) return dynamic("the assignment contains an unclosed comment");
+  if (bytes[cursor] !== 91) return dynamic("the assigned value is not one literal list");
+  const expressionStart = cursor;
+  cursor += 1;
+  const channels: string[] = [];
+  while (cursor < limit) {
+    skipped = skipConfigTrivia(bytes, cursor, limit);
+    cursor = skipped.cursor;
+    if (!skipped.complete) return dynamic("the channel list contains an unclosed comment");
+    if (bytes[cursor] === 93) {
+      cursor += 1;
+      break;
+    }
+    if (channels.length >= MAX_NEXTFLOW_CONDA_CHANNELS) {
+      return dynamic(`the channel list exceeds ${MAX_NEXTFLOW_CONDA_CHANNELS} entries`);
+    }
+    const quote = bytes[cursor];
+    if (quote !== 39 && quote !== 34) return dynamic("every channel must be one quoted literal");
+    const valueStart = ++cursor;
+    while (cursor < limit && bytes[cursor] !== quote) {
+      if (bytes[cursor] === 10 || bytes[cursor] === 13 || bytes[cursor] === 92) {
+        return dynamic("channel literals cannot contain newlines or escapes");
+      }
+      cursor += 1;
+    }
+    if (cursor >= limit) return dynamic("the channel list contains an unclosed literal");
+    const value = decoder.decode(bytes.subarray(valueStart, cursor));
+    if (!staticChannelValue(value)) return dynamic("the channel list contains an unsupported literal");
+    channels.push(value);
+    cursor += 1;
+    skipped = skipConfigTrivia(bytes, cursor, limit);
+    cursor = skipped.cursor;
+    if (!skipped.complete) return dynamic("the channel list contains an unclosed comment");
+    if (bytes[cursor] === 44) {
+      cursor += 1;
+      continue;
+    }
+    if (bytes[cursor] === 93) {
+      cursor += 1;
+      break;
+    }
+    return dynamic("channel literals are not separated by commas");
+  }
+  if (!channels.length || bytes[cursor - 1] !== 93) return dynamic("the channel list is empty or unclosed");
+  if (new Set(channels).size !== channels.length) return dynamic("the channel list repeats a channel");
+
+  let tail = cursor;
+  while (tail < bytes.byteLength) {
+    const byte = bytes[tail]!;
+    if (byte === 32 || byte === 9 || byte === 13 || byte === 12 || byte === 11) {
+      tail += 1;
+      continue;
+    }
+    if (byte === 10 || byte === 59 || byte === 125) break;
+    if (byte === 47 && bytes[tail + 1] === 47) break;
+    if (byte === 47 && bytes[tail + 1] === 42) {
+      tail += 2;
+      let lineBreak = false;
+      while (tail + 1 < bytes.byteLength && !(bytes[tail] === 42 && bytes[tail + 1] === 47)) {
+        if (bytes[tail] === 10) lineBreak = true;
+        tail += 1;
+      }
+      if (tail + 1 >= bytes.byteLength) return dynamic("the assignment contains an unclosed trailing comment");
+      tail += 2;
+      if (lineBreak) break;
+      continue;
+    }
+    return dynamic("the literal list is followed by a dynamic expression");
+  }
+
+  return {
+    resolution: "static",
+    channels,
+    span: {
+      path: file.path,
+      start_line: channelToken.line,
+      end_line: configExpressionEndLine(bytes, channelToken.end, cursor, channelToken.line),
+    },
+    expression_provenance: {
+      start_byte: expressionStart,
+      end_byte: cursor,
+      digest: byteDigest(bytes.subarray(expressionStart, cursor)),
+    },
+  };
+}
+
+function inspectCondaConfig(
+  file: FrozenSourceFile,
+  tokens: readonly NextflowToken[],
+  braces: ReadonlyMap<number, number>,
+) {
+  const declarations: ConfigCondaChannelDeclaration[] = [];
+  const profiles: ConfigCondaProfileBlock[] = [];
+  const stack: ConfigBlock[] = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    if (token.kind === "right_brace") {
+      stack.pop();
+      continue;
+    }
+    if (token.kind === "left_brace") {
+      const owner = tokens[index - 1];
+      const ownerName = owner?.kind === "ident" ? tokenText(file.bytes, owner) : undefined;
+      let role: ConfigBlock["role"] = "other";
+      if (ownerName === "profiles" && stack.length === 0 && braces.has(index)) role = "profiles";
+      else if (ownerName === "conda" && stack.length === 1 && stack[0]?.role === "profiles" && braces.has(index)) {
+        role = "conda_profile";
+        const close = tokens[braces.get(index)!]!;
+        const start = owner!.offset;
+        const end = close.offset + 1;
+        profiles.push({
+          span: { path: file.path, start_line: owner!.line, end_line: close.endLine },
+          digest: byteDigest(file.bytes.subarray(start, end)),
+        });
+      }
+      stack.push({ role });
+      continue;
+    }
+    if (token.kind !== "ident" || tokenText(file.bytes, token) !== "conda"
+      || tokens[index - 1]?.kind === "dot" || tokens[index + 1]?.kind !== "dot"
+      || tokens[index + 2]?.kind !== "ident" || tokenText(file.bytes, tokens[index + 2]!) !== "channels") continue;
+    const origin = stack.length === 0 ? "top_level" as const
+      : stack.length === 2 && stack[0]?.role === "profiles" && stack[1]?.role === "conda_profile"
+        ? "profile" as const
+        : undefined;
+    if (!origin) continue;
+    declarations.push({ origin, ...parseStaticCondaChannelList(file, tokens[index + 2]!) });
+  }
+  return { declarations, profiles };
+}
+
 function configLineRemainder(bytes: Uint8Array, offset: number, line: number) {
   let end = offset;
   while (end < bytes.length && bytes[end] !== 10 && bytes[end] !== 59) end += 1;
@@ -571,41 +847,6 @@ function configArgument(
   };
 }
 
-function literalAfter(file: FrozenSourceFile, tokens: readonly NextflowToken[], directiveIndex: number) {
-  let valueIndex = directiveIndex + 1;
-  if (tokens[valueIndex]?.kind === "left_paren") valueIndex += 1;
-  const value = tokens[valueIndex];
-  if (value?.kind !== "string") return undefined;
-  if (value.end - value.start > MAX_TASK_ENVIRONMENT_EXPRESSION_BYTES) {
-    throw new Error(`task environment config literal at line ${value.line} exceeds ${MAX_TASK_ENVIRONMENT_EXPRESSION_BYTES} bytes`);
-  }
-  return tokenText(file.bytes, value);
-}
-
-function selectorEndLine(
-  file: FrozenSourceFile,
-  tokens: readonly NextflowToken[],
-  braces: ReadonlyMap<number, number>,
-  selectorIndex: number,
-) {
-  const selector = tokens[selectorIndex]!;
-  const next = tokens[selectorIndex + 1];
-  const prefixEnd = Math.min(next?.offset ?? file.bytes.byteLength, selector.end + MAX_TASK_ENVIRONMENT_EXPRESSION_BYTES);
-  const prefix = decoder.decode(file.bytes.subarray(selector.end, prefixEnd)).trimStart();
-  if (!prefix.startsWith(":")) return undefined;
-  const limit = Math.min(tokens.length, selectorIndex + 64);
-  for (let cursor = selectorIndex + 1; cursor < limit; cursor += 1) {
-    const candidate = tokens[cursor]!;
-    if (candidate.offset - selector.offset > MAX_TASK_ENVIRONMENT_EXPRESSION_BYTES) break;
-    if (candidate.kind === "left_brace") {
-      const close = braces.get(cursor);
-      return close === undefined ? selector.endLine : tokens[close]!.endLine;
-    }
-    if (candidate.kind === "right_brace" || candidate.kind === "semicolon") break;
-  }
-  return selector.endLine;
-}
-
 function inspectConfigFile(file: FrozenSourceFile) {
   try {
     decoder.decode(file.bytes);
@@ -614,9 +855,11 @@ function inspectConfigFile(file: FrozenSourceFile) {
   }
   const declarations: TaskEnvironmentDeclaration[] = [];
   const includes: ConfigInclude[] = [];
+  const pluginDeclarations: ConfigPluginDeclaration[] = [];
   const issues: TaskEnvironmentIssue[] = [];
   const tokens = tokenizeNextflow(file.bytes);
   const braces = bracePairs(tokens);
+  const condaConfig = inspectCondaConfig(file, tokens, braces);
   const pushIssue = (entry: TaskEnvironmentIssue) => {
     if (issues.length >= MAX_TASK_ENVIRONMENT_CONFIGURATION_ISSUES) {
       throw new Error(`source exceeds ${MAX_TASK_ENVIRONMENT_CONFIGURATION_ISSUES} configuration issues`);
@@ -629,21 +872,16 @@ function inspectConfigFile(file: FrozenSourceFile) {
     if (token.kind !== "ident") continue;
     const name = tokenText(file.bytes, token);
     if (name === "conda" || name === "container" || name === "spack" || name === "module") {
-      const previous = tokens[index - 1];
-      const qualified = previous?.kind !== "dot"
-        || (tokens[index - 2]?.kind === "ident" && tokenText(file.bytes, tokens[index - 2]!) === "process");
-      if (qualified) {
-        const assignment = /^=\s*([\s\S]*)$/.exec(configLineRemainder(file.bytes, token.end, token.line));
-        if (assignment) {
-          const expression = assignment[1]!.trim();
-          declarations.push({
-            kind: name,
-            origin: "config",
-            expression,
-            resolution: "dynamic",
-            span: { path: file.path, start_line: token.line, end_line: token.endLine },
-          });
-        }
+      const assignment = /^=\s*([\s\S]*)$/.exec(configLineRemainder(file.bytes, token.end, token.line));
+      if (assignment) {
+        const expression = assignment[1]!.trim();
+        declarations.push({
+          kind: name,
+          origin: "config",
+          expression,
+          resolution: "dynamic",
+          span: { path: file.path, start_line: token.line, end_line: token.endLine },
+        });
       }
     }
     if (name === "includeConfig" && tokens[index - 1]?.kind !== "dot") {
@@ -661,44 +899,50 @@ function inspectConfigFile(file: FrozenSourceFile) {
     }
     if (name === "plugins" && tokens[index - 1]?.kind !== "dot" && tokens[index + 1]?.kind === "left_brace") {
       const close = braces.get(index + 1);
-      const end = close === undefined ? index + 1 : close;
-      const pluginDetails: string[] = [];
-      let pluginDeclarationCount = 0;
-      for (let cursor = index + 2; cursor < end; cursor += 1) {
+      if (close === undefined) {
+        pushIssue(issue(
+          "source_config_plugins_unclosed",
+          `Nextflow plugins block in ${file.path} is not closed.`,
+          { path: file.path, start_line: token.line, end_line: token.endLine },
+        ));
+        continue;
+      }
+      let depth = 0;
+      for (let cursor = index + 2; cursor < close; cursor += 1) {
         const candidate = tokens[cursor]!;
-        if (candidate.kind !== "ident") continue;
+        if (candidate.kind === "left_brace") {
+          depth += 1;
+          continue;
+        }
+        if (candidate.kind === "right_brace") {
+          depth -= 1;
+          continue;
+        }
+        if (depth !== 0 || candidate.kind !== "ident") continue;
         const directive = tokenText(file.bytes, candidate);
-        if (directive !== "id" && directive !== "version") continue;
-        const value = literalAfter(file, tokens, cursor);
-        if (!value) continue;
-        pluginDeclarationCount += 1;
-        if (pluginDetails.length < MAX_TASK_ENVIRONMENT_PLUGIN_DETAILS) {
-          pluginDetails.push(directive === "id" ? value : `version ${value}`);
+        const argument = configArgument(file, tokens, cursor);
+        pluginDeclarations.push({
+          directive,
+          expression: argument.expression,
+          literal: argument.literal,
+          span: argument.span,
+        });
+        if (pluginDeclarations.length > MAX_TASK_ENVIRONMENT_PLUGIN_DECLARATIONS) {
+          throw new Error(`source exceeds ${MAX_TASK_ENVIRONMENT_PLUGIN_DECLARATIONS} Nextflow plugin declarations`);
         }
       }
-      const omitted = pluginDeclarationCount - pluginDetails.length;
-      const detail = pluginDetails.length
-        ? ` (${pluginDetails.join(", ")}${omitted ? `, plus ${omitted} more declaration${omitted === 1 ? "" : "s"}` : ""})`
-        : "";
-      pushIssue(issue(
-        "source_config_plugins_unsupported",
-        `Nextflow plugins block${detail} in ${file.path} is not frozen by Somite's source execution environment.`,
-        { path: file.path, start_line: token.line, end_line: tokens[end]?.endLine ?? token.endLine },
-      ));
-      index = end;
+      index = close;
       continue;
     }
-    if (name === "withName" || name === "withLabel") {
-      const endLine = selectorEndLine(file, tokens, braces, index);
-      if (endLine === undefined) continue;
-      pushIssue(issue(
-        "source_config_selector_unsupported",
-        `Nextflow ${name} selector in ${file.path} is not statically resolved by Somite's source execution planner.`,
-        { path: file.path, start_line: token.line, end_line: endLine },
-      ));
-    }
   }
-  return { declarations, includes, issues };
+  return {
+    declarations,
+    includes,
+    pluginDeclarations,
+    condaChannelDeclarations: condaConfig.declarations,
+    condaProfiles: condaConfig.profiles,
+    issues,
+  };
 }
 
 function sortSpans(spans: readonly SourceSpan[]) {
@@ -712,6 +956,254 @@ function sortIssues(issues: readonly TaskEnvironmentIssue[]) {
     || (left.spans[0]?.start_line ?? 0) - (right.spans[0]?.start_line ?? 0)
     || compareText(left.code, right.code)
     || compareText(left.message, right.message));
+}
+
+function freezeCondaChannelOrder(
+  declarations: readonly ConfigCondaChannelDeclaration[],
+  problems: TaskEnvironmentIssue[],
+): NextflowCondaChannelOrder | undefined {
+  const sorted = [...declarations].sort((left, right) => compareText(left.span.path, right.span.path)
+    || left.span.start_line - right.span.start_line || compareText(left.origin, right.origin));
+  const dynamic = sorted.filter((declaration) => declaration.resolution === "dynamic");
+  for (const declaration of dynamic) problems.push(issue(
+    "source_config_conda_channels_dynamic",
+    `conda.channels in ${declaration.span.path} is not one exact static channel list: ${declaration.reason ?? "the expression is not bounded"}.`,
+    declaration.span,
+  ));
+  const exact = sorted.filter((declaration): declaration is ConfigCondaChannelDeclaration & Readonly<{
+    resolution: "static";
+    channels: readonly string[];
+    expression_provenance: NonNullable<ConfigCondaChannelDeclaration["expression_provenance"]>;
+  }> => declaration.resolution === "static" && !!declaration.channels && !!declaration.expression_provenance);
+  if (exact.length > 1) {
+    const orders = new Set(exact.map((declaration) => declaration.channels.join("\0")));
+    problems.push(issue(
+      orders.size > 1 ? "source_config_conda_channels_conflict" : "source_config_conda_channels_ambiguous",
+      orders.size > 1
+        ? `The frozen config declares ${orders.size} conflicting conda.channels orders.`
+        : "The frozen config repeats conda.channels; Somite requires one unambiguous source declaration.",
+      ...exact.map((declaration) => declaration.span),
+    ));
+  }
+  if (dynamic.length || exact.length !== 1) return undefined;
+  const selected = exact[0]!;
+  return {
+    channels: [...selected.channels],
+    origin: selected.origin,
+    ...(selected.origin === "profile" ? { profile: "conda" as const } : {}),
+    span: selected.span,
+    expression_provenance: selected.expression_provenance,
+  };
+}
+
+function condaProfileProvenance(
+  blocks: readonly ConfigCondaProfileBlock[],
+): NextflowCondaProfileProvenance | undefined {
+  if (!blocks.length) return undefined;
+  const unique = new Map<string, ConfigCondaProfileBlock>();
+  for (const block of blocks) unique.set(JSON.stringify([block.span, block.digest]), block);
+  return {
+    name: "conda",
+    blocks: [...unique.values()].sort((left, right) => compareText(left.span.path, right.span.path)
+      || left.span.start_line - right.span.start_line || left.span.end_line - right.span.end_line
+      || compareText(left.digest, right.digest)),
+  };
+}
+
+function validConfigScalar(value: unknown): value is NextflowConfigScalar {
+  return value === null || typeof value === "boolean"
+    || (typeof value === "number" && Number.isFinite(value))
+    || (typeof value === "string"
+      && new TextEncoder().encode(value).byteLength <= MAX_TASK_ENVIRONMENT_EXPRESSION_BYTES
+      && [...value].every((character) => {
+        const point = character.codePointAt(0) ?? 0;
+        return point >= 32 && point !== 127;
+      }));
+}
+
+function configParameters(
+  rootConfigs: readonly FrozenSourceFile[],
+  overrides: Readonly<Record<string, NextflowConfigScalar>> | undefined,
+) {
+  const candidates = new Map<string, NextflowConfigScalar[]>();
+  for (const file of rootConfigs) {
+    const defaults = extractNextflowConfigScalarDefaults(file.bytes);
+    for (const [name, value] of Object.entries(defaults.values)) {
+      const entries = candidates.get(name) ?? [];
+      entries.push(value);
+      candidates.set(name, entries);
+    }
+  }
+  const parameters: Record<string, NextflowConfigScalar> = {};
+  for (const [name, values] of [...candidates].sort(([left], [right]) => compareText(left, right))) {
+    const encoded = new Set(values.map((value) => JSON.stringify(value)));
+    if (encoded.size === 1) parameters[name] = values[0]!;
+  }
+  const overrideEntries = Object.entries(overrides ?? {}).sort(([left], [right]) => compareText(left, right));
+  if (overrideEntries.length > 10_000) throw new Error("source task config parameter override count exceeds 10000");
+  for (const [name, value] of overrideEntries) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || !validConfigScalar(value)) {
+      throw new Error(`source task config parameter ${name} is not one bounded scalar override`);
+    }
+    parameters[name] = value;
+  }
+  return parameters;
+}
+
+function configIncludeResolution(
+  include: ConfigInclude,
+  includingPath: string,
+  parameters: Readonly<Record<string, NextflowConfigScalar>>,
+  fileMap: ReadonlyMap<string, FrozenSourceFile>,
+): NextflowConfigIncludeResolution {
+  const evaluated = include.resolved_path
+    ? {
+        status: "resolved" as const,
+        value: include.resolved_path,
+        parameters: [] as readonly string[],
+        environment: [] as readonly string[],
+      }
+    : resolveNextflowConfigExpression(include.expression, {
+        parameters,
+        environment: { NXF_OFFLINE: "true" },
+      });
+  const usedParameters = evaluated.parameters.flatMap((name) => (
+    Object.hasOwn(parameters, name) ? [{ name, value: parameters[name]! }] : []
+  ));
+  const usedEnvironment = evaluated.environment.map((name) => ({
+    name,
+    ...(name === "NXF_OFFLINE" ? { value: "true" } : {}),
+  }));
+  const base = {
+    expression: include.expression,
+    span: include.span,
+    parameters: usedParameters,
+    environment: usedEnvironment,
+  };
+  if (evaluated.status === "unresolved") {
+    return { ...base, status: "unresolved", reason: evaluated.reason };
+  }
+  const ambientEnvironment = evaluated.environment.filter((name) => name !== "NXF_OFFLINE");
+  if (ambientEnvironment.length) {
+    return {
+      ...base,
+      status: "unresolved",
+      reason: `includeConfig depends on ambient environment ${ambientEnvironment.join(", ")}`,
+    };
+  }
+  if (typeof evaluated.value !== "string") {
+    return { ...base, status: "unresolved", reason: "includeConfig expression did not resolve to a path string" };
+  }
+  if (evaluated.value === "/dev/null") return { ...base, status: "ignored", resolved_path: "/dev/null" };
+  if (/^(?:\/|~\/|[A-Za-z][A-Za-z0-9+.-]*:\/\/)/.test(evaluated.value)) {
+    return {
+      ...base,
+      status: "external",
+      reason: `includeConfig resolved outside the frozen source: ${evaluated.value}`,
+    };
+  }
+  const resolvedPath = include.resolved_path
+    ?? normalizePath(includingPath.split("/").slice(0, -1), evaluated.value);
+  if (!resolvedPath) {
+    return { ...base, status: "external", reason: `includeConfig resolved to unsafe path ${evaluated.value}` };
+  }
+  if (!fileMap.has(resolvedPath)) {
+    return { ...base, status: "missing", resolved_path: resolvedPath };
+  }
+  return { ...base, status: "source", resolved_path: resolvedPath };
+}
+
+function freezeNextflowPlugins(
+  declarations: readonly ConfigPluginDeclaration[],
+  problems: TaskEnvironmentIssue[],
+) {
+  const parsed = new Map<string, Array<Readonly<{
+    version: string;
+    requirement: string;
+    span: SourceSpan;
+  }>>>();
+  const exactVersion = /^\d+(?:\.\d+)*(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/;
+  const pluginName = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
+  for (const declaration of [...declarations].sort((left, right) => compareText(left.span.path, right.span.path)
+    || left.span.start_line - right.span.start_line || compareText(left.directive, right.directive))) {
+    if (declaration.directive !== "id") {
+      problems.push(issue(
+        "source_config_plugin_declaration_unsupported",
+        `Nextflow plugins block in ${declaration.span.path} uses unsupported ${declaration.directive} syntax; use id 'name@exact-version'.`,
+        declaration.span,
+      ));
+      continue;
+    }
+    if (!declaration.literal) {
+      problems.push(issue(
+        "source_config_plugin_declaration_dynamic",
+        `Nextflow plugin declaration in ${declaration.span.path} is not one literal name@exact-version requirement.`,
+        declaration.span,
+      ));
+      continue;
+    }
+    const separator = declaration.expression.lastIndexOf("@");
+    if (separator < 1) {
+      problems.push(issue(
+        "source_config_plugin_unpinned",
+        `Nextflow plugin ${declaration.expression} in ${declaration.span.path} has no exact version pin.`,
+        declaration.span,
+      ));
+      continue;
+    }
+    const name = declaration.expression.slice(0, separator);
+    const version = declaration.expression.slice(separator + 1);
+    if (!pluginName.test(name)) {
+      problems.push(issue(
+        "source_config_plugin_name_invalid",
+        `Nextflow plugin requirement ${declaration.expression} in ${declaration.span.path} has an invalid plugin name.`,
+        declaration.span,
+      ));
+      continue;
+    }
+    if (!exactVersion.test(version)) {
+      problems.push(issue(
+        "source_config_plugin_version_not_exact",
+        `Nextflow plugin ${name} in ${declaration.span.path} uses non-exact version ${version || "<missing>"}.`,
+        declaration.span,
+      ));
+      continue;
+    }
+    const group = parsed.get(name) ?? [];
+    group.push({ version, requirement: `${name}@${version}`, span: declaration.span });
+    parsed.set(name, group);
+  }
+
+  const requirements: NextflowPluginRequirement[] = [];
+  for (const [name, entries] of [...parsed].sort(([left], [right]) => compareText(left, right))) {
+    const versions = [...new Set(entries.map((entry) => entry.version))].sort(compareText);
+    if (versions.length > 1) {
+      problems.push(issue(
+        "source_config_plugin_conflict",
+        `Nextflow plugin ${name} has conflicting exact versions: ${versions.join(", ")}.`,
+        ...entries.map((entry) => entry.span),
+      ));
+      continue;
+    }
+    const version = versions[0]!;
+    const uniqueSpans = new Map<string, SourceSpan>();
+    for (const entry of entries) uniqueSpans.set(JSON.stringify(entry.span), entry.span);
+    requirements.push({
+      name,
+      version,
+      requirement: `${name}@${version}`,
+      spans: sortSpans([...uniqueSpans.values()]),
+    });
+  }
+  if (requirements.length > MAX_NEXTFLOW_PLUGIN_REQUIREMENTS) {
+    problems.push(issue(
+      "source_config_plugin_limit",
+      `Source requires ${requirements.length} Nextflow plugins; Somite freezes at most ${MAX_NEXTFLOW_PLUGIN_REQUIREMENTS}.`,
+      ...requirements.slice(0, MAX_NEXTFLOW_PLUGIN_REQUIREMENTS + 1).flatMap((requirement) => requirement.spans.slice(0, 1)),
+    ));
+    return [];
+  }
+  return requirements;
 }
 
 function mergedDependencies(dependencies: readonly CondaDependency[], problems: TaskEnvironmentIssue[]) {
@@ -772,6 +1264,7 @@ function mergedDependencies(dependencies: readonly CondaDependency[], problems: 
 export function planTaskEnvironments(
   files: readonly FrozenSourceFile[],
   entrypoint: string,
+  options: TaskEnvironmentPlanningOptions = {},
 ): TaskEnvironmentPlan {
   if (!safeSourcePath(entrypoint)) throw new Error(`task environment entrypoint is not one safe source path: ${entrypoint}`);
   const fileMap = new Map<string, FrozenSourceFile>();
@@ -782,6 +1275,9 @@ export function planTaskEnvironments(
   const processes: TaskEnvironmentProcess[] = [];
   const declarations: TaskEnvironmentDeclaration[] = [];
   const configurationIssues: TaskEnvironmentIssue[] = [];
+  const pluginDeclarations: ConfigPluginDeclaration[] = [];
+  const condaChannelDeclarations: ConfigCondaChannelDeclaration[] = [];
+  const condaProfiles: ConfigCondaProfileBlock[] = [];
   let sourceBytes = 0;
   const sortedFiles = [...files].sort((left, right) => compareText(left.path, right.path));
   for (const file of sortedFiles) {
@@ -805,9 +1301,12 @@ export function planTaskEnvironments(
   // beside that entrypoint to Nextflow. Inspect that same root set, then follow
   // every statically resolvable include regardless of its file extension.
   const entrypointConfig = [...entrypoint.split("/").slice(0, -1), "nextflow.config"].join("/");
-  const pendingConfigs = [...new Set([entrypointConfig, "nextflow.config"])]
+  const rootConfigPaths = [...new Set([entrypointConfig, "nextflow.config"])]
     .filter((path) => fileMap.has(path));
+  const parameters = configParameters(rootConfigPaths.map((path) => fileMap.get(path)!), options.parameters);
+  const pendingConfigs = [...rootConfigPaths];
   const visitedConfigs = new Set<string>();
+  const includeResolutions: NextflowConfigIncludeResolution[] = [];
   let pendingConfigIndex = 0;
   while (pendingConfigIndex < pendingConfigs.length) {
     const configPath = pendingConfigs[pendingConfigIndex++]!;
@@ -828,21 +1327,37 @@ export function planTaskEnvironments(
     }
     const indexed = inspectConfigFile(file);
     declarations.push(...indexed.declarations);
+    pluginDeclarations.push(...indexed.pluginDeclarations);
+    condaChannelDeclarations.push(...indexed.condaChannelDeclarations);
+    condaProfiles.push(...indexed.condaProfiles);
+    if (pluginDeclarations.length > MAX_TASK_ENVIRONMENT_PLUGIN_DECLARATIONS) {
+      throw new Error(`source exceeds ${MAX_TASK_ENVIRONMENT_PLUGIN_DECLARATIONS} Nextflow plugin declarations`);
+    }
     configurationIssues.push(...indexed.issues);
     for (const include of indexed.includes) {
-      if (!include.resolved_path) {
+      const resolution = configIncludeResolution(include, configPath, parameters, fileMap);
+      includeResolutions.push(resolution);
+      if (resolution.status === "source") {
+        pendingConfigs.push(resolution.resolved_path!);
+      } else if (resolution.status === "unresolved") {
         configurationIssues.push(issue(
           "task_environment_config_include_unresolved",
-          `includeConfig in ${include.span.path} is not one frozen source-relative literal: ${include.expression}.`,
+          `includeConfig in ${include.span.path} could not be resolved from bounded frozen inputs: ${include.expression}. ${resolution.reason ?? ""}`.trim(),
           include.span,
         ));
-      } else if (!fileMap.has(include.resolved_path)) {
+      } else if (resolution.status === "missing") {
         configurationIssues.push(issue(
           "task_environment_config_include_missing",
-          `includeConfig in ${include.span.path} refers to missing frozen config ${include.resolved_path}.`,
+          `includeConfig in ${include.span.path} refers to missing frozen config ${resolution.resolved_path}.`,
           include.span,
         ));
-      } else pendingConfigs.push(include.resolved_path);
+      } else if (resolution.status === "external") {
+        configurationIssues.push(issue(
+          "task_environment_config_include_external",
+          `includeConfig in ${include.span.path} resolves outside the frozen source: ${include.expression}. ${resolution.reason ?? ""}`.trim(),
+          include.span,
+        ));
+      }
     }
     if (declarations.length > MAX_TASK_ENVIRONMENT_DECLARATIONS) {
       throw new Error(`source exceeds ${MAX_TASK_ENVIRONMENT_DECLARATIONS} task environment declarations`);
@@ -852,6 +1367,20 @@ export function planTaskEnvironments(
     }
   }
 
+  const nextflowPlugins = freezeNextflowPlugins(pluginDeclarations, configurationIssues);
+  const condaChannelOrder = freezeCondaChannelOrder(condaChannelDeclarations, configurationIssues);
+  const condaProfile = condaProfileProvenance(condaProfiles);
+  const configClosure: NextflowConfigClosure = {
+    paths: [...visitedConfigs].sort(compareText),
+    includes: [...includeResolutions].sort((left, right) => compareText(left.span.path, right.span.path)
+      || left.span.start_line - right.span.start_line
+      || compareText(left.expression, right.expression)),
+    ...(condaChannelOrder ? { conda_channel_order: condaChannelOrder } : {}),
+    ...(condaProfile ? { conda_profile: condaProfile } : {}),
+  };
+  if (configurationIssues.length > MAX_TASK_ENVIRONMENT_CONFIGURATION_ISSUES) {
+    throw new Error(`source exceeds ${MAX_TASK_ENVIRONMENT_CONFIGURATION_ISSUES} configuration issues`);
+  }
   const problems: TaskEnvironmentIssue[] = [...configurationIssues];
   const direct: CondaDependency[] = [];
   const environments = new Map<string, MutableEnvironment>();
@@ -898,9 +1427,9 @@ export function planTaskEnvironments(
       }
       direct.push(...dependencies);
       for (const dependency of dependencies) {
-        if (!dependency.channel) problems.push(issue(
+        if (!dependency.channel && !condaChannelOrder) problems.push(issue(
           "conda_direct_channel_unqualified",
-          `${declaration.process} directly declares ${dependency.match_spec} without an explicit channel; use channel::package so Pixi resolution is reproducible.`,
+          `${declaration.process} directly declares ${dependency.match_spec} without an explicit channel and the frozen config has no exact conda.channels order.`,
           dependency.span,
         ));
       }
@@ -957,11 +1486,15 @@ export function planTaskEnvironments(
   }
 
   const condaEnvironments = [...environments.values()].sort((left, right) => compareText(left.path, right.path));
-  const channelOrders = [...new Map(condaEnvironments.map((environment) => [environment.channels.join("\0"), environment.channels])).values()];
+  const channelOrderMap = new Map<string, readonly string[]>();
+  for (const environment of condaEnvironments) channelOrderMap.set(environment.channels.join("\0"), environment.channels);
+  if (condaChannelOrder) channelOrderMap.set(condaChannelOrder.channels.join("\0"), condaChannelOrder.channels);
+  const channelOrders = [...channelOrderMap.values()];
   if (channelOrders.length > 1) problems.push(issue(
     "conda_channel_order_conflict",
-    `Referenced Conda environments use ${channelOrders.length} different channel orders.`,
+    `Frozen Conda inputs use ${channelOrders.length} different channel orders.`,
     ...condaEnvironments.flatMap((environment) => environment.dependencies.slice(0, 1).map((entry) => entry.span)),
+    ...(condaChannelOrder ? [condaChannelOrder.span] : []),
   ));
   const directChannels = [...new Set(direct.flatMap((dependency) => dependency.channel ? [dependency.channel] : []))]
     .sort(compareText);
@@ -972,7 +1505,7 @@ export function planTaskEnvironments(
     const absent = directChannels.filter((channel) => !sharedChannelSet.has(channel));
     if (absent.length) problems.push(issue(
       "conda_direct_channel_absent_from_shared_order",
-      `Direct Conda package channels are absent from the referenced environment channel order: ${absent.join(", ")}.`,
+      `Direct Conda package channels are absent from the frozen shared channel order: ${absent.join(", ")}.`,
       ...direct.filter((dependency) => dependency.channel && absent.includes(dependency.channel)).map((dependency) => dependency.span),
     ));
   } else if (channelOrders.length === 0 && directChannels.length === 1) {
@@ -998,6 +1531,8 @@ export function planTaskEnvironments(
     declarations: [...declarations].sort((left, right) => compareText(left.span.path, right.span.path)
       || left.span.start_line - right.span.start_line || compareText(left.kind, right.kind)),
     configuration_issues: sortIssues(configurationIssues),
+    config_closure: configClosure,
+    nextflow_plugins: nextflowPlugins,
     conda_environments: condaEnvironments.map((environment) => ({
       path: environment.path,
       digest: environment.digest,

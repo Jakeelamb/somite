@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { buildSourceManifest, type FrozenSourceFile } from "../nextflowSource.ts";
+import { planSourceTaskExecution } from "../sourceTaskExecution.ts";
 import { deriveSourceWorkflow } from "../sourceWorkflow.ts";
 
 const encoder = new TextEncoder();
@@ -66,7 +67,7 @@ test("a source workflow is executable only through its complete root Pixi lock",
 });
 
 test("a source without root Pixi files advertises exact execution when its per-task plan is deterministic", () => {
-  const workflow = derive([
+  const files = [
     file("main.nf", [
       "process PREPARE {",
       "  conda \"${moduleDir}/environment.yml\"",
@@ -76,10 +77,16 @@ test("a source without root Pixi files advertises exact execution when its per-t
       "",
     ].join("\n")),
     file("environment.yml", "channels:\n  - conda-forge\ndependencies:\n  - conda-forge::coreutils=9.5\n"),
-  ]);
+  ];
+  const workflow = derive(files);
+  const plan = planSourceTaskExecution(files, "main.nf");
 
   assert.equal(workflow.capabilities.exact_execution, true);
   assert.equal(workflow.diagnostics?.some((entry) => entry.code === "source_pixi_environment_missing"), false);
+  assert.equal(workflow.workflow_revision, "blake3:0934f82c6e08d6eb0c58cd350a0d03dd0c42518c3521987ad19cd92b823a81c1");
+  assert.equal(plan.status, "candidate");
+  assert.equal(plan.plan.plan_digest, "blake3:ba4d129be73bfa0d2f27c7213ffb598d41a56c79533115a13dda54879603da1f");
+  assert.deepEqual(plan.plan.assignments.map((entry) => entry.process_scope_id), [workflow.scopes?.[0]?.id]);
 });
 
 test("a source without root Pixi files exposes exact per-task planning blockers", () => {
@@ -121,7 +128,7 @@ test("external process environments remain inspectable even beside a Pixi lock",
   assert.ok(workflow.diagnostics?.some((entry) => entry.code === "source_external_task_environment"));
 });
 
-test("a root Pixi lock fails closed for plugins, unresolved includes, and config selectors", () => {
+test("a root Pixi lock accepts frozen plugins and resource selectors but rejects uncertain config", () => {
   const root = [
     file("main.nf", "process PREPARE { script: \"\"\"touch ready\"\"\" }\nworkflow { PREPARE() }\n"),
     file("pixi.toml", pixiToml),
@@ -132,10 +139,8 @@ test("a root Pixi lock fails closed for plugins, unresolved includes, and config
     file("nextflow.config", "includeConfig 'conf/plugins.conf'\n"),
     file("conf/plugins.conf", "plugins { id 'nf-schema@2.7.2' }\n"),
   ]);
-  assert.equal(plugins.capabilities.exact_execution, false);
-  const plugin = plugins.diagnostics?.find((entry) => entry.code === "source_config_plugins_unsupported");
-  assert.match(plugin?.message ?? "", /nf-schema@2\.7\.2/);
-  assert.deepEqual(plugin?.span, { path: "conf/plugins.conf", start_line: 1, end_line: 1 });
+  assert.equal(plugins.capabilities.exact_execution, true);
+  assert.equal(plugins.diagnostics?.some((entry) => entry.code.startsWith("source_config_plugin")), false);
 
   const dynamicInclude = derive([
     ...root,
@@ -148,6 +153,12 @@ test("a root Pixi lock fails closed for plugins, unresolved includes, and config
     ...root,
     file("nextflow.config", "process { withName: PREPARE { cpus = 2 } }\n"),
   ]);
-  assert.equal(selector.capabilities.exact_execution, false);
-  assert.ok(selector.diagnostics?.some((entry) => entry.code === "source_config_selector_unsupported"));
+  assert.equal(selector.capabilities.exact_execution, true);
+
+  const environmentSelector = derive([
+    ...root,
+    file("nextflow.config", "process { withName: PREPARE { container = 'ubuntu:24.04' } }\n"),
+  ]);
+  assert.equal(environmentSelector.capabilities.exact_execution, false);
+  assert.ok(environmentSelector.diagnostics?.some((entry) => entry.code === "source_external_task_environment"));
 });

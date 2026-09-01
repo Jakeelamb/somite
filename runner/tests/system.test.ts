@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { environmentBinaryDirectories, executablePath, pixiPlatform } from "../src/system.ts";
+import {
+  environmentBinaryDirectories,
+  executablePath,
+  pixiPlatform,
+  requireNextflowHostBash,
+} from "../src/system.ts";
 
 test("Pixi binary search uses native environment layouts", () => {
   const root = join("project", "root");
@@ -37,4 +42,18 @@ test("workflow execution supports Unix Pixi targets and directs Windows users to
   assert.throws(() => pixiPlatform("freebsd", "x64"), /unsupported on freebsd\/x64/);
   assert.throws(() => pixiPlatform("linux", "riscv64"), /unsupported on linux\/riscv64/);
   assert.throws(() => pixiPlatform("darwin", "ppc64"), /unsupported on darwin\/ppc64/);
+});
+
+test("Nextflow host Bash readiness is explicit before a local source run", async () => {
+  const checks: Array<[string, number]> = [];
+  assert.equal(await requireNextflowHostBash(async (path, mode) => {
+    checks.push([path, mode]);
+  }), "/bin/bash");
+  assert.deepEqual(checks, [["/bin/bash", 1]]);
+  await assert.rejects(
+    requireNextflowHostBash(async () => {
+      throw new Error("missing");
+    }),
+    /requires an executable \/bin\/bash/,
+  );
 });

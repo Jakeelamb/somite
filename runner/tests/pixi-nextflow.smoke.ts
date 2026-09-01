@@ -136,8 +136,12 @@ test("RunManager completes representative validation through real Pixi and Nextf
   assert.equal(sourceValidationStatus.evidence_receipt?.kind, "source_preview_validation");
   assert.equal(sourceValidationStatus.evidence_receipt?.scope, "nextflow_source_compile_and_dag");
   assert.deepEqual(sourceValidationStatus.evidence_receipt?.fixture_digests, []);
-  assert.equal(sourceValidationStatus.evidence_receipt?.artifact_digests.length, 1);
-  assert.ok((await stat(join(projectRoot, ".somite", "runs", sourceValidation.run_id, ".somite", "run", "source-preview-dag.html"))).size > 0);
+  assert.equal(sourceValidationStatus.evidence_receipt?.artifact_digests.length, 2);
+  const sourceValidationRoot = join(projectRoot, ".somite", "runs", sourceValidation.run_id, ".somite", "run");
+  assert.ok((await stat(join(sourceValidationRoot, "source-preview-dag.html"))).size > 0);
+  const sourceConfigProof = JSON.parse(await readFile(join(sourceValidationRoot, "nextflow-config-proof.json"), "utf8"));
+  assert.equal(sourceConfigProof.schema_version, 2);
+  assert.equal(sourceConfigProof.status, "passed");
 
   const sourceRun = await manager.start(imported.graph, "run", "source-run-smoke");
   const sourceRunStatus = await terminalStatus(manager, sourceRun.run_id);
@@ -153,7 +157,20 @@ test("RunManager completes representative validation through real Pixi and Nextf
     mkdir(join(taskSourceRoot, "modules", "used_old"), { recursive: true }),
     mkdir(join(taskSourceRoot, "modules", "used_new"), { recursive: true }),
     mkdir(join(taskSourceRoot, "inputs"), { recursive: true }),
-    writeFile(join(taskSourceRoot, "nextflow.config"), "docker.enabled = true\n"),
+    writeFile(join(taskSourceRoot, "nextflow.config"), [
+      "docker.enabled = true",
+      "trace.enabled = true",
+      "process {",
+      "  withName: USED_OLD {",
+      "    executor = 'slurm'",
+      "    scratch = true",
+      "    stageOutMode = 'rclone'",
+      "    shell = ['/bin/false', '-x']",
+      "  }",
+      "  withName: USED_NEW { executor = 'pbs' }",
+      "}",
+      "",
+    ].join("\n")),
     writeFile(join(taskSourceRoot, "README.md"), "source-owned file\n"),
     writeFile(join(taskSourceRoot, "nextflow_schema.json"), `${JSON.stringify({
       type: "object",
@@ -191,7 +208,18 @@ test("RunManager completes representative validation through real Pixi and Nextf
   const taskValidationStatus = await terminalStatus(manager, taskValidation.run_id);
   assert.equal(taskValidationStatus.phase, "completed", taskValidationStatus.error);
   assert.equal(taskValidationStatus.evidence_receipt?.result, "passed");
-  assert.equal(taskValidationStatus.evidence_receipt?.artifact_digests.length, 1);
+  assert.equal(taskValidationStatus.evidence_receipt?.artifact_digests.length, 2);
+  const taskConfigProof = JSON.parse(await readFile(join(
+    projectRoot,
+    ".somite",
+    "runs",
+    taskValidation.run_id,
+    ".somite",
+    "run",
+    "nextflow-config-proof.json",
+  ), "utf8"));
+  assert.equal(taskConfigProof.schema_version, 2);
+  assert.equal(taskConfigProof.status, "passed");
 
   const taskRun = await manager.start(taskGraph, "run", "source-task-run-smoke");
   const taskRunStatus = await terminalStatus(manager, taskRun.run_id);
@@ -205,6 +233,11 @@ test("RunManager completes representative validation through real Pixi and Nextf
   assert.ok((await stat(join(taskPackage, ".somite", "run", "stdout.log"))).isFile());
   assert.match(await readFile(join(taskPackage, "modules", "used_old", "main.nf"), "utf8"), /\.pixi\/envs\/task-[a-f0-9]{64}/);
   assert.match(await readFile(join(taskPackage, "modules", "used_new", "main.nf"), "utf8"), /\.pixi\/envs\/task-[a-f0-9]{64}/);
+  const taskWrapperPath = await findNamedFile(join(taskPackage, ".somite", "run", "work"), ".command.run");
+  assert.ok(taskWrapperPath);
+  const taskWrapper = await readFile(taskWrapperPath, "utf8");
+  assert.doesNotMatch(taskWrapper, /nxf_trace_linux/);
+  assert.match(taskWrapper, /\.pixi\/envs\/default\/bin\/bash/);
   const taskPlan = JSON.parse(await readFile(join(taskPackage, ".somite", "run", "source-task-plan.json"), "utf8")) as { environments?: unknown[]; rewrites?: unknown[] };
   assert.equal(taskPlan.environments?.length, 2);
   assert.equal(taskPlan.rewrites?.length, 2);

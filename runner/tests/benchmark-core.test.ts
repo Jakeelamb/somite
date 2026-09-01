@@ -9,6 +9,8 @@ import { fileURLToPath } from "node:url";
 import {
   BENCHMARK_HARNESS_FILES,
   compareBenchmarkReports,
+  MAX_BENCHMARK_OUTPUT_BYTES,
+  parseBenchmarkCaseMeasurement,
   parseBenchmarkReport,
   percentile,
   semanticDigest,
@@ -88,6 +90,43 @@ function report(options: Readonly<{
     }],
   };
 }
+
+test("isolated benchmark measurements are decoded before becoming evidence", () => {
+  const valid = {
+    schema_version: 1,
+    id: "source.index_8k",
+    ...sample(),
+    quality: {
+      passed: true,
+      assertions_passed: 5,
+      assertions_total: 5,
+      semantic_digest: digest("c"),
+    },
+  };
+  assert.deepEqual(parseBenchmarkCaseMeasurement(structuredClone(valid), valid.id), valid);
+  assert.throws(
+    () => parseBenchmarkCaseMeasurement({ ...structuredClone(valid), unexpected: true }, valid.id),
+    /unknown or missing fields/,
+  );
+  assert.throws(
+    () => parseBenchmarkCaseMeasurement({ ...structuredClone(valid), id: "paper.gold_text" }, valid.id),
+    /does not match/,
+  );
+  assert.throws(
+    () => parseBenchmarkCaseMeasurement({
+      ...structuredClone(valid),
+      output_bytes: MAX_BENCHMARK_OUTPUT_BYTES + 1,
+    }),
+    /output_bytes exceeds/,
+  );
+  assert.throws(
+    () => parseBenchmarkCaseMeasurement({
+      ...structuredClone(valid),
+      quality: { ...valid.quality, assertions_passed: 4 },
+    }),
+    /contradicts its assertion counts/,
+  );
+});
 
 test("benchmark report parsing accepts the exact schema and rejects forged summaries or extra fields", () => {
   const valid = report();

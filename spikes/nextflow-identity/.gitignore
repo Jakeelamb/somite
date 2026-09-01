@@ -1,9 +1,0 @@
-.work/
-.pixi/
-.nextflow*
-work/
-results/
-*.html
-*.txt
-*.jsonl
-*.log

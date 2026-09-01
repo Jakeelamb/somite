@@ -6,14 +6,19 @@ import {
   MAX_SOURCE_FILE_BYTES,
   type FrozenSourceFile,
 } from "@somite/workflow/nextflowSource";
+import { assertSourceTaskExecutionPlanContract } from "@somite/workflow/sourceTaskPixi";
 import type {
   SourceTaskExecutionPlan,
   SourceTaskExecutionRewrite,
 } from "@somite/workflow/sourceTaskExecution";
+import {
+  planTaskEnvironments,
+} from "@somite/workflow/taskEnvironment";
 
 const MAX_PREFIX_BYTES = 4096;
 const PIXI_ENVIRONMENT_NAME = /^[a-z0-9][a-z0-9_-]{0,79}$/;
 const encoder = new TextEncoder();
+type NextflowConfigScalar = SourceTaskExecutionPlan["config_closure"]["includes"][number]["parameters"][number]["value"];
 
 export type StagedSourceTaskRewrite = Readonly<{
   path: string;
@@ -46,13 +51,6 @@ function compareText(left: string, right: string) {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function verifyPlanDigest(plan: SourceTaskExecutionPlan) {
-  const { plan_digest: advertised, ...base } = plan;
-  if (canonicalJsonDigest(base) !== advertised) {
-    throw new Error("source task execution plan does not match its content digest");
-  }
-}
-
 function uniqueMembers(values: readonly string[], label: string) {
   const members = new Set<string>();
   for (const value of values) {
@@ -60,6 +58,31 @@ function uniqueMembers(values: readonly string[], label: string) {
     members.add(value);
   }
   return members;
+}
+
+function verifyFrozenConfigAndPluginProvenance(
+  sourceFiles: readonly FrozenSourceFile[],
+  plan: SourceTaskExecutionPlan,
+) {
+  const parameters: Record<string, NextflowConfigScalar> = {};
+  for (const include of plan.config_closure.includes) {
+    for (const parameter of include.parameters) parameters[parameter.name] = parameter.value;
+  }
+  const derived = planTaskEnvironments(sourceFiles, plan.entrypoint, { parameters });
+  if (derived.configuration_issues.length) {
+    const codes = [...new Set(derived.configuration_issues.map((entry) => entry.code))].sort(compareText);
+    throw new Error(`source task execution plan frozen config has unresolved declarations: ${codes.join(", ")}`);
+  }
+  const configOverrides = derived.declarations.filter((declaration) => declaration.origin === "config");
+  if (configOverrides.length) {
+    throw new Error("source task execution plan frozen config contains an unclosed task-environment override");
+  }
+  if (canonicalJsonDigest(derived.config_closure) !== canonicalJsonDigest(plan.config_closure)) {
+    throw new Error("source task execution plan config closure does not match the frozen source");
+  }
+  if (canonicalJsonDigest(derived.nextflow_plugins) !== canonicalJsonDigest(plan.nextflow_plugins)) {
+    throw new Error("source task execution plan plugin requirements do not match the frozen source");
+  }
 }
 
 function verifyAssignmentMembership(plan: SourceTaskExecutionPlan) {
@@ -333,7 +356,7 @@ function stageSourceTaskExecutionWithStrategy(
   plan: SourceTaskExecutionPlan,
   strategy: RewriteStrategy,
 ): StagedSourceTaskExecution {
-  verifyPlanDigest(plan);
+  assertSourceTaskExecutionPlanContract(plan);
   const assignmentsByProcessScope = verifyAssignmentMembership(plan);
   verifyRewriteMembership(plan, assignmentsByProcessScope);
   for (const environment of plan.environments) strategy.validateEnvironment(environment.name);
@@ -341,6 +364,7 @@ function stageSourceTaskExecutionWithStrategy(
   if (sourceManifest.source_digest !== plan.source_digest) {
     throw new Error("source task execution plan does not describe the frozen source");
   }
+  verifyFrozenConfigAndPluginProvenance(sourceFiles, plan);
   const rewritesByPath = new Map<string, SourceTaskExecutionRewrite[]>();
   for (const rewrite of plan.rewrites) {
     const group = rewritesByPath.get(rewrite.path) ?? [];

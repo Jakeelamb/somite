@@ -180,9 +180,12 @@ pins the validated Nextflow and OpenJDK versions, and merges all tool packages.
 package. A package without the exact target lock is a draft, not a frozen Run
 closure.
 
-Containers and per-node environments are intentionally deferred. An Operator
-must not invoke Conda, Pixi, Docker, Apptainer, Nextflow, Snakemake, or another
-workflow/package engine itself.
+Native-workflow Operators still use the graph-wide Pixi environment; containers
+and per-Node environments are not part of an Operator contract. An Operator must
+not invoke Conda, Pixi, Docker, Apptainer, Nextflow, Snakemake, or another
+workflow/package engine itself. Source-backed task environments are frozen from
+the immutable upstream workflow under the separate contract below; they do not
+turn nested package-manager calls into Operators.
 
 ## nf-core source-backed workflows and modules
 
@@ -196,6 +199,14 @@ Operator. A whole-root import must:
 4. expose workflow-schema parameters as typed bindings;
 5. index nested scopes and invocations with exact source locations; and
 6. freeze source-defined task environments before claiming Readiness.
+
+Rendering a frozen source task environment preserves its source-owned package
+requirements and channel order exactly. Somite does not add launcher packages
+or an implementation-support channel to the task Pixi feature. The separate
+default runtime pins Nextflow, OpenJDK, micromamba, Bash, coreutils, gawk, grep,
+sed, and procps-ng on Linux. Nextflow starts without an ambient `CONDA_PREFIX`,
+allowing task-prefix activation to retain the default runtime only as a fallback
+for wrapper utilities without changing the scientific solve.
 
 Module-level structured editing additionally requires the complete callable
 channel Interface, including metadata values and transforms, plus a source map

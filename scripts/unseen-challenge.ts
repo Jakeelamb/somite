@@ -2,9 +2,14 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { loadOperatorCatalog } from "@somite/workflow/catalog.node";
-import { atomicWrite, ensurePrivateDirectory } from "../runner/src/files.ts";
+import { atomicWrite } from "../runner/src/files.ts";
 import { NfcoreGateway } from "../runner/src/nfcoreGateway.ts";
-import { persistChallengeReport, readChallengeLedger } from "../runner/src/unseenChallengeLedger.ts";
+import {
+  advanceChallengeLedger,
+  parseUnseenChallengeArguments,
+  prepareUnseenChallengeDirectories,
+} from "../runner/src/unseenChallengeCli.ts";
+import { readChallengeLedger } from "../runner/src/unseenChallengeLedger.ts";
 import {
   NoUnseenChallengeError,
   runUnseenPaperChallenge,
@@ -14,21 +19,12 @@ import {
 } from "../runner/src/unseenChallenge.ts";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
-const argumentsList = process.argv.slice(2);
-const supported = new Set(["--paper", "--workflow", "--all"]);
-if (argumentsList.some((argument) => !supported.has(argument)) || argumentsList.length > 1) {
-  throw new Error("usage: unseen-challenge.ts [--paper|--workflow|--all]");
-}
-const selection = argumentsList[0] ?? "--all";
-const kinds: readonly ChallengeKind[] = selection === "--paper"
-  ? ["paper"]
-  : selection === "--workflow"
-    ? ["workflow"]
-    : ["paper", "workflow"];
+const options = parseUnseenChallengeArguments(process.argv.slice(2));
+const kinds: readonly ChallengeKind[] = options.kinds;
 const startedAt = new Date().toISOString();
-const stateDirectory = await ensurePrivateDirectory(repositoryRoot, ".somite/challenges");
-const reportDirectory = await ensurePrivateDirectory(repositoryRoot, "output/challenges");
-const ledgerPath = join(stateDirectory, "ledger.json");
+const directories = await prepareUnseenChallengeDirectories(repositoryRoot, options);
+const reportDirectory = directories.report_directory;
+const ledgerPath = directories.ledger_path;
 let ledger = await readChallengeLedger(ledgerPath);
 const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
 const gateway = new NfcoreGateway(repositoryRoot, catalog);
@@ -45,7 +41,10 @@ for (const kind of kinds) {
     if (report.quality.result === "failed") {
       failures.push({ kind, error: report.quality.issues.join(" ") });
     } else {
-      ledger = await persistChallengeReport(ledgerPath, report);
+      ledger = await advanceChallengeLedger(ledger, report, {
+        dry_run: options.dry_run,
+        ledger_path: ledgerPath,
+      });
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -57,6 +56,7 @@ for (const kind of kinds) {
 const completedAt = new Date().toISOString();
 const run = {
   schema_version: 1,
+  ...(options.dry_run ? { dry_run: true } : {}),
   started_at: startedAt,
   completed_at: completedAt,
   reports,

@@ -124,6 +124,109 @@ test("follows includeConfig regardless of extension and blocks hidden environmen
   assert.ok(missing.configuration_issues.some((entry) => entry.code === "task_environment_config_include_missing"));
 });
 
+test("treats resource selectors as closure-neutral but blocks selector environment assignments", () => {
+  const base = [
+    sourceFile("main.nf", "process TOOL { conda 'conda-forge::coreutils=9.5'; script: \"\"\"true\"\"\" }\n"),
+  ];
+  const resourcesOnly = planTaskEnvironments([
+    ...base,
+    sourceFile("nextflow.config", [
+      "process {",
+      "  withName: TOOL { cpus = 2; memory = '2 GB' }",
+      "  withLabel: process_medium { time = '4h' }",
+      "}",
+      "",
+    ].join("\n")),
+  ], "main.nf");
+
+  assert.deepEqual(resourcesOnly.configuration_issues, []);
+  assert.equal(resourcesOnly.pixi_closure.status, "candidate", JSON.stringify(resourcesOnly, null, 2));
+
+  for (const [kind, expression] of [
+    ["conda", "'bioconda::samtools=1.20'"],
+    ["container", "'ubuntu:24.04'"],
+    ["spack", "'samtools@1.20'"],
+    ["module", "'samtools/1.20'"],
+  ] as const) {
+    const configured = planTaskEnvironments([
+      ...base,
+      sourceFile("nextflow.config", `process { withName: TOOL { ${kind} = ${expression} } }\n`),
+    ], "main.nf");
+    assert.ok(
+      configured.pixi_closure.blockers.some((entry) => entry.code === "task_environment_config_override"),
+      `${kind} assignment must remain blocked`,
+    );
+  }
+
+  const dottedSelector = planTaskEnvironments([
+    ...base,
+    sourceFile("nextflow.config", "process.withName:'TOOL'.container = 'ubuntu:24.04'\n"),
+  ], "main.nf");
+  assert.ok(dottedSelector.pixi_closure.blockers.some((entry) => entry.code === "task_environment_config_override"));
+});
+
+test("freezes reachable exact plugin requirements and blocks uncertain plugin declarations", () => {
+  const base = [
+    sourceFile("main.nf", "process TOOL { conda 'conda-forge::coreutils=9.5'; script: \"\"\"true\"\"\" }\n"),
+  ];
+  const exactFiles = [
+    ...base,
+    sourceFile("nextflow.config", "includeConfig 'conf/plugins.config'\nplugins { id 'nf-schema@2.7.2' }\n"),
+    sourceFile("conf/plugins.config", "plugins { id 'nf-core-utils@0.5.0'; id 'nf-schema@2.7.2' }\n"),
+  ];
+  const exact = planTaskEnvironments(exactFiles, "main.nf");
+
+  assert.equal(exact.pixi_closure.status, "candidate", JSON.stringify(exact, null, 2));
+  assert.deepEqual(exact.nextflow_plugins, [
+    {
+      name: "nf-core-utils",
+      version: "0.5.0",
+      requirement: "nf-core-utils@0.5.0",
+      spans: [{ path: "conf/plugins.config", start_line: 1, end_line: 1 }],
+    },
+    {
+      name: "nf-schema",
+      version: "2.7.2",
+      requirement: "nf-schema@2.7.2",
+      spans: [
+        { path: "conf/plugins.config", start_line: 1, end_line: 1 },
+        { path: "nextflow.config", start_line: 2, end_line: 2 },
+      ],
+    },
+  ]);
+  assert.deepEqual(planTaskEnvironments([...exactFiles].reverse(), "main.nf"), exact);
+
+  for (const [declaration, code] of [
+    ["id 'nf-schema'", "source_config_plugin_unpinned"],
+    ["id 'nf-schema@>=2.7.0'", "source_config_plugin_version_not_exact"],
+    ["load 'nf-schema@2.7.2'", "source_config_plugin_declaration_unsupported"],
+  ] as const) {
+    const plan = planTaskEnvironments([
+      ...base,
+      sourceFile("nextflow.config", `plugins { ${declaration} }\n`),
+    ], "main.nf");
+    assert.equal(plan.pixi_closure.status, "blocked");
+    assert.ok(plan.configuration_issues.some((entry) => entry.code === code), JSON.stringify(plan, null, 2));
+  }
+
+  const conflict = planTaskEnvironments([
+    ...base,
+    sourceFile("nextflow.config", "includeConfig 'other.config'\nplugins { id 'nf-schema@2.7.2' }\n"),
+    sourceFile("other.config", "plugins { id 'nf-schema@2.6.1' }\n"),
+  ], "main.nf");
+  assert.equal(conflict.pixi_closure.status, "blocked");
+  assert.deepEqual(conflict.nextflow_plugins, []);
+  assert.ok(conflict.configuration_issues.some((entry) => entry.code === "source_config_plugin_conflict"));
+
+  const overLimit = planTaskEnvironments([
+    ...base,
+    sourceFile("nextflow.config", `plugins { ${Array.from({ length: 65 }, (_, index) => `id 'plugin-${index}@1.0.0'`).join("; ")} }\n`),
+  ], "main.nf");
+  assert.equal(overLimit.pixi_closure.status, "blocked");
+  assert.deepEqual(overLimit.nextflow_plugins, []);
+  assert.ok(overLimit.configuration_issues.some((entry) => entry.code === "source_config_plugin_limit"));
+});
+
 test("analyzes only root and entrypoint config closures", () => {
   const plan = planTaskEnvironments([
     sourceFile("workflows/coproid.nf", "process TOOL { conda \"${moduleDir}/environment.yml\"; script: \"\"\"true\"\"\" }\n"),
@@ -137,6 +240,72 @@ test("analyzes only root and entrypoint config closures", () => {
   assert.ok(plan.declarations.some((entry) => entry.span.path === "workflows/conf/runtime.conf"));
   assert.ok(plan.pixi_closure.blockers.some((entry) => entry.code === "task_environment_config_override"));
   assert.equal(plan.configuration_issues.some((entry) => entry.spans.some((span) => span.path === "nf-test.config")), false);
+});
+
+test("closes standard nf-core offline includes from frozen defaults and bound overrides", () => {
+  const base = [
+    sourceFile("main.nf", "process TOOL { conda \"${moduleDir}/environment.yml\"; script: \"\"\"true\"\"\" }\n"),
+    sourceFile("environment.yml", "channels: [conda-forge]\ndependencies: [coreutils=9.5]\n"),
+    sourceFile("nextflow.config", [
+      "params {",
+      "  custom_config_version = 'master'",
+      "  custom_config_base = \"https://raw.example.test/configs/${params.custom_config_version}\"",
+      "  igenomes_ignore = false",
+      "}",
+      "includeConfig params.custom_config_base && (!System.getenv('NXF_OFFLINE') || !params.custom_config_base.startsWith('http')) ? \"${params.custom_config_base}/pipeline/demo.config\" : '/dev/null'",
+      "includeConfig !params.igenomes_ignore ? 'conf/igenomes.config' : 'conf/igenomes_ignored.config'",
+      "",
+    ].join("\n")),
+    sourceFile("conf/igenomes.config", "process { withName: TOOL { cpus = 2 } }\n"),
+    sourceFile("conf/igenomes_ignored.config", "process { withName: TOOL { memory = '1 GB' } }\n"),
+  ];
+  const defaults = planTaskEnvironments(base, "main.nf");
+
+  assert.equal(defaults.pixi_closure.status, "candidate", JSON.stringify(defaults, null, 2));
+  assert.deepEqual(defaults.config_closure.paths, ["conf/igenomes.config", "nextflow.config"]);
+  assert.deepEqual(defaults.config_closure.includes.map((entry) => [entry.status, entry.resolved_path]), [
+    ["ignored", "/dev/null"],
+    ["source", "conf/igenomes.config"],
+  ]);
+
+  const overridden = planTaskEnvironments(base, "main.nf", { parameters: { igenomes_ignore: true } });
+  assert.equal(overridden.pixi_closure.status, "candidate", JSON.stringify(overridden, null, 2));
+  assert.deepEqual(overridden.config_closure.paths, ["conf/igenomes_ignored.config", "nextflow.config"]);
+  assert.equal(overridden.config_closure.includes[1]?.resolved_path, "conf/igenomes_ignored.config");
+  assert.notEqual(overridden.config_closure.includes[1]?.resolved_path, defaults.config_closure.includes[1]?.resolved_path);
+});
+
+test("fails closed when an include cannot be proven inside the frozen source", () => {
+  const files = [
+    sourceFile("main.nf", "process TOOL { conda 'conda-forge::coreutils=9.5'; script: \"\"\"true\"\"\" }\n"),
+  ];
+  const unresolved = planTaskEnvironments([
+    ...files,
+    sourceFile("nextflow.config", "includeConfig params.extra_config\n"),
+  ], "main.nf");
+  assert.ok(unresolved.configuration_issues.some((entry) => entry.code === "task_environment_config_include_unresolved"));
+
+  const external = planTaskEnvironments([
+    ...files,
+    sourceFile("nextflow.config", "params { extra_config = 'https://example.test/runtime.config' }\nincludeConfig params.extra_config\n"),
+  ], "main.nf");
+  assert.ok(external.configuration_issues.some((entry) => entry.code === "task_environment_config_include_external"));
+
+  const missing = planTaskEnvironments([
+    ...files,
+    sourceFile("nextflow.config", "params { extra_config = 'conf/missing.config' }\nincludeConfig params.extra_config\n"),
+  ], "main.nf");
+  assert.ok(missing.configuration_issues.some((entry) => entry.code === "task_environment_config_include_missing"));
+
+  const ambient = planTaskEnvironments([
+    ...files,
+    sourceFile("nextflow.config", "includeConfig System.getenv('HOME') ? 'conf/local.config' : '/dev/null'\n"),
+    sourceFile("conf/local.config", "process.cpus = 1\n"),
+  ], "main.nf");
+  assert.ok(ambient.configuration_issues.some((entry) => (
+    entry.code === "task_environment_config_include_unresolved"
+      && entry.message.includes("ambient environment HOME")
+  )));
 });
 
 test("preserves case-sensitive channel URLs exactly", () => {
@@ -212,6 +381,107 @@ test("blocks an unqualified direct Conda package instead of guessing its channel
   assert.ok(plan.pixi_closure.blockers.some((entry) => (
     entry.code === "conda_direct_channel_unqualified" && entry.message.includes("pandas=1.4.3")
   )));
+});
+
+test("closes crisprseq-style unqualified tools from one exact source Conda profile order", () => {
+  const workflow = sourceFile("main.nf", [
+    "process FASTQC { conda 'fastqc=0.12.1'; script: \"\"\"true\"\"\" }",
+    "process TRIMGALORE { conda 'trim-galore=0.6.10'; script: \"\"\"true\"\"\" }",
+    "",
+  ].join("\n"));
+  const config = sourceFile("nextflow.config", [
+    "// conda.channels = ['ignored-comment']",
+    "def note = \"conda.channels = ['ignored-string']\"",
+    "profiles {",
+    "  docker { conda.channels = params.unselected_channels }",
+    "  conda {",
+    "    conda.enabled = true",
+    "    conda.channels = [",
+    "      'conda-forge',",
+    "      'bioconda',",
+    "    ]",
+    "  }",
+    "}",
+    "",
+  ].join("\n"));
+  const first = planTaskEnvironments([workflow, config], "main.nf");
+  const second = planTaskEnvironments([config, workflow], "main.nf");
+
+  assert.equal(first.pixi_closure.status, "candidate", JSON.stringify(first, null, 2));
+  assert.deepEqual(second, first);
+  assert.deepEqual(first.pixi_closure.channels, ["conda-forge", "bioconda"]);
+  assert.deepEqual(first.pixi_closure.dependencies.map((dependency) => dependency.match_spec), [
+    "fastqc=0.12.1",
+    "trim-galore=0.6.10",
+  ]);
+  assert.deepEqual(first.config_closure.conda_channel_order?.channels, ["conda-forge", "bioconda"]);
+  assert.equal(first.config_closure.conda_channel_order?.origin, "profile");
+  assert.equal(first.config_closure.conda_channel_order?.profile, "conda");
+  assert.deepEqual(first.config_closure.conda_channel_order?.span, {
+    path: "nextflow.config",
+    start_line: 7,
+    end_line: 10,
+  });
+  assert.match(first.config_closure.conda_channel_order?.expression_provenance.digest ?? "", /^blake3:[0-9a-f]{64}$/);
+  assert.equal(first.config_closure.conda_profile?.name, "conda");
+  assert.deepEqual(first.config_closure.conda_profile?.blocks.map((block) => block.span), [
+    { path: "nextflow.config", start_line: 5, end_line: 11 },
+  ]);
+});
+
+test("accepts one top-level static channel order and blocks dynamic, repeated, or conflicting orders", () => {
+  const workflow = sourceFile(
+    "main.nf",
+    "process FASTQC { conda 'fastqc=0.12.1'; script: \"\"\"true\"\"\" }\n",
+  );
+  const root = planTaskEnvironments([
+    workflow,
+    sourceFile("nextflow.config", "conda.channels = ['bioconda', 'conda-forge']\n"),
+  ], "main.nf");
+  assert.equal(root.pixi_closure.status, "candidate", JSON.stringify(root, null, 2));
+  assert.deepEqual(root.pixi_closure.channels, ["bioconda", "conda-forge"]);
+  assert.equal(root.config_closure.conda_channel_order?.origin, "top_level");
+  assert.equal(root.config_closure.conda_channel_order?.profile, undefined);
+  assert.equal(root.config_closure.conda_profile, undefined);
+
+  const dynamic = planTaskEnvironments([
+    workflow,
+    sourceFile("nextflow.config", "profiles { conda { conda.channels = params.conda_channels } }\n"),
+  ], "main.nf");
+  assert.equal(dynamic.pixi_closure.status, "blocked");
+  assert.ok(dynamic.configuration_issues.some((entry) => entry.code === "source_config_conda_channels_dynamic"));
+
+  const ambiguous = planTaskEnvironments([
+    workflow,
+    sourceFile("nextflow.config", [
+      "conda.channels = ['conda-forge', 'bioconda']",
+      "profiles { conda { conda.channels = ['conda-forge', 'bioconda'] } }",
+      "",
+    ].join("\n")),
+  ], "main.nf");
+  assert.ok(ambiguous.configuration_issues.some((entry) => entry.code === "source_config_conda_channels_ambiguous"));
+
+  const conflicting = planTaskEnvironments([
+    workflow,
+    sourceFile("nextflow.config", [
+      "conda.channels = ['conda-forge', 'bioconda']",
+      "profiles { conda { conda.channels = ['bioconda', 'conda-forge'] } }",
+      "",
+    ].join("\n")),
+  ], "main.nf");
+  assert.ok(conflicting.configuration_issues.some((entry) => entry.code === "source_config_conda_channels_conflict"));
+
+  const override = planTaskEnvironments([
+    workflow,
+    sourceFile("nextflow.config", [
+      "profiles { conda {",
+      "  conda.channels = ['conda-forge', 'bioconda']",
+      "  process.container = 'ubuntu:24.04'",
+      "} }",
+      "",
+    ].join("\n")),
+  ], "main.nf");
+  assert.ok(override.pixi_closure.blockers.some((entry) => entry.code === "task_environment_config_override"));
 });
 
 test("rejects duplicate top-level YAML keys instead of merging their meaning", () => {

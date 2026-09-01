@@ -120,6 +120,7 @@ import { appendFile, lstat, mkdir, readFile, writeFile } from "node:fs/promises"
 import { dirname, join } from "node:path";
 const args = process.argv.slice(2);
 await appendFile(join(dirname(process.argv[1]), "invocations.log"), args[0] + "\\n");
+await appendFile(join(dirname(process.argv[1]), "invocations-detail.log"), JSON.stringify(args) + "\\n");
 if (args[0] === "run" && process.env.NXF_DISABLE_CHECK_LATEST !== "true") {
   process.stderr.write("Nextflow latest-version check was not disabled\\n");
   process.exit(42);
@@ -134,6 +135,15 @@ if (args[0] === "lock") {
 if (args[0] === "install") {
   const manifest = args[args.indexOf("--manifest-path") + 1];
   await mkdir(join(dirname(manifest), ".pixi", "envs", "default"), { recursive: true });
+  process.exit(0);
+}
+if (args[0] === "run" && args.includes("plugin") && args.includes("install")) {
+  const requirement = args.at(-1);
+  const pluginRoot = process.env.NXF_PLUGINS_DIR;
+  if (!requirement || !pluginRoot) process.exit(43);
+  const directory = join(pluginRoot, requirement);
+  await mkdir(directory, { recursive: true });
+  await writeFile(join(directory, "plugin.jar"), "mock plugin " + requirement + "\\n");
   process.exit(0);
 }
 const delay = Number(process.env.SOMITE_MOCK_RUN_DELAY_MS ?? 0);
@@ -154,7 +164,12 @@ await mkdir(join(process.cwd(), "results"), { recursive: true });
 await writeFile(join(process.cwd(), "results", "output.txt"), "ok\\n");
 `, "utf8");
   await chmod(pixi, 0o755);
-  return { root, path: `${bin}${delimiter}${process.env.PATH ?? ""}`, log: join(bin, "invocations.log") };
+  return {
+    root,
+    path: `${bin}${delimiter}${process.env.PATH ?? ""}`,
+    log: join(bin, "invocations.log"),
+    detailLog: join(bin, "invocations-detail.log"),
+  };
 }
 
 async function exactSourceGraphFixture(projectRoot: string) {
@@ -176,6 +191,101 @@ async function exactSourceGraphFixture(projectRoot: string) {
   ]);
   const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
   const imported = await new ProjectGateway(projectRoot, catalog).open({ path: "compiled-source-fixture" });
+  assert.equal(imported.kind, "nextflow");
+  assert.equal(imported.graph.nodes[0]?.source_workflow?.capabilities.exact_execution, true);
+  return { catalog, graph: imported.graph };
+}
+
+async function generatedProfileSourceGraphFixture(projectRoot: string) {
+  const sourceRoot = join(projectRoot, "generated-profile-source-fixture");
+  await mkdir(sourceRoot);
+  await Promise.all([
+    writeFile(join(sourceRoot, "main.nf"), [
+      "nextflow.enable.dsl=2",
+      "process CHECK {",
+      "  conda 'fastqc=0.12.1'",
+      "  output:",
+      "  path 'done.txt'",
+      "  script:",
+      "  \"touch done.txt\"",
+      "}",
+      "workflow { CHECK() }",
+      "",
+    ].join("\n")),
+    writeFile(join(sourceRoot, "nextflow.config"), [
+      "profiles {",
+      "  conda {",
+      "    conda.channels = ['conda-forge', 'bioconda']",
+      "  }",
+      "}",
+      "",
+    ].join("\n")),
+  ]);
+  const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+  const imported = await new ProjectGateway(projectRoot, catalog).open({ path: "generated-profile-source-fixture" });
+  assert.equal(imported.kind, "nextflow");
+  assert.equal(imported.graph.nodes[0]?.source_workflow?.capabilities.exact_execution, true);
+  return { catalog, graph: imported.graph };
+}
+
+async function generatedTopLevelChannelsSourceGraphFixture(projectRoot: string) {
+  const sourceRoot = join(projectRoot, "generated-top-level-channels-source-fixture");
+  await mkdir(sourceRoot);
+  await Promise.all([
+    writeFile(join(sourceRoot, "main.nf"), [
+      "nextflow.enable.dsl=2",
+      "process CHECK {",
+      "  conda 'fastqc=0.12.1'",
+      "  output:",
+      "  path 'done.txt'",
+      "  script:",
+      "  \"touch done.txt\"",
+      "}",
+      "workflow { CHECK() }",
+      "",
+    ].join("\n")),
+    writeFile(join(sourceRoot, "nextflow.config"), [
+      "conda.channels = ['conda-forge', 'bioconda']",
+      "profiles {",
+      "  conda {",
+      "    params.unrelated = true",
+      "  }",
+      "}",
+      "",
+    ].join("\n")),
+  ]);
+  const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+  const imported = await new ProjectGateway(projectRoot, catalog).open({ path: "generated-top-level-channels-source-fixture" });
+  assert.equal(imported.kind, "nextflow");
+  assert.equal(imported.graph.nodes[0]?.source_workflow?.capabilities.exact_execution, true);
+  return { catalog, graph: imported.graph };
+}
+
+async function generatedPluginSourceGraphFixture(projectRoot: string) {
+  const sourceRoot = join(projectRoot, "generated-plugin-source-fixture");
+  await mkdir(sourceRoot);
+  await Promise.all([
+    writeFile(join(sourceRoot, "main.nf"), [
+      "nextflow.enable.dsl=2",
+      "process CHECK {",
+      "  conda 'conda-forge::coreutils=9.5'",
+      "  output:",
+      "  path 'done.txt'",
+      "  script:",
+      "  \"touch done.txt\"",
+      "}",
+      "workflow { CHECK() }",
+      "",
+    ].join("\n")),
+    writeFile(join(sourceRoot, "nextflow.config"), [
+      "plugins {",
+      "  id 'nf-schema@2.7.2'",
+      "}",
+      "",
+    ].join("\n")),
+  ]);
+  const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+  const imported = await new ProjectGateway(projectRoot, catalog).open({ path: "generated-plugin-source-fixture" });
   assert.equal(imported.kind, "nextflow");
   assert.equal(imported.graph.nodes[0]?.source_workflow?.capabilities.exact_execution, true);
   return { catalog, graph: imported.graph };
@@ -681,6 +791,100 @@ test("compiled source cache rejects stale policy bytes without deleting the cach
     );
     assert.deepEqual(await readFile(policy), stale);
     assert.ok((await lstat(root)).isDirectory());
+  } finally {
+    process.env.PATH = previousPath;
+    await rm(project.root, { recursive: true, force: true });
+  }
+});
+
+test("generated source packages activate a proven Conda profile before the Somite policy", async () => {
+  const project = await mockProject();
+  const previousPath = process.env.PATH;
+  process.env.PATH = project.path;
+  try {
+    const { catalog, graph } = await generatedProfileSourceGraphFixture(project.root);
+    const manager = new RunManager(project.root, repositoryRoot, catalog);
+    const compiled = await manager.compile(graph, { archiveName: "source-profile", platform: "linux-64" });
+    const root = join(project.root, compiled.output_path);
+    const launcher = await readFile(join(root, "somite-run"), "utf8");
+    assert.match(launcher, /pixi run --clean-env --frozen/);
+    assert.match(launcher, /-- env -u CONDA_PREFIX NXF_HOME=/);
+    assert.match(launcher, /'-profile' 'conda,somite_frozen_execution'/);
+    assert.match(launcher, /'-C' '\.somite\/run\/source-effective-nextflow\.config'/);
+    const plan = JSON.parse(await readFile(join(root, ".somite", "run", "source-task-plan.json"), "utf8")) as {
+      environments: Array<{ channels: string[] }>;
+      config_closure: { conda_channel_order?: {
+        channels: string[];
+        origin: string;
+        profile?: string;
+        expression_provenance: { digest: string };
+      } };
+    };
+    assert.ok(plan.environments.length > 0);
+    assert.ok(plan.environments.every((environment) => (
+      JSON.stringify(environment.channels) === JSON.stringify(["conda-forge", "bioconda"])
+    )));
+    assert.deepEqual(plan.config_closure.conda_channel_order?.channels, ["conda-forge", "bioconda"]);
+    assert.equal(plan.config_closure.conda_channel_order?.origin, "profile");
+    assert.equal(plan.config_closure.conda_channel_order?.profile, "conda");
+    assert.match(plan.config_closure.conda_channel_order?.expression_provenance.digest ?? "", /^blake3:[a-f0-9]{64}$/);
+  } finally {
+    process.env.PATH = previousPath;
+    await rm(project.root, { recursive: true, force: true });
+  }
+});
+
+test("a top-level channel order does not activate an unrelated Conda profile", async () => {
+  const project = await mockProject();
+  const previousPath = process.env.PATH;
+  process.env.PATH = project.path;
+  try {
+    const { catalog, graph } = await generatedTopLevelChannelsSourceGraphFixture(project.root);
+    const manager = new RunManager(project.root, repositoryRoot, catalog);
+    const compiled = await manager.compile(graph, { archiveName: "source-top-level-channels", platform: "linux-64" });
+    const root = join(project.root, compiled.output_path);
+    const launcher = await readFile(join(root, "somite-run"), "utf8");
+    assert.match(launcher, /'-profile' 'somite_frozen_execution'/);
+    assert.doesNotMatch(launcher, /'-profile' 'conda,somite_frozen_execution'/);
+    const plan = JSON.parse(await readFile(join(root, ".somite", "run", "source-task-plan.json"), "utf8")) as {
+      config_closure: {
+        conda_channel_order?: { origin: string };
+        conda_profile?: { name: string };
+      };
+    };
+    assert.equal(plan.config_closure.conda_channel_order?.origin, "top_level");
+    assert.equal(plan.config_closure.conda_profile?.name, "conda");
+  } finally {
+    process.env.PATH = previousPath;
+    await rm(project.root, { recursive: true, force: true });
+  }
+});
+
+test("plugin-bearing source compilation freezes only the default runtime and binds plugin bytes to closure identity", async () => {
+  const project = await mockProject();
+  const previousPath = process.env.PATH;
+  process.env.PATH = project.path;
+  try {
+    const { catalog, graph } = await generatedPluginSourceGraphFixture(project.root);
+    const manager = new RunManager(project.root, repositoryRoot, catalog);
+    const compiled = await manager.compile(graph, { archiveName: "source-plugin", platform: "linux-64" });
+    const root = join(project.root, compiled.output_path);
+    const closure = JSON.parse(await readFile(join(root, ".somite", "run", "run-closure.json"), "utf8")) as {
+      closure_digest: string;
+      environment: { plugin_store_digest?: string };
+    };
+    const store = JSON.parse(await readFile(join(root, ".somite", "run", "nextflow-plugin-store.json"), "utf8")) as {
+      store_digest: string;
+    };
+    assert.equal(closure.closure_digest, compiled.closure_digest);
+    assert.equal(closure.environment.plugin_store_digest, store.store_digest);
+    assert.match(store.store_digest, /^blake3:[a-f0-9]{64}$/);
+
+    const invocations = (await readFile(project.detailLog, "utf8")).trim().split("\n")
+      .map((line) => JSON.parse(line) as string[]);
+    const installs = invocations.filter((args) => args[0] === "install");
+    assert.ok(installs.some((args) => args.includes("--environment") && args.includes("default")));
+    assert.equal(installs.some((args) => args.includes("--all")), false, "compile must not install every scientific task environment");
   } finally {
     process.env.PATH = previousPath;
     await rm(project.root, { recursive: true, force: true });

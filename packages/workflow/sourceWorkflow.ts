@@ -26,11 +26,14 @@ import {
   validateSourceWorkflow,
 } from "./workflow.ts";
 import { planTaskEnvironments } from "./taskEnvironment.ts";
-import { planSourceTaskExecution } from "./sourceTaskExecution.ts";
+import {
+  planAnalyzedSourceTaskExecution,
+  type SourceTaskExecutionAnalysis,
+} from "./sourceTaskExecution.ts";
 
 // Bump whenever immutable source-derived fields or capabilities change. This is
 // part of every cached source request identity, not a presentation version.
-export const SOURCE_INDEXER_REVISION = "source-indexer-ts-v9";
+export const SOURCE_INDEXER_REVISION = "source-indexer-ts-v10";
 const encoder = new TextEncoder();
 const MAX_SCHEMA_BYTES = 8 * 1024 * 1024;
 const MAX_SCHEMA_NODES = 100_000;
@@ -892,11 +895,14 @@ function rootPixiDependencies(text: string) {
   return dependencies;
 }
 
-function sourceExecutionCapability(files: readonly FrozenSourceFile[], entrypoint: string) {
+function sourceExecutionCapability(
+  files: readonly FrozenSourceFile[],
+  analysis: SourceTaskExecutionAnalysis,
+) {
+  const { entrypoint, inventory: environments } = analysis;
   const diagnostics: SourceDiagnostic[] = [];
   const manifestFile = files.find((file) => file.path === "pixi.toml");
   const lockFile = files.find((file) => file.path === "pixi.lock");
-  const environments = planTaskEnvironments(files, entrypoint);
   const sourcePath = files.find((file) => file.path.endsWith(".nf"))?.path ?? "main.nf";
   const processDeclarations = environments.declarations.filter((entry) => entry.origin === "process");
   const condaDeclarations = processDeclarations.filter((entry) => entry.kind === "conda");
@@ -912,7 +918,7 @@ function sourceExecutionCapability(files: readonly FrozenSourceFile[], entrypoin
     span: { path, start_line: line, end_line: line },
   });
   if (!manifestFile && !lockFile) {
-    const decision = planSourceTaskExecution(files, entrypoint);
+    const decision = planAnalyzedSourceTaskExecution(analysis);
     if (decision.status === "candidate") return { exact: true, diagnostics };
     for (const blocker of decision.blockers.slice(0, 64)) {
       const span = blocker.spans[0];
@@ -968,7 +974,13 @@ export function deriveSourceWorkflow(files: readonly FrozenSourceFile[], source:
   const projectionBudget = new DerivedProjectionBudget();
   const outline = indexNextflowSource(files, source.entrypoint, manifest.source_digest, projectionBudget);
   const schema = parseNextflowParameterSchema(files, projectionBudget);
-  const execution = sourceExecutionCapability(files, source.entrypoint);
+  const inventory = planTaskEnvironments(files, source.entrypoint);
+  const execution = sourceExecutionCapability(files, {
+    entrypoint: source.entrypoint,
+    source_digest: manifest.source_digest,
+    outline,
+    inventory,
+  });
   const diagnostics = [...outline.diagnostics, ...schema.diagnostics, ...execution.diagnostics].sort((left, right) =>
     (left.span?.path ?? "").localeCompare(right.span?.path ?? "")
     || (left.span?.start_line ?? 0) - (right.span?.start_line ?? 0)

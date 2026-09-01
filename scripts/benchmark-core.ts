@@ -4,6 +4,7 @@ export const BENCHMARK_SCHEMA_VERSION = 1 as const;
 export const MAX_BENCHMARK_REPORT_BYTES = 2 * 1024 * 1024;
 export const MAX_BENCHMARK_CASES = 32;
 export const MAX_BENCHMARK_SAMPLES = 20;
+export const MAX_BENCHMARK_OUTPUT_BYTES = 512 * 1024 * 1024;
 export const BENCHMARK_HARNESS_FILES = [
   "package.json",
   "pixi.toml",
@@ -26,6 +27,18 @@ export type BenchmarkSample = Readonly<{
   peak_rss_bytes: number | null;
   output_bytes: number;
   stages_ms: Readonly<Record<string, number>>;
+}>;
+
+export type BenchmarkCaseMeasurement = Readonly<{
+  schema_version: 1;
+  id: string;
+  wall_ms: number;
+  cpu_user_ms: number | null;
+  cpu_system_ms: number | null;
+  peak_rss_bytes: number | null;
+  output_bytes: number;
+  stages_ms: Readonly<Record<string, number>>;
+  quality: BenchmarkQuality;
 }>;
 
 export type BenchmarkSummary = Readonly<{
@@ -163,6 +176,52 @@ function parseQuality(value: unknown, label: string): BenchmarkQuality {
   const digest = boundedString(raw.semantic_digest, `${label}.semantic_digest`, 96);
   if (!/^sha256:[0-9a-f]{64}$/.test(digest)) throw new Error(`${label}.semantic_digest must be a SHA-256 digest`);
   return { passed: raw.passed, assertions_passed: passed, assertions_total: total, semantic_digest: digest };
+}
+
+/** Decode the bounded JSON emitted by one isolated benchmark worker. */
+export function parseBenchmarkCaseMeasurement(
+  value: unknown,
+  expectedId?: string,
+): BenchmarkCaseMeasurement {
+  const raw = record(value, "benchmark case measurement");
+  exactKeys(raw, [
+    "schema_version",
+    "id",
+    "wall_ms",
+    "cpu_user_ms",
+    "cpu_system_ms",
+    "peak_rss_bytes",
+    "output_bytes",
+    "stages_ms",
+    "quality",
+  ], "benchmark case measurement");
+  if (raw.schema_version !== BENCHMARK_SCHEMA_VERSION) {
+    throw new Error("benchmark case measurement schema version is unsupported");
+  }
+  const id = boundedString(raw.id, "benchmark case measurement.id", 128);
+  if (expectedId !== undefined && id !== expectedId) {
+    throw new Error(`benchmark case measurement id ${id} does not match ${expectedId}`);
+  }
+  const sample = parseSample({
+    wall_ms: raw.wall_ms,
+    cpu_user_ms: raw.cpu_user_ms,
+    cpu_system_ms: raw.cpu_system_ms,
+    peak_rss_bytes: raw.peak_rss_bytes,
+    output_bytes: raw.output_bytes,
+    stages_ms: raw.stages_ms,
+  }, "benchmark case measurement");
+  if (!Object.keys(sample.stages_ms).length) {
+    throw new Error("benchmark case measurement must contain at least one stage");
+  }
+  if (sample.output_bytes > MAX_BENCHMARK_OUTPUT_BYTES) {
+    throw new Error(`benchmark case measurement.output_bytes exceeds ${MAX_BENCHMARK_OUTPUT_BYTES}`);
+  }
+  return {
+    schema_version: BENCHMARK_SCHEMA_VERSION,
+    id,
+    ...sample,
+    quality: parseQuality(raw.quality, "benchmark case measurement.quality"),
+  };
 }
 
 function parseEnvironment(value: unknown): BenchmarkEnvironment {

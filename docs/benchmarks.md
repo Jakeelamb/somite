@@ -72,10 +72,12 @@ npm run profile:heap -- canvas.wide_deep_5k
 
 Profiles are written under `output/profiles/`, are never committed, and are not
 benchmark receipts. Each profile has a JSON sidecar binding it to the revision,
-dirty state, lockfile, benchmark contract, host, passing outcome digest, and
-profile content digest. Inspector sampling begins only around the case's primary
-product operations after module loading and synthetic-fixture preparation, and
-stops before adjudication and semantic hashing. Use it to locate work after a
+dirty state, lockfile, complete workflow implementation and reviewed Operator
+contracts, host, passing outcome digest, and profile content digest. The parent
+runtime-decodes the exact bounded worker measurement before publishing that
+sidecar. Inspector sampling begins only around the case's primary product
+operations after module loading and synthetic-fixture preparation, and stops
+before adjudication and semantic hashing. Use it to locate work after a
 repeatable baseline proves which case regressed.
 
 Before a release, independently prove that the committed source archive can be
@@ -271,6 +273,13 @@ that are absent from its novelty ledger. Network latency, source size, upstream
 content, and scientific difficulty change from run to run. This is valuable
 compatibility evidence, but it is not a stable performance workload and must
 never be promoted into a baseline automatically.
+
+For repeated local investigation, run `npm run challenge:live -- --dry-run`.
+The command keeps novelty advancement in memory across the paper and workflow
+checks, leaves the ledger unchanged, and reports the path of its private
+temporary JSON report. Use `--state-dir PATH` to read a separate ledger and
+`--report-dir PATH` to retain reports at an explicit absolute or
+repository-relative location.
 
 The scheduled `npm run canary:mcp:live` check follows the same boundary: it
 monitors official documentation, package discovery and installation, and module

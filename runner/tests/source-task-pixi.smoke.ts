@@ -87,6 +87,12 @@ test("one real frozen Pixi lock isolates conflicting Samtools tasks and Nextflow
   for (const environment of rendered.expected_environments) assert.match(lockText, new RegExp(environment));
 
   const runtimePrefix = realized.prefixes.get(rendered.runtime_environment)!;
+  assert.match((await run(join(runtimePrefix, "bin", "bash"), ["--version"])).stdout, /5\.2\.37/);
+  assert.match((await run(join(runtimePrefix, "bin", "awk"), ["--version"])).stdout, /5\.4\.1/);
+  assert.match((await run(join(runtimePrefix, "bin", "grep"), ["--version"])).stdout, /3\.12/);
+  assert.match((await run(join(runtimePrefix, "bin", "ps"), ["--version"])).stdout, /ps from procps-ng/);
+  assert.match(lockText, /procps-ng-4\.0\.6-/);
+  assert.match((await run(join(runtimePrefix, "bin", "sed"), ["--version"])).stdout, /4\.10/);
   assert.match((await run(join(runtimePrefix, "bin", "nextflow"), ["-version"])).stdout, /26\.04\.6/);
   assert.match((await run(join(runtimePrefix, "bin", "java"), ["-version"])).stderr, /25\.0\.2/);
   assert.match((await run(join(runtimePrefix, "bin", "micromamba"), ["--version"])).stdout, /2\.9\.0/);
@@ -187,6 +193,9 @@ test("one real frozen Pixi lock isolates conflicting Samtools tasks and Nextflow
     "--manifest-path",
     join(portableRoot, "pixi.toml"),
     "--",
+    "env",
+    "-u",
+    "CONDA_PREFIX",
     "nextflow",
     "-c",
     "somite-task.config",

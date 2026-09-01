@@ -55,11 +55,12 @@ export type PaperChallengeReport = Readonly<{
     assays: readonly string[];
     operators: readonly string[];
     unsupported: readonly string[];
-    mentions: readonly Readonly<{ name: string; support: "operator" | "unsupported"; executable?: boolean; operator_id?: string }>[];
+    mentions: readonly Readonly<{ name: string; support: "operator" | "unsupported"; executable?: boolean; core?: boolean; operator_id?: string }>[];
     workflow_sources: readonly Readonly<{ provider: "github"; repository: string; source_location?: string }>[];
     gaps: readonly string[];
     evidence_only_methods: readonly string[];
     omitted_methods: readonly string[];
+    omitted_core_methods?: readonly string[];
     required_actions: number;
     unresolved_method_inputs: readonly string[];
     warnings: readonly string[];
@@ -196,6 +197,7 @@ export function createPaperChallengeReport(input: Readonly<{
     .map((node) => typeof node.params?.tool === "string" ? node.params.tool : "")
     .filter(Boolean)
     .map(canonicalMethodName));
+  const representedOperators = new Set(input.review.candidates.flatMap((candidate) => candidate.graph.nodes.map((node) => node.operator)));
   const evidenceOnlyRepresentedMethods = new Set(gapNodes
     .filter((node) => node.ports.length === 0 && typeof node.params?.tool === "string")
     .map((node) => canonicalMethodName(String(node.params!.tool))));
@@ -213,16 +215,28 @@ export function createPaperChallengeReport(input: Readonly<{
       && mention.executable !== false
       && !representedMethods.has(canonicalMethodName(mention.normalized_name)))
     .map((mention) => mention.normalized_name));
+  const omittedCoreMethods = status === "candidate_built"
+    ? unique(input.review.mentions
+      .filter((mention) => mention.core
+        && mention.executable !== false
+        && (mention.operator_id
+          ? !representedOperators.has(mention.operator_id)
+          : !representedMethods.has(canonicalMethodName(mention.normalized_name))))
+      .map((mention) => mention.normalized_name))
+    : [];
   const qualityIssues = [
     ...(status === "source_workflow_found" ? ["The paper cites a workflow repository; its frozen source must be imported and assessed separately."] : []),
     ...(status === "evidence_only" ? ["Method evidence was retained, but no typed visual draft was built."] : []),
     ...(gaps.length ? [`The visual draft still needs ${gaps.length} reviewed tool adapter${gaps.length === 1 ? "" : "s"}.`] : []),
     ...(evidenceOnlyMethods.length ? [`The visual draft retains ${evidenceOnlyMethods.length} executable paper method${evidenceOnlyMethods.length === 1 ? "" : "s"} as untyped evidence: ${evidenceOnlyMethods.join(", ")}.`] : []),
     ...(status === "candidate_built" && omittedMethods.length ? [`The visual draft omits ${omittedMethods.length} executable paper method${omittedMethods.length === 1 ? "" : "s"}: ${omittedMethods.join(", ")}.`] : []),
+    ...(omittedCoreMethods.length ? [`The visual draft omits a named core method${omittedCoreMethods.length === 1 ? "" : "s"}: ${omittedCoreMethods.join(", ")}.`] : []),
     ...(unresolvedMethodInputs.length ? [`The visual draft has ${unresolvedMethodInputs.length} unconnected required method input${unresolvedMethodInputs.length === 1 ? "" : "s"}.`] : []),
   ];
   const quality: ChallengeQuality = status === "no_methods"
     ? { result: "failed", issues: ["A full-text article with a Methods section produced no computational-method evidence."] }
+    : omittedCoreMethods.length
+      ? { result: "failed", issues: qualityIssues }
     : qualityIssues.length
       ? { result: "attention", issues: qualityIssues }
       : { result: "passed", issues: [] };
@@ -249,6 +263,7 @@ export function createPaperChallengeReport(input: Readonly<{
         name: mention.normalized_name,
         support: mention.support,
         ...(mention.executable === undefined ? {} : { executable: mention.executable }),
+        ...(mention.core ? { core: true } : {}),
         ...(mention.operator_id ? { operator_id: mention.operator_id } : {}),
       })),
       workflow_sources: (input.review.workflow_sources ?? []).map((source) => ({
@@ -259,6 +274,7 @@ export function createPaperChallengeReport(input: Readonly<{
       gaps,
       evidence_only_methods: evidenceOnlyMethods,
       omitted_methods: omittedMethods,
+      omitted_core_methods: omittedCoreMethods,
       required_actions: requiredActions,
       unresolved_method_inputs: unresolvedMethodInputs,
       warnings: input.review.warnings,

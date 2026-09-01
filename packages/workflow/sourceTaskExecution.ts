@@ -9,12 +9,16 @@ import {
   planTaskEnvironments,
   type CondaDependency,
   type CondaEnvironment,
+  type NextflowConfigClosure,
+  type NextflowPluginRequirement,
+  type TaskEnvironmentPlan,
+  type TaskEnvironmentPlanningOptions,
   type TaskEnvironmentDeclaration,
   type TaskEnvironmentIssue,
   type TaskEnvironmentProcess,
 } from "./taskEnvironment.ts";
 
-export const SOURCE_TASK_EXECUTION_PLANNER_REVISION = "source-task-execution-ts-v4";
+export const SOURCE_TASK_EXECUTION_PLANNER_REVISION = "source-task-execution-ts-v6";
 
 export type SourceTaskExecutionDependency = Readonly<{
   name: string;
@@ -56,11 +60,12 @@ export type SourceTaskExecutionRewrite = Readonly<{
 }>;
 
 export type SourceTaskExecutionPlan = Readonly<{
-  schema_version: 1;
+  schema_version: 2;
   planner_revision: typeof SOURCE_TASK_EXECUTION_PLANNER_REVISION;
   source_digest: string;
   entrypoint: string;
-  channels: readonly string[];
+  config_closure: NextflowConfigClosure;
+  nextflow_plugins: readonly NextflowPluginRequirement[];
   environments: readonly SourceTaskExecutionEnvironment[];
   assignments: readonly SourceTaskExecutionAssignment[];
   rewrites: readonly SourceTaskExecutionRewrite[];
@@ -77,6 +82,14 @@ export type SourceTaskExecutionDecision =
       status: "candidate";
       plan: SourceTaskExecutionPlan;
     }>;
+
+/** @internal Validated source analysis shared only by source derivation internals. */
+export type SourceTaskExecutionAnalysis = Readonly<{
+  entrypoint: string;
+  source_digest: string;
+  outline: Pick<ReturnType<typeof indexNextflowSource>, "scopes" | "invocations">;
+  inventory: TaskEnvironmentPlan;
+}>;
 
 type ReachableOutline = Readonly<{
   processScopes: readonly SourceScope[];
@@ -212,6 +225,22 @@ function reachableOutline(
 
 function withinEnvironmentIssues(environment: ResolvedTaskEnvironment) {
   const problems: TaskEnvironmentIssue[] = [];
+  const channelSet = new Set(environment.channels);
+  if (!environment.channels.length || channelSet.size !== environment.channels.length) problems.push(issue(
+    "source_task_environment_channel_order_invalid",
+    `Environment ${environment.reference} does not declare one non-empty unique channel order.`,
+    ...environment.dependencies.slice(0, 1).map((dependency) => dependency.span),
+  ));
+  const absentChannels = [...new Set(environment.dependencies.flatMap((dependency) => (
+    dependency.channel && !channelSet.has(dependency.channel) ? [dependency.channel] : []
+  )))].sort(compareText);
+  if (absentChannels.length) problems.push(issue(
+    "source_task_environment_channel_absent",
+    `Environment ${environment.reference} pins dependencies to channels absent from its own order: ${absentChannels.join(", ")}.`,
+    ...environment.dependencies.filter((dependency) => (
+      dependency.channel && absentChannels.includes(dependency.channel)
+    )).map((dependency) => dependency.span),
+  ));
   const dependenciesByName = new Map<string, CondaDependency[]>();
   for (const dependency of environment.dependencies) {
     const group = dependenciesByName.get(dependency.name) ?? [];
@@ -274,19 +303,28 @@ function fileTaskEnvironment(environment: CondaEnvironment): ResolvedTaskEnviron
   };
 }
 
-function directTaskEnvironment(declaration: TaskEnvironmentDeclaration): ResolvedTaskEnvironment | undefined {
+function directTaskEnvironment(
+  declaration: TaskEnvironmentDeclaration,
+  configChannels: readonly string[] | undefined,
+): ResolvedTaskEnvironment | undefined {
   const dependencies = declaration.direct_dependencies;
   const provenance = declaration.expression_provenance;
   if (!dependencies?.length || !provenance) return undefined;
+  const explicitChannels = [...new Set(dependencies.flatMap((dependency) => dependency.channel ? [dependency.channel] : []))];
+  // A direct package's explicit channel identifies that package, not the
+  // complete source set needed to solve its transitive dependencies. When the
+  // frozen config declares an order, Nextflow supplies it to the whole direct
+  // Conda expression, so preserve that complete order here as well.
+  const channels = configChannels ? [...configChannels] : explicitChannels;
   return {
     origin: "direct",
     reference: `direct-conda:${provenance.digest}`,
     digest: canonicalJsonDigest({
       kind: "nextflow-direct-conda-expression",
       expression: declaration.expression,
+      channels,
     }),
-    channels: [...new Set(dependencies.flatMap((dependency) => dependency.channel ? [dependency.channel] : []))]
-      .sort(compareText),
+    channels,
     dependencies,
     problems: [],
   };
@@ -300,10 +338,25 @@ function directTaskEnvironment(declaration: TaskEnvironmentDeclaration): Resolve
 export function planSourceTaskExecution(
   files: readonly FrozenSourceFile[],
   entrypoint: string,
+  options: TaskEnvironmentPlanningOptions = {},
 ): SourceTaskExecutionDecision {
   const manifest = buildSourceManifest(files);
   const outline = indexNextflowSource(files, entrypoint, manifest.source_digest);
-  const inventory = planTaskEnvironments(files, entrypoint);
+  const inventory = planTaskEnvironments(files, entrypoint, options);
+  return planAnalyzedSourceTaskExecution({
+    entrypoint,
+    source_digest: manifest.source_digest,
+    outline,
+    inventory,
+  });
+}
+
+/** @internal Reuse already-validated immutable source analysis without repeating it. */
+export function planAnalyzedSourceTaskExecution(
+  analysis: SourceTaskExecutionAnalysis,
+): SourceTaskExecutionDecision {
+  const { entrypoint, source_digest: sourceDigest, outline, inventory } = analysis;
+  const configChannelOrder = inventory.config_closure.conda_channel_order;
   const blockers = new Map<string, TaskEnvironmentIssue>();
   const reachable = reachableOutline(outline.scopes, outline.invocations, entrypoint, blockers);
   if (!reachable.processScopes.length) addIssue(blockers, issue(
@@ -403,7 +456,7 @@ export function planSourceTaskExecution(
         continue;
       }
     } else {
-      environment = directTaskEnvironment(declaration);
+      environment = directTaskEnvironment(declaration, configChannelOrder?.channels);
       if (!environment) {
         addIssue(blockers, issue(
           "source_task_conda_unsupported",
@@ -413,10 +466,10 @@ export function planSourceTaskExecution(
         continue;
       }
       const unqualified = environment.dependencies.filter((dependency) => !dependency.channel);
-      if (unqualified.length) {
+      if (unqualified.length && !configChannelOrder) {
         for (const dependency of unqualified) addIssue(blockers, issue(
           "source_task_direct_conda_channel_unqualified",
-          `${name} directly declares ${dependency.match_spec} without an explicit channel; use channel::package so its Pixi source is frozen.`,
+          `${name} directly declares ${dependency.match_spec} without an explicit channel and the frozen config has no exact conda.channels order.`,
           dependency.span,
         ));
         continue;
@@ -436,45 +489,9 @@ export function planSourceTaskExecution(
   for (const environment of usedEnvironments.values()) {
     for (const problem of withinEnvironmentIssues(environment)) addIssue(blockers, problem);
   }
-  const channelOrders = new Map<string, readonly string[]>();
-  const directChannels = new Set<string>();
-  for (const environment of usedEnvironments.values()) {
-    if (environment.origin === "file") channelOrders.set(environment.channels.join("\0"), environment.channels);
-    else for (const channel of environment.channels) directChannels.add(channel);
-  }
-  if (channelOrders.size > 1) addIssue(blockers, issue(
-    "source_task_channel_order_conflict",
-    `Reachable task environments use ${channelOrders.size} different channel orders.`,
-    ...[...usedEnvironments.values()]
-      .filter((environment) => environment.origin === "file")
-      .map((environment) => ({ path: environment.reference, start_line: 1, end_line: 1 })),
-  ));
-  let sharedChannels: readonly string[] = [];
-  if (channelOrders.size === 1) {
-    sharedChannels = [...channelOrders.values()][0]!;
-    const sharedChannelSet = new Set(sharedChannels);
-    const absent = [...directChannels].filter((channel) => !sharedChannelSet.has(channel)).sort(compareText);
-    if (absent.length) addIssue(blockers, issue(
-      "source_task_direct_channel_absent_from_shared_order",
-      `Direct Conda package channels are absent from the reachable environment-file channel order: ${absent.join(", ")}.`,
-      ...assignments.filter((assignment) => assignment.environment.origin === "direct"
-        && assignment.environment.channels.some((channel) => absent.includes(channel)))
-        .map((assignment) => assignment.declaration.span),
-    ));
-  } else if (channelOrders.size === 0 && directChannels.size === 1) {
-    sharedChannels = [...directChannels];
-  } else if (channelOrders.size === 0 && directChannels.size > 1) {
-    const channels = [...directChannels].sort(compareText);
-    addIssue(blockers, issue(
-      "source_task_direct_channel_order_unproven",
-      `Reachable direct Conda declarations name multiple channels without declaring one shared priority order: ${channels.join(", ")}.`,
-      ...assignments.filter((assignment) => assignment.environment.origin === "direct")
-        .map((assignment) => assignment.declaration.span),
-    ));
-  }
 
   if (blockers.size) {
-    return { status: "blocked", source_digest: manifest.source_digest, blockers: sortedIssues(blockers.values()) };
+    return { status: "blocked", source_digest: sourceDigest, blockers: sortedIssues(blockers.values()) };
   }
 
   const sortedAssignments = [...assignments].sort((left, right) => compareSpans(left.scope.span, right.scope.span) || compareText(left.scope.id, right.scope.id));
@@ -493,7 +510,7 @@ export function planSourceTaskExecution(
       name: namesByDigest.get(digest)!,
       source_environment_digest: digest,
       source_paths: sameDigestPaths,
-      channels: [...sharedChannels],
+      channels: [...representative.channels],
       dependencies: representative.dependencies
         .map(dependencyProjection)
         .sort((left, right) => compareText(left.name, right.name) || compareText(left.match_spec, right.match_spec)),
@@ -520,11 +537,12 @@ export function planSourceTaskExecution(
     environment: namesByDigest.get(assignment.environment.digest)!,
   })).sort((left, right) => compareText(left.path, right.path) || left.start_byte - right.start_byte || compareText(left.process_scope_id, right.process_scope_id));
   const base: Omit<SourceTaskExecutionPlan, "plan_digest"> = {
-    schema_version: 1 as const,
+    schema_version: 2 as const,
     planner_revision: SOURCE_TASK_EXECUTION_PLANNER_REVISION,
-    source_digest: manifest.source_digest,
+    source_digest: sourceDigest,
     entrypoint,
-    channels: sharedChannels,
+    config_closure: inventory.config_closure,
+    nextflow_plugins: inventory.nextflow_plugins,
     environments,
     assignments: projectedAssignments,
     rewrites,

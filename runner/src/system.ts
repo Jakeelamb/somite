@@ -3,6 +3,8 @@ import { constants as fsConstants } from "node:fs";
 import { delimiter, join } from "node:path";
 import { platform } from "node:os";
 
+type AccessCheck = (path: string, mode: number) => Promise<void>;
+
 export function environmentBinaryDirectories(projectRoot: string, operatingSystem: NodeJS.Platform = platform()) {
   const environment = join(projectRoot, ".pixi", "envs", "default");
   return operatingSystem === "win32"
@@ -28,6 +30,22 @@ export async function executablePath(projectRoot: string, binary: string) {
     }
   }
   return undefined;
+}
+
+/**
+ * Nextflow 26.04.6's local executor starts its outer `.command.run` wrapper
+ * with an absolute /bin/bash path before any Pixi task environment is active.
+ * Fail before a scientific run instead of surfacing a late executor error.
+ */
+export async function requireNextflowHostBash(check: AccessCheck = access) {
+  try {
+    await check("/bin/bash", fsConstants.X_OK);
+  } catch {
+    throw new Error(
+      "Nextflow 26.04.6 local execution requires an executable /bin/bash on the host; install Bash at /bin/bash or run Somite inside a compatible Linux or macOS environment.",
+    );
+  }
+  return "/bin/bash" as const;
 }
 
 export function pixiPlatform(

@@ -59,14 +59,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   execution, compilation, and export when the source carries one complete root
   Pixi lock without delegated task environments.
 - Exact per-task execution for source Nextflow projects without root Pixi files
-  when every reachable process has one static environment-file or fully
-  channel-qualified direct Conda literal. Somite preserves a source-proven
-  shared channel order and dependency conflicts, isolates unique file and
-  expression environments in one frozen Pixi lock, uses verified host-prefix
-  rewrites only for Run, and emits portable
-  `${projectDir}/.pixi/envs/...` rewrites for compilation and export. Dynamic,
-  missing, ambiguous, unqualified, config-overridden, and unsupported task
-  environments remain explicit blockers.
+  when every reachable process has one static environment file or bounded direct
+  Conda literal. Unique file and expression environments remain isolated in one
+  frozen Pixi lock and retain their own case-sensitive channel order; direct
+  expressions may use an exact source `conda.channels` order. Run uses verified
+  host-prefix rewrites, while compilation and export emit portable
+  `${projectDir}/.pixi/envs/...` rewrites. Dynamic, missing, ambiguous, and
+  unsupported task environments remain explicit blockers. Rendering preserves
+  source-owned requirements, channel order, and digest exactly: task features
+  receive no launcher-package or support-channel injection. A separate default
+  Pixi runtime pins Nextflow, OpenJDK, micromamba, and wrapper utilities, remains
+  a fallback after task-prefix activation, and avoids conflicts with older
+  scientific dependency closures.
+- Frozen source preparation now closes source-local configuration through a
+  bounded scalar/include evaluator, emits one exact effective `-C` wrapper with
+  a final catch-all local/no-scratch/Pixi-Bash policy and disabled reports,
+  freezes exact Nextflow plugins through only the default runtime and binds
+  their store digest into closure identity, activates a source `conda` profile
+  only when it supplies the frozen channel order, and requires offline native
+  `config` and `inspect` receipts before execution.
 - A daily unseen-source challenge that advances a content-addressed novelty
   ledger across recent Europe PMC methods papers and current nf-core releases
   and retains structured diagnostic reports without expanding the fixed corpus.
@@ -74,7 +85,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tracked generated state and oversized browser chunks.
 - Versioned deterministic and release-trend benchmark receipts with paired
   same-host comparison, CPU and heap profiling tasks, adjudicated outcome
-  digests, and machine-readable bundle budgets.
+  digests, runtime-decoded profile measurements bound to workflow and Operator
+  sources, and machine-readable bundle budgets.
 - A clean committed-source proof that installs, builds, launches, health-checks,
   and shuts down the source archive before releases are published.
 - A project-local Operator Workshop where agents can draft evidence-backed
@@ -155,11 +167,14 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Native and source compilation caches now require an exact bounded inventory,
   file modes, BLAKE3 digests, and matching Run-closure identity before reuse;
   corrupt or extra entries fail closed and remain available for inspection.
-- Source execution now ignores ambient Nextflow configuration through an
-  explicit `-C` set, private offline `NXF_HOME`, local-only Somite profile, and
-  container-engine shutdown. Plugins and process selectors block admission,
-  validation requires a real bounded DAG artifact, and exported ZIPs preserve
-  an executable `somite-run` launcher with portable task-environment paths.
+- Source execution now ignores ambient Nextflow configuration through one
+  generated effective `-C` wrapper, exact scalar bindings, a private offline
+  `NXF_HOME`, a local-only Somite profile, and container-engine shutdown. Exact
+  plugins are frozen and allowlisted; dynamic plugins, unresolved configuration,
+  and unsupported process selectors still block admission. Validation requires
+  native configuration and process inspection plus a real bounded DAG artifact,
+  and exported ZIPs preserve an executable `somite-run` launcher with portable
+  task-environment paths.
 - Run cancellation now rechecks the abort signal at process creation and always
   releases child ownership, closing the cancel-before-spawn race.
 - Source-index cache identity now advances whenever immutable indexing or

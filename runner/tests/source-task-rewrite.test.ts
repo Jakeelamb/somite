@@ -47,11 +47,12 @@ function fixture() {
     invocation_ids: [`call_${name}`],
   }));
   const base: Omit<SourceTaskExecutionPlan, "plan_digest"> = {
-    schema_version: 1,
+    schema_version: 2,
     planner_revision: SOURCE_TASK_EXECUTION_PLANNER_REVISION,
     source_digest: sourceDigest,
     entrypoint: "main.nf",
-    channels: ["conda-forge", "bioconda"],
+    config_closure: { paths: [], includes: [] },
+    nextflow_plugins: [],
     environments,
     assignments: [
       {
@@ -186,7 +187,7 @@ test("portable staging rejects unsafe environment names after full plan re-diges
 
   assert.throws(
     () => stagePortableSourceTaskExecution(files, malformed),
-    /unsafe portable Pixi environment name/,
+    /source task execution plan environments are invalid or repeated/,
   );
 });
 
@@ -309,5 +310,99 @@ test("rejects a re-digested rewrite outside its assigned process scope", () => {
       ["task_new", "/cache/new"],
     ])),
     /rewrite for process scope scope_task_old is outside its assignment span/,
+  );
+});
+
+test("stages source-provenanced config and exact plugin metadata", () => {
+  const { files, plan } = fixture();
+  const configuredFiles = [
+    ...files,
+    file("nextflow.config", "plugins { id 'nf-schema@2.7.2' }\n"),
+  ];
+  const configured = redigest({
+    ...plan,
+    source_digest: buildSourceManifest(configuredFiles).source_digest,
+    config_closure: { paths: ["nextflow.config"], includes: [] },
+    nextflow_plugins: [{
+      name: "nf-schema",
+      version: "2.7.2",
+      requirement: "nf-schema@2.7.2",
+      spans: [{ path: "nextflow.config", start_line: 1, end_line: 1 }],
+    }],
+  });
+
+  const staged = stageSourceTaskExecution(configuredFiles, configured, new Map([
+    ["task_old", "/cache/old"],
+    ["task_new", "/cache/new"],
+  ]));
+  assert.equal(staged.source_digest, configured.source_digest);
+});
+
+test("rejects forged, omitted, or malformed config and plugin provenance before staging", () => {
+  const { files, plan } = fixture();
+  const prefixes = new Map([["task_old", "/cache/old"], ["task_new", "/cache/new"]]);
+
+  const unsafe = redigest({
+    ...plan,
+    config_closure: { paths: ["../nextflow.config"], includes: [] },
+  });
+  assert.throws(() => stageSourceTaskExecution(files, unsafe, prefixes), /unsafe config path/);
+
+  const configFiles = [
+    ...files,
+    file("nextflow.config", "includeConfig 'conf/runtime.config'\n"),
+    file("conf/runtime.config", "process { withName: OLD { cpus = 2 } }\n"),
+  ];
+  const omittedInclude = redigest({
+    ...plan,
+    source_digest: buildSourceManifest(configFiles).source_digest,
+    config_closure: { paths: ["nextflow.config"], includes: [] },
+  });
+  assert.throws(
+    () => stageSourceTaskExecution(configFiles, omittedInclude, prefixes),
+    /config closure does not match the frozen source/,
+  );
+
+  const pluginFiles = [
+    ...files,
+    file("nextflow.config", "plugins { id 'nf-schema@2.7.2' }\n"),
+  ];
+  const omittedPlugin = redigest({
+    ...plan,
+    source_digest: buildSourceManifest(pluginFiles).source_digest,
+    config_closure: { paths: ["nextflow.config"], includes: [] },
+  });
+  assert.throws(
+    () => stageSourceTaskExecution(pluginFiles, omittedPlugin, prefixes),
+    /plugin requirements do not match the frozen source/,
+  );
+
+  const overrideFiles = [
+    ...files,
+    file("nextflow.config", "process { withName: OLD { conda = params.environment } }\n"),
+  ];
+  const omittedOverride = redigest({
+    ...plan,
+    source_digest: buildSourceManifest(overrideFiles).source_digest,
+    config_closure: { paths: ["nextflow.config"], includes: [] },
+  });
+  assert.throws(
+    () => stageSourceTaskExecution(overrideFiles, omittedOverride, prefixes),
+    /frozen config contains an unclosed task-environment override/,
+  );
+
+  const malformedPlugin = redigest({
+    ...plan,
+    config_closure: { paths: ["nextflow.config"], includes: [] },
+    nextflow_plugins: [{
+      name: "nf-schema",
+      version: "2.7.2",
+      requirement: "nf-schema@latest",
+      spans: [{ path: "nextflow.config", start_line: 1, end_line: 1 }],
+    }],
+  });
+  assert.throws(
+    () => stageSourceTaskExecution(files, malformedPlugin, prefixes),
+    /not one exact requirement/,
   );
 });

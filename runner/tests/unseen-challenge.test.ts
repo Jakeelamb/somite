@@ -20,6 +20,7 @@ import {
 const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
 const retrievedAt = "2026-08-30T18:00:00.000Z";
 const digest = (character: string) => `blake3:${character.repeat(64)}`;
+const canonicalTool = (value: unknown) => String(value ?? "").replace(/[^A-Za-z0-9]/g, "").toLocaleLowerCase("en-US");
 
 test("novelty selection skips previously exercised content digests", () => {
   const oldContent = new TextEncoder().encode("already exercised paper");
@@ -184,6 +185,40 @@ test("paper challenge uses the reviewed Picard action while retaining typed loca
   assert.ok(report.reconstruction.operators.includes("files.import_gtf"));
   assert.deepEqual(report.reconstruction.unresolved_method_inputs, []);
   assert.deepEqual(report.quality.issues, []);
+});
+
+test("paper challenge fails quality when a candidate omits its named core method", async () => {
+  const content = new TextEncoder().encode([
+    "Methods",
+    "RNA-MosaicHunter was the core workflow used to identify RNA mosaic variants.",
+    "The RNA-MosaicHunter source code is available at https://github.com/example/RNA-MosaicHunter.",
+    "STAR aligned the RNA-seq reads before the workflow was run.",
+  ].join("\n"));
+  const { catalog } = await loadOperatorCatalog(join(repositoryRoot, "operators"));
+  const review = reconstructPaper(catalog, new TextDecoder().decode(content), "jats");
+  assert.ok(review.mentions.some((mention) => mention.normalized_name === "rnamosaichunter" && mention.core));
+  assert.ok(review.candidates.length > 0);
+  const brokenReview = {
+    ...review,
+    candidates: review.candidates.map((candidate) => ({
+      ...candidate,
+      graph: {
+        ...candidate.graph,
+        nodes: candidate.graph.nodes.filter((node) => !(node.operator === "gap.missing"
+          && canonicalTool(node.params?.tool) === "rnamosaichunter")),
+      },
+    })),
+  };
+  const report = createPaperChallengeReport({
+    source: { provider: "europe_pmc", id: "PMC-CORE", title: "Core omission", url: "https://example.invalid/core" },
+    content,
+    retrieved_at: retrievedAt,
+    review: brokenReview,
+  });
+
+  assert.equal(report.quality.result, "failed");
+  assert.deepEqual(report.reconstruction.omitted_core_methods, ["rnamosaichunter"]);
+  assert.ok(report.quality.issues.some((issue) => /named core method.*rnamosaichunter/i.test(issue)));
 });
 
 test("workflow challenge reports the frozen source identity and exact blockers", () => {

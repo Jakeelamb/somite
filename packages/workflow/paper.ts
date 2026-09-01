@@ -27,6 +27,7 @@ export type PaperMethodMention = {
   evidence: string;
   support: "operator" | "unsupported";
   executable?: boolean;
+  core?: boolean;
   operator_id?: string;
   source_location?: string;
 };
@@ -119,8 +120,9 @@ const unsupportedMethods: readonly UnsupportedMethod[] = [
   { displayName: "Ballgown", normalizedName: "ballgown", operationClass: "differential_expression", aliases: ["ballgown"], assays: ["rna_seq"], ports: { input: "Gtf", output: "Table" } },
   { displayName: "Kallisto", normalizedName: "kallisto", operationClass: "transcript_quantification", aliases: ["kallisto"], assays: ["rna_seq"], ports: { input: "Fastq", output: "Table" } },
   { displayName: "MultiQC", normalizedName: "multiqc", operationClass: "aggregate_qc", aliases: ["multiqc"], ports: { input: "Directory", output: "Html" } },
-  { displayName: "Picard", normalizedName: "picard", operationClass: "bam_processing", aliases: ["picard", "markduplicates"], assays: ["rna_seq", "variants"], ports: { input: "Bam", output: "Bam" } },
-  { displayName: "Mutect2", normalizedName: "mutect2", operationClass: "variant_calling", aliases: ["mutect2", "mutect"], assays: ["variants"], ports: { input: "Bam", output: "Vcf" } },
+  { displayName: "Picard", normalizedName: "picard", operationClass: "bam_processing", aliases: ["picard", "markduplicates"], assays: ["rna_seq", "variants"] },
+  { displayName: "Mutect2", normalizedName: "mutect2", operationClass: "variant_calling", aliases: ["mutect2"], assays: ["variants"], ports: { input: "Bam", output: "Vcf" } },
+  { displayName: "MuTect", normalizedName: "mutect", operationClass: "variant_calling", aliases: ["mutect"], assays: ["variants"], ports: { input: "Bam", output: "Vcf" } },
   { displayName: "MetaBAT", normalizedName: "metabat", operationClass: "binning", aliases: ["metabat"], assays: ["metagenome"], ports: { input: "Bam", output: "Directory" } },
   { displayName: "SPAdes", normalizedName: "spades", operationClass: "assemble", aliases: ["spades"], assays: ["assembly", "metagenome"], ports: { input: "Fastq", output: "Directory" } },
   { displayName: "Cell Ranger", normalizedName: "cellranger", operationClass: "single_cell_preprocessing", aliases: ["cellranger", "cell ranger"], assays: ["single_cell"], ports: { input: "Fastq", output: "Directory" } },
@@ -153,6 +155,7 @@ const unsupportedMethods: readonly UnsupportedMethod[] = [
   { displayName: "RagTag", normalizedName: "ragtag", operationClass: "scaffold", aliases: ["ragtag"], assays: ["assembly"], ports: { input: "Fasta", inputUnion: ["FastaGz"], output: "Fasta" } },
   { displayName: "ABySS Sealer", normalizedName: "abysssealer", operationClass: "gap_closing", aliases: ["abyss-sealer", "abyss sealer"], assays: ["assembly"], ports: { input: "Fasta", inputUnion: ["FastaGz"], output: "Fasta" } },
   { displayName: "BRAKER3", normalizedName: "braker3", operationClass: "genome_annotation", aliases: ["braker3", "braker"], assays: ["assembly"] },
+  { displayName: "AUGUSTUS", normalizedName: "augustus", operationClass: "gene_prediction", aliases: ["augustus"], assays: ["assembly"] },
   { displayName: "LiftOn", normalizedName: "lifton", operationClass: "annotation_liftover", aliases: ["lifton"], assays: ["assembly"] },
   { displayName: "FCS Adaptor", normalizedName: "fcsadaptor", operationClass: "contamination_screening", aliases: ["fcs adaptor", "fcs-adaptor"], assays: ["assembly"] },
   { displayName: "FCS-GX", normalizedName: "fcsgx", operationClass: "contamination_screening", aliases: ["fcs-gx", "fcs gx"], assays: ["assembly"] },
@@ -269,26 +272,77 @@ function escapedAlias(alias: string) {
   return alias.trim().split(/\s+/).map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\\s+");
 }
 
-function aliasMatchSummary(text: string, aliases: readonly string[]) {
+type CompiledAliasMatcher = Readonly<{
+  expression: RegExp;
+}>;
+
+type CatalogRecognitionPlanEntry = Readonly<{
+  operator: PinnedOperator;
+  paper: NonNullable<PinnedOperator["paper"]>;
+  aliases: readonly CompiledAliasMatcher[];
+}>;
+
+type UnsupportedRecognitionPlanEntry = Readonly<{
+  spec: UnsupportedMethod;
+  aliases: readonly CompiledAliasMatcher[];
+}>;
+
+function compileAliasMatchers(aliases: readonly string[]) {
+  return Object.freeze(aliases.map((alias): CompiledAliasMatcher => {
+    const exactCase = alias.length <= 4 && /^[A-Z]+$/.test(alias);
+    return Object.freeze({
+      expression: new RegExp(`(^|[^A-Za-z0-9_+-])(${escapedAlias(alias)})(?=$|[^A-Za-z0-9_+-])`, exactCase ? "g" : "gi"),
+    });
+  }));
+}
+
+const unsupportedRecognitionPlan: readonly UnsupportedRecognitionPlanEntry[] = Object.freeze(unsupportedMethods.map((spec) => Object.freeze({
+  spec,
+  aliases: compileAliasMatchers(spec.aliases),
+})));
+const catalogRecognitionPlans = new WeakMap<OperatorCatalog, readonly CatalogRecognitionPlanEntry[]>();
+
+function catalogRecognitionPlan(catalog: OperatorCatalog) {
+  const cached = catalogRecognitionPlans.get(catalog);
+  if (cached) return cached;
+  const plan: CatalogRecognitionPlanEntry[] = [];
+  for (const operator of catalog.values()) {
+    if (!operator.paper) continue;
+    plan.push(Object.freeze({ operator, paper: operator.paper, aliases: compileAliasMatchers(operator.paper.aliases) }));
+  }
+  const immutable = Object.freeze(plan);
+  catalogRecognitionPlans.set(catalog, immutable);
+  return immutable;
+}
+
+function aliasMatchSummary(text: string, aliases: readonly CompiledAliasMatcher[]) {
   let first: { start: number; end: number } | undefined;
   let firstExecutable: { start: number; end: number } | undefined;
-  for (const alias of aliases) {
-    const exactCase = alias.length <= 4 && /^[A-Z]+$/.test(alias);
-    const expression = new RegExp(`(^|[^A-Za-z0-9])(${escapedAlias(alias)})(?=$|[^A-Za-z0-9])`, exactCase ? "g" : "gi");
+  for (const { expression } of aliases) {
     const classifyExecutable = executableMatchClassifier(text);
-    for (const match of text.matchAll(expression)) {
-      const prefix = match[1] ?? "";
-      const surface = match[2] ?? "";
-      const start = (match.index ?? 0) + prefix.length;
-      const end = start + surface.length;
-      if (!first || start < first.start) first = { start, end };
-      if (classifyExecutable(start, end)) {
-        if (!firstExecutable || start < firstExecutable.start) firstExecutable = { start, end };
-        break;
+    expression.lastIndex = 0;
+    try {
+      for (let match = expression.exec(text); match; match = expression.exec(text)) {
+        const prefix = match[1] ?? "";
+        const surface = match[2] ?? "";
+        const start = (match.index ?? 0) + prefix.length;
+        const end = start + surface.length;
+        if (!first || start < first.start) first = { start, end };
+        if (classifyExecutable(start, end)) {
+          if (!firstExecutable || start < firstExecutable.start) firstExecutable = { start, end };
+          break;
+        }
+        if (match[0].length === 0) expression.lastIndex += 1;
       }
+    } finally {
+      expression.lastIndex = 0;
     }
   }
   return first ? { first, firstExecutable } : undefined;
+}
+
+function dynamicAliasMatchSummary(text: string, aliases: readonly string[]) {
+  return aliasMatchSummary(text, compileAliasMatchers(aliases));
 }
 
 function detectedVersion(text: string, end: number) {
@@ -348,6 +402,63 @@ function endsWithAsciiMarker(text: string, left: number, end: number, marker: st
   return markerStart >= left && asciiEqualAt(text, markerStart, marker, end);
 }
 
+function boundedClause(text: string, start: number, end: number) {
+  const boundary = (offset: number) => {
+    const value = text[offset];
+    if (value === ";" || value === "\n") return true;
+    if (value !== ".") return false;
+    return !(/\d/.test(text[offset - 1] ?? "") && /\d/.test(text[offset + 1] ?? ""));
+  };
+  const maximumLeft = Math.max(0, start - 512);
+  let left = start;
+  while (left > maximumLeft && !boundary(left - 1)) left -= 1;
+  const maximumRight = Math.min(text.length, end + 512);
+  let right = end;
+  while (right < maximumRight && !boundary(right)) right += 1;
+  return {
+    before: text.slice(left, start).replace(/\s+/g, " ").trim(),
+    after: text.slice(end, right).replace(/\s+/g, " ").trim(),
+    text: text.slice(left, right).replace(/\s+/g, " ").trim(),
+  };
+}
+
+function semanticNonExecutableContext(text: string, start: number, end: number) {
+  const clause = boundedClause(text, start, end);
+  const roleWindow = text.slice(Math.max(0, start - 512), Math.min(text.length, end + 512)).replace(/\s+/g, " ");
+  if (/\b(?:view(?:ed|ing)?|visuali[sz](?:ed|ing)?|display(?:ed|ing)?|inspect(?:ed|ing)?|edit(?:ed|ing)?|manual(?:ly)?\s+curat(?:ed|ing))\b(?:\s+and\s+[A-Za-z-]+){0,2}\s+(?:with|using)\s*$/i.test(clause.before)) {
+    return true;
+  }
+  if (/^\s*(?:\[[^\]]+\]\s*)?(?:was|were|is|are)?\s*(?:used\s+)?only\s+as\s+(?:a\s+)?comparator\b/i.test(clause.after)
+    || /\b(?:not\s+part\s+of|not\s+used\s+in)\s+(?:the\s+)?(?:workflow|pipeline|analysis)\b/i.test(clause.after)) {
+    return true;
+  }
+  if (/^\s*(?:\(?(?:version\s*)?v\.?\s*\d+(?:\.\d+)+(?:[-._]?[A-Za-z0-9]+)?\)?\s*)?(?:was|were|is|are)\s+used\s+only\s+to\s+(?:view|visuali[sz]e|display|inspect|edit)\b/i.test(clause.after)) {
+    return true;
+  }
+  if (/\b(?:as\s+(?:its|an?|the)\s+)?(?:internal\s+)?(?:component|module|backbone)\b/i.test(clause.after)
+    || (/\b(?:integrates?|incorporates?)\b/i.test(clause.before)
+      && /^(?:(?:\s*\[[^\]]+\]|\s*\(\s*[^)]{1,24}\s*\)|\s*\d+))*\s+to\b/i.test(clause.after))) {
+    return true;
+  }
+  if (/\b(?:compar(?:e|ed|ing|ison)|benchmark(?:ed|ing)?|evaluat(?:e|ed|ing|ion))\b/i.test(clause.text)
+    && /\b(?:comparator|previous\s+(?:tool|method)|call\s+set|performance|outperform)/i.test(clause.text)) {
+    return true;
+  }
+  if (/\b(?:sensitivity|specificity|benchmark|comparison)\b/i.test(clause.text)
+    && /\b(?:variants?|calls?|sites?)\s+(?:reported|called|detected)\s+by\s*$/i.test(clause.before)) {
+    return true;
+  }
+  if (/\b(?:sensitivity|specificity|precision|benchmark|comparison|reference\s+set|recaptured|confirmed|missed)\b/i.test(roleWindow)
+    && /\b(?:reported|called|detected|missed|confirmed)\s+by\s*$/i.test(clause.before)) {
+    return true;
+  }
+  if (/\b(?:calls?|results?|outputs?)\b/i.test(clause.before)
+    && /\b(?:downloaded|obtained)\b/i.test(clause.after)) {
+    return true;
+  }
+  return false;
+}
+
 function executableMatchClassifier(text: string) {
   let left = 0;
   let scannedTo = 0;
@@ -381,7 +492,7 @@ function executableMatchClassifier(text: string) {
     for (const marker of NON_EXECUTABLE_BEFORE) {
       if (endsWithAsciiMarker(text, left, beforeEnd, marker)) return false;
     }
-    return lastAfter < end;
+    return lastAfter < end && !semanticNonExecutableContext(text, start, end);
   };
 }
 
@@ -393,18 +504,39 @@ function evidenceSnippet(text: string, start: number, end: number) {
   return text.slice(Math.max(0, start - 72), Math.min(text.length, end + 96)).replace(/\s+/g, " ").trim();
 }
 
-function inferredNovelToolContract(methods: string) {
+function directPrimaryAssemblyUse(text: string, mention: LocatedMention) {
+  const clause = boundedClause(text, mention.offset, mention.end).text;
+  const name = escapedAlias(mention.display_name);
+  return new RegExp(
+    `\\b(?:reads?|sequencing\\s+data)[^;\\n]{0,384}\\bassembled\\s+(?:with|using|by)\\s+${name}\\b|\\b${name}\\b[^;\\n]{0,128}\\b(?:used\\s+to\\s+)?assembl(?:e|ed|ing)\\b`,
+    "i",
+  ).test(clause);
+}
+
+function canBePrimaryAssemblyMethod(mention: LocatedMention) {
+  return mention.operation_class === "assemble" || mention.operator_id === "asm.hifiasm";
+}
+
+function inferredNovelToolContract(methods: string, methodName?: string) {
   const lower = methods.toLocaleLowerCase("en-US");
-  if (/\b(?:variant|snp)\s*call/i.test(methods) && /\bbam\s+files?\b/i.test(methods) && /\bvcf\s+files?\b/i.test(methods)) {
+  const named = methodName ? escapedAlias(methodName) : "[A-Za-z][A-Za-z0-9_.+-]*";
+  const directlyPerforms = (action: string) => new RegExp(
+    `(?:${action})[^.;\\n]{0,96}(?:with|using|by)\\s+${named}\\b|\\b${named}\\b[^.;\\n]{0,96}(?:${action})`,
+    "i",
+  ).test(methods);
+  if (directlyPerforms("(?:variant|snp)\\s*call(?:ed|ing)?") && /\bbam\s+files?\b/i.test(methods) && /\bvcf\s+files?\b/i.test(methods)) {
     return { operationClass: "variant_calling", ports: { input: "Bam" as const, output: "Vcf" as const } };
   }
-  if (/\b(?:(?:genome|metagenome)\s+assembl|assembled|assembler)\b/i.test(methods) && /\b(?:fastq|sequencing reads?)\b/i.test(methods) && /\b(?:fasta|assembl(?:y|ies))\b/i.test(methods)) {
+  if (directlyPerforms("(?:(?:genome|metagenome)\\s+assembl(?:ed|y|ing)?|assembled|assembler)")
+    && /\b(?:fastq|sequencing reads?|long reads?|short reads?)\b/i.test(methods)
+    && /\b(?:fasta|assembl(?:y|ies))\b/i.test(methods)) {
     return { operationClass: "assemble", ports: { input: "Fastq" as const, inputUnion: ["FastqGz" as const], output: "Fasta" as const } };
   }
-  if (/\b(?:align|mapp)(?:ed|ing|ment)?\b/i.test(methods) && /\b(?:fastq|sequencing reads?)\b/i.test(methods) && /\bbam\b/i.test(methods)) {
+  if (directlyPerforms("(?:align|mapp)(?:ed|ing|ment)?") && /\b(?:fastq|sequencing reads?)\b/i.test(methods) && /\bbam\b/i.test(methods)) {
     return { operationClass: "align", ports: { input: "Fastq" as const, inputUnion: ["FastqGz" as const], output: "Bam" as const } };
   }
-  if (lower.includes("count matrix") && /\b(?:fastq|bam)\b/i.test(methods)) {
+  if (directlyPerforms("(?:quantif(?:ied|y|ication)|count(?:ed|ing)?)")
+    && lower.includes("count matrix") && /\b(?:fastq|bam)\b/i.test(methods)) {
     return { operationClass: "quantification", ports: { input: lower.includes("bam") ? "Bam" as const : "Fastq" as const, output: "Table" as const } };
   }
   return undefined;
@@ -416,21 +548,36 @@ function inferredNovelToolContract(methods: string) {
  * executable contract; command and package details still require proof.
  */
 function discoveredNovelMethods(fullText: string, methods: ReturnType<typeof paperMethodsWindow>): LocatedMention[] {
-  const names = new Map<string, string>();
-  const availability = /\b([A-Za-z][A-Za-z0-9_.+-]{2,40})\s+is\s+(?:freely\s+)?available\s+(?:at|on)\s+(?:https?:\/\/)?github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/gi;
+  const names = new Map<string, { displayName: string; core: boolean }>();
+  const proseMethods = methods.text.replace(/https?:\/\/[^\s)\]}]+/gi, (value) => " ".repeat(value.length));
+  const genericNames = new Set(["code", "sourcecode", "workflow", "pipeline", "implementation", "software", "package"]);
+  const availability = /\b([A-Za-z][A-Za-z0-9_.+-]{2,40})(?:\s+v\.?\s*\d+(?:\.\d+)+)?\s+is\s+(?:freely\s+)?available\s+(?:at|on)\s+(?:https?:\/\/)?github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+/gi;
   for (const match of fullText.matchAll(availability)) {
     const displayName = match[1]!;
     const normalized = normalizedName(displayName);
-    if (normalized.length >= 3) names.set(normalized, displayName);
+    if (normalized.length >= 3 && !/^v\d/i.test(normalized) && !genericNames.has(normalized)) names.set(normalized, { displayName, core: true });
   }
-  const contract = inferredNovelToolContract(methods.text);
-  return [...names].flatMap(([normalized, displayName]): LocatedMention[] => {
-    const matched = aliasMatchSummary(methods.text, [displayName]);
+  const repository = /https?:\/\/github\.com\/[A-Za-z0-9_.-]+\/([A-Za-z0-9_.-]+)/gi;
+  for (const match of fullText.matchAll(repository)) {
+    const rawName = match[1]!.replace(/\.git$/i, "").replace(/[.,;:]+$/, "");
+    const normalized = normalizedName(rawName);
+    if (normalized.length < 3) continue;
+    const start = Math.max(0, (match.index ?? 0) - 256);
+    const end = Math.min(fullText.length, (match.index ?? 0) + match[0].length + 96);
+    const context = fullText.slice(start, end);
+    const beforeRepository = fullText.slice(start, match.index ?? 0);
+    if (!/\b(?:source\s+code|workflows?|pipelines?|analysis\s+code|implementation|project\s+home\s*page)\b[^.\n]{0,192}\b(?:available|hosted|repository|github|page)\b[^.\n]{0,96}(?:\(?\s*)?$/i.test(beforeRepository)) continue;
+    if (!dynamicAliasMatchSummary(proseMethods, [rawName])) continue;
+    names.set(normalized, { displayName: rawName, core: true });
+  }
+  return [...names].flatMap(([normalized, { displayName, core }]): LocatedMention[] => {
+    const matched = dynamicAliasMatchSummary(methods.text, [displayName]);
     if (!matched) return [];
     const selected = matched.firstExecutable ?? matched.first;
     const offset = methods.offset + selected.start;
     const end = methods.offset + selected.end;
     const version = detectedVersion(methods.text, selected.end);
+    const contract = inferredNovelToolContract(methods.text, displayName);
     return [{
       display_name: displayName,
       normalized_name: normalized,
@@ -441,6 +588,7 @@ function discoveredNovelMethods(fullText: string, methods: ReturnType<typeof pap
       offset,
       end,
       executable: matched.firstExecutable !== undefined,
+      core,
       aliases: [displayName],
     }];
   });
@@ -449,6 +597,41 @@ function discoveredNovelMethods(fullText: string, methods: ReturnType<typeof pap
 const VERSIONED_METHOD_STOP_WORDS = new Set([
   "algorithm", "analysis", "assembly", "data", "document", "figure", "genome", "method", "methods", "our", "package", "pipeline", "program", "reads", "sample", "samples", "software", "suite", "supplement", "table", "the", "this", "tool", "version", "workflow",
 ]);
+
+const VERSIONED_BRAND_BOUNDARIES = new Set([
+  "a", "an", "and", "another", "as", "at", "by", "for", "from", "in", "into", "of", "on", "or", "our", "the", "then", "to", "using", "was", "were", "with",
+]);
+
+function precedingVersionedBrand(text: string, markerStart: number) {
+  let cursor = markerStart;
+  while (cursor > 0 && /\s/.test(text[cursor - 1]!)) cursor -= 1;
+  if (cursor > 0 && text[cursor - 1] === "(") {
+    cursor -= 1;
+    while (cursor > 0 && /\s/.test(text[cursor - 1]!)) cursor -= 1;
+  }
+  const end = cursor;
+  const tokens: Array<{ value: string; start: number }> = [];
+  while (tokens.length < 4 && cursor > 0) {
+    const sliceStart = Math.max(0, cursor - 48);
+    const tail = text.slice(sliceStart, cursor);
+    const matched = tail.match(/([A-Za-z][A-Za-z0-9_.+\/-]{1,40})$/);
+    if (!matched?.[1]) break;
+    const value = matched[1];
+    const normalized = normalizedName(value);
+    const start = sliceStart + tail.length - value.length;
+    if (VERSIONED_METHOD_STOP_WORDS.has(normalized) || VERSIONED_BRAND_BOUNDARIES.has(normalized)) break;
+    if (tokens.length > 0 && !(/^[A-Z]/.test(value) || /[A-Z].*[A-Z0-9]|[0-9_.+\/-]/.test(value))) break;
+    tokens.unshift({ value, start });
+    cursor = start;
+    while (cursor > 0 && /[ \t]/.test(text[cursor - 1]!)) cursor -= 1;
+  }
+  if (!tokens.length) return undefined;
+  const start = tokens[0]!.start;
+  const displayName = text.slice(start, end).replace(/\s+/g, " ").trim();
+  const normalized = normalizedName(displayName);
+  if (normalized.length < 3 || VERSIONED_METHOD_STOP_WORDS.has(normalized)) return undefined;
+  return { displayName, normalized, start, end };
+}
 
 function inferredOperationClass(context: string) {
   if (/\b(?:scaffold|gap[- ]?clos|order(?:ed|ing)? and orient)/i.test(context)) return "scaffold";
@@ -468,20 +651,19 @@ function inferredOperationClass(context: string) {
  */
 function discoveredVersionedMethods(fullText: string, methods: ReturnType<typeof paperMethodsWindow>): LocatedMention[] {
   const found: LocatedMention[] = [];
-  const versioned = /(^|[^A-Za-z0-9])([A-Za-z][A-Za-z0-9_.+-]{2,40})\s+(?:(?:version\s*)|v)([0-9]+(?:\.[0-9]+)+(?:[-._]?[A-Za-z0-9]+)?)/gi;
+  const versioned = /(^|[^A-Za-z0-9])((?:\(\s*)?(?:(?:version)\s*|v\.?\s*)([0-9]+(?:\.[0-9]+)+(?:[-._]?[A-Za-z0-9]+)?)(?:\s*\))?)/gi;
   for (const match of methods.text.matchAll(versioned)) {
     const prefix = match[1] ?? "";
-    const displayName = match[2]!;
-    const normalized = normalizedName(displayName);
-    if (normalized.length < 3 || VERSIONED_METHOD_STOP_WORDS.has(normalized)) continue;
-    const localStart = (match.index ?? 0) + prefix.length;
-    const localEnd = localStart + displayName.length;
-    if (!executableMatch(methods.text, localStart, localEnd)) continue;
+    const markerStart = (match.index ?? 0) + prefix.length;
+    const brand = precedingVersionedBrand(methods.text, markerStart);
+    if (!brand) continue;
+    const { displayName, normalized, start: localStart, end: localEnd } = brand;
+    const executable = executableMatch(methods.text, localStart, localEnd);
     const lineStart = methods.text.lastIndexOf("\n", localStart - 1) + 1;
     const nextLine = methods.text.indexOf("\n", localEnd);
     const lineEnd = nextLine < 0 ? methods.text.length : nextLine;
     const context = methods.text.slice(Math.max(lineStart, localStart - 192), Math.min(lineEnd, localEnd + 256));
-    const contract = inferredNovelToolContract(context);
+    const contract = executable ? inferredNovelToolContract(context, displayName) : undefined;
     const offset = methods.offset + localStart;
     const end = methods.offset + localEnd;
     found.push({
@@ -493,7 +675,7 @@ function discoveredVersionedMethods(fullText: string, methods: ReturnType<typeof
       support: "unsupported",
       offset,
       end,
-      executable: true,
+      executable,
       aliases: [displayName],
       ...(contract ? { ports: contract.ports } : {}),
     });
@@ -621,9 +803,8 @@ function applyReadLayoutSpecificOperators(fullText: string, mentions: LocatedMen
 function recognizedMethods(catalog: OperatorCatalog, fullText: string, extractedVia: PaperExtractVia): LocatedMention[] {
   const window = paperMethodsWindow(fullText);
   const found: LocatedMention[] = [];
-  for (const operator of catalog.values()) {
-    if (!operator.paper) continue;
-    const matched = aliasMatchSummary(window.text, operator.paper.aliases);
+  for (const { operator, paper, aliases } of catalogRecognitionPlan(catalog)) {
+    const matched = aliasMatchSummary(window.text, aliases);
     if (!matched) continue;
     const selected = matched.firstExecutable ?? matched.first;
     const offset = window.offset + selected.start;
@@ -632,7 +813,7 @@ function recognizedMethods(catalog: OperatorCatalog, fullText: string, extracted
     found.push({
       display_name: window.text.slice(selected.start, selected.end).replace(/\s+/g, " ").trim(),
       normalized_name: normalizedName(operator.title),
-      ...(operator.paper.operation_class ? { operation_class: operator.paper.operation_class } : {}),
+      ...(paper.operation_class ? { operation_class: paper.operation_class } : {}),
       ...(version ? { version } : {}),
       evidence: evidenceSnippet(fullText, offset, end),
       support: "operator",
@@ -640,11 +821,11 @@ function recognizedMethods(catalog: OperatorCatalog, fullText: string, extracted
       offset,
       end,
       executable: matched.firstExecutable !== undefined,
-      aliases: operator.paper.aliases,
+      aliases: paper.aliases,
     });
   }
-  for (const spec of unsupportedMethods) {
-    const matched = aliasMatchSummary(window.text, spec.aliases);
+  for (const { spec, aliases } of unsupportedRecognitionPlan) {
+    const matched = aliasMatchSummary(window.text, aliases);
     if (!matched) continue;
     const selected = matched.firstExecutable ?? matched.first;
     const offset = window.offset + selected.start;
@@ -670,7 +851,7 @@ function recognizedMethods(catalog: OperatorCatalog, fullText: string, extracted
   applyReadLayoutSpecificOperators(fullText, found);
   const alreadyNamed = new Set(found.map((mention) => mention.normalized_name));
   for (const mention of [...discoveredNovelMethods(fullText, window), ...discoveredVersionedMethods(fullText, window)]) {
-    if (found.some((existing) => mention.offset >= existing.offset && mention.end <= existing.end)) continue;
+    if (found.some((existing) => mention.offset < existing.end && existing.offset < mention.end)) continue;
     if (found.some((existing) => existing.normalized_name !== mention.normalized_name && existing.normalized_name.endsWith(mention.normalized_name))) continue;
     if (!alreadyNamed.has(mention.normalized_name)) found.push(mention);
     alreadyNamed.add(mention.normalized_name);
@@ -679,7 +860,11 @@ function recognizedMethods(catalog: OperatorCatalog, fullText: string, extracted
   for (const mention of found.sort((left, right) => left.offset - right.offset || left.normalized_name.localeCompare(right.normalized_name))) {
     if (!unique.has(mention.normalized_name)) unique.set(mention.normalized_name, mention);
   }
-  const mentions = [...unique.values()];
+  const mentions = [...unique.values()].map((mention): LocatedMention => (
+    mention.executable && (mention.core || (canBePrimaryAssemblyMethod(mention) && directPrimaryAssemblyUse(fullText, mention)))
+      ? { ...mention, core: true }
+      : mention
+  ));
   if (extractedVia !== "pdfjs" && extractedVia !== "ocr") return mentions;
   let page = 1;
   let nextPageBreak = fullText.indexOf("\f");
@@ -1380,6 +1565,7 @@ function buildCandidate(
   const linkageWorkflow = assay === "assembly"
     && lowerText.includes("allmaps")
     && (lowerText.includes("linkage map") || lowerText.includes("ordering and orientation"));
+  const rnaDerivedVariantWorkflow = assay === "variants" && /\brna[- ]?seq\b/i.test(text);
   const firstVariantMethod = assay === "variants"
     ? mentions
       .filter((mention) => mention.executable && mention.operation_class === "variant_calling")
@@ -1402,7 +1588,9 @@ function buildCandidate(
     }
     if (mention.assays?.length && !mention.assays.includes(assay)) return false;
     const operator = catalog.get(mention.operator_id!);
-    return Boolean(operator && (operatorAssay(operator, assay) || mention === variantUpstreamAligner));
+    return Boolean(operator && (operatorAssay(operator, assay)
+      || mention === variantUpstreamAligner
+      || (rnaDerivedVariantWorkflow && (mention.operation_class === "read_alignment" || mention.operation_class === "align"))));
   });
   const compounds = new Set(selected.filter((mention) => mention.support === "operator" && mention.operator_id?.startsWith("nf.")).map((mention) => mention.operator_id));
   const filtered = selected.filter((mention) => {
@@ -1532,7 +1720,10 @@ function buildCandidate(
   layoutGraph(graph);
   const reviewed = graph.nodes.some((node) => node.operator !== "gap.missing" && catalog.get(node.operator)?.paper);
   const evidenceBackedGap = graph.nodes.some((node) => node.operator === "gap.missing" && node.note && node.ports.some((port) => port.dir === "in") && node.ports.some((port) => port.dir === "out"));
-  if (!reviewed && !evidenceBackedGap) return undefined;
+  const coreEvidenceGap = filtered.some((mention) => mention.core
+    && graph.nodes.some((node) => node.operator === "gap.missing"
+      && normalizedName(String(node.params?.tool ?? "")) === mention.normalized_name));
+  if (!reviewed && !evidenceBackedGap && !coreEvidenceGap) return undefined;
   const graphValidation = validateGraph(graph);
   const catalogValidation = catalog.verifyGraph(graph);
   if (!graphValidation.ok || !catalogValidation.ok) return undefined;
@@ -1554,26 +1745,123 @@ function buildCandidate(
   } satisfies PaperCandidate;
 }
 
-/**
- * Untyped evidence belongs on one canvas as an unconnected evidence node, not
- * on every assay canvas. If a typed unsupported contract does not apply to any
- * detected assay, degrade it to the same honest evidence-only representation
- * instead of dropping it or wiring it into the wrong workflow.
- */
-function scopeUnsupportedEvidence(mentions: readonly LocatedMention[], assays: readonly Assay[]) {
-  if (!assays.length) return [...mentions];
-  return mentions.map((mention): LocatedMention => {
-    if (mention.support !== "unsupported" || !mention.executable) return mention;
-    const applicable = mention.assays?.length
-      ? assays.filter((assay) => mention.assays!.includes(assay))
-      : [];
-    if (mention.ports && (!mention.assays?.length || applicable.length > 0)) return mention;
-    const { ports: _ports, ...evidenceOnly } = mention;
-    return {
-      ...evidenceOnly,
-      assays: [applicable[0] ?? assays[0]!],
-    };
+function operationClassAssays(operationClass?: string): readonly Assay[] {
+  if (!operationClass) return [];
+  if (/single_cell/i.test(operationClass)) return ["single_cell"];
+  if (/(?:metagenom|binning|taxonomic_classification)/i.test(operationClass)) return ["metagenome"];
+  if (/(?:variant|somatic|germline)/i.test(operationClass)) return ["variants"];
+  if (/(?:transcript|differential_expression|read_quantification)/i.test(operationClass)) return ["rna_seq"];
+  if (/(?:^assemble$|assembly|scaffold|gap_closing|genome_annotation|repeat_|kmer|optical_map)/i.test(operationClass)) return ["assembly"];
+  return [];
+}
+
+function localAssayScores(text: string, mention: LocatedMention) {
+  const clause = `${boundedClause(text, mention.offset, mention.end).text} ${text.slice(Math.max(0, mention.offset - 384), Math.min(text.length, mention.end + 256))}`;
+  const score = (cues: readonly [RegExp, number][]) => cues.reduce((total, [cue, weight]) => total + (cue.test(clause) ? weight : 0), 0);
+  return new Map<Assay, number>([
+    ["assembly", score([
+      [/\b(?:genome|de novo)\s+assembl|\bassembl(?:ed|er)\b/i, 5],
+      [/\b(?:pacbio|hifi|ccs|long reads?|genome size|k[- ]?mer)\b/i, 3],
+      [/\b(?:contig|scaffold|genome annotation|gene prediction)\b/i, 3],
+      [/\b(?:genomic dna|dna librar|mgi|dnbs?|proteome|protein-coding genes?)\b/i, 2],
+    ])],
+    ["rna_seq", score([
+      [/\b(?:rna[- ]?seq|metatranscriptom\w*|transcriptom\w*|transcript|gene expression)\b/i, 5],
+      [/\b(?:feature counts?|count matrix|differential expression)\b/i, 3],
+      [/\brna\b/i, 1],
+    ])],
+    ["variants", score([
+      [/\b(?:variant call|somatic|germline|mosaic variant|vcf)\b/i, 5],
+      [/\bvariants?\b/i, 3],
+      [/\bmosaic\b/i, 2],
+    ])],
+    ["metagenome", score([[/\b(?:metagenom|taxonomic|microbiome|binning)\b/i, 5]])],
+    ["single_cell", score([[/\b(?:single[- ]cell|scrna|cell barcode|cellular barcode)\b/i, 8]])],
+    ["qc", score([[/\b(?:quality control|quality assessment|qc report)\b/i, 4]])],
+    ["unknown", 0],
+  ]);
+}
+
+function uniqueLocalAssay(text: string, mention: LocatedMention, choices: readonly Assay[]) {
+  const scores = localAssayScores(text, mention);
+  const ranked = choices
+    .map((assay) => ({ assay, score: scores.get(assay) ?? 0 }))
+    .filter(({ score }) => score > 0)
+    .sort((left, right) => right.score - left.score);
+  if (!ranked.length || ranked[0]!.score === ranked[1]?.score) return undefined;
+  return ranked[0]!.assay;
+}
+
+function inferredMentionAssay(
+  text: string,
+  mention: LocatedMention,
+  priorMentions: readonly LocatedMention[],
+  assays: readonly Assay[],
+) {
+  const applicable = mention.assays?.length
+    ? assays.filter((assay) => mention.assays!.includes(assay))
+    : [...assays];
+  const choices = applicable.length ? applicable : assays.length === 1 ? [...assays] : [];
+  if (!choices.length) return undefined;
+  const local = uniqueLocalAssay(text, mention, choices);
+  if (local) return local;
+  const semantic = operationClassAssays(mention.operation_class).filter((assay) => choices.includes(assay));
+  if (semantic.length === 1) return semantic[0];
+  const prior = [...priorMentions].reverse().find((candidate) => {
+    if (!candidate.executable || mention.offset - candidate.end > 768) return false;
+    return candidate.assays?.filter((assay) => choices.includes(assay)).length === 1;
   });
+  const inherited = prior?.assays?.filter((assay) => choices.includes(assay));
+  if (inherited?.length === 1) return inherited[0];
+  return choices.length === 1 ? choices[0] : undefined;
+}
+
+/**
+ * Unsupported evidence is projected only where the method sentence, semantic
+ * operation, or an immediately preceding scoped method identifies its assay.
+ * Ambiguous evidence stays in the review as unknown instead of falling onto
+ * whichever detected assay happened to sort first.
+ */
+function scopeUnsupportedEvidence(text: string, mentions: readonly LocatedMention[], assays: readonly Assay[]) {
+  if (!assays.length) return [...mentions];
+  const scoped: LocatedMention[] = [];
+  for (const mention of mentions) {
+    if (mention.support !== "unsupported" || !mention.executable) {
+      scoped.push(mention);
+      continue;
+    }
+    const inferred = inferredMentionAssay(text, mention, scoped, assays);
+    if (inferred) {
+      if (mention.assays?.length && !mention.assays.includes(inferred)) {
+        const { ports: _ports, ...evidenceOnly } = mention;
+        scoped.push({ ...evidenceOnly, assays: [inferred] });
+      } else {
+        scoped.push({ ...mention, assays: [inferred] });
+      }
+      continue;
+    }
+    if (mention.core) {
+      const applicable = mention.assays?.length
+        ? assays.filter((assay) => mention.assays!.includes(assay))
+        : [...assays];
+      if (applicable.length) {
+        scoped.push({ ...mention, assays: applicable });
+        continue;
+      }
+    }
+    const { ports: _ports, ...evidenceOnly } = mention;
+    scoped.push({
+      ...evidenceOnly,
+      assays: ["unknown"],
+    });
+  }
+  return scoped;
+}
+
+function candidateRepresentsMention(candidate: PaperCandidate, mention: LocatedMention) {
+  if (mention.operator_id) return candidate.graph.nodes.some((node) => node.operator === mention.operator_id);
+  return candidate.graph.nodes.some((node) => node.operator === "gap.missing"
+    && normalizedName(String(node.params?.tool ?? "")) === mention.normalized_name);
 }
 
 export function reconstructPaper(catalog: OperatorCatalog, text: string, extractedVia: PaperExtractVia): PaperReview {
@@ -1598,8 +1886,8 @@ export function reconstructPaper(catalog: OperatorCatalog, text: string, extract
   const assays = detectedAssays.includes("rna_seq") && detectedAssays.includes("variants") && !hasRnaAnalysis
     ? detectedAssays.filter((assay) => assay !== "rna_seq")
     : detectedAssays;
-  const candidateMentions = scopeUnsupportedEvidence(mentions, assays);
-  const candidates: PaperCandidate[] = [];
+  const candidateMentions = scopeUnsupportedEvidence(normalized, mentions, assays);
+  const builtCandidates: PaperCandidate[] = [];
   for (const assay of assays) {
     const assemblers = assay === "assembly"
       ? candidateMentions.filter((mention) => mention.executable && isAssemblyMethod(mention))
@@ -1607,13 +1895,17 @@ export function reconstructPaper(catalog: OperatorCatalog, text: string, extract
     if (assemblers.length > 1) {
       for (const assembler of assemblers) {
         const candidate = buildCandidate(catalog, normalized, normalizedLower, resources, candidateMentions, assay, extractedVia, "alternative", assembler);
-        if (candidate) candidates.push(candidate);
+        if (candidate) builtCandidates.push(candidate);
       }
     } else {
       const candidate = buildCandidate(catalog, normalized, normalizedLower, resources, candidateMentions, assay, extractedVia, assays.length > 1 ? "parallel" : "primary");
-      if (candidate) candidates.push(candidate);
+      if (candidate) builtCandidates.push(candidate);
     }
   }
+  const unrepresentedCoreMethods = candidateMentions.filter((mention) => mention.core
+    && mention.executable
+    && !builtCandidates.some((candidate) => candidateRepresentsMention(candidate, mention)));
+  const candidates = unrepresentedCoreMethods.length ? [] : builtCandidates;
   const outcome: PaperReconstructionOutcome = candidates.length
     ? "drafts_ready"
     : mentions.length
@@ -1622,7 +1914,12 @@ export function reconstructPaper(catalog: OperatorCatalog, text: string, extract
   const outcomeWarnings = outcome === "drafts_ready"
     ? [...new Set(candidates.flatMap((candidate) => candidate.warnings))]
     : outcome === "recognized_unsupported"
-      ? ["Somite found computational methods and retained their evidence, but no reviewed executable workflow could be assembled without guessing."]
+      ? [
+        "Somite found computational methods and retained their evidence, but no reviewed executable workflow could be assembled without guessing.",
+        ...(unrepresentedCoreMethods.length
+          ? [`Somite did not offer a supporting-tools-only draft because its named core method${unrepresentedCoreMethods.length === 1 ? "" : "s"} could not be placed honestly: ${unrepresentedCoreMethods.map((mention) => mention.display_name).join(", ")}.`]
+          : []),
+      ]
       : workflowSourceScan.workflow_sources.length
         ? ["Somite found the paper's cited workflow repository, but did not invent a separate workflow from insufficient prose evidence. Pin the cited source below to inspect it directly."]
         : ["Somite read the document but did not find enough computational-method evidence to propose a workflow."];
@@ -1647,6 +1944,7 @@ export function reconstructPaper(catalog: OperatorCatalog, text: string, extract
       evidence: mention.evidence,
       support: mention.support,
       executable: mention.executable,
+      ...(mention.core ? { core: true } : {}),
       ...(mention.operator_id ? { operator_id: mention.operator_id } : {}),
       ...(mention.source_location ? { source_location: mention.source_location } : {}),
     })),

@@ -142,52 +142,101 @@ OpenJDK, and cover source with no delegated container, Conda, Spack, system
 module, or config-level task environment. Somite adopts those exact bytes and
 does not solve a replacement environment or fall back from an incomplete pair.
 
+Static source admission is pure. It consumes immutable bytes, the entrypoint,
+and exact scalar bindings and returns either one content-addressed plan or
+ordered blockers. It never invokes Nextflow or Pixi, installs a plugin, rewrites
+source, or treats a candidate closure as execution evidence. The later
+preparation Adapter owns Pixi adoption or solving, environment realization,
+plugin installation, staged rewrites, and package assembly.
+
 With no root Pixi files, the per-task planner closes over invocations reachable
 from the indexed entry workflow and accepts each process only when it maps
 unambiguously to one static, quoted Conda literal. That literal may name a
-source-relative environment file or a bounded direct MatchSpec list whose every
-package explicitly names its channel. One named Pixi environment is rendered
-per unique environment-file content or direct-expression digest, while a
-pinned default environment supplies Nextflow, OpenJDK, and micromamba. Exact
-dependency constraints, builds, explicit channels, and channel spelling and
-order are preserved. A shared environment-file order may cover direct package
-channels; without one, direct declarations must use a single shared channel
-because Somite does not invent priority between multiple channels. Different
-package versions in different named environments are valid; conflicts within
-one environment and different channel orders across reachable environments are
-blockers. The plan also fails closed for unresolved reachable invocations,
-missing or ambiguous process mappings, dynamic, missing, unsupported, or
-unqualified environment expressions, config environment overrides, and
-dynamic, external, missing, or overriding `includeConfig` sources. Static
-includes are traversed before admission; plugins and `withName` or `withLabel`
-selectors fail closed because their runtime effects cannot be reduced to the
-discovered process contracts. Unreachable process declarations do not enlarge
-the software closure.
+source-relative environment file or a bounded direct MatchSpec list. One named
+Pixi environment is rendered per unique environment-file content or
+direct-expression digest. The pinned default environment supplies Nextflow,
+OpenJDK, micromamba, Bash, coreutils, gawk, grep, sed, and procps-ng on Linux.
+Each named environment retains its own exact dependency constraints, builds,
+channel spelling, and case-sensitive channel priority; different isolated
+environments may use different channel orders. Direct expressions use their
+explicit channels or an exact `conda.channels` declaration from the frozen
+config closure. Multiple channels without a proven priority are blocked rather
+than sorted.
+
+Pixi rendering preserves source-owned requirements rather than replacing them.
+Each task feature contains exactly its frozen scientific dependencies and exact
+source channel order; no launcher dependency or implementation-support channel
+is injected. The default environment separately pins Nextflow, OpenJDK,
+micromamba, Bash, coreutils, gawk, grep, sed, and procps-ng on Linux. Nextflow is
+launched with ambient `CONDA_PREFIX` removed. Its micromamba activation can then
+prepend an existing task prefix while the default Pixi runtime remains a
+fallback for wrapper utilities, without perturbing scientific task solves or
+their identity.
+
+The planner follows only source-local configuration paths proven by a bounded,
+side-effect-free expression evaluator. It accepts exact scalar parameter
+defaults and bindings plus the fixed `NXF_OFFLINE` value needed by reviewed
+literal, interpolation, boolean, conditional, and `startsWith` include guards.
+It is not a Groovy interpreter. Unresolved reachable invocations, ambiguous
+process mappings, dynamic or missing environments, dynamic or external config,
+unsupported configuration precedence, and missing includes fail closed.
+Unreachable process declarations do not enlarge the software closure.
+
+Static plugin declarations are admitted only as exact, non-conflicting
+`id@version` requirements. Preparation installs them with the frozen
+Pixi/Nextflow runtime into a private store, bounds and hashes every portable
+file, and publishes a cache object keyed by platform, runtime manifest and lock,
+and requirements. Cache reads reverify the complete manifest and file inventory;
+dynamic, inexact, conflicting, corrupt, or oversized plugin state fails closed.
 
 Pixi solves one lock containing the default and every planned named
 environment. Run realizes and verifies every prefix, then byte-guards the
 original Conda expressions while rewriting a host-only staged source copy to
-those canonical prefixes. Compile, Agent compilation, and Export do not install
-the workspace and instead rewrite their staged source to portable
+those canonical prefixes. Compile, Agent compilation, and Export never realize
+scientific task environments and instead rewrite their staged source to portable
 `${projectDir}/.pixi/envs/<content-addressed-name>` literals. Both forms retain
 the original source digest, plan digest, rewrite ranges, and executed-source
-digest; the frozen imported object is never mutated. Generated runs enable
+digest; the frozen imported object is never mutated. A portable package with
+exact plugins may realize only the locked default runtime needed to freeze those
+plugin bytes. Their store digest enters the package and closure identity.
+Generated runs enable
 Nextflow's micromamba-backed Conda adapter against the existing Pixi prefixes.
 
 Source execution never inherits the user's Nextflow configuration search path.
-The runner passes only the reviewed source config files plus a generated Somite
-policy through `nextflow -C`, appends the Somite profile last, uses a private
-offline `NXF_HOME`, forces the local executor, and disables container, Wave,
-and Fusion engines. Compile and Export add a mode-preserving `somite-run`
-launcher that installs every locked Pixi environment and repeats this exact
-configuration. Input bindings stay project-relative rather than embedding the
-authoring machine's absolute paths.
+The runner creates one effective wrapper as the sole `nextflow -C` input. Exact
+scalar bindings precede source config so parameter-dependent includes resolve,
+the same bindings follow source defaults so the selected values stay
+authoritative, and the generated Somite policy is included last. When the
+frozen channel order originates in the source `conda` profile, the runner
+activates that profile before the final Somite profile and later requires native
+`conda.channels` resolution to match the plan. An unrelated profile is not
+activated merely because it exists. The final profile disables trace, timeline, report,
+container, Wave, and Fusion engines. In generated-task mode, a catch-all process
+selector also forces the local executor, disables scratch staging, and uses the
+locked default-environment Bash for task scripts even when source selectors set
+different values. Nextflow's outer local wrapper still invokes `/bin/bash`, so
+source Run checks that explicit host prerequisite before preparation. Compile
+and Export add a mode-preserving
+`somite-run` launcher that installs every locked Pixi environment and repeats
+this exact configuration. Input bindings stay project-relative rather than
+embedding the authoring machine's absolute paths.
+
+Before either preview or ordinary execution, the runner asks the locked
+Nextflow runtime for bounded JSON from native `config` and `inspect` commands.
+Both run offline with a private `NXF_HOME`, private work and cache directories,
+the exact wrapper and profiles, and only the frozen plugin store and allowlist.
+The default syntax parser is tried first. Parser v1 is tried exactly once only
+when the default parser returns the known mixed-variable/config-statement
+compatibility diagnostic; `inspect` then uses the same selected parser. Hashed
+receipts retain every attempt and parser decision. All other failures remain
+fail-closed blockers.
 
 Validate invokes Nextflow preview mode for either whole-source mode and records
 source-preview evidence only after Nextflow emits one bounded regular DAG
 artifact whose digest enters the receipt. It proves compilation and DAG
-construction but does not execute scientific tasks or provide
-representative-data validation.
+construction. The preceding config/inspect proof establishes only structural
+and configuration resolution. Neither executes scientific tasks, provides
+representative-data validation, or establishes scientific equivalence.
 Missing parameter editing support is an inspector limitation, not an execution
 blocker unless a required parameter is actually unresolved.
 

@@ -50,11 +50,12 @@ import {
   MAX_WORKFLOW_DOCUMENT_BYTES,
 } from "@somite/workflow/limits";
 import { semanticGraphRevision } from "@somite/workflow/workflow";
+import { MAX_NEXTFLOW_CONDA_CHANNELS } from "@somite/workflow/taskEnvironment";
 import { EvidenceStore } from "./evidenceStore.ts";
 import { atomicWrite, containedPath, pathExists } from "./files.ts";
 import { PixiCache, type LockedManifest } from "./pixiCache.ts";
 import { readSourceObject } from "./sourceWorkflowStore.ts";
-import { runAbortableProcess, terminateProcessTree } from "./process.ts";
+import { runAbortableProcess, terminateProcessTree, withoutEnvironmentPrefix } from "./process.ts";
 import {
   materializePortableProductionGraph,
   materializeProductionGraph,
@@ -63,7 +64,7 @@ import {
 } from "./productionGraph.ts";
 import { RunStorage } from "./runStorage.ts";
 import { requireReadyWorkflow } from "./workflowAdmission.ts";
-import { executablePath, pixiPlatform } from "./system.ts";
+import { executablePath, pixiPlatform, requireNextflowHostBash } from "./system.ts";
 import {
   createCompiledArtifactManifest,
   verifyCompiledArtifactDirectory,
@@ -72,12 +73,22 @@ import {
 } from "./compiledArtifact.ts";
 import {
   freezeSourceExecution,
+  freezeSourceExecutionPluginStore,
   packagePortableSourceExecution,
   realizeSourceExecution,
   SOURCE_EXECUTION_CONFIG,
   SOURCE_EXECUTION_PACKAGE_REVISION,
+  SOURCE_EXECUTION_PLUGIN_DIRECTORY,
   SOURCE_EXECUTION_PROFILE,
 } from "./sourceExecution.ts";
+import {
+  renderSourceConfigWrapper,
+  SOURCE_EFFECTIVE_CONFIG,
+} from "./sourceConfigWrapper.ts";
+import {
+  NextflowConfigProbeError,
+  probeNextflowConfiguration,
+} from "./nextflowConfigProbe.ts";
 
 export type RunPhase = "preparing" | "running" | "finalizing" | "completed" | "failed" | "cancelling" | "cancelled";
 export type RunNodeState = "queued" | "running" | "cached" | "done" | "failed" | "skipped" | "cancelled";
@@ -85,6 +96,7 @@ export type RunNodeState = "queued" | "running" | "cached" | "done" | "failed" |
 const MAX_FAILURE_LOG_TAIL_BYTES = 64 * 1024;
 const MAX_SOURCE_PREVIEW_DAG_BYTES = 8 * 1024 * 1024;
 const SOURCE_PREVIEW_DAG_PATH = ".somite/run/source-preview-dag.html";
+const SOURCE_CONFIG_PROOF_PATH = ".somite/run/nextflow-config-proof.json";
 const SOURCE_LAUNCHER_PATH = "somite-run";
 const SOURCE_LAUNCHER_README_PATH = ".somite/run/README.md";
 
@@ -221,6 +233,8 @@ type PreparedSourcePackage = Readonly<{
   executionMode: "root_lock" | "generated_task_environments";
   nextflowConfigurationPaths: readonly string[];
   nextflowProfiles: readonly string[];
+  nextflowAllowedPluginIds: readonly string[];
+  nextflowExpectedCondaChannels?: readonly string[];
   files: ReadonlyMap<string, Uint8Array>;
   archiveModes: ReadonlyMap<string, 0o644 | 0o755>;
   artifactManifest: CompiledArtifactManifest;
@@ -245,16 +259,17 @@ function shellQuote(value: string) {
 
 function sourceLauncher(
   entrypoint: string,
-  configurationPaths: readonly string[],
+  configurationPath: string,
   profiles: readonly string[],
   generatedTaskEnvironments: boolean,
+  allowedPluginIds: readonly string[],
 ) {
   const nextflow = [
     "nextflow",
     "-log",
     ".somite/run/nextflow.log",
     "-C",
-    configurationPaths.join(","),
+    configurationPath,
     "run",
     entrypoint,
     "-params-file",
@@ -265,6 +280,15 @@ function sourceLauncher(
     "-resume",
     '"$@"',
   ].map((value) => value === '"$@"' ? value : shellQuote(value)).join(" ");
+  const runtimeEnvironment = [
+    'NXF_HOME="$root/.somite/run/nextflow-home"',
+    'NXF_PLUGINS_DIR="$root/.somite/run/nextflow-plugins"',
+    shellQuote(`NXF_PLUGINS_ALLOWED=${allowedPluginIds.join(",")}`),
+    "NXF_PLUGINS_DEFAULT=false",
+    "NXF_OFFLINE=true",
+    "NXF_DISABLE_CHECK_LATEST=true",
+    ...(generatedTaskEnvironments ? ['MAMBA_ROOT_PREFIX="$root/.somite/run/mamba-root"'] : []),
+  ].join(" ");
   return [
     "#!/bin/sh",
     "set -eu",
@@ -274,12 +298,13 @@ function sourceLauncher(
     "  echo 'Somite source packages require Pixi on PATH: https://pixi.prefix.dev/' >&2",
     "  exit 127",
     "fi",
-    'mkdir -p .somite/run/nextflow-home',
-    'export NXF_HOME="$root/.somite/run/nextflow-home"',
-    "export NXF_OFFLINE=true",
-    "export NXF_DISABLE_CHECK_LATEST=true",
+    "if [ ! -x /bin/bash ]; then",
+    "  echo 'Nextflow 26.04.6 local execution requires an executable /bin/bash on the host.' >&2",
+    "  exit 127",
+    "fi",
+    `mkdir -p .somite/run/nextflow-home .somite/run/nextflow-plugins${generatedTaskEnvironments ? " .somite/run/mamba-root" : ""}`,
     "pixi install --all --frozen --manifest-path pixi.toml",
-    `exec pixi run --frozen --manifest-path pixi.toml -- ${nextflow}`,
+    `exec pixi run --clean-env --frozen --manifest-path pixi.toml -- env -u CONDA_PREFIX ${runtimeEnvironment} ${nextflow}`,
     "",
   ].join("\n");
 }
@@ -319,6 +344,84 @@ function sourceJobLogPaths(packagePath: string) {
   };
 }
 
+async function proveSourceConfiguration(
+  prepared: PreparedSourcePackage,
+  packagePath: string,
+  signal: AbortSignal,
+) {
+  const environmentManifest = prepared.environmentManifest;
+  if (!environmentManifest) throw new Error("source workflow execution environment was not realized");
+  const proofPath = join(packagePath, SOURCE_CONFIG_PROOF_PATH);
+  try {
+    const proof = await probeNextflowConfiguration({
+      pixiBinary: prepared.locked.pixi,
+      frozenManifestPath: environmentManifest,
+      projectDirectory: packagePath,
+      entrypoint: prepared.workflow.source.entrypoint,
+      configurationPaths: prepared.nextflowConfigurationPaths,
+      profiles: prepared.nextflowProfiles,
+      paramsFile: ".somite/run/params.json",
+      frozenPluginDirectory: join(packagePath, SOURCE_EXECUTION_PLUGIN_DIRECTORY),
+      allowedPluginIds: prepared.nextflowAllowedPluginIds,
+      signal,
+    });
+    if (prepared.nextflowExpectedCondaChannels) {
+      const conda = proof.config.document.conda;
+      const channels = conda && typeof conda === "object" && !Array.isArray(conda)
+        ? (conda as Readonly<Record<string, unknown>>).channels
+        : undefined;
+      const validChannels = Array.isArray(channels) && channels.length > 0
+        && channels.length <= MAX_NEXTFLOW_CONDA_CHANNELS
+        && channels.every((channel): channel is string => typeof channel === "string"
+          && channel === channel.trim() && channel.length > 0
+          && !/[\u0000-\u001f\u007f]/u.test(channel))
+        && new Set(channels).size === channels.length;
+      if (!validChannels
+        || channels.length !== prepared.nextflowExpectedCondaChannels.length
+        || channels.some((channel, index) => channel !== prepared.nextflowExpectedCondaChannels![index])) {
+        throw new NextflowConfigProbeError(
+          "invalid_shape",
+          `resolved Nextflow conda.channels does not match the frozen source plan: expected ${JSON.stringify(prepared.nextflowExpectedCondaChannels)}, received ${validChannels ? JSON.stringify(channels) : "an invalid value"}`,
+          {
+            stage: "config",
+            receipt: proof.config.receipt,
+            attempts: proof.config.attempts,
+            ...(proof.fallback_reason ? { fallbackReason: proof.fallback_reason } : {}),
+          },
+        );
+      }
+    }
+    const processNames = proof.inspect.document.processes.map((process) => process.name).sort();
+    await atomicWrite(proofPath, `${JSON.stringify({
+      schema_version: 2,
+      status: "passed",
+      proof_digest: proof.proof_digest,
+      parser_mode: proof.parser_mode,
+      fallback_reason: proof.fallback_reason,
+      config_attempts: proof.config.attempts,
+      config_receipt: proof.config.receipt,
+      inspect_attempts: proof.inspect.attempts,
+      inspect_receipt: proof.inspect.receipt,
+      process_count: processNames.length,
+      process_names_digest: canonicalJsonDigest(processNames),
+    }, null, 2)}\n`);
+    return proof;
+  } catch (error) {
+    const failure = error instanceof NextflowConfigProbeError ? error : undefined;
+    await atomicWrite(proofPath, `${JSON.stringify({
+      schema_version: 2,
+      status: "failed",
+      code: failure?.code ?? "unexpected_error",
+      ...(failure?.stage ? { stage: failure.stage } : {}),
+      ...(failure?.fallbackReason ? { fallback_reason: failure.fallbackReason } : {}),
+      ...(failure?.attempts ? { attempts: failure.attempts } : {}),
+      ...(failure?.receipt ? { receipt: failure.receipt } : {}),
+      message: (error instanceof Error ? error.message : String(error)).slice(0, 8_192),
+    }, null, 2)}\n`).catch(() => undefined);
+    throw error;
+  }
+}
+
 async function requireSourcePreviewDag(packagePath: string) {
   const path = join(packagePath, SOURCE_PREVIEW_DAG_PATH);
   let metadata;
@@ -352,26 +455,54 @@ async function prepareSourcePackage(
   if (source.files.some((file) => reservedSourcePath(file.path))) {
     throw new Error("source workflow uses a path reserved for Somite execution metadata");
   }
-  const frozenExecution = await freezeSourceExecution(source.files, workflow.source.entrypoint, platform, cache, signal);
-  const portableExecution = packagePortableSourceExecution(frozenExecution);
+  const params = sourceParameters(workflow);
+  const frozenExecution = await freezeSourceExecution(
+    source.files,
+    workflow.source.entrypoint,
+    platform,
+    cache,
+    signal,
+    { parameters: params },
+  );
   const realizedExecution = realizeEnvironment
     ? await realizeSourceExecution(frozenExecution, platform, cache, signal)
     : undefined;
-  const execution = realizedExecution ?? portableExecution;
+  const portablePlugins = realizedExecution?.nextflow_plugins
+    ?? await freezeSourceExecutionPluginStore(frozenExecution, platform, cache, signal);
+  const portableExecution = packagePortableSourceExecution(frozenExecution, portablePlugins);
+  const execution = realizeEnvironment ? realizedExecution! : portableExecution;
   const locked = execution.locked;
   const graphRevision = semanticGraphRevision(graph);
-  const params = sourceParameters(workflow);
   const sourcePaths = new Set(execution.source_files.map((file) => file.path));
   const projectConfig = posix.join(posix.dirname(workflow.source.entrypoint), "nextflow.config");
-  const nextflowConfigurationPaths = [...new Set([projectConfig, "nextflow.config"])]
+  const rootConfigurationPaths = [...new Set([projectConfig, "nextflow.config"])]
     .filter((path) => sourcePaths.has(path));
-  nextflowConfigurationPaths.push(SOURCE_EXECUTION_CONFIG);
-  const nextflowProfiles = [...new Set([...(workflow.profiles ?? []), SOURCE_EXECUTION_PROFILE])];
+  const effectiveConfigBytes = renderSourceConfigWrapper(
+    rootConfigurationPaths,
+    params,
+    SOURCE_EXECUTION_CONFIG,
+  );
+  const nextflowConfigurationPaths = [SOURCE_EFFECTIVE_CONFIG];
+  const channelOrder = frozenExecution.plan?.config_closure.conda_channel_order;
+  const condaProfile = frozenExecution.plan?.config_closure.conda_profile;
+  const sourceCondaProfile = channelOrder?.origin === "profile"
+    && condaProfile
+    && channelOrder.profile === condaProfile.name
+    ? [condaProfile.name]
+    : [];
+  const nextflowProfiles = [...new Set([
+    ...(workflow.profiles ?? []),
+    ...sourceCondaProfile,
+    SOURCE_EXECUTION_PROFILE,
+  ])];
+  const nextflowAllowedPluginIds = execution.nextflow_plugins?.allowed_plugin_ids ?? [];
+  const nextflowExpectedCondaChannels = frozenExecution.plan?.config_closure.conda_channel_order?.channels;
   const launcherBytes = encoder.encode(sourceLauncher(
     workflow.source.entrypoint,
-    nextflowConfigurationPaths,
+    SOURCE_EFFECTIVE_CONFIG,
     nextflowProfiles,
     execution.mode === "generated_task_environments",
+    nextflowAllowedPluginIds,
   ));
   const policyBytes = portableExecution.generated_files.get(SOURCE_EXECUTION_CONFIG);
   if (!policyBytes) throw new Error("source workflow package is missing its frozen Nextflow execution policy");
@@ -382,6 +513,9 @@ async function prepareSourcePackage(
     lock_digest: execution.environment_identity.lock_digest,
     ...(execution.environment_identity.source_plan_digest
       ? { source_plan_digest: execution.environment_identity.source_plan_digest }
+      : {}),
+    ...(execution.environment_identity.plugin_store_digest
+      ? { plugin_store_digest: execution.environment_identity.plugin_store_digest }
       : {}),
   };
   const closureDigest = canonicalJsonDigest({
@@ -395,12 +529,14 @@ async function prepareSourcePackage(
     packaging: {
       revision: SOURCE_EXECUTION_PACKAGE_REVISION,
       execution_policy_digest: byteDigest(policyBytes),
+      effective_config_digest: byteDigest(effectiveConfigBytes),
       launcher_digest: byteDigest(launcherBytes),
       portable_source_digest: portableSourceDigest,
     },
   });
   const generated = new Map<string, Uint8Array>([
     ...execution.generated_files,
+    [SOURCE_EFFECTIVE_CONFIG, effectiveConfigBytes],
     [SOURCE_LAUNCHER_PATH, launcherBytes],
     [SOURCE_LAUNCHER_README_PATH, encoder.encode(sourceLauncherReadme())],
     ["evidence/index.json", encoder.encode(`${JSON.stringify(emptyEvidenceIndex(), null, 2)}\n`)],
@@ -426,10 +562,17 @@ async function prepareSourcePackage(
       packaging: {
         revision: SOURCE_EXECUTION_PACKAGE_REVISION,
         execution_policy_digest: byteDigest(policyBytes),
+        effective_config_digest: byteDigest(effectiveConfigBytes),
         launcher_digest: byteDigest(launcherBytes),
         portable_source_digest: portableSourceDigest,
       },
     }, null, 2)}\n`)],
+  ]);
+  const generatedExecutablePaths = new Set<string>([
+    SOURCE_LAUNCHER_PATH,
+    ...(execution.nextflow_plugins?.files
+      .filter((file) => file.mode === 0o100755)
+      .map((file) => `${SOURCE_EXECUTION_PLUGIN_DIRECTORY}/${file.path}`) ?? []),
   ]);
   const graphBytes = generated.get(".somite/run/workflow.somite.json")!.byteLength;
   if (graphBytes > MAX_WORKFLOW_DOCUMENT_BYTES) {
@@ -446,7 +589,7 @@ async function prepareSourcePackage(
     await writeFile(destination, file.bytes, { flag: "wx", mode: file.mode === 0o100755 ? 0o755 : 0o644 });
     if (file.mode === 0o100755) await chmod(destination, 0o755);
   }
-  await writePackageFiles(directory, generated, new Set([SOURCE_LAUNCHER_PATH]));
+  await writePackageFiles(directory, generated, generatedExecutablePaths);
   const sourceArtifactFiles: CompiledArtifactSourceFile[] = execution.source_files.map((file) => ({
     path: file.path,
     bytes: file.bytes,
@@ -455,7 +598,7 @@ async function prepareSourcePackage(
   const generatedArtifactFiles: CompiledArtifactSourceFile[] = [...generated].map(([path, bytes]) => ({
     path,
     bytes,
-    mode: path === SOURCE_LAUNCHER_PATH ? 0o755 : 0o644,
+    mode: generatedExecutablePaths.has(path) ? 0o755 : 0o644,
   }));
   const artifactManifest = createCompiledArtifactManifest(
     closureDigest,
@@ -470,10 +613,12 @@ async function prepareSourcePackage(
     closureDigest,
     graphRevision,
     locked,
-    ...(realizedExecution ? { environmentManifest: realizedExecution.environment_manifest } : {}),
+    ...(realizeEnvironment ? { environmentManifest: realizedExecution!.environment_manifest } : {}),
     executionMode: execution.mode,
     nextflowConfigurationPaths,
     nextflowProfiles,
+    nextflowAllowedPluginIds,
+    ...(nextflowExpectedCondaChannels ? { nextflowExpectedCondaChannels } : {}),
     files,
     archiveModes,
     artifactManifest,
@@ -1031,6 +1176,7 @@ export class RunManager {
 
   async #executeSource(job: RunJob) {
     const target = { platform: pixiPlatform() };
+    if (job.intent === "run") await requireNextflowHostBash();
     this.#update(job, { progress: { ...job.status.progress, message: "Verifying and installing the source workflow environment" } });
     const prepared = await prepareSourcePackage(
       job.graph,
@@ -1041,6 +1187,10 @@ export class RunManager {
       true,
       job.abort.signal,
     );
+    if (job.abort.signal.aborted) return this.#finishCancelled(job);
+    await mkdir(join(job.packagePath, SOURCE_EXECUTION_PLUGIN_DIRECTORY), { recursive: true });
+    this.#update(job, { progress: { ...job.status.progress, message: "Checking the resolved Nextflow configuration offline" } });
+    const configurationProof = await proveSourceConfiguration(prepared, job.packagePath, job.abort.signal);
     if (job.abort.signal.aborted) return this.#finishCancelled(job);
     const nodeId = job.graph.nodes[0]!.id;
     job.status.states[nodeId] = "running";
@@ -1070,21 +1220,25 @@ export class RunManager {
           ? ["-preview", "-with-dag", SOURCE_PREVIEW_DAG_PATH]
           : ["-resume"]),
       ];
-      const environmentManifest = prepared.environmentManifest;
-      if (!environmentManifest) throw new Error("source workflow execution environment was not realized");
+      const environmentManifest = prepared.environmentManifest!;
+      const nextflowEnvironment: NodeJS.ProcessEnv = {
+        ...withoutEnvironmentPrefix(process.env, "NXF_"),
+        NXF_DISABLE_CHECK_LATEST: "true",
+        NXF_HOME: nextflowHome,
+        NXF_OFFLINE: "true",
+        NXF_PLUGINS_ALLOWED: prepared.nextflowAllowedPluginIds.join(","),
+        NXF_PLUGINS_DEFAULT: "false",
+        NXF_PLUGINS_DIR: join(job.packagePath, SOURCE_EXECUTION_PLUGIN_DIRECTORY),
+        ...(configurationProof.parser_mode === "v1" ? { NXF_SYNTAX_PARSER: "v1" } : {}),
+        ...(generatedTaskEnvironments ? { MAMBA_ROOT_PREFIX: mambaRoot } : {}),
+      };
       const result = await runAbortableProcess(job.abort.signal, () => spawn(
         prepared.locked.pixi,
-        ["run", "--frozen", "--manifest-path", environmentManifest, "--", "nextflow", ...nextflowArgs],
+        ["run", "--frozen", "--manifest-path", environmentManifest, "--", "env", "-u", "CONDA_PREFIX", "nextflow", ...nextflowArgs],
         {
           cwd: job.packagePath,
           detached: process.platform !== "win32",
-          env: {
-            ...process.env,
-            NXF_DISABLE_CHECK_LATEST: "true",
-            NXF_HOME: nextflowHome,
-            NXF_OFFLINE: "true",
-            ...(generatedTaskEnvironments ? { MAMBA_ROOT_PREFIX: mambaRoot } : {}),
-          },
+          env: nextflowEnvironment,
           windowsHide: true,
           stdio: ["ignore", stdout.fd, stderr.fd],
         },
@@ -1191,7 +1345,10 @@ export class RunManager {
       return [edge.id, result];
     }));
     const artifactFiles = await collectFiles(join(job.packagePath, "results"));
-    if (validation.kind === "source_preview") artifactFiles.push(await requireSourcePreviewDag(job.packagePath));
+    if (validation.kind === "source_preview") {
+      artifactFiles.push(await requireSourcePreviewDag(job.packagePath));
+      artifactFiles.push(join(job.packagePath, SOURCE_CONFIG_PROOF_PATH));
+    }
     const sourceLogs = sourceJobLogPaths(job.packagePath);
     const candidateLogFiles = validation.kind === "source_preview"
       ? [sourceLogs.stdout, sourceLogs.stderr, sourceLogs.nextflow]

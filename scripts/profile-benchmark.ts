@@ -7,7 +7,8 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
 import { ensurePrivateDirectory, immutableWrite } from "../runner/src/files.ts";
-import { BENCHMARK_HARNESS_FILES, semanticDigest, type BenchmarkQuality } from "./benchmark-core.ts";
+import { parseBenchmarkCaseMeasurement, semanticDigest } from "./benchmark-core.ts";
+import { benchmarkProfileContractDigest } from "./benchmark-profile-contract.ts";
 import { spawnOwnedProcess, terminateOwnedProcess, throwIfProcessInterrupted, waitForOwnedProcessTermination } from "./process-owner.ts";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
@@ -68,39 +69,18 @@ const metadata = await lstat(destination);
 if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.size === 0 || metadata.size > 256 * 1024 * 1024) {
   throw new Error("generated benchmark profile is missing, empty, or exceeds 256 MiB");
 }
-const worker = JSON.parse(Buffer.concat(stdoutChunks).toString("utf8")) as { id?: string; quality?: BenchmarkQuality };
-if (worker.id !== benchmarkCase || !worker.quality?.passed) throw new Error("profiled benchmark did not return a passing quality receipt");
-
-async function contractFiles() {
-  const files = ["scripts/profile-benchmark.ts", "scripts/benchmark-case.ts", "runner/src/files.ts", ...BENCHMARK_HARNESS_FILES];
-  if (benchmarkCase !== "paper.gold_text") return files;
-  const rows = (await readFile(join(repositoryRoot, "testdata", "papers", "gold.tsv"), "utf8"))
-    .split("\n")
-    .filter((line) => line && !line.startsWith("#"));
-  const headers = rows.shift()?.split("\t") ?? [];
-  const fixtureIndex = headers.indexOf("fixture");
-  if (fixtureIndex < 0) throw new Error("paper gold corpus has no fixture column");
-  const fixtures = rows.map((line) => line.split("\t")[fixtureIndex]).filter((value): value is string => Boolean(value));
-  if (fixtures.some((fixture) => !/^[A-Za-z0-9._-]+$/.test(fixture))) throw new Error("paper gold corpus contains an unsafe fixture path");
-  return [...files, "scripts/benchmark-paper-topology.ts", "testdata/papers/gold.tsv", ...fixtures.map((fixture) => `testdata/papers/${fixture}`)];
-}
-
-async function digestFiles(paths: readonly string[]) {
-  const hash = createHash("sha256");
-  for (const path of [...new Set(paths)].sort()) {
-    const bytes = await readFile(join(repositoryRoot, path));
-    hash.update(`${Buffer.byteLength(path)}:${path}:${bytes.byteLength}:`);
-    hash.update(bytes);
-  }
-  return `sha256:${hash.digest("hex")}`;
-}
+const worker = parseBenchmarkCaseMeasurement(
+  JSON.parse(Buffer.concat(stdoutChunks).toString("utf8")) as unknown,
+  benchmarkCase,
+);
+if (!worker.quality.passed) throw new Error("profiled benchmark did not return a passing quality receipt");
 
 const profileBytes = await readFile(destination);
 const [{ stdout: revisionOutput }, { stdout: statusOutput }, lockfile, contractDigest] = await Promise.all([
   execFileAsync("git", ["rev-parse", "HEAD"], { cwd: repositoryRoot, encoding: "utf8", maxBuffer: 1024 }),
   execFileAsync("git", ["status", "--porcelain", "--untracked-files=normal"], { cwd: repositoryRoot, encoding: "utf8", maxBuffer: 1024 * 1024 }),
   readFile(join(repositoryRoot, "package-lock.json")),
-  contractFiles().then(digestFiles),
+  benchmarkProfileContractDigest(repositoryRoot, benchmarkCase),
 ]);
 const receipt = {
   schema_version: 1,

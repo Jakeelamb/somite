@@ -19,6 +19,15 @@ export type ChildProcessOwner = {
 const MAX_CAPTURE_BYTES = 512 * 1024;
 const terminationTimers = new WeakMap<ChildProcess, ReturnType<typeof setTimeout>>();
 
+/** Copy an inherited process environment while removing one owned namespace. */
+export function withoutEnvironmentPrefix(
+  environment: Readonly<NodeJS.ProcessEnv>,
+  prefix: string,
+): NodeJS.ProcessEnv {
+  if (!prefix || /[^A-Za-z0-9_]/.test(prefix)) throw new Error("environment prefix must be a non-empty identifier");
+  return Object.fromEntries(Object.entries(environment).filter(([name]) => !name.startsWith(prefix)));
+}
+
 function boundedAppend(current: string, chunk: Buffer, maximumBytes: number) {
   const next = current + chunk.toString("utf8");
   return next.length <= maximumBytes ? next : next.slice(next.length - maximumBytes);
@@ -110,8 +119,12 @@ export async function runCaptured(
 }
 
 export function commandFailure(command: string, result: CapturedCommand) {
-  const detail = result.stderr.split("\n").reverse().find((line) => line.trim())
-    ?? result.stdout.split("\n").reverse().find((line) => line.trim())
-    ?? `${command} exited with ${result.code ?? result.signal ?? "unknown status"}`;
-  return detail.trim();
+  const lines = [result.stderr, result.stdout]
+    .flatMap((stream) => stream.replaceAll("\r", "").split("\n"))
+    .map((line) => line.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, "?").trim())
+    .filter(Boolean)
+    .slice(-8);
+  if (!lines.length) return `${command} exited with ${result.code ?? result.signal ?? "unknown status"}`;
+  const detail = lines.join(" | ");
+  return detail.length > 4_096 ? detail.slice(detail.length - 4_096) : detail;
 }
