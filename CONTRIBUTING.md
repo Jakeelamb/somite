@@ -40,8 +40,8 @@ workflow semantics, `packages/mcp-runtime/` owns the shared MCP boundary, and
 graphs, uploads, evidence, benchmark profiles, and generated tool environments
 live under `.somite/` or `output/` and must not be committed.
 
-Development is supported directly on Linux and macOS. Windows contributors
-should use WSL2; the project does not claim a native Windows execution path.
+Linux x64 is the verified development and execution target. Contributions may
+retain portable seams, but other hosts are not release-gated yet.
 
 ## Make a reviewable change
 
@@ -75,8 +75,8 @@ unavailable, state that directly and explain why.
 The browser smoke uses a system Chrome or Chromium against the built production
 bundle. Set `SOMITE_BROWSER_PATH` for a nonstandard executable location.
 
-Release-affecting changes also require `pixi run smoke` on a supported POSIX
-host. This is a slower networked gate because it resolves and executes the real
+Release-affecting changes also require `pixi run smoke` on Linux x64. This is a
+slower networked gate because it resolves and executes the real
 pinned Pixi and Nextflow environment.
 
 Performance changes must start with the relevant `benchmark:quick` receipt and

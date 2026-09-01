@@ -22,9 +22,8 @@ localhost Adapter, not a second application model. A future hosted execution
 Adapter must accept the same frozen package and return the same ordered events;
 it may not introduce a second graph, compiler, or readiness system.
 
-The direct local execution targets are Linux and macOS. Windows users run the
-same Linux runner and workflow environments inside WSL2; native Windows is not
-an execution target.
+Linux x64 is the verified direct execution target. Other host adapters may be
+added later without changing the graph, compiler, or evidence contracts.
 
 Somite is implemented in TypeScript. Pixi and Nextflow remain external tools,
 and scientific Python belongs inside workflow environments rather than the

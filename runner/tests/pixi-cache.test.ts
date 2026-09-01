@@ -359,12 +359,12 @@ test("a failed old builder cannot remove a replacement cache entry it no longer 
 
     firstController.abort();
     await assert.rejects(first, /operation cancelled/);
-    await new Promise((resolve) => setTimeout(resolve, 150));
     assert.equal(await readFile(sentinelPath, "utf8"), "owned by replacement builder\n");
     assert.deepEqual(await readJsonWhenPresent(join(destination, "building.json")), replacementMarker);
 
     secondController.abort();
     await assert.rejects(second, /operation cancelled/);
+    await assert.rejects(lstat(destination), { code: "ENOENT" });
   } finally {
     await rm(setup.installGate, { force: true });
     process.env.PATH = previousPath;

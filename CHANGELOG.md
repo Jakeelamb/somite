@@ -34,9 +34,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   extraction, cached reconstruction, explicit outcomes, and retained evidence.
 - Streaming, bounded local-file intake; engine-authored Snakemake import; and a
   thin stdio MCP adapter for Somite-owned Agent tools.
-- One root npm workspace and Pixi development lock spanning Linux and macOS,
-  with a launcher that starts and stops the browser and runner together. Windows
-  users run the same Linux path through WSL2.
+- One root npm workspace and Linux x64 Pixi development lock, with a launcher
+  that starts and stops the browser and runner together.
 - Continuous verification for the complete TypeScript product on pushes and
   pull requests.
 - Dependency review, automated dependency updates, issue forms, and pull
@@ -103,8 +102,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Removed the Cargo workspace, Rust toolchain, native-executor spike, duplicate
   web lockfile, and obsolete implementation documents. Accepted output fixtures
   remain as language-independent regression contracts.
-- Replaced the server and shell launcher with a cross-platform TypeScript runner
-  and process supervisor. Pixi and Nextflow remain external execution tools.
+- Replaced the server and shell launcher with a TypeScript runner and process
+  supervisor. Pixi and Nextflow remain external execution tools.
 - Paper intake now has one startup-validated configuration for its upload, text,
   PDF-page, OCR-page, command-timeout, concurrency, and Tesseract-language
   bounds, with actionable failures.
@@ -122,8 +121,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   anchored patterns, and retains remote URI defaults in pinned source. Unseen
   workflow reports also time discovery, import, and the same semantic canvas
   projection used by the UI, with exact invocation coverage.
-- Release verification separates read-only tagged-source execution from the
-  minimal publish authority and crosses Linux and macOS on x64 and arm64.
+- Release verification separates read-only tagged-source execution from minimal
+  publish authority and proves the Linux x64 product path.
 - Replaced the abbreviated license notice with the complete Apache License 2.0
   text so hosting and compliance tools can identify the project license.
 
@@ -153,7 +152,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   offline state, local-only policy, and frozen plugins. Native config, process,
   and DAG proofs gate admission; exported ZIPs retain a portable launcher.
 - Run cancellation now rechecks the abort signal at process creation and always
-  releases child ownership, closing the cancel-before-spawn race.
+  releases child ownership, waits for last-waiter cache cleanup, and closes the
+  cancel-before-spawn race.
 - Source-index cache identity now advances whenever immutable indexing or
   execution-capability derivation changes, so an older source graph is rebuilt
   instead of failing later trust verification against newer semantics.
@@ -198,7 +198,7 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   until a compare-and-swap-protected explicit rebind succeeds.
 - Launcher shutdown now cancels active workflow, paper, and Agent process trees
   without leaving the local runner behind. Module paths and Pixi executable
-  discovery use platform-appropriate layouts on supported direct platforms.
+  discovery use host-appropriate layouts.
 - Lazy workspace-panel loading now exposes authoritative expanded state, and
   semantic-zoom browser checks retain stable source invocation identities while
   viewport rendering mounts only visible Nodes.

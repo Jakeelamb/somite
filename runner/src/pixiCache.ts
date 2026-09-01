@@ -466,7 +466,10 @@ export class PixiCache {
       return await waitFor(operation.promise, signal);
     } finally {
       operation.waiters -= 1;
-      if (operation.waiters === 0 && !operation.settled) operation.controller.abort();
+      if (operation.waiters === 0 && !operation.settled) {
+        operation.controller.abort();
+        await operation.promise.catch(() => undefined);
+      }
     }
   }
 

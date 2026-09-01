@@ -2,8 +2,8 @@
 
 Somite's current release is source-only. It does not yet publish a managed
 hosted service or a standalone desktop bundle. Do not attach a partial artifact
-and describe it as an installable application. Direct source execution supports
-Linux and macOS; Windows verification runs inside WSL2, not native Windows.
+and describe it as an installable application. Linux x64 is the sole verified
+direct source-execution target for this release line.
 
 ## Prepare the release
 
@@ -60,10 +60,9 @@ CI checks and restrict the release environment to maintainers. Those GitHub
 settings are part of the publication boundary and cannot be enforced by the
 source workflow alone.
 
-The execution matrix crosses Linux and macOS on x64 and arm64. Linux arm64 runs
-the real launcher/Pixi/Nextflow gate without the browser leg because GitHub's
-standard ARM image does not include Chrome; the other three matrix entries run
-both.
+The Linux x64 release gate runs both real execution and browser-to-runner smoke.
+Other hosts remain unverified until their scientific package fixtures can be
+resolved without changing source-owned requirements.
 
 After publication, verify the release page, source archives, rendered README,
 license detection, and installation instructions from a fresh directory. Fix

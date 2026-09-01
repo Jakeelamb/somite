@@ -65,9 +65,8 @@ For active development, install once with `pixi run install`, then use
 Pixi is optional for browsing and editing. It is required to freeze and execute
 the generated Nextflow environment.
 
-Linux and macOS are supported directly. On Windows, run Somite inside WSL2;
-native Windows execution is not supported because Somite's reviewed Nextflow
-execution path and bioinformatics package set target a POSIX environment.
+Linux x64 is the verified local execution and release target. Other hosts are
+not release-gated yet; use a Linux x64 host or VM for workflow execution.
 
 ## What Somite does
 
@@ -426,7 +425,7 @@ npm audit --audit-level=moderate
 
 `npm run check` typechecks every workspace and the launcher, lints the browser,
 builds the production web bundle, enforces tracked-source and client-bundle
-size budgets, verifies native package locks for every supported CPU/OS target,
+size budgets, verifies the Linux x64 native package lock,
 and runs the runner, shared-workflow, and UI tests.
 `npm run smoke:browser` then launches that built bundle in a system Chrome or
 Chromium and checks document persistence, Agent controls, local and public data,
