@@ -88,8 +88,9 @@ npm run proof:source
 ```
 
 `proof:source` archives `HEAD`, extracts it into a private temporary directory,
-enforces the strict source-size contract, runs `npm ci`, builds the product, and
-exercises the production launcher. It writes a bounded phase receipt under
+enforces the source-size contract, runs `npm ci` with isolated npm configuration,
+builds the product, and exercises the production launcher.
+It writes a bounded phase receipt under
 `output/benchmarks/` and removes the temporary checkout. Because it archives
 `HEAD`, it does not include uncommitted changes; record the reported source
 commit with the release evidence.

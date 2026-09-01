@@ -16,7 +16,7 @@ const limits = {
 
 const repository = fileURLToPath(new URL("../", import.meta.url));
 const client = join(repository, "web", "dist", "client");
-const generatedPath = /^(?:node_modules|target|coverage|\.somite|\.pixi|\.nextflow|\.next|\.vinext|\.wrangler|\.turbo|output|web\/dist)(?:\/|$)|\/(?:node_modules|target|coverage|\.somite|\.pixi|\.nextflow|\.next|\.vinext|\.wrangler|\.turbo)(?:\/|$)/;
+const generatedPath = /(?:^|\/)(?:node_modules|target|coverage|dist|\.somite|\.pixi|\.nextflow|\.next|\.vinext|\.wrangler|\.turbo)(?:\/|$)|^output(?:\/|$)|(?:^|\/)[^/]+\.tsbuildinfo$/;
 const MAX_SOURCE_FILES = 10_000;
 const argumentsList = process.argv.slice(2);
 const supportedArguments = new Set(["--source-only", "--json"]);

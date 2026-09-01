@@ -21,18 +21,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   paths without hiding source operations from the graph.
 - Evidence-bound paper reconstruction with reviewable candidates and explicit
   unsupported-method, input, resource, and manual-checkpoint boundaries.
-- Paper reconstruction retains explicitly cited public GitHub workflow
-  repositories with page evidence. One action resolves the repository to an
-  immutable commit and opens its pinned Nextflow source on an unchanged empty
-  canvas, independently of the prose-derived draft.
-- Public GitHub Nextflow import resolves a canonical repository and optional
-  revision to one full commit, bounds and verifies the exact source archive,
-  runtime-decodes cached workflow metadata, and requires an unambiguous
-  comment-aware entrypoint before inserting the source graph.
-- Reviewed, version-pinned paper adapters for MultiQC report aggregation,
-  Picard MarkDuplicates with coordinate-sort provenance, and separate Kallisto
-  transcriptome indexing, paired-end quantification, and single-end
-  quantification with explicit fragment-distribution inputs.
+- Paper reconstruction retains cited public workflow repositories with page
+  evidence and can open their immutable Nextflow source independently of a
+  prose-derived draft.
+- Bounded public GitHub Nextflow import with immutable commits, verified source
+  archives, decoded cache metadata, and unambiguous entrypoint selection.
+- Reviewed paper adapters for MultiQC, Picard MarkDuplicates, and Kallisto
+  indexing plus paired- and single-end quantification.
 - Bring-your-own ACP agents backed by revision-safe MCP tools and normal,
   undoable canvas transactions.
 - A content-addressed, observable paper-intake pipeline using native PDF.js
@@ -58,43 +53,28 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Full browser directory import for local Nextflow trees, plus exact validation,
   execution, compilation, and export when the source carries one complete root
   Pixi lock without delegated task environments.
-- Exact per-task execution for source Nextflow projects without root Pixi files
-  when every reachable process has one static environment file or bounded direct
-  Conda literal. Unique file and expression environments remain isolated in one
-  frozen Pixi lock and retain their own case-sensitive channel order; direct
-  expressions may use an exact source `conda.channels` order. Run uses verified
-  host-prefix rewrites, while compilation and export emit portable
-  `${projectDir}/.pixi/envs/...` rewrites. Dynamic, missing, ambiguous, and
-  unsupported task environments remain explicit blockers. Rendering preserves
-  source-owned requirements, channel order, and digest exactly: task features
-  receive no launcher-package or support-channel injection. A separate default
-  Pixi runtime pins Nextflow, OpenJDK, micromamba, and wrapper utilities, remains
-  a fallback after task-prefix activation, and avoids conflicts with older
-  scientific dependency closures.
-- Frozen source preparation now closes source-local configuration through a
-  bounded scalar/include evaluator, emits one exact effective `-C` wrapper with
-  a final catch-all local/no-scratch/Pixi-Bash policy and disabled reports,
-  freezes exact Nextflow plugins through only the default runtime and binds
-  their store digest into closure identity, activates a source `conda` profile
-  only when it supplies the frozen channel order, and requires offline native
-  `config` and `inspect` receipts before execution.
+- Exact per-task execution for source Nextflow projects. Static Conda task
+  environments retain their dependencies and channel order in one Pixi lock;
+  dynamic, missing, ambiguous, or unsupported environments fail closed.
+  Host-only Run rewrites and portable Compile/Export rewrites are separately
+  verified, while wrapper tools remain isolated in the default runtime.
+- Frozen source preparation with bounded configuration closure, exact plugins,
+  one final local/no-scratch policy, and offline native `config` and `inspect`
+  receipts before execution.
 - A daily unseen-source challenge that advances a content-addressed novelty
   ledger across recent Europe PMC methods papers and current nf-core releases
   and retains structured diagnostic reports without expanding the fixed corpus.
 - Enforced source and production-client size budgets, including rejection of
   tracked generated state and oversized browser chunks.
-- Versioned deterministic and release-trend benchmark receipts with paired
-  same-host comparison, CPU and heap profiling tasks, adjudicated outcome
-  digests, runtime-decoded profile measurements bound to workflow and Operator
-  sources, and machine-readable bundle budgets.
+- Versioned benchmark receipts, paired same-host comparison, CPU and heap
+  profiles, quality digests, and machine-readable bundle budgets.
 - A clean committed-source proof that installs, builds, launches, health-checks,
   and shuts down the source archive before releases are published.
 - A project-local Operator Workshop where agents can draft evidence-backed
   `project.*` contracts, prove them through isolated frozen fixture runs, and
   leave final catalog acceptance to the user.
-- Checksum-pinned managed scientific resources with explicit transfer/storage
-  consent, scientific-effect disclosure, private cross-project caching,
-  progress, cancellation, retry, receipts, and typed graph insertion.
+- Checksum-pinned managed resources with consent, effect disclosure, private
+  caching, progress, cancellation, retry, receipts, and typed graph insertion.
 - Security, contribution, conduct, and release-maintainer policies.
 
 ### Changed
@@ -149,6 +129,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Clean-source proof drops inherited npm configuration and excludes generated
+  build outputs from the archive's tracked-source profile.
 - Local gzip-compressed FASTQ inputs now retain exact `FastqGz` types and paired
   read roles. Mixed-compression pairs fail before upload, and STAR accepts them
   only through a visible typed decompression step while gzip-aware tools can
@@ -167,14 +149,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Native and source compilation caches now require an exact bounded inventory,
   file modes, BLAKE3 digests, and matching Run-closure identity before reuse;
   corrupt or extra entries fail closed and remain available for inspection.
-- Source execution now ignores ambient Nextflow configuration through one
-  generated effective `-C` wrapper, exact scalar bindings, a private offline
-  `NXF_HOME`, a local-only Somite profile, and container-engine shutdown. Exact
-  plugins are frozen and allowlisted; dynamic plugins, unresolved configuration,
-  and unsupported process selectors still block admission. Validation requires
-  native configuration and process inspection plus a real bounded DAG artifact,
-  and exported ZIPs preserve an executable `somite-run` launcher with portable
-  task-environment paths.
+- Source execution now uses one effective `-C` wrapper, exact bindings, private
+  offline state, local-only policy, and frozen plugins. Native config, process,
+  and DAG proofs gate admission; exported ZIPs retain a portable launcher.
 - Run cancellation now rechecks the abort signal at process creation and always
   releases child ownership, closing the cancel-before-spawn race.
 - Source-index cache identity now advances whenever immutable indexing or

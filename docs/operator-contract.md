@@ -200,13 +200,10 @@ Operator. A whole-root import must:
 5. index nested scopes and invocations with exact source locations; and
 6. freeze source-defined task environments before claiming Readiness.
 
-Rendering a frozen source task environment preserves its source-owned package
-requirements and channel order exactly. Somite does not add launcher packages
-or an implementation-support channel to the task Pixi feature. The separate
-default runtime pins Nextflow, OpenJDK, micromamba, Bash, coreutils, gawk, grep,
-sed, and procps-ng on Linux. Nextflow starts without an ambient `CONDA_PREFIX`,
-allowing task-prefix activation to retain the default runtime only as a fallback
-for wrapper utilities without changing the scientific solve.
+Frozen task features preserve exact source packages and channel order; Somite
+injects no launcher package or support channel. Wrapper tools live only in the
+default runtime. Nextflow drops ambient `CONDA_PREFIX` before task activation,
+so the fallback runtime cannot change the scientific solve.
 
 Module-level structured editing additionally requires the complete callable
 channel Interface, including metadata values and transforms, plus a source map

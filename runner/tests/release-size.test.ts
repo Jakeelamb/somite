@@ -26,6 +26,9 @@ test("release size checking distinguishes a pristine archive from an installed t
 
   await mkdir(join(root, "web", "dist", "client"), { recursive: true });
   await writeFile(join(root, "web", "dist", "client", "app.js"), "export {};\n");
+  await mkdir(join(root, "mcp", "nextflow", "dist"), { recursive: true });
+  await writeFile(join(root, "mcp", "nextflow", "dist", "server.js"), Buffer.alloc(2 * 1024 * 1024));
+  await writeFile(join(root, "web", "tsconfig.tsbuildinfo"), Buffer.alloc(2 * 1024 * 1024));
   const installed = spawnSync(process.execPath, ["--experimental-strip-types", join(root, "scripts", "check-release-size.ts")], { cwd: root, encoding: "utf8" });
   assert.equal(installed.status, 0, installed.stderr);
   const machineReadable = spawnSync(process.execPath, ["--experimental-strip-types", join(root, "scripts", "check-release-size.ts"), "--json"], { cwd: root, encoding: "utf8" });

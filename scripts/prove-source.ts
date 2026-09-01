@@ -164,9 +164,15 @@ try {
   const sourceRoot = join(proofRoot, "source");
   const archivePath = join(proofRoot, "source.tar");
   const npmCache = join(proofRoot, "npm-cache");
+  const npmUserConfig = join(proofRoot, "npmrc");
   await Promise.all([mkdir(sourceRoot), mkdir(npmCache)]);
-  const childEnvironment: NodeJS.ProcessEnv = { ...process.env, NPM_CONFIG_CACHE: npmCache };
-  delete childEnvironment.npm_config_cache;
+  await atomicWrite(npmUserConfig, "");
+  const childEnvironment: NodeJS.ProcessEnv = { ...process.env };
+  for (const name of Object.keys(childEnvironment)) {
+    if (name.toLowerCase().startsWith("npm_config_")) delete childEnvironment[name];
+  }
+  childEnvironment.NPM_CONFIG_CACHE = npmCache;
+  childEnvironment.NPM_CONFIG_USERCONFIG = npmUserConfig;
 
   sourceCommit = (await capture("git", ["rev-parse", "HEAD"], {
     cwd: repositoryRoot,
