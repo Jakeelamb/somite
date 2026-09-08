@@ -130,6 +130,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Update the locked Browserslist build dependency to 4.28.9, fixing
+  [GHSA-73wf-gq98-2v4g](https://github.com/browserslist/browserslist/security/advisories/GHSA-73wf-gq98-2v4g).
+  Regression tests cover malicious custom stats and auto-discovered stats files.
 - Clean-source proof drops inherited npm configuration and excludes generated
   build outputs from the archive's tracked-source profile.
 - Local gzip-compressed FASTQ inputs now retain exact `FastqGz` types and paired
