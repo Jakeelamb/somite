@@ -37,6 +37,7 @@ import {
   FileSearch,
   FlaskConical,
   FolderOpen,
+  Hand,
   LoaderCircle,
   Maximize2,
   MousePointer2,
@@ -178,7 +179,7 @@ type WorkspaceFlowNode = SomiteFlowNode | SourceFlowNode;
 type WorkspaceFlowEdge = SomiteFlowEdge | SourceFlowEdge;
 type History = WorkflowDocumentHistory;
 type Theme = "dark" | "light";
-type CanvasTool = "select" | "pen" | "sticky" | "box";
+type CanvasTool = "select" | "hand" | "pen" | "sticky" | "box";
 type ContinueFromPort = (nodeId: string, port: SomitePort) => void;
 type SemanticFrame = Readonly<{
   sourceNodeId: string;
@@ -3023,6 +3024,10 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
         setPaperVisible(false);
         setLibraryVisible(true);
         window.setTimeout(() => searchInputRef.current?.focus(), 0);
+      } else if (!command && !event.altKey && event.key.toLowerCase() === "h") {
+        event.preventDefault();
+        setCanvasTool("hand");
+        setSelectedAnnotationId(null);
       } else if (!command && event.key.toLowerCase() === "m") {
         setCanvasTool("pen");
         setSelectedAnnotationId(null);
@@ -3033,6 +3038,10 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
         setCanvasTool("box");
         setSelectedAnnotationId(null);
       } else if (event.key === "Escape") {
+        if (canvasTool === "hand") {
+          setCanvasTool("select");
+          return;
+        }
         if (openSourceNodeId) {
           semanticFramesRef.current = [];
           setSourceFocusGroupId(null);
@@ -3050,7 +3059,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [duplicateSelected, flow, openSourceNodeId, redo, removeAnnotation, runGraph, save, selectedAnnotationId, undo]);
+  }, [canvasTool, duplicateSelected, flow, openSourceNodeId, redo, removeAnnotation, runGraph, save, selectedAnnotationId, undo]);
 
   const selectedNode = nodes.find((node) => node.id === selectedIds.at(-1)) ?? null;
   const promotedSourceInvocationIds = useMemo(
@@ -3189,7 +3198,7 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
   const selectedOperator = selectedNode ? operatorMap.get(selectedNode.data.graphNode.operator) : undefined;
   const selectedHiddenCount = nodes.filter((node) => selectedIds.includes(node.id) && node.data.viewerHidden).length;
   const allViewersHidden = nodes.length > 0 && nodes.every((node) => node.data.viewerHidden);
-  const showCanvasPalette = canvasTool !== "select" || selectedIds.length > 0 || selectedAnnotationId !== null;
+  const showCanvasPalette = canvasTool !== "hand" && (canvasTool !== "select" || selectedIds.length > 0 || selectedAnnotationId !== null);
   const statusError = /not running|could not|cannot|failed|invalid/i.test(status);
   const readinessStatus = readinessSummary(readiness, running, validationEvidence, readinessError);
 
@@ -3354,19 +3363,21 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
             snapGrid={SNAP}
             minZoom={.02}
             maxZoom={16}
-            deleteKeyCode={["Backspace", "Delete"]}
+            deleteKeyCode={canvasTool === "hand" ? null : ["Backspace", "Delete"]}
             multiSelectionKeyCode={sourceCanvasOpen ? ["Meta", "Control", "Shift"] : ["Meta", "Control"]}
-            selectionOnDrag
+            selectionKeyCode={canvasTool === "hand" ? null : "Shift"}
+            selectionOnDrag={canvasTool !== "hand"}
             panOnScroll={false}
             zoomOnScroll
             preventScrolling
             zoomOnDoubleClick={false}
             zoomOnPinch
             zoomActivationKeyCode={["Meta", "Control"]}
-            panOnDrag={canvasTool === "select" ? [1, 2] : false}
+            panOnDrag={canvasTool === "hand" ? true : canvasTool === "select" ? [1, 2] : false}
             nodesDraggable={canvasTool === "select"}
-            nodesConnectable={!sourceCanvasOpen}
-            edgesReconnectable={!sourceCanvasOpen}
+            elementsSelectable={canvasTool !== "hand"}
+            nodesConnectable={!sourceCanvasOpen && canvasTool !== "hand"}
+            edgesReconnectable={!sourceCanvasOpen && canvasTool !== "hand"}
             panActivationKeyCode="Space"
             connectionRadius={28}
             onlyRenderVisibleElements
@@ -3395,7 +3406,8 @@ function SomiteWorkspace({ initialQuery, client }: { initialQuery: string; clien
           <button type="button" className={libraryVisible ? "primary active" : "primary"} aria-label="Add Anything" aria-expanded={libraryVisible} title="Add anything (Ctrl K)" onClick={() => { setProjectVisible(false); setPaperVisible(false); setToolchainVisible(false); setPendingConnection(null); setLibraryVisible(true); window.setTimeout(() => searchInputRef.current?.focus(), 0); }}><Plus size={17} aria-hidden="true" /><span>Add</span></button>
           <label className="canvas-tool" title="Import local files"><CloudUpload size={16} aria-hidden="true" /><span>Import files</span><input type="file" multiple aria-label="Import local files" onChange={(event) => { const files = [...(event.currentTarget.files ?? [])]; event.currentTarget.value = ""; void addDroppedFiles(files, canvasCenter()); }} /></label>
           <i className="canvas-toolbar-divider" />
-          <button type="button" className={canvasTool === "select" ? "active" : ""} aria-label="Select Tool" title="Select (Esc)" onClick={() => setCanvasTool("select")}><MousePointer2 size={15} aria-hidden="true" /></button>
+          <button type="button" className={canvasTool === "select" ? "active" : ""} aria-label="Select Tool" aria-pressed={canvasTool === "select"} title="Select (Esc)" onClick={() => setCanvasTool("select")}><MousePointer2 size={15} aria-hidden="true" /></button>
+          <button type="button" className={canvasTool === "hand" ? "active" : ""} aria-label="Hand Tool" aria-pressed={canvasTool === "hand"} title="Hand / pan (H) · drag to move around the canvas" onClick={() => { setCanvasTool("hand"); setSelectedAnnotationId(null); }}><Hand size={15} aria-hidden="true" /></button>
           <button type="button" className={canvasTool === "pen" ? "active" : ""} aria-label="Pen Tool" title="Pen (M)" onClick={() => { setCanvasTool("pen"); setSelectedAnnotationId(null); }}><PenTool size={15} aria-hidden="true" /></button>
           <button type="button" className={canvasTool === "sticky" ? "active" : ""} aria-label="Sticky Note Tool" title="Sticky note (S)" onClick={() => { setCanvasTool("sticky"); setSelectedAnnotationId(null); }}><StickyNote size={15} aria-hidden="true" /></button>
           <button type="button" className={canvasTool === "box" ? "active" : ""} aria-label="Box Tool" title="Stage box (B)" onClick={() => { setCanvasTool("box"); setSelectedAnnotationId(null); }}><Square size={15} aria-hidden="true" /></button>

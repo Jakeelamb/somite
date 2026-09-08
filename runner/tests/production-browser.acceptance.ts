@@ -375,6 +375,31 @@ test("production Nextflow workflow uses one continuous semantic-zoom canvas", { 
   assert.equal(await canvas.locator("[data-source-entity-kind='invocation']").count(), 3);
   assert.equal(await flowHost.getAttribute("data-persistent-flow"), "semantic-host");
 
+  {
+    const flowViewport = () => canvas.locator(".react-flow__viewport").evaluate((element) => {
+      const matrix = new DOMMatrixReadOnly(getComputedStyle(element).transform);
+      return { x: matrix.e, y: matrix.f, zoom: matrix.a };
+    });
+    await page.getByRole("button", { name: "Fit Workflow", exact: true }).click();
+    await page.waitForTimeout(350);
+    const focusedViewport = await flowViewport();
+    const invocationPosition = await invocations.first().locator("..").evaluate((element) => (element as HTMLElement).style.transform);
+    await page.getByRole("button", { name: "Hand Tool", exact: true }).click();
+    const invocationBox = await invocations.first().boundingBox();
+    assert.ok(invocationBox);
+    await page.mouse.move(invocationBox.x + invocationBox.width / 2, invocationBox.y + invocationBox.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(invocationBox.x + invocationBox.width / 2 + 65, invocationBox.y + invocationBox.height / 2 + 30, { steps: 5 });
+    await page.mouse.up();
+    const handViewport = await flowViewport();
+    assert.ok(Math.abs(handViewport.x - focusedViewport.x - 65) < 2 && Math.abs(handViewport.y - focusedViewport.y - 30) < 2, "Hand pans over source calls in the focused canvas");
+    assert.equal(handViewport.zoom, focusedViewport.zoom);
+    assert.equal(await invocations.first().locator("..").evaluate((element) => (element as HTMLElement).style.transform), invocationPosition);
+    await page.keyboard.press("Escape");
+    assert.equal(await page.getByRole("button", { name: "Select Tool", exact: true }).getAttribute("aria-pressed"), "true");
+    assert.equal(await canvas.getAttribute("data-semantic-depth"), "2", "Escape leaves Hand mode before leaving the focused source frame");
+  }
+
   const sourceProjectionScreenBounds = async () => {
     const projectedNodes = canvas.locator([
       ".react-flow__node-sourceEntity",
@@ -815,6 +840,114 @@ test("public-source validation explains exactly what representative data did not
   assert.deepEqual(submittedGraph?.nodes.map((node) => node.operator), ["ensembl.fasta", "archive.gunzip_fasta", "align.star_index"]);
   assert.equal(submittedGraph?.nodes.find((node) => node.id === "index")?.params?.genome_sa_index_nbases, undefined,
     "fixture-only STAR sizing belongs to runner binding, not the saved canvas submission");
+  assertNoPageErrors();
+});
+
+test("Hand tool pans over canvas content without editing and returns to Select", { timeout: 45_000 }, async (context) => {
+  const app = await startProductionApp();
+  context.after(app.stop);
+  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+  context.after(() => page.close());
+  const assertNoPageErrors = watchPage(page);
+  await emptyCatalogs(page, app);
+  const named = (scope: Page | Locator, name: string, exact = true) => scope.getByRole("button", { name, exact });
+  const button = named;
+  const saveWorkflow = async (page: Page) => {
+    await button(page, "Save").click();
+    await button(page, "Saved").waitFor();
+  };
+  await page.goto(app.webUrl);
+  await page.getByRole("textbox", { name: "Workflow name" }).waitFor();
+  await named(page, "Close Library").click();
+  await page.getByLabel("Import local files").setInputFiles(join(repositoryRoot, "testdata", "tiny_R1.fastq"));
+  const node = page.locator(".react-flow__node-somite");
+  await node.waitFor();
+  await named(page, "Close Parameters").click();
+  await named(page, "Fit Workflow").click();
+  await page.waitForTimeout(350);
+
+  const canvas = page.locator("#workflow-canvas");
+  const pane = canvas.locator(".react-flow__pane");
+  const viewport = () => canvas.locator(".react-flow__viewport").evaluate((element) => {
+    const matrix = new DOMMatrixReadOnly(getComputedStyle(element).transform);
+    return { x: matrix.e, y: matrix.f, zoom: matrix.a };
+  });
+  await named(page, "Sticky Note Tool").click();
+  await pane.click({ position: { x: 480, y: 620 } });
+  const note = canvas.locator(".canvas-annotation.sticky");
+  await note.getByRole("textbox").fill("Keep this note in place");
+  await saveWorkflow(page);
+  const graphBefore = (await (await fetch(`${app.runnerUrl}/api/session`)).json()).graph;
+  const nodePosition = await node.evaluate((element) => element.style.transform);
+  const notePosition = await note.evaluate((element) => [element.style.left, element.style.top]);
+
+  const select = named(page, "Select Tool", true);
+  const hand = named(page, "Hand Tool", true);
+  assert.equal(await select.getAttribute("aria-pressed"), "true");
+  assert.equal(await select.evaluate((element) => element.nextElementSibling?.getAttribute("aria-label")), "Hand Tool");
+  await hand.click();
+  assert.equal(await hand.getAttribute("aria-pressed"), "true");
+  assert.equal(await select.getAttribute("aria-pressed"), "false");
+  assert.equal(await page.getByLabel("Canvas colors", { exact: true }).count(), 0);
+  assert.equal(await pane.evaluate((element) => getComputedStyle(element).cursor), "grab");
+
+  const dragToPan = async (point: { x: number; y: number }, label: string) => {
+    const before = await viewport();
+    await page.mouse.move(point.x, point.y);
+    await page.mouse.down();
+    await page.mouse.move(point.x + 75, point.y + 35, { steps: 6 });
+    assert.equal(await pane.evaluate((element) => getComputedStyle(element).cursor), "grabbing");
+    await page.mouse.up();
+    const after = await viewport();
+    assert.ok(Math.abs(after.x - before.x - 75) < 2 && Math.abs(after.y - before.y - 35) < 2, `${label} must pan with the primary button`);
+    assert.equal(after.zoom, before.zoom, `${label} must not zoom`);
+    assert.equal(await canvas.locator(".react-flow__selection").count(), 0);
+  };
+  const center = async (locator: Locator) => {
+    const box = await locator.boundingBox();
+    assert.ok(box);
+    return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  };
+  const paneBox = await pane.boundingBox();
+  assert.ok(paneBox);
+  await dragToPan({ x: paneBox.x + 180, y: paneBox.y + 100 }, "blank canvas");
+  await dragToPan(await center(node), "node card");
+  await dragToPan(await center(node.locator(".react-flow__handle").first()), "connection handle");
+  await dragToPan(await center(note.locator("header")), "note drag handle");
+  await page.keyboard.down("Shift");
+  await dragToPan(await center(note.getByRole("textbox")), "note text with Shift held");
+  await page.keyboard.up("Shift");
+  assert.equal(await node.evaluate((element) => element.style.transform), nodePosition);
+  assert.deepEqual(await note.evaluate((element) => [element.style.left, element.style.top]), notePosition);
+  assert.equal(await note.getByRole("textbox").inputValue(), "Keep this note in place");
+  assert.equal(await canvas.locator(".react-flow__node.selected").count(), 0);
+  assert.equal(await button(page, "Save").count(), 0, "panning must not dirty the workflow");
+  assert.deepEqual((await (await fetch(`${app.runnerUrl}/api/session`)).json()).graph, graphBefore);
+
+  await page.keyboard.press("Escape");
+  assert.equal(await select.getAttribute("aria-pressed"), "true");
+  await select.click();
+  await page.keyboard.press("h");
+  assert.equal(await hand.getAttribute("aria-pressed"), "true");
+  await select.click();
+  const library = await openLibrary(page);
+  const search = library.getByRole("textbox", { name: "Search everything" });
+  await search.fill("");
+  await search.press("h");
+  assert.equal(await search.inputValue(), "h");
+  assert.equal(await hand.getAttribute("aria-pressed"), "false", "typing H must not change tools");
+  await named(library, "Close Library").click();
+  await page.keyboard.down("Space");
+  await dragToPan({ x: paneBox.x + 180, y: paneBox.y + 100 }, "existing Space-drag navigation");
+  await page.keyboard.up("Space");
+  await named(page, "Fit Workflow").click();
+  await page.waitForTimeout(350);
+  const nodeCenter = await center(node);
+  await page.mouse.move(nodeCenter.x, nodeCenter.y);
+  await page.mouse.down();
+  await page.mouse.move(nodeCenter.x + 80, nodeCenter.y + 40, { steps: 6 });
+  await page.mouse.up();
+  assert.notEqual(await node.evaluate((element) => element.style.transform), nodePosition, "Select restores node dragging");
   assertNoPageErrors();
 });
 

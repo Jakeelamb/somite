@@ -8,6 +8,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- A Hand tool beside Select for touchpad-friendly canvas panning: H activates it,
+  and Escape returns to Select without leaving the current source-workflow frame.
 - A local-first visual canvas for typed bioinformatics graphs, direct editing,
   autosave, undo/redo, annotations, and human-readable readiness guidance.
 - Deterministic Nextflow DSL2 and Pixi package generation with pinned operator,

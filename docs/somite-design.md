@@ -491,6 +491,10 @@ replacement sidecar is durably published.
 
 - The canvas is the primary surface; temporary panels never become alternate
   editors.
+- Hand sits beside Select in the bottom toolbar. Click Hand or press H to pan
+  with a primary-button drag, including over Nodes, groups, wires, and notes.
+  Escape returns to Select before leaving a nested source frame. Hand gestures
+  change only the viewport; existing Space-drag and zoom controls remain available.
 - Connections are typed and paired reads retain separate R1/R2 streams.
 - Workflow names edit in place and drive safe export names.
 - Annotations and colors are portable presentation state only.

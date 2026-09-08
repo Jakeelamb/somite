@@ -354,6 +354,8 @@ button:disabled { cursor: default; opacity: .42; }
 .canvas-color-palette > button.clear { display: grid; place-items: center; background: var(--surface); color: var(--muted); }
 .studio-canvas.tool-pen .react-flow__pane { cursor: crosshair; }
 .studio-canvas.tool-sticky .react-flow__pane, .studio-canvas.tool-box .react-flow__pane { cursor: copy; }
+/* Let Hand drags reach the pane even over node controls, wires, groups, and notes. */
+.studio-canvas.tool-hand .react-flow__viewport, .studio-canvas.tool-hand .react-flow__viewport * { pointer-events: none !important; }
 
 .panel-layer { position: absolute; top: calc(66px + env(safe-area-inset-top)); bottom: calc(36px + env(safe-area-inset-bottom)); left: 68px; z-index: 42; pointer-events: none; }
 .workspace-panel-loading { position: absolute; top: 74px; left: 50%; z-index: 55; padding: 8px 11px; display: flex; align-items: center; gap: 7px; transform: translateX(-50%); border: 1px solid var(--border); border-radius: 7px; background: var(--surface-raised); box-shadow: var(--shadow); color: var(--muted); font-size: 9px; }
