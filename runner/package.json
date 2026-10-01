@@ -13,11 +13,11 @@
   },
   "devDependencies": {
     "@types/busboy": "1.5.4",
-    "@types/node": "22.19.19",
-    "typescript": "5.9.3"
+    "@types/node": "26.6.3",
+    "typescript": "7.0.2"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "1.4.0",
+    "@agentclientprotocol/sdk": "1.5.1",
     "@somite/workflow": "0.1.0",
     "busboy": "1.6.0",
     "pdfjs-dist": "6.3.289"
