@@ -12,14 +12,14 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
-    "@types/busboy": "1.5.4",
-    "@types/node": "22.19.19",
-    "typescript": "5.9.3"
+    "@types/busboy": "1.5.5",
+    "@types/node": "26.6.6",
+    "typescript": "7.0.2"
   },
   "dependencies": {
-    "@agentclientprotocol/sdk": "1.4.0",
+    "@agentclientprotocol/sdk": "2.1.0",
     "@somite/workflow": "0.1.0",
     "busboy": "1.6.0",
-    "pdfjs-dist": "6.3.289"
+    "pdfjs-dist": "6.4.299"
   }
 }
