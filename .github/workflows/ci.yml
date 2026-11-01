@@ -25,7 +25,7 @@ jobs:
       - name: Lint GitHub workflows
         run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: .nvmrc
           cache: npm
@@ -46,7 +46,7 @@ jobs:
         run: npm run benchmark:quick
       - name: Upload main benchmark receipt
         if: steps.main_benchmark.outcome == 'success'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: quick-benchmark-${{ github.sha }}
           path: output/benchmarks/*-quick.json
@@ -246,7 +246,7 @@ jobs:
         run: echo 'The base revision has no benchmark contract; candidate outcome receipts establish the first series without a fabricated comparison.'
       - name: Upload paired receipts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: paired-benchmark-${{ github.event.pull_request.number }}-${{ github.run_attempt }}
           path: |
@@ -267,7 +267,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Set up locked Pixi environment
-        uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
+        uses: prefix-dev/setup-pixi@ad1da6449d9e506fd127fd67ab2d054a769f6a94 # v0.11.2
         with:
           pixi-version: v0.77.1
           locked: true
