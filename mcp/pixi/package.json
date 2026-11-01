@@ -15,13 +15,13 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
-    "@modelcontextprotocol/server": "2.0.0",
+    "@modelcontextprotocol/server": "2.4.0",
     "@somite/mcp-runtime": "0.1.0",
-    "zod": "4.5.4"
+    "zod": "4.6.7"
   },
   "devDependencies": {
-    "@modelcontextprotocol/client": "^2.0.0",
-    "@types/node": "22.19.19",
-    "typescript": "5.9.3"
+    "@modelcontextprotocol/client": "^2.4.0",
+    "@types/node": "26.6.6",
+    "typescript": "7.0.2"
   }
 }
